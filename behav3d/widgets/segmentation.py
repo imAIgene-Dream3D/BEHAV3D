@@ -1749,9 +1749,9 @@ class CellposeChannelConfigPanel:
                     sample_row.append(dropdown)
 
                 children.append(widgets.HBox(sample_row))
-        
+
         self.channel_config_container.children = children
-    
+
     def _persist_params(self):
         """Save channel configuration to config file"""
         cellpose_cfg = self.metadata_loader.behav3d_parameters.setdefault("cellpose", {})
@@ -1763,7 +1763,7 @@ class CellposeChannelConfigPanel:
         self.n_channels_display.value = self._channels_summary_html()
 
         cellpose_cfg["labels_mode"] = self.labels_mode.value
-        
+
         if self.labels_mode.value == 'same_for_all':
             # Save global channel labels
             channel_labels = {}
@@ -1780,7 +1780,7 @@ class CellposeChannelConfigPanel:
                     per_sample_labels[sample_name] = {i: dd.value for i, dd in dropdowns.items()}
             cellpose_cfg["per_sample_channel_labels"] = per_sample_labels
             cellpose_cfg["channel_labels"] = {}
-        
+
         # Save to file
         if hasattr(self.metadata_loader, "behav3d_parameters_path"):
             yaml.safe_dump(
@@ -1788,7 +1788,7 @@ class CellposeChannelConfigPanel:
                 self.metadata_loader.behav3d_parameters_path.open("w"),
                 sort_keys=False
             )
-    
+
     def _on_save(self, btn):
         """Save channel configuration"""
         with self.out:
@@ -1796,7 +1796,7 @@ class CellposeChannelConfigPanel:
             try:
                 self._persist_params()
                 print("Channel configuration saved successfully!")
-                
+
                 # Show summary
                 mode = self.labels_mode.value
                 if mode == 'same_for_all' and 'global' in self.channel_dropdowns:
@@ -2018,14 +2018,139 @@ class CellposeInferencePanel:
         display(self.ui)
 
 
+class SAMChannelSelectorBox(widgets.VBox):
+    """Per-cell-type channel picker for Cellpose-SAM.
+
+    Notebook twin of ``behav3d.napari._segmentation.SAMChannelSelector``: one
+    checkbox per raw channel, for whichever cell type is currently selected in
+    ``cell_type_dropdown`` - "which channels feed this cell type", separate
+    from classic Cellpose's per-channel :class:`CellposeChannelConfigPanel`.
+    Stores to its own config block, ``cellpose_sam.channel_selection:
+    {cell_type: [channel_idx, ...]}``, uniform across samples (like the
+    existing ``cellpose_sam.size_filter``).
+    """
+
+    def __init__(self, metadata_loader, cell_type_dropdown, get_cell_types):
+        self.metadata_loader = metadata_loader
+        self._cell_type_dropdown = cell_type_dropdown
+        self._get_cell_types = get_cell_types
+        self._checkboxes = []
+
+        self.hint = widgets.HTML(
+            "<i>Select which raw channels feed Cellpose-SAM for the cell type "
+            "chosen above. Multiple channels are stacked as separate planes "
+            "(up to 3).</i>"
+        )
+        self.checkbox_box = widgets.VBox()
+        super().__init__([self.hint, self.checkbox_box])
+
+        self._detect_channels()
+        self._build_checkboxes()
+        cell_type_dropdown.observe(lambda _c: self._load_for_current_cell_type(), names="value")
+
+    # ── channel count + label hints (read-only reference to classic Cellpose config) ──
+    def _detect_channels(self):
+        from behav3d.core.metadata import (
+            detect_organoid_types_from_metadata,
+            detect_immune_cell_types_from_metadata,
+            detect_other_cell_types_from_metadata,
+            has_dead_channel,
+        )
+        metadata = self.metadata_loader.metadata
+        if metadata is None:
+            self._n_channels = 0
+            return
+        n = (len(detect_organoid_types_from_metadata(metadata))
+             + len(detect_immune_cell_types_from_metadata(metadata))
+             + len(detect_other_cell_types_from_metadata(metadata)))
+        if has_dead_channel(metadata):
+            n += 1
+        classic_cfg = _cfg_get(self.metadata_loader.behav3d_parameters, "cellpose", {}) or {}
+        manual_n = classic_cfg.get("manual_n_channels")
+        self._n_channels = manual_n if manual_n is not None else n
+
+    # ── UI ──────────────────────────────────────────────────────────────
+    def _build_checkboxes(self):
+        self._checkboxes = []
+        if self._n_channels == 0:
+            self.checkbox_box.children = [widgets.HTML(
+                '<span style="color: orange;">No channels detected. Load metadata first.</span>'
+            )]
+            return
+
+        self._ensure_migrated()
+
+        boxes = []
+        for i in range(self._n_channels):
+            cb = widgets.Checkbox(value=False, description=f"Channel {i}", indent=False)
+            cb.observe(lambda _c: self._sync_current_cell_type_to_memory(), names="value")
+            boxes.append(cb)
+            self._checkboxes.append(cb)
+        self.checkbox_box.children = boxes
+
+        self._load_for_current_cell_type()
+
+    # ── config: cellpose_sam.channel_selection ────────────────────────────
+    def _current_cell_type(self):
+        v = self._cell_type_dropdown.value
+        return v if v and v != "None detected" else None
+
+    def _ensure_migrated(self):
+        """Seed a default for any cell type that has no channel_selection
+        entry yet, from classic Cellpose's single-channel assignment (if
+        any) - so a working config exists immediately for users who already
+        configured channel labels there, without visiting every cell type."""
+        from behav3d.preprocessing.segmentation.cellpose_prediction import (
+            _label_to_channel_from_stored_map,
+        )
+        cfg = self.metadata_loader.behav3d_parameters.setdefault("cellpose_sam", {})
+        selection = cfg.setdefault("channel_selection", {})
+        classic_cfg = _cfg_get(self.metadata_loader.behav3d_parameters, "cellpose", {}) or {}
+        label_to_channel = _label_to_channel_from_stored_map(classic_cfg.get("channel_labels", {}))
+        for ct in self._get_cell_types():
+            if ct not in selection:
+                ch = label_to_channel.get(ct)
+                selection[ct] = [ch] if ch is not None else []
+
+    def _load_for_current_cell_type(self):
+        cell_type = self._current_cell_type()
+        if cell_type is None or not self._checkboxes:
+            return
+        selected = set(self.channels_for(cell_type))
+        for i, cb in enumerate(self._checkboxes):
+            cb.value = i in selected
+
+    def channels_for(self, cell_type) -> list:
+        """Return the persisted channel indices for *cell_type*."""
+        cfg = _cfg_get(self.metadata_loader.behav3d_parameters, "cellpose_sam", {}) or {}
+        return [int(c) for c in ((cfg.get("channel_selection") or {}).get(cell_type) or [])]
+
+    def _sync_current_cell_type_to_memory(self):
+        cell_type = self._current_cell_type()
+        if cell_type is None:
+            return
+        cfg = self.metadata_loader.behav3d_parameters.setdefault("cellpose_sam", {})
+        selection = cfg.setdefault("channel_selection", {})
+        selection[cell_type] = [i for i, cb in enumerate(self._checkboxes) if cb.value]
+
+    # ── refresh ──────────────────────────────────────────────────────────
+    def refresh(self):
+        """Re-detect channel count/hints and rebuild - e.g. when metadata
+        changes or classic Cellpose's channel config is edited elsewhere."""
+        self._detect_channels()
+        self._build_checkboxes()
+
+
 class CellposeSAMInferencePanel:
     """Notebook panel for Cellpose-SAM (cellpose v4) zero-shot segmentation.
 
     Notebook twin of ``behav3d.napari._segmentation.CellposeSAMWidget``; both call
     ``run_cellpose_sam_and_sync_metadata``, so they stay behaviourally identical.
 
-    There is no model to load or train. Channel labels come from the shared
-    ``cellpose`` config block (configure them once via ``CellposeChannelConfigPanel``).
+    There is no model to load or train. Channel selection is its own,
+    Cellpose-SAM-specific per-cell-type checkbox picker
+    (:class:`SAMChannelSelectorBox`), separate from classic Cellpose's
+    per-channel ``CellposeChannelConfigPanel``.
     """
 
     def __init__(self, metadata_loader, category=None):
@@ -2062,6 +2187,11 @@ class CellposeSAMInferencePanel:
             value=bool(cfg.get("all_cell_types", False)),
             description="Run all cell types in one batch",
             indent=False,
+        )
+
+        self.channel_panel = SAMChannelSelectorBox(
+            self.metadata_loader, self.label_selector,
+            get_cell_types=lambda: self.cell_types,
         )
 
         self.use_all_tp = widgets.Checkbox(
@@ -2197,6 +2327,55 @@ class CellposeSAMInferencePanel:
         self.show_napari_btn.on_click(self._on_show_napari_clicked)
         self._load_size_filter_for_cell_type()
 
+        # ── Reliability ──────────────────────────────────────────────
+        # A full Cellpose-SAM run is long and saturates the GPU and every CPU core
+        # at once. On machines whose power delivery cannot sustain both rails the
+        # result is an abrupt shutdown mid-run, which these two options address
+        # from opposite ends: survive one, or avoid provoking it.
+        from behav3d.preprocessing.segmentation.cellpose_sam_prediction import (
+            power_safe_settings,
+        )
+        self._power_safe_preset = power_safe_settings()
+
+        self.resume_cb = widgets.Checkbox(
+            value=bool(cfg.get("resume", False)),
+            description="Resume interrupted run (keep timepoints already segmented)",
+            indent=False,
+        )
+        self.power_safe_cb = widgets.Checkbox(
+            value=bool(cfg.get("power_safe", False)),
+            description="Power-safe mode (slower, much lower peak power draw)",
+            indent=False,
+        )
+        self.power_safe_cb.observe(self._on_power_safe_changed, names="value")
+        self.n_threads = widgets.IntText(
+            value=int(cfg.get("n_threads", 0)), description="CPU threads (0=all):",
+            style={"description_width": "initial"},
+        )
+        self.cooldown_s = widgets.FloatText(
+            value=float(cfg.get("cooldown_s", 0.0)), description="Cooldown between frames (s):",
+            style={"description_width": "initial"},
+        )
+        reliability = widgets.VBox([
+            self.resume_cb,
+            widgets.HTML(
+                "<i>Resume re-reads the progress journal written beside the output "
+                "and segments only the missing timepoints. It refuses to run if the "
+                "settings changed since the interrupted run, so one array can never "
+                "mix two segmentations.</i>"
+            ),
+            self.power_safe_cb,
+            widgets.HBox([self.n_threads, self.cooldown_s]),
+            widgets.HTML(
+                f"<i>Power-safe sets batch size "
+                f"{self._power_safe_preset['batch_size']}, "
+                f"{self._power_safe_preset['n_threads']} CPU threads and a "
+                f"{self._power_safe_preset['cooldown_s']:g}s pause between frames. "
+                "Use it if the machine freezes, reboots or powers off during long "
+                "runs - that is a power/thermal limit, not a memory one.</i>"
+            ),
+        ])
+
         # ── Apply ────────────────────────────────────────────────────
         self.apply_btn = widgets.Button(description="Apply Cellpose-SAM Segmentation",
                                         button_style="success", layout={"width": "max-content"})
@@ -2209,7 +2388,7 @@ class CellposeSAMInferencePanel:
             widgets.HTML("<b>1. Environment</b>"),
             self.env_status, self.setup_btn,
             widgets.HTML("<hr><b>2. What to segment</b>"),
-            self.label_selector, self.all_cell_types_cb,
+            self.label_selector, self.channel_panel, self.all_cell_types_cb,
             self.use_all_tp, widgets.HBox([self.tp_start, self.tp_end]),
             widgets.HTML("<hr><b>3. Device</b>"),
             self.device_selector, self.force_cpu_cb,
@@ -2222,6 +2401,8 @@ class CellposeSAMInferencePanel:
             self.preview_btn,
             widgets.HBox([self.size_min, self.size_max]),
             self.filter_stats, self.hist_out, self.show_napari_btn,
+            widgets.HTML("<hr><b>6. Reliability on long runs</b>"),
+            reliability,
             widgets.HTML("<hr>"),
             widgets.HBox([self.apply_btn, self.spinner]),
             self.out,
@@ -2297,6 +2478,29 @@ class CellposeSAMInferencePanel:
         )
         self.stitch_threshold.disabled = is_3d
 
+    def _on_power_safe_changed(self, change):
+        """Apply the power-safe preset to the individual knobs, and back again.
+
+        The preset writes through to the real controls rather than shadowing them,
+        so what the run uses is always what the panel shows - and a user who wants
+        a different trade-off can still adjust any one value afterwards.
+        """
+        if bool(change.get("new")):
+            self._pre_power_safe = {
+                "batch_size": int(self.batch_size.value),
+                "n_threads": int(self.n_threads.value),
+                "cooldown_s": float(self.cooldown_s.value),
+            }
+            self.batch_size.value = int(self._power_safe_preset["batch_size"])
+            self.n_threads.value = int(self._power_safe_preset["n_threads"])
+            self.cooldown_s.value = float(self._power_safe_preset["cooldown_s"])
+        else:
+            previous = getattr(self, "_pre_power_safe", None)
+            if previous:
+                self.batch_size.value = previous["batch_size"]
+                self.n_threads.value = previous["n_threads"]
+                self.cooldown_s.value = previous["cooldown_s"]
+
     def _on_cell_type_changed(self, _change):
         self._load_size_filter_for_cell_type()
 
@@ -2346,6 +2550,10 @@ class CellposeSAMInferencePanel:
         cfg["tp_start"] = int(self.tp_start.value)
         cfg["tp_end"] = int(self.tp_end.value)
         cfg["preview_timepoint"] = int(self.preview_tp.value)
+        cfg["resume"] = bool(self.resume_cb.value)
+        cfg["power_safe"] = bool(self.power_safe_cb.value)
+        cfg["n_threads"] = int(self.n_threads.value)
+        cfg["cooldown_s"] = float(self.cooldown_s.value)
         cfg.setdefault("size_filter", {})[self.label_selector.value] = {
             "size_min": int(self.size_min.value),
             "size_max": int(self.size_max.value),
@@ -2484,6 +2692,9 @@ class CellposeSAMInferencePanel:
                         force_cpu=bool(self.force_cpu_cb.value),
                         sam_params=self._collect_sam_params(),
                         size_filter=size_filters.get(ct),
+                        resume=bool(self.resume_cb.value),
+                        n_threads=int(self.n_threads.value) or None,
+                        cooldown_s=float(self.cooldown_s.value),
                     )
                     total["processed"].extend(summary["processed"])
                     total["skipped"].extend(summary["skipped"])

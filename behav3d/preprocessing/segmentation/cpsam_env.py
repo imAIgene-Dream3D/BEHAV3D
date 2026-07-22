@@ -70,7 +70,23 @@ def find_cpsam_python(config: dict | None = None) -> Optional[Path]:
     return candidate if candidate.exists() else None
 
 
-def build_worker_env(device: str = "auto", force_cpu: bool = False) -> dict:
+#: Environment variables read by the numeric libraries the worker pulls in, in the
+#: order they matter: torch's own ATen pool, MKL (numpy/scipy on conda), OpenBLAS
+#: (numpy on pip wheels), and numexpr. All of them default to "one thread per
+#: logical CPU", so they must all be capped together or the uncapped one wins.
+_THREAD_ENV_VARS = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+)
+
+
+def build_worker_env(
+    device: str = "auto",
+    force_cpu: bool = False,
+    n_threads: int | None = None,
+) -> dict:
     """Build the environment mapping for a sidecar subprocess.
 
     Handles two Windows-specific hazards discovered while validating the sidecar:
@@ -84,8 +100,20 @@ def build_worker_env(device: str = "auto", force_cpu: bool = False) -> dict:
     2. **Device selection.** ``CUDA_VISIBLE_DEVICES`` is used instead of a torch
        device string so the child physically cannot see other GPUs; ``""`` hides
        every GPU, which is the force-CPU path.
+
+    *n_threads* caps the CPU-side thread pools. Left unset, every library below
+    spawns one thread per logical CPU, so the mask post-processing and zstd
+    compression between GPU bursts saturate the whole package. On machines whose
+    power delivery cannot sustain full CPU *and* full GPU at once that is enough to
+    trip a hard shutdown, so being able to run narrower - slower, but to completion
+    - matters more than peak throughput.
     """
     env = os.environ.copy()
+
+    if n_threads is not None:
+        n_threads = max(1, int(n_threads))
+        for var in _THREAD_ENV_VARS:
+            env[var] = str(n_threads)
 
     base = Path(sys.prefix)
     dll_dirs = [

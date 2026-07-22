@@ -35,6 +35,7 @@ from PIL import Image  # noqa: F401  (import for side effect; do not move)
 
 import argparse
 import json
+import os
 import sys
 import time
 import traceback
@@ -83,12 +84,22 @@ def _resolve_device(force_cpu: bool):
     The parent already restricted visibility via ``CUDA_VISIBLE_DEVICES``, so a
     requested GPU is always index 0 here, and force-CPU arrives as an empty
     ``CUDA_VISIBLE_DEVICES`` (no visible devices at all).
+
+    Returns ``(device, using_gpu, info)`` where *info* names the *physical* card.
+    ``cuda:0`` is a visibility-local index, so on its own it cannot tell the user
+    which GPU actually ran; the name and VRAM can.
     """
     import torch
 
     if force_cpu or not torch.cuda.is_available():
-        return torch.device("cpu"), False
-    return torch.device("cuda:0"), True
+        return torch.device("cpu"), False, {"gpu_name": None}
+    props = torch.cuda.get_device_properties(0)
+    return torch.device("cuda:0"), True, {
+        "gpu_name": props.name,
+        "gpu_total_mb": round(props.total_memory / 2**20),
+        # Which physical index the parent exposed as cuda:0 (unset => all visible).
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", "<all>"),
+    }
 
 
 def main(argv=None) -> int:
@@ -105,8 +116,19 @@ def main(argv=None) -> int:
     timepoints = list(job.get("timepoints") or [])
     force_cpu = bool(job.get("force_cpu", False))
 
+    n_threads = job.get("n_threads")
+    cooldown_s = float(job.get("cooldown_s", 0) or 0)
+
     import zarr
     from cellpose import models
+
+    # The *_NUM_THREADS env vars set by build_worker_env are read at import time by
+    # MKL/OpenBLAS, but torch's own ATen pool has to be set through the API, and
+    # only after torch is imported. Both halves are needed for the cap to hold.
+    if n_threads:
+        import torch
+
+        torch.set_num_threads(max(1, int(n_threads)))
 
     # behav3d is normally importable via the parent env's editable install; fall
     # back to the repo root so the worker also runs from an uninstalled checkout.
@@ -116,7 +138,7 @@ def main(argv=None) -> int:
         sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
         from behav3d.preprocessing.segmentation import segment_size_filter, segment_2d_filter
 
-    device, using_gpu = _resolve_device(force_cpu)
+    device, using_gpu, device_info = _resolve_device(force_cpu)
 
     model = models.CellposeModel(
         gpu=using_gpu,
@@ -124,12 +146,21 @@ def main(argv=None) -> int:
         device=device,
     )
 
+    # Read the placement back off the loaded weights rather than trusting the
+    # requested device: cellpose silently falls back to CPU if it cannot use the
+    # GPU, and a run that is 30x slower for that reason should say so.
+    try:
+        device_info["weights_device"] = str(next(model.net.parameters()).device)
+    except Exception:
+        pass
+
     _emit(
         "ready",
         device=str(device),
         gpu=using_gpu,
         model=str(job.get("model_name", "cpsam")),
         cellpose_version=__import__("cellpose").version,
+        **device_info,
     )
 
     raw = zarr.open(str(job["raw_zarr"]), mode="r")
@@ -146,6 +177,15 @@ def main(argv=None) -> int:
     diameter = sam.get("diameter")
     diameter = float(diameter) if diameter not in (None, "", 0) else None
     niter = int(sam.get("niter", 0) or 0) or None
+
+    # Cellpose's own eval() only treats the input as a real 3D/stitched volume
+    # (and forwards z_axis to convert_image) when do_3D or stitch_threshold>0
+    # - see models.py: `do_3D=(do_3D or stitch_threshold > 0)`. Outside that,
+    # it requires z_axis=None and instead infers a "batch of independent 2D
+    # planes" layout with Z on axis 0 and channels elsewhere - the opposite of
+    # our channel-first (C, Z, Y, X) raw layout - so this is the one case
+    # where the per-timepoint array needs transposing before eval().
+    batched_2d = not (do_3D or stitch_threshold > 0)
 
     eval_kwargs = dict(
         batch_size=int(sam.get("batch_size", 8)),
@@ -164,8 +204,8 @@ def main(argv=None) -> int:
         min_size=int(sam.get("min_size", 1)),
         max_size_fraction=float(sam.get("max_size_fraction", 1.0)),
         niter=niter,
-        channel_axis=0,
-        z_axis=1,
+        channel_axis=1 if batched_2d else 0,
+        z_axis=None if batched_2d else 1,
     )
 
     out = None
@@ -189,6 +229,8 @@ def main(argv=None) -> int:
 
         img_t = np.asarray(raw[t])           # (C, Z, Y, X)
         img_t = img_t[channels]              # keep only the requested channels
+        if batched_2d:
+            img_t = np.moveaxis(img_t, 0, 1)  # (C, Z, Y, X) -> (Z, C, Y, X)
 
         mask, *_ = model.eval(img_t, **eval_kwargs)
         mask = np.asarray(mask)
@@ -210,6 +252,17 @@ def main(argv=None) -> int:
         else:
             preview_volume = mask
 
+        peak_mb = None
+        if using_gpu:
+            import torch
+
+            peak_mb = round(torch.cuda.max_memory_allocated() / 2**20)
+            # A batch run is many independent eval() calls in one process. Without
+            # this the caching allocator keeps every frame's peak reserved, and a
+            # later, larger frame OOMs on memory that is free but fragmented.
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.empty_cache()
+
         _emit(
             "progress",
             t=int(t),
@@ -217,7 +270,16 @@ def main(argv=None) -> int:
             total=total,
             n_objects=n_objects,
             seconds=round(time.time() - started, 2),
+            peak_vram_mb=peak_mb,
         )
+
+        # Idle between frames so the CPU/GPU voltage regulators (and, on a laptop,
+        # the battery that covers the gap between draw and adapter rating) get a
+        # recovery window. Emitted first so the parent records the frame as done
+        # before we go quiet - a machine that dies during the cooldown must still
+        # be able to resume from here.
+        if cooldown_s and n_done < total:
+            time.sleep(cooldown_s)
 
     if mode == "preview" and preview_volume is not None:
         np.save(str(job["preview_out"]), preview_volume)

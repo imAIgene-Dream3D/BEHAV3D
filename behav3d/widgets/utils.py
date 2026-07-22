@@ -78,9 +78,10 @@ _DEFAULT_CONFIG = {
         "channel_labels": {},  # {0: "organoid1", 1: "tcell", ...}
         "per_sample_channel_labels": {},  # {sample_name: {0: "organoid1", ...}, ...}
     },
-    # Cellpose-SAM (cellpose v4, zero-shot). Channel labels are deliberately not
-    # duplicated here: they describe the images, not the backend, so this block
-    # reuses the "cellpose" channel_labels above.
+    # Cellpose-SAM (cellpose v4, zero-shot). Channel selection is its own,
+    # per-cell-type config here (channel_selection below) - separate from
+    # classic Cellpose's per-channel "cellpose" block above, since Cellpose-SAM
+    # supports selecting several raw channels per cell type.
     "cellpose_sam": {
         "model_name": "cpsam",
         "python_path": "",       # optional override for the sidecar interpreter
@@ -121,6 +122,9 @@ _DEFAULT_CONFIG = {
         # Interactive size filter, native voxels, per cell type:
         # {"tcell": {"size_min": 10, "size_max": 0}}  (0 => bound disabled)
         "size_filter": {},
+        # Which raw channels feed Cellpose-SAM for each cell type, uniform
+        # across samples: {"tcell": [0], "organoid1": [1], "organoid2": [2, 3]}
+        "channel_selection": {},
     },
     "tracking": {
         "track_organoids_together": False,

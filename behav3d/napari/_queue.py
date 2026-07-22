@@ -1643,6 +1643,16 @@ class ProcessingQueuePanel(QWidget):
         if hasattr(cp, "btn_force_cpu"):
             cp.btn_force_cpu.setChecked(bool(p.get("force_cpu", False)))
 
+        if hasattr(cp, "check_resume"):
+            cp.check_resume.setChecked(bool(p.get("resume", False)))
+        # Restored before the run so a queued step keeps the power profile it was
+        # queued with; a queue is exactly where an unattended overnight run lives,
+        # which is where an abrupt shutdown costs the most.
+        if hasattr(cp, "spin_n_threads"):
+            cp.spin_n_threads.setValue(int(p.get("n_threads") or 0))
+        if hasattr(cp, "spin_cooldown"):
+            cp.spin_cooldown.setValue(float(p.get("cooldown_s") or 0.0))
+
         all_cell_types = bool(p.get("all_cell_types", False))
         if hasattr(cp, "check_all_cell_types"):
             cp.check_all_cell_types.setChecked(all_cell_types)

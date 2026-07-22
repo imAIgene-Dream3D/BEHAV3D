@@ -18,15 +18,20 @@ tracker consumes it with no changes.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import subprocess
+import sys
 import tempfile
+import threading
+from collections import deque
 from pathlib import Path
 from typing import Callable, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
-import yaml
+from tqdm import tqdm
 
 from behav3d.io.images import load_image
 from behav3d.io.formats.zarr import write_zarr_parallel
@@ -34,9 +39,6 @@ from behav3d.core.metadata import (
     detect_organoid_types_from_metadata,
     detect_immune_cell_types_from_metadata,
     detect_other_cell_types_from_metadata,
-)
-from behav3d.preprocessing.segmentation.cellpose_prediction import (
-    _label_to_channel_from_stored_map,
 )
 from behav3d.preprocessing.segmentation.cpsam_env import (
     build_worker_env,
@@ -89,6 +91,29 @@ DEFAULT_SAM_PARAMS = {
 #: Interactive size filter, in native voxels. ``None``/0 disables a bound.
 DEFAULT_SIZE_FILTER = {"size_min": 0, "size_max": 0}
 
+#: Version tag for the on-disk progress journal, so a future format change can be
+#: detected instead of silently misreading an old file as "nothing done yet".
+_JOURNAL_VERSION = 1
+
+
+def power_safe_settings(n_cpus: Optional[int] = None) -> dict:
+    """Return the conservative overrides for power-constrained machines.
+
+    A full Cellpose-SAM run is one of the rare workloads that pins the GPU *and*
+    every CPU core for minutes at a time. Laptops in particular size their power
+    delivery for one rail at a time, and the shortfall on the other is covered by
+    the battery; once that battery ages, the transient sag can trip the machine's
+    over-current protection and cut power outright - no traceback, no dump, just
+    off. These settings trade throughput for a much flatter power profile.
+    """
+    if n_cpus is None:
+        n_cpus = os.cpu_count() or 4
+    return {
+        "batch_size": 2,                     # smaller GPU bursts
+        "n_threads": max(1, int(n_cpus) // 4),  # leave most cores idle
+        "cooldown_s": 5.0,                   # recovery window between frames
+    }
+
 
 class CellposeSAMEnvironmentError(RuntimeError):
     """Raised when the Cellpose-SAM sidecar environment is missing or broken."""
@@ -108,41 +133,23 @@ def _resolve_category(cell_type, organoid_types, immune_types, other_types):
     )
 
 
-def _load_channel_config(output_dir: Path, channel_labels_config: Optional[dict]) -> dict:
-    """Read the Cellpose channel-label map, reusing the existing `cellpose` config block."""
-    if channel_labels_config is not None:
-        return channel_labels_config
-    config_path = Path(output_dir) / "behav3d_parameters.yml"
-    if not config_path.exists():
-        return {}
-    with open(config_path, "r") as fh:
-        config = yaml.safe_load(fh) or {}
-    # Channel labels are a property of the images, not of the segmentation
-    # backend, so Cellpose-SAM deliberately shares the `cellpose` block rather
-    # than making users configure the same thing twice.
-    return config.get("cellpose", {}) or {}
+def _channels_for_cell_type(config: Optional[dict], cell_type: str) -> list:
+    """Return the raw channel indices selected for *cell_type*.
 
-
-def _label_to_channel_for_sample(sample_name, channel_labels_config) -> dict:
-    """Resolve the label -> channel-index map for one sample."""
-    labels_mode = channel_labels_config.get("labels_mode", "same_for_all")
-    global_labels = channel_labels_config.get("channel_labels", {})
-    per_sample = channel_labels_config.get("per_sample_channel_labels", {})
-
-    if labels_mode == "per_sample":
-        if sample_name not in per_sample:
-            raise ValueError(
-                f"Sample '{sample_name}' not found in per_sample_channel_labels config. "
-                f"Available samples: {list(per_sample.keys())}. Configure it in the "
-                "'Configure Channel Labels' panel."
-            )
-        return _label_to_channel_from_stored_map(per_sample[sample_name])
-    if global_labels:
-        return _label_to_channel_from_stored_map(global_labels)
-    raise ValueError(
-        "No channel labels configured. Please configure channel labels in the "
-        "'Configure Channel Labels' panel before running segmentation."
-    )
+    Reads ``cellpose_sam.channel_selection`` (set on the Cellpose-SAM page's
+    channel selection panel) - a plain ``{cell_type: [channel_idx, ...]}``
+    map, uniform across samples (like ``cellpose_sam.size_filter``). This is
+    intentionally separate from classic Cellpose v3's ``cellpose.channel_labels``
+    block; the two backends no longer share channel configuration.
+    """
+    channel_selection = ((config or {}).get("cellpose_sam") or {}).get("channel_selection") or {}
+    channels = channel_selection.get(cell_type) or []
+    if not channels:
+        raise ValueError(
+            f"No channels selected for '{cell_type}'. Configure it on the "
+            "Cellpose-SAM page's channel selection panel."
+        )
+    return sorted(int(c) for c in channels)
 
 
 def _ensure_sidecar(config: dict | None = None) -> Path:
@@ -160,6 +167,49 @@ def _ensure_sidecar(config: dict | None = None) -> Path:
     return python
 
 
+def _describe_device(ready_event: dict) -> str:
+    """Render a worker ``ready`` event as a human-checkable device line.
+
+    ``cuda:0`` alone is not verifiable by the user: it is an index into whatever
+    ``CUDA_VISIBLE_DEVICES`` exposed, not a physical slot. Naming the card, its
+    VRAM and where the weights actually landed makes a silent CPU fallback or a
+    wrong-GPU selection visible in the log instead of only as a slow run.
+    """
+    name = ready_event.get("gpu_name")
+    if not name:
+        return "device=CPU"
+    parts = [f"device={ready_event.get('device')} ({name}"]
+    if ready_event.get("gpu_total_mb"):
+        parts.append(f", {ready_event['gpu_total_mb']} MB")
+    parts.append(f", CUDA_VISIBLE_DEVICES={ready_event.get('cuda_visible_devices')})")
+    line = "".join(parts)
+    weights = ready_event.get("weights_device")
+    if weights and not str(weights).startswith("cuda"):
+        line += f"  [WARNING] weights are on {weights} - running on CPU!"
+    return line
+
+
+def _stream_stderr(proc: subprocess.Popen, tail: deque, lock: threading.Lock) -> None:
+    """Echo the worker's stderr to the real stderr live, in a background thread.
+
+    The worker redirects cellpose's own logger/tqdm chatter to stderr. Reading
+    it only after ``proc.wait()`` (the previous approach) means a single long
+    ``model.eval()`` call gives zero terminal feedback until it's already
+    finished. Streaming it concurrently surfaces that chatter - including
+    cellpose's own progress bars - live while the call is still running.
+    """
+    if proc.stderr is None:
+        return
+    try:
+        for line in proc.stderr:
+            sys.stderr.write(line)
+            sys.stderr.flush()
+            with lock:
+                tail.append(line.rstrip("\n"))
+    except Exception:
+        pass
+
+
 def _run_worker(
     job: dict,
     python: Path,
@@ -167,13 +217,15 @@ def _run_worker(
     force_cpu: bool,
     on_event: Optional[Callable[[dict], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
+    n_threads: Optional[int] = None,
 ) -> None:
     """Spawn the sidecar worker for one job and stream its JSON Lines events."""
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as fh:
         json.dump(job, fh)
         job_path = Path(fh.name)
 
-    stderr_tail: list[str] = []
+    stderr_tail: deque = deque(maxlen=20)
+    stderr_lock = threading.Lock()
     try:
         proc = subprocess.Popen(
             [str(python), str(_WORKER), str(job_path)],
@@ -181,8 +233,13 @@ def _run_worker(
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
-            env=build_worker_env(device=device, force_cpu=force_cpu),
+            env=build_worker_env(device=device, force_cpu=force_cpu, n_threads=n_threads),
         )
+
+        stderr_thread = threading.Thread(
+            target=_stream_stderr, args=(proc, stderr_tail, stderr_lock), daemon=True,
+        )
+        stderr_thread.start()
 
         error: Optional[dict] = None
         assert proc.stdout is not None
@@ -195,7 +252,8 @@ def _run_worker(
             except json.JSONDecodeError:
                 # Anything non-JSON on stdout is a bug in the worker's stream
                 # hygiene; surface it rather than silently dropping it.
-                stderr_tail.append(line)
+                with stderr_lock:
+                    stderr_tail.append(line)
                 continue
             if event.get("event") == "error":
                 error = event
@@ -207,17 +265,17 @@ def _run_worker(
                 raise RuntimeError("Cellpose-SAM run cancelled.")
 
         proc.wait()
-        if proc.stderr is not None:
-            stderr_tail.extend((proc.stderr.read() or "").splitlines()[-20:])
+        stderr_thread.join(timeout=5)
 
         if error is not None:
             raise RuntimeError(
                 f"Cellpose-SAM worker failed: {error.get('message')}\n{error.get('traceback', '')}"
             )
         if proc.returncode != 0:
+            with stderr_lock:
+                tail_msg = "\n".join(stderr_tail)
             raise RuntimeError(
-                "Cellpose-SAM worker exited with code "
-                f"{proc.returncode}:\n" + "\n".join(stderr_tail[-20:])
+                f"Cellpose-SAM worker exited with code {proc.returncode}:\n{tail_msg}"
             )
     finally:
         job_path.unlink(missing_ok=True)
@@ -233,21 +291,109 @@ def _timepoints_for(t_total: int, timepoint_range: Optional[Tuple[int, int]]) ->
     return list(range(start, end + 1))
 
 
-def _build_job(**kwargs) -> dict:
-    """Assemble a worker job spec, filling in BEHAV3D defaults."""
+def _effective_params(sam_params=None, size_filter=None) -> Tuple[dict, dict, bool]:
+    """Merge caller overrides onto the BEHAV3D defaults.
+
+    Split out of :func:`_build_job` so the resume fingerprint is computed from the
+    same fully-resolved values the worker actually runs with - comparing the raw
+    overrides would call two runs identical whenever one of them relied on a
+    default that later changed.
+    """
     sam = dict(DEFAULT_SAM_PARAMS)
-    sam.update(kwargs.pop("sam_params", None) or {})
-    size_filter = dict(DEFAULT_SIZE_FILTER)
-    size_filter.update(kwargs.pop("size_filter", None) or {})
+    sam.update(sam_params or {})
+    resolved_filter = dict(DEFAULT_SIZE_FILTER)
+    resolved_filter.update(size_filter or {})
     # drop_2d_segments is a BEHAV3D post-process rather than a cellpose eval
     # kwarg, so it is lifted out of the sam block for the worker.
     drop_2d = bool(sam.pop("drop_2d_segments", True))
+    return sam, resolved_filter, drop_2d
+
+
+def _build_job(**kwargs) -> dict:
+    """Assemble a worker job spec, filling in BEHAV3D defaults."""
+    sam, size_filter, drop_2d = _effective_params(
+        kwargs.pop("sam_params", None), kwargs.pop("size_filter", None)
+    )
     return {
         "sam": sam,
         "size_filter": size_filter,
         "drop_2d_segments": drop_2d,
         **kwargs,
     }
+
+
+# ── resume journal ──────────────────────────────────────────────────────────
+#
+# A power loss or a kill mid-run leaves a partially filled label zarr. The array
+# is pre-allocated and written one timepoint at a time, so the frames already in
+# it are perfectly good - the only thing missing is a record of *which* ones, and
+# a promise that they were produced with the settings now being requested. That
+# is all this journal is.
+
+
+def _journal_path(out_zarr: Path) -> Path:
+    """Return the journal path beside *out_zarr* (``..._segments.progress.json``)."""
+    return out_zarr.with_suffix(".progress.json")
+
+
+def _params_fingerprint(model_name, channels, anisotropy, sam, size_filter, drop_2d) -> str:
+    """Hash everything that changes what a segmented frame looks like.
+
+    Resuming is only sound when the frames already on disk would have come out the
+    same way today. Anything that feeds the worker's ``eval`` call or its
+    post-processing therefore belongs in here; run bookkeeping (timepoint range,
+    device, thread count, cooldown) deliberately does not, because none of it
+    changes the resulting labels.
+    """
+    payload = json.dumps(
+        {
+            "model_name": str(model_name),
+            "channels": list(channels),
+            "anisotropy": round(float(anisotropy), 6),
+            "sam": sam,
+            "size_filter": size_filter,
+            "drop_2d_segments": bool(drop_2d),
+        },
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _read_journal(path: Path) -> Optional[dict]:
+    """Return the journal at *path*, or ``None`` if absent/unreadable/stale."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        # A truncated journal is the expected casualty of a power cut. Treating it
+        # as "no journal" costs a recompute; trusting it could corrupt the output.
+        return None
+    if not isinstance(data, dict) or data.get("version") != _JOURNAL_VERSION:
+        return None
+    return data
+
+
+def _write_journal(path: Path, data: dict) -> None:
+    """Write *data* to *path* atomically.
+
+    Written on every frame of a run whose whole purpose is surviving abrupt power
+    loss, so a half-written journal is a real possibility rather than a theoretical
+    one: fsync the temp file, then rename over the target.
+    """
+    tmp = Path(str(path) + ".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        # Losing the journal degrades resume to a full recompute; it must never
+        # take the segmentation itself down with it.
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def run_cellpose_sam_segmentation(
@@ -257,13 +403,15 @@ def run_cellpose_sam_segmentation(
     only_cell_types: Optional[Sequence[str]] = None,
     model_name: str = "cpsam",
     timepoint_range: Optional[Tuple[int, int]] = None,
-    channel_labels_config: Optional[dict] = None,
     device: str = "auto",
     force_cpu: bool = False,
     sam_params: Optional[dict] = None,
     size_filter: Optional[dict] = None,
     overwrite_existing: bool = True,
     skip_existing: bool = False,
+    resume: bool = False,
+    n_threads: Optional[int] = None,
+    cooldown_s: float = 0.0,
     progress_cb: Optional[Callable] = None,
     log_callback: Optional[Callable[[str], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
@@ -277,8 +425,8 @@ def run_cellpose_sam_segmentation(
     label_name:
         Single cell type to segment. Ignored when *only_cell_types* is given.
     only_cell_types:
-        Run these cell types in one batch. Each one uses the channel assigned to
-        it in the Cellpose channel-label configuration.
+        Run these cell types in one batch. Each one uses the channels selected
+        for it on the Cellpose-SAM channel selection panel.
     timepoint_range:
         ``(start_t, end_t)`` inclusive, in global indices. Frames outside the
         range keep whatever they already contained.
@@ -286,6 +434,14 @@ def run_cellpose_sam_segmentation(
         ``"auto"``, ``"cpu"``, or ``"cuda:<n>"``. *force_cpu* overrides it.
     sam_params / size_filter:
         Overrides for :data:`DEFAULT_SAM_PARAMS` / :data:`DEFAULT_SIZE_FILTER`.
+    resume:
+        Continue an interrupted run instead of starting over: keep the timepoints
+        already recorded in the sidecar journal and segment only the rest. Raises
+        if the settings no longer match the ones those frames were produced with.
+    n_threads / cooldown_s:
+        CPU thread cap and per-frame idle time. See :func:`power_safe_settings` -
+        both exist to keep a machine with marginal power delivery alive through a
+        long run, at the cost of wall-clock time.
 
     Returns
     -------
@@ -301,128 +457,220 @@ def run_cellpose_sam_segmentation(
     if not cell_types:
         raise ValueError("Provide either label_name or only_cell_types.")
 
-    channel_cfg = _load_channel_config(output_dir, channel_labels_config)
     organoid_types = detect_organoid_types_from_metadata(metadata)
     immune_types = detect_immune_cell_types_from_metadata(metadata)
     other_types = detect_other_cell_types_from_metadata(metadata)
 
     summary = {"processed": [], "skipped": []}
     units = [(ct, idx, sample) for ct in cell_types for idx, sample in metadata.iterrows()]
-    total_units = len(units)
 
-    for unit_i, (cell_type, idx, sample) in enumerate(units):
-        prefix, category = _resolve_category(cell_type, organoid_types, immune_types, other_types)
-        path_col = f"{prefix}_{cell_type}_segments_image_path"
-        if path_col not in metadata.columns:
-            metadata[path_col] = pd.NA
-        metadata[path_col] = metadata[path_col].astype("object")
-
+    # Precompute how many timepoints will actually run, across every unit, so
+    # progress can be reported per-timepoint (smoothly, within a single long
+    # sample) rather than only once per cell_type x sample unit.
+    total_ticks = 0
+    for cell_type, _idx, sample in units:
         sample_name = sample["sample_name"]
-        tag = f"{cell_type} / {sample_name}"
+        sample_dir = output_dir / "images" / str(sample_name)
+        raw_zarr = sample_dir / f"{sample_name}.zarr"
+        out_zarr = sample_dir / f"{sample_name}_{cell_type}_segments.zarr"
+        if not raw_zarr.exists() or (skip_existing and out_zarr.exists()):
+            continue
+        try:
+            t_total = load_image(raw_zarr).shape[0]
+        except Exception:
+            continue
+        wanted = _timepoints_for(t_total, timepoint_range)
+        if resume:
+            # Best-effort only: this drives the progress bar's denominator. The
+            # authoritative (fingerprint-checked) filtering happens per unit below,
+            # so a journal that turns out to be unusable just makes the bar jump.
+            journal = _read_journal(_journal_path(out_zarr))
+            if journal:
+                done = set(journal.get("done") or ())
+                wanted = [t for t in wanted if t not in done]
+        total_ticks += len(wanted)
+
+    completed_ticks = 0
+    pbar = tqdm(total=total_ticks, desc="Cellpose-SAM", unit="frame",
+                file=sys.stdout, dynamic_ncols=True)
+    try:
+        for unit_i, (cell_type, idx, sample) in enumerate(units):
+            prefix, category = _resolve_category(cell_type, organoid_types, immune_types, other_types)
+            path_col = f"{prefix}_{cell_type}_segments_image_path"
+            if path_col not in metadata.columns:
+                metadata[path_col] = pd.NA
+            metadata[path_col] = metadata[path_col].astype("object")
+
+            sample_name = sample["sample_name"]
+            tag = f"{cell_type} / {sample_name}"
+            pbar.set_description(f"Cellpose-SAM {tag}")
+            if progress_cb is not None:
+                try:
+                    progress_cb(completed_ticks, total_ticks, f"Cellpose-SAM {tag}")
+                except Exception:
+                    pass
+
+            sample_dir = output_dir / "images" / str(sample_name)
+            sample_dir.mkdir(parents=True, exist_ok=True)
+            raw_zarr = sample_dir / f"{sample_name}.zarr"
+            if not raw_zarr.exists():
+                log(f"  [SKIP] Zarr file missing for {sample_name}, run image preprocessing first.")
+                summary["skipped"].append(f"{tag} (no zarr)")
+                continue
+
+            out_zarr = sample_dir / f"{sample_name}_{cell_type}_segments.zarr"
+            if skip_existing and out_zarr.exists():
+                log(f"  [SKIP] {tag}: segments already exist.")
+                summary["skipped"].append(f"{tag} (exists)")
+                metadata.at[idx, path_col] = str(out_zarr)
+                continue
+
+            images = load_image(raw_zarr)
+            t_total, _c, z, y, x = images.shape
+            timepoints = _timepoints_for(t_total, timepoint_range)
+
+            channels = _channels_for_cell_type(config, cell_type)
+
+            anisotropy = float(sample["pixel_distance_z"]) / float(sample["pixel_distance_xy"])
+
+            eff_sam, eff_size_filter, eff_drop_2d = _effective_params(sam_params, size_filter)
+            fingerprint = _params_fingerprint(
+                model_name, channels, anisotropy, eff_sam, eff_size_filter, eff_drop_2d
+            )
+
+            # Recreate the array only when it is absent, mis-shaped, or a full-range
+            # overwrite was requested. Never recreate for a sub-range run: doing so
+            # would zero every timepoint outside the range. Never recreate when
+            # resuming either - that is the whole point.
+            recreate = overwrite_existing and timepoint_range is None and not resume
+            if not out_zarr.exists():
+                recreate = True
+            else:
+                try:
+                    import zarr
+
+                    existing = zarr.open(str(out_zarr), mode="r")
+                    if tuple(existing.shape) != (t_total, z, y, x) or np.dtype(existing.dtype) != np.uint16:
+                        recreate = True
+                except Exception:
+                    recreate = True
+
+            journal_file = _journal_path(out_zarr)
+            journal = None if recreate else _read_journal(journal_file)
+            # A journal only vouches for frames produced under the settings it
+            # records; once those differ it says nothing about what is on disk.
+            if journal is not None and journal.get("fingerprint") != fingerprint:
+                if resume:
+                    raise RuntimeError(
+                        f"Cannot resume {tag}: the segmentation settings have changed since "
+                        f"the interrupted run (channels, model, anisotropy, cellpose params "
+                        f"or size filter).\nResuming would mix frames segmented under two "
+                        f"different settings in one array.\nEither restore the previous "
+                        f"settings, or untick 'Resume interrupted run' to re-segment from "
+                        f"scratch."
+                    )
+                journal = None
+
+            already_done = set(journal.get("done") or ()) if journal else set()
+            if resume and already_done:
+                remaining = [t for t in timepoints if t not in already_done]
+                n_skip = len(timepoints) - len(remaining)
+                if not remaining:
+                    log(f"  [SKIP] {tag}: all {len(timepoints)} timepoints already segmented.")
+                    summary["skipped"].append(f"{tag} (complete)")
+                    metadata.at[idx, path_col] = str(out_zarr)
+                    continue
+                log(f"  [RESUME] {tag}: {n_skip} timepoints already done, {len(remaining)} to go.")
+                timepoints = remaining
+
+            write_zarr_parallel(
+                out_zarr,
+                shape=(t_total, z, y, x),
+                dtype=np.uint16,
+                chunks=(1, z, y, x),
+                overwrite=recreate,
+            )
+
+            journal = {
+                "version": _JOURNAL_VERSION,
+                "fingerprint": fingerprint,
+                "shape": [t_total, z, y, x],
+                "dtype": "uint16",
+                "channels": list(channels),
+                "model_name": str(model_name),
+                "done": sorted(already_done),
+                "frames": (journal.get("frames") if journal else None) or {},
+            }
+            _write_journal(journal_file, journal)
+
+            log(
+                f"Cellpose-SAM ({model_name}) '{cell_type}' [{category}] on {sample_name}: "
+                f"channel{'s' if len(channels) > 1 else ''} {channels}, "
+                f"{len(timepoints)}/{t_total} timepoints, anisotropy {anisotropy:.2f}"
+            )
+
+            job = _build_job(
+                mode="run",
+                raw_zarr=str(raw_zarr),
+                out_zarr=str(out_zarr),
+                channels=channels,
+                timepoints=timepoints,
+                model_name=model_name,
+                force_cpu=force_cpu,
+                anisotropy=anisotropy,
+                sam_params=sam_params,
+                size_filter=size_filter,
+                n_threads=n_threads,
+                cooldown_s=cooldown_s,
+            )
+
+            def _on_event(event, _tag=tag, _journal=journal, _journal_file=journal_file):
+                nonlocal completed_ticks
+                if event.get("event") == "progress":
+                    completed_ticks += 1
+                    pbar.update(1)
+                    # Persisted per frame, before anything else: the failure this
+                    # guards against gives no warning and no chance to flush later.
+                    t_done = int(event["t"])
+                    if t_done not in _journal["done"]:
+                        _journal["done"].append(t_done)
+                        _journal["done"].sort()
+                    _journal["frames"][str(t_done)] = {
+                        "n_objects": event.get("n_objects"),
+                        "seconds": event.get("seconds"),
+                        "peak_vram_mb": event.get("peak_vram_mb"),
+                    }
+                    _write_journal(_journal_file, _journal)
+                    if progress_cb is not None:
+                        try:
+                            progress_cb(
+                                completed_ticks, total_ticks,
+                                f"Cellpose-SAM {_tag}: t={event['t']} "
+                                f"({event['n_done']}/{event['total']}, {event['n_objects']} objects)",
+                            )
+                        except Exception:
+                            pass
+                elif event.get("event") == "log":
+                    log(f"  {event.get('msg')}")
+                elif event.get("event") == "ready":
+                    log(f"  {_describe_device(event)} cellpose={event.get('cellpose_version')}")
+
+            _run_worker(
+                job, python, device, force_cpu,
+                on_event=_on_event, should_cancel=should_cancel, n_threads=n_threads,
+            )
+
+            log(f"  [SAVED] {out_zarr}")
+            metadata.at[idx, path_col] = str(out_zarr)
+            summary["processed"].append(tag)
+
         if progress_cb is not None:
             try:
-                progress_cb(unit_i, total_units, f"Cellpose-SAM {tag}")
+                progress_cb(total_ticks, total_ticks, "Cellpose-SAM done")
             except Exception:
                 pass
-
-        sample_dir = output_dir / "images" / str(sample_name)
-        sample_dir.mkdir(parents=True, exist_ok=True)
-        raw_zarr = sample_dir / f"{sample_name}.zarr"
-        if not raw_zarr.exists():
-            log(f"  [SKIP] Zarr file missing for {sample_name}, run image preprocessing first.")
-            summary["skipped"].append(f"{tag} (no zarr)")
-            continue
-
-        out_zarr = sample_dir / f"{sample_name}_{cell_type}_segments.zarr"
-        if skip_existing and out_zarr.exists():
-            log(f"  [SKIP] {tag}: segments already exist.")
-            summary["skipped"].append(f"{tag} (exists)")
-            metadata.at[idx, path_col] = str(out_zarr)
-            continue
-
-        images = load_image(raw_zarr)
-        t_total, _c, z, y, x = images.shape
-        timepoints = _timepoints_for(t_total, timepoint_range)
-
-        label_to_channel = _label_to_channel_for_sample(sample_name, channel_cfg)
-        if cell_type not in label_to_channel:
-            raise ValueError(
-                f"Channel label '{cell_type}' not configured for sample '{sample_name}'. "
-                f"Available labels: {list(label_to_channel.keys())}."
-            )
-        channels = [label_to_channel[cell_type]]
-
-        anisotropy = float(sample["pixel_distance_z"]) / float(sample["pixel_distance_xy"])
-
-        # Recreate the array only when it is absent, mis-shaped, or a full-range
-        # overwrite was requested. Never recreate for a sub-range run: doing so
-        # would zero every timepoint outside the range.
-        recreate = overwrite_existing and timepoint_range is None
-        if not out_zarr.exists():
-            recreate = True
-        else:
-            try:
-                import zarr
-
-                existing = zarr.open(str(out_zarr), mode="r")
-                if tuple(existing.shape) != (t_total, z, y, x) or np.dtype(existing.dtype) != np.uint16:
-                    recreate = True
-            except Exception:
-                recreate = True
-
-        write_zarr_parallel(
-            out_zarr,
-            shape=(t_total, z, y, x),
-            dtype=np.uint16,
-            chunks=(1, z, y, x),
-            overwrite=recreate,
-        )
-
-        log(
-            f"Cellpose-SAM ({model_name}) '{cell_type}' [{category}] on {sample_name}: "
-            f"channel {channels[0]}, {len(timepoints)}/{t_total} timepoints, anisotropy {anisotropy:.2f}"
-        )
-
-        job = _build_job(
-            mode="run",
-            raw_zarr=str(raw_zarr),
-            out_zarr=str(out_zarr),
-            channels=channels,
-            timepoints=timepoints,
-            model_name=model_name,
-            force_cpu=force_cpu,
-            anisotropy=anisotropy,
-            sam_params=sam_params,
-            size_filter=size_filter,
-        )
-
-        def _on_event(event, _tag=tag, _i=unit_i):
-            if event.get("event") == "progress":
-                if progress_cb is not None:
-                    try:
-                        progress_cb(
-                            _i, total_units,
-                            f"Cellpose-SAM {_tag}: t={event['t']} "
-                            f"({event['n_done']}/{event['total']}, {event['n_objects']} objects)",
-                        )
-                    except Exception:
-                        pass
-            elif event.get("event") == "log":
-                log(f"  {event.get('msg')}")
-            elif event.get("event") == "ready":
-                log(f"  device={event.get('device')} cellpose={event.get('cellpose_version')}")
-
-        _run_worker(job, python, device, force_cpu, on_event=_on_event, should_cancel=should_cancel)
-
-        log(f"  [SAVED] {out_zarr}")
-        metadata.at[idx, path_col] = str(out_zarr)
-        summary["processed"].append(tag)
-
-    if progress_cb is not None:
-        try:
-            progress_cb(total_units, total_units, "Cellpose-SAM done")
-        except Exception:
-            pass
+    finally:
+        pbar.close()
     return metadata, summary
 
 
@@ -458,7 +706,6 @@ def preview_cellpose_sam(
     cell_type: str,
     timepoint: int = 0,
     model_name: str = "cpsam",
-    channel_labels_config: Optional[dict] = None,
     device: str = "auto",
     force_cpu: bool = False,
     sam_params: Optional[dict] = None,
@@ -484,12 +731,7 @@ def preview_cellpose_sam(
     if not raw_zarr.exists():
         raise FileNotFoundError(f"Converted zarr missing for {sample_name}: {raw_zarr}")
 
-    channel_cfg = _load_channel_config(output_dir, channel_labels_config)
-    label_to_channel = _label_to_channel_for_sample(sample_name, channel_cfg)
-    if cell_type not in label_to_channel:
-        raise ValueError(
-            f"Channel label '{cell_type}' not configured for sample '{sample_name}'."
-        )
+    channels = _channels_for_cell_type(config, cell_type)
 
     t_total = load_image(raw_zarr).shape[0]
     timepoint = max(0, min(int(timepoint), t_total - 1))
@@ -502,7 +744,7 @@ def preview_cellpose_sam(
             raw_zarr=str(raw_zarr),
             out_zarr=None,
             preview_out=str(preview_out),
-            channels=[label_to_channel[cell_type]],
+            channels=channels,
             timepoints=[timepoint],
             model_name=model_name,
             force_cpu=force_cpu,
@@ -510,12 +752,14 @@ def preview_cellpose_sam(
             sam_params=sam_params,
             size_filter={},
         )
-        log(f"Cellpose-SAM preview: {sample_name} / {cell_type} / t={timepoint}")
-        _run_worker(
-            job, python, device, force_cpu,
-            on_event=lambda e: (
-                log(f"  t={e['t']}: {e['n_objects']} objects in {e['seconds']}s")
-                if e.get("event") == "progress" else None
-            ),
-        )
+        log(f"Cellpose-SAM preview: {sample_name} / {cell_type} / t={timepoint}, channels {channels}")
+
+        def _on_event(e):
+            if e.get("event") == "ready":
+                log(f"  {_describe_device(e)} cellpose={e.get('cellpose_version')}")
+            elif e.get("event") == "progress":
+                vram = f", peak VRAM {e['peak_vram_mb']} MB" if e.get("peak_vram_mb") else ""
+                log(f"  t={e['t']}: {e['n_objects']} objects in {e['seconds']}s{vram}")
+
+        _run_worker(job, python, device, force_cpu, on_event=_on_event)
         return np.load(preview_out)
