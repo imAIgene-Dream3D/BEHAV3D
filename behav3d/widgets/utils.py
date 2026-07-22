@@ -1,5 +1,6 @@
 import os
 import re
+import threading
 import traceback
 from copy import deepcopy
 from pathlib import Path
@@ -31,6 +32,28 @@ from behav3d.io.images import (
     load_image,
 )
 from behav3d.preprocessing.tracking import convert_tracked_image_to_csv
+
+class Debouncer:
+    """Delays calling `func` until `wait` seconds pass with no new call.
+
+    Each call cancels any pending invocation and reschedules, so rapid-fire
+    calls (typing digit-by-digit, holding a spinner button) collapse into a
+    single call once the value has settled.
+    """
+    def __init__(self, func, wait=1.0):
+        self._func = func
+        self._wait = wait
+        self._timer = None
+        self._lock = threading.Lock()
+
+    def __call__(self, *args, **kwargs):
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+            self._timer = threading.Timer(self._wait, self._func, args=args, kwargs=kwargs)
+            self._timer.daemon = True
+            self._timer.start()
+
 
 # ===============================
 # CONSTANTS

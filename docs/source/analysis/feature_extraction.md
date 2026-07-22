@@ -115,21 +115,23 @@ The collapsible **▶ Extended Analysis — Active Killing (Immune Cells)** sect
 
 ### How it works in plain terms
 
-For each sample, the detector first measures the **background death rate** — how fast organoids die on average when no immune cell is around (computed from the first-to-last change in the death signal of every organoid track). Then it looks at each immune cell's contact events with organoids, and for every contact timepoint it asks:
+For each contact event, the detector looks at every organoid the immune cell actually touched, independently, anchored at the moment contact started:
 
-> *Over the next N timepoints, does the death signal on the organoid this immune cell is touching rise faster than the background rate?*
+> *From the start of contact to N timepoints later, does the death signal on this specific organoid rise enough to count as killing?*
 
-If yes (and contact lasted long enough), that timepoint is flagged `is_active_killing = True`.
+Whichever touched organoid clears its own threshold by the largest margin is reported as the event's target. There is no sample-wide or cross-organoid averaging involved — each organoid is judged only against its own signal.
+
+If yes (and contact lasted long enough), the whole observed contact duration is flagged `is_active_killing = True`.
 
 ### Parameters
 
 | Control | Default | Range | Meaning |
 |---|---|---|---|
 | **Immune cell type** | first immune type | dropdown | Which immune tracks to analyse. |
-| **Observation window** | 5 | 1 – 100 timepoints | How many frames after each contact to measure the death-signal rise on the touched organoid. |
+| **Observation window** | 5 | 1 – 100 timepoints | How many frames after contact starts to measure the death-signal rise on each touched organoid. |
 | **Death signal column** | `percentage_dead_mask` | dropdown of `percentage_dead_mask`, `mean_dead_dye`, `nr_dead_mask_pixels` | Which organoid column is read as the "death signal". |
-| **Killing threshold multiplier** | 1.5 | 0.1 – 20.0 | If absolute mode is off: the observed death-signal increase must exceed `background_rate × observation_window × multiplier` to count as killing. More robust to staining variation than an absolute number. |
-| **Use absolute threshold instead of multiplier** | OFF | checkbox | When on, the multiplier is replaced by a fixed value (next field). |
+| **Killing threshold multiplier** | 1.5 | 0.1 – 20.0 | If absolute mode is off: an organoid's death signal must reach at least `signal_at_contact_start × multiplier` by the end of the window to count as killing. Scales with each organoid's own starting signal (a signal of exactly 0 is treated as 0.1 to avoid a trivial threshold). |
+| **Use absolute threshold instead of multiplier** | OFF | checkbox | When on, the multiplier is replaced by a fixed value (next field). Recommended together with `nr_dead_mask_pixels`, since a flat pixel-count cutoff is easier to reason about than one on a fraction/intensity scale. |
 | **Absolute threshold** | 0.0 | 0.0 – 100.0 | Fixed minimum death-signal increase (only used when "Use absolute threshold" is on). |
 | **Min contact duration** | 1 | 1 – 50 timepoints | Minimum consecutive timepoints an immune cell must be in contact with the same target before a killing event can be counted. |
 | **Top-N killers to display** | 5 | 1 – 50 | Used by the preview button below. |
@@ -147,8 +149,8 @@ Written under `<output_dir>/analysis/<immune_type>/active_killing/`:
 | File | Contents |
 |---|---|
 | `BEHAV3D_<immune_type>_advanced_track_features.csv` | The full immune feature table with extra columns: `is_active_killing`, `killing_efficiency`, `targeted_track_id`, `contact_event_id`, and a `death_signal_increase_<N>tp` column where N is your observation window. |
-| `active_killing_per_timepoint_<immune_type>.csv` | One row per contact-event timepoint, with the per-timepoint classification and the background rate used. |
-| `active_killing_summary_<immune_type>.csv` | Per-sample aggregates: number of active-killing timepoints, mean killing efficiency, active-killing rate, background rate. |
+| `active_killing_per_timepoint_<immune_type>.csv` | One row per contact-event timepoint, with the event's classification and the threshold used. |
+| `active_killing_summary_<immune_type>.csv` | Per-sample aggregates: number of active-killing timepoints, mean killing efficiency, active-killing rate. |
 | `contact_events_<immune_type>.csv` | One row per contact event (start / end timepoint, duration, target track IDs). |
 | `plots/combined_killing_efficiency_distribution.png` | Histogram of killing efficiency across all active-killing timepoints. |
 
