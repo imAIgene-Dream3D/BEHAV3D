@@ -3367,6 +3367,52 @@ class TrackClassificationSubTab(QWidget):
             _apply_group_tracked_gate(self.warning_label, self.grp_bp, self.metadata_loader, ct)
             return True
 
+    @staticmethod
+    def _read_h5ad_obs_column(f, col):
+        """Read one obs column from an open h5ad file, handling both plain
+        arrays and AnnData's categorical (categories/codes) group encoding."""
+        import h5py
+        node = f["obs"][col]
+        if isinstance(node, h5py.Group):
+            categories = node["categories"][:]
+            categories = [c.decode() if isinstance(c, bytes) else c for c in categories]
+            codes = node["codes"][:]
+            return [categories[c] if c >= 0 else None for c in codes]
+        data = node[:]
+        return [v.decode() if isinstance(v, bytes) else v for v in data]
+
+    def _max_available_track_length(self, ct: str):
+        """Longest (sample_name, TrackID) track in this cell type's behavioral-states
+        h5ad — the same file/keys the dtaidistance clustering step reads — so the
+        Trajectory size spinbox can never be pushed past what any track can supply."""
+        states_path = self._state_adata_path(ct) if ct else None
+        if not states_path or not states_path.exists():
+            return None
+        try:
+            import h5py
+            import pandas as pd
+            with h5py.File(str(states_path), "r") as f:
+                obs = f.get("obs", {})
+                if "sample_name" not in obs or "TrackID" not in obs:
+                    return None
+                sample_names = self._read_h5ad_obs_column(f, "sample_name")
+                track_ids = self._read_h5ad_obs_column(f, "TrackID")
+            if not sample_names or len(sample_names) != len(track_ids):
+                return None
+            counts = pd.DataFrame({"sample_name": sample_names, "TrackID": track_ids}).groupby(
+                ["sample_name", "TrackID"]
+            ).size()
+            max_len = int(counts.max()) if len(counts) else 0
+            return max_len if max_len > 0 else None
+        except Exception:
+            return None
+
+    def _apply_max_trajectory_size(self, ct: str):
+        """Cap the Trajectory size spinbox at the longest available track,
+        so a value guaranteed to filter out every track can't be selected."""
+        max_len = self._max_available_track_length(ct)
+        self.spin_traj_size.setMaximum(max_len if max_len else 9999)
+
     # ── Guided pipeline dispatch (Step 3 create plots) ───────────────────
     _TRACK_PIPELINE_RUN_BUTTONS = {
         "track_diagnostics": "btn_diagnostics",
@@ -3624,6 +3670,7 @@ class TrackClassificationSubTab(QWidget):
             self.le_pretrained_states_path.setText(str(states_path))
 
         self._populate_track_settings(ct)
+        self._apply_max_trajectory_size(ct)
         self._check_prerequisites()
         self._update_view_buttons()
         self._update_bp_buttons()
@@ -5322,6 +5369,7 @@ class SingleCellTab(QWidget):
             # last time this tab was visited, and _autofill_paths alone doesn't
             # refresh the "states not found" warning/lock state.
             self.track_tab._check_prerequisites()
+            self.track_tab._apply_max_trajectory_size(self._current_cell_type())
             if self.track_tab.chk_use_original.isChecked():
                 self.track_tab._show_original_dtw_disclaimer()
 
