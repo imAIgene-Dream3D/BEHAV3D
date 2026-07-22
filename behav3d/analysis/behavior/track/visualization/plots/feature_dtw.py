@@ -5,33 +5,44 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.gridspec import GridSpec
+from matplotlib.patches import Patch
 import seaborn as sns
 from sklearn.preprocessing import MinMaxScaler
 
-from behav3d.analysis.filtering import round_legend_ticks
+from behav3d.analysis.filtering import round_legend_ticks, _make_figure, _maybe_show
+from behav3d.analysis.behavior.general.visualization.plots.proportion_bars import (
+    draw_thin_stacked_proportion_barh,
+    hash_stable_label_color_map,
+)
+from behav3d.analysis.behavior.state.utils import _apply_state_order
 
 
 def plot_cluster_percentage_bars(
     df_clust_perc: pd.DataFrame,
     outprefix,
-    group_by_columns=None,
+    group_cols=None,
     plot_results=True,
-    grid_figsize=(20, 10),
+    grid_figsize=None,
     ncols_samples=3,
     sample_panel_width=6.0,
     sample_row_height=2.8,
     title_fontsize=24,
     label_fontsize=12,
     info_fontsize=10,
+    cluster_key="ClusterID",
+    cluster_colors=None,
+    saved_cluster_order=None,
 ):
     """
     Produce a PDF with cluster percentage visualizations.
 
-    Page(s) 1+: 'Combined' view (samples pooled). Grid layout:
-                rows = this cell_type's line_condition values
-                columns = values of user-selected grouping column
-                One page per selected grouping column.
-                If group_by_columns is empty/None, skip these pages.
+    Page 1: 'Combined' view (samples pooled). Grid layout: 1 or 2 user-selected
+            `group_cols` (e.g. organoid_line_condition, tcell_line_condition)
+            arranged as a true 2D grid on one page — the column with more unique
+            values becomes rows, the other becomes columns. If only 1 column is
+            given, panels are laid out as a single column of rows. If more than
+            2 columns are given, only the first 2 are used. If group_cols is
+            empty/None, this page is skipped.
 
     Last Page: 'Per-sample' view. Panels laid out in 3 columns (configurable).
                Each panel is a single horizontal stacked bar of ClusterID percentages
@@ -40,44 +51,54 @@ def plot_cluster_percentage_bars(
     outprefix = Path(outprefix)
     outpdf = outprefix.with_suffix(".pdf")
 
-    if group_by_columns is None:
-        group_by_columns = []
-    elif isinstance(group_by_columns, str):
-        group_by_columns = [group_by_columns]
+    if group_cols is None:
+        group_cols = []
+    elif isinstance(group_cols, str):
+        group_cols = [group_cols]
 
-    group_by_columns = [c for c in group_by_columns if c in df_clust_perc.columns]
+    valid_group_cols = [c for c in group_cols if c in df_clust_perc.columns]
+    if len(valid_group_cols) > 2:
+        print(f"  Note: {len(valid_group_cols)} group_cols given — using only the first 2 for the grid.")
+        valid_group_cols = valid_group_cols[:2]
 
-    all_line_cols = [c for c in df_clust_perc.columns if c.endswith("_line_condition")]
-    this_cell_line_col = all_line_cols[0] if all_line_cols else None
+    grid_config = None
+    if valid_group_cols:
+        pooled_group_cols = valid_group_cols + [cluster_key]
 
-    if this_cell_line_col:
-        group_by_columns = [c for c in group_by_columns if c != this_cell_line_col]
-
-    pooled_group_cols = all_line_cols + group_by_columns + ["ClusterID"]
-    pooled_group_cols = list(dict.fromkeys(pooled_group_cols))
-
-    pooled = (
-        df_clust_perc
-        .groupby(pooled_group_cols, as_index=False, observed=True)["count"]
-        .sum()
-    )
-    pooled_total_cols = all_line_cols + group_by_columns
-    pooled_total_cols = list(dict.fromkeys(pooled_total_cols))
-
-    if pooled_total_cols:
+        pooled = (
+            df_clust_perc
+            .groupby(pooled_group_cols, as_index=False, observed=True)["count"]
+            .sum()
+        )
         pooled_combo_totals = (
-            pooled.groupby(pooled_total_cols, observed=True)["count"]
+            pooled.groupby(valid_group_cols, observed=True)["count"]
             .sum()
             .reset_index(name="combo_total_pooled")
         )
-        pooled = pooled.merge(pooled_combo_totals, on=pooled_total_cols, how="left")
-    else:
-        pooled["combo_total_pooled"] = pooled["count"].sum()
-    pooled["percentage_pooled"] = pooled["count"] / pooled["combo_total_pooled"]
+        pooled = pooled.merge(pooled_combo_totals, on=valid_group_cols, how="left")
+        pooled["percentage_pooled"] = pooled["count"] / pooled["combo_total_pooled"]
+
+        if len(valid_group_cols) == 2:
+            row_col, col_col = sorted(valid_group_cols, key=lambda c: -df_clust_perc[c].nunique())
+            row_values = df_clust_perc[row_col].drop_duplicates().sort_values().tolist()
+            col_values = df_clust_perc[col_col].drop_duplicates().sort_values().tolist()
+        else:
+            row_col = valid_group_cols[0]
+            col_col = None
+            row_values = df_clust_perc[row_col].drop_duplicates().sort_values().tolist()
+            col_values = [None]
+        grid_config = {
+            "row_col": row_col,
+            "row_values": row_values,
+            "col_col": col_col,
+            "col_values": col_values,
+            "nrows": len(row_values),
+            "ncols": len(col_values),
+        }
 
     per_sample = (
         df_clust_perc
-        .groupby(["sample_name", "ClusterID"], as_index=False, observed=True)["count"]
+        .groupby(["sample_name", cluster_key], as_index=False, observed=True)["count"]
         .sum()
     )
     per_sample_totals = (
@@ -90,32 +111,16 @@ def plot_cluster_percentage_bars(
     samples = per_sample["sample_name"].drop_duplicates().tolist()
 
     cluster_order = (
-        df_clust_perc["ClusterID"]
+        df_clust_perc[cluster_key]
         .drop_duplicates()
         .sort_values()
         .tolist()
     )
-
-    grids_to_plot = []
-
-    if group_by_columns and this_cell_line_col:
-        line_values_rows = df_clust_perc[this_cell_line_col].drop_duplicates().sort_values().tolist()
-        nrows = len(line_values_rows)
-
-        for col_for_columns in group_by_columns:
-            if col_for_columns in df_clust_perc.columns:
-                col_values = df_clust_perc[col_for_columns].drop_duplicates().sort_values().tolist()
-                grids_to_plot.append({
-                    "row_col": this_cell_line_col,
-                    "row_values": line_values_rows,
-                    "col_col": col_for_columns,
-                    "col_values": col_values,
-                    "nrows": nrows,
-                    "ncols": len(col_values),
-                })
+    cluster_order_str = _apply_state_order([str(c) for c in cluster_order], saved_cluster_order)
+    resolved_colors = hash_stable_label_color_map(cluster_order_str, colors=cluster_colors)
 
     with PdfPages(outpdf) as pdf:
-        for grid_config in grids_to_plot:
+        if grid_config is not None:
             row_col = grid_config["row_col"]
             row_values = grid_config["row_values"]
             col_col = grid_config["col_col"]
@@ -123,24 +128,24 @@ def plot_cluster_percentage_bars(
             nrows = grid_config["nrows"]
             ncols = grid_config["ncols"]
 
-            fig1, axes1 = plt.subplots(
-                nrows, ncols,
-                figsize=grid_figsize,
-                sharex=True, sharey=True,
-                squeeze=False,
+            combined_figsize = grid_figsize if grid_figsize is not None else (
+                max(sample_panel_width * ncols, 6.0), max(sample_row_height * nrows, 3.0) + 1.5,
             )
-
-            legend_handles_1, legend_labels_1 = None, None
+            fig1 = _make_figure(figsize=combined_figsize)
+            axes1 = fig1.subplots(nrows, ncols, sharex=True, sharey=True, squeeze=False)
 
             for i, row_val in enumerate(row_values):
                 for j, col_val in enumerate(col_values):
                     ax = axes1[i, j]
-                    subset = pooled[
-                        (pooled[row_col] == row_val) &
-                        (pooled[col_col] == col_val)
-                    ]
+                    if col_col is not None:
+                        subset = pooled[
+                            (pooled[row_col] == row_val) &
+                            (pooled[col_col] == col_val)
+                        ]
+                    else:
+                        subset = pooled[pooled[row_col] == row_val]
 
-                    if i == 0:
+                    if i == 0 and col_col is not None:
                         ax.set_title(f"{col_val}", fontsize=title_fontsize)
                     if j == 0:
                         ax.text(
@@ -154,20 +159,18 @@ def plot_cluster_percentage_bars(
                         ax.axis("off")
                         continue
 
-                    subset_unique = subset.drop_duplicates(subset=["ClusterID"], keep="first")
+                    subset_unique = subset.drop_duplicates(subset=[cluster_key], keep="first")
                     row = (
                         subset_unique
-                        .set_index("ClusterID")
+                        .set_index(cluster_key)
                         .reindex(cluster_order)["percentage_pooled"]
                         .fillna(0.0)
                     )
-                    pivot = row.to_frame().T
-                    pivot.index = ["combined"]
+                    values_dict = {str(k): float(v) for k, v in row.to_dict().items()}
 
-                    bar_ax = pivot.plot(kind="barh", stacked=True, ax=ax, legend=False)
-
-                    if legend_handles_1 is None:
-                        legend_handles_1, legend_labels_1 = bar_ax.get_legend_handles_labels()
+                    draw_thin_stacked_proportion_barh(
+                        ax, values_dict, cluster_order_str, resolved_colors, xmax=1.0,
+                    )
 
                     num_cells = int(subset["combo_total_pooled"].iloc[0]) if not subset.empty else 0
                     ax.text(
@@ -178,35 +181,31 @@ def plot_cluster_percentage_bars(
                     ax.axis("off")
 
             row_col_name = row_col.replace("_line_condition", "").replace("_", " ").title()
-            col_col_name = col_col.replace("_line_condition", "").replace("_", " ").title()
-            fig1.suptitle(f"Cluster percentages: {row_col_name} × {col_col_name}", fontsize=title_fontsize, y=0.995)
-
-            if legend_handles_1 and legend_labels_1:
-                fig1.legend(
-                    legend_handles_1, legend_labels_1,
-                    fontsize=label_fontsize,
-                    title="ClusterID", title_fontsize=label_fontsize,
-                    bbox_to_anchor=(0.92, 0.5), loc="center left",
-                )
-                fig1.tight_layout(rect=[0, 0, 0.88, 0.96])
+            if col_col is not None:
+                col_col_name = col_col.replace("_line_condition", "").replace("_", " ").title()
+                fig1.suptitle(f"Cluster percentages: {row_col_name} × {col_col_name}", fontsize=title_fontsize, y=0.995)
             else:
-                fig1.tight_layout(rect=[0, 0, 1, 0.96])
+                fig1.suptitle(f"Cluster percentages: {row_col_name}", fontsize=title_fontsize, y=0.995)
+
+            legend_handles_1 = [Patch(facecolor=resolved_colors[c], label=c) for c in cluster_order_str]
+            fig1.legend(
+                legend_handles_1, cluster_order_str,
+                fontsize=label_fontsize,
+                title=str(cluster_key), title_fontsize=label_fontsize,
+                bbox_to_anchor=(0.92, 0.5), loc="center left",
+            )
+            fig1.tight_layout(rect=[0, 0, 0.88, 0.96])
 
             if plot_results:
-                plt.show()
+                _maybe_show()
             pdf.savefig(fig1, bbox_inches="tight")
             plt.close(fig1)
 
         n_panels = len(samples)
         ncols = ncols_samples
         nrows = int(np.ceil(n_panels / ncols))
-        fig2, axes2 = plt.subplots(
-            nrows, ncols,
-            figsize=(sample_panel_width * ncols, sample_row_height * nrows),
-            squeeze=False,
-        )
-
-        legend_handles_2, legend_labels_2 = None, None
+        fig2 = _make_figure(figsize=(sample_panel_width * ncols, sample_row_height * nrows))
+        axes2 = fig2.subplots(nrows, ncols, squeeze=False)
 
         for k, sample in enumerate(samples):
             i, j = divmod(k, ncols)
@@ -216,23 +215,21 @@ def plot_cluster_percentage_bars(
                 ax.axis("off")
                 continue
 
-            sub_unique = sub.drop_duplicates(subset=["ClusterID"], keep="first")
+            sub_unique = sub.drop_duplicates(subset=[cluster_key], keep="first")
             row = (
                 sub_unique
-                .set_index("ClusterID")
+                .set_index(cluster_key)
                 .reindex(cluster_order)["percentage_overall"]
                 .fillna(0.0)
             )
-            pivot = row.to_frame().T
-            pivot.index = [sample]
+            values_dict = {str(k2): float(v) for k2, v in row.to_dict().items()}
 
-            bar_ax = pivot.plot(kind="barh", stacked=True, ax=ax, legend=False)
-
-            if legend_handles_2 is None:
-                legend_handles_2, legend_labels_2 = bar_ax.get_legend_handles_labels()
+            draw_thin_stacked_proportion_barh(
+                ax, values_dict, cluster_order_str, resolved_colors, xmax=1.0,
+            )
 
             num_cells = int(sub["sample_total_all"].iloc[0]) if not sub.empty else 0
-            ax.set_title(sample, fontsize=label_fontsize)
+            ax.set_title(sample, fontsize=label_fontsize, pad=2)
             ax.text(
                 0.5, 0.08, f"# Cells: {num_cells}",
                 ha="center", va="center",
@@ -240,9 +237,6 @@ def plot_cluster_percentage_bars(
             )
             ax.set_xlabel("")
             ax.set_ylabel("")
-            ax.set_yticks([])
-            ax.set_xticks([])
-            ax.spines[["top", "right", "bottom", "left"]].set_visible(False)
 
         for k in range(n_panels, nrows * ncols):
             i, j = divmod(k, ncols)
@@ -250,19 +244,17 @@ def plot_cluster_percentage_bars(
 
         fig2.suptitle("Per-sample cluster composition", fontsize=title_fontsize, y=0.995)
 
-        if legend_handles_2 and legend_labels_2:
-            fig2.legend(
-                legend_handles_2, legend_labels_2,
-                fontsize=label_fontsize,
-                title="ClusterID", title_fontsize=label_fontsize,
-                bbox_to_anchor=(0.92, 0.5), loc="center left",
-            )
-            fig2.tight_layout(rect=[0, 0, 0.88, 0.96])
-        else:
-            fig2.tight_layout(rect=[0, 0, 1, 0.96])
+        legend_handles_2 = [Patch(facecolor=resolved_colors[c], label=c) for c in cluster_order_str]
+        fig2.legend(
+            legend_handles_2, cluster_order_str,
+            fontsize=label_fontsize,
+            title=str(cluster_key), title_fontsize=label_fontsize,
+            bbox_to_anchor=(0.92, 0.5), loc="center left",
+        )
+        fig2.tight_layout(rect=[0, 0, 0.88, 0.96])
 
         if plot_results:
-            plt.show()
+            _maybe_show()
         pdf.savefig(fig2, bbox_inches="tight")
         plt.close(fig2)
 
@@ -277,8 +269,14 @@ def plot_feature_umap(
     rows_first_img=2,
     figsize=(8.27, 11.69),
     plot_results=True,
+    cluster_key="ClusterID",
+    cluster_colors=None,
 ):
     n_plots = len(info_cols)
+    umap_palette = "Set1"
+    if cluster_colors:
+        cluster_labels = sorted(df_umap[cluster_key].dropna().astype(str).unique().tolist())
+        umap_palette = hash_stable_label_color_map(cluster_labels, colors=cluster_colors)
     n_rows = (n_plots // nr_cols) + (1 if n_plots % nr_cols != 0 else 0) + rows_first_img
     nr_pages = (n_rows // rows_per_page) + (1 if n_rows % rows_per_page != 0 else 0)
 
@@ -286,21 +284,21 @@ def plot_feature_umap(
         plot_idx = 0
 
         for page in range(nr_pages):
-            fig = plt.figure(figsize=figsize)
+            fig = _make_figure(figsize=figsize)
             gs = GridSpec(rows_per_page, nr_cols, figure=fig, wspace=0.3)
 
             if page == 0:
                 ax = fig.add_subplot(gs[:rows_first_img, :])
                 sns.scatterplot(
                     data=df_umap, x="UMAP1", y="UMAP2",
-                    hue="ClusterID", s=20, alpha=0.5, palette="Set1", ax=ax,
+                    hue=cluster_key, s=20, alpha=0.5, palette=umap_palette, ax=ax,
                 )
                 ax.legend(
                     loc="upper left", prop={"size": 8},
                     bbox_to_anchor=(1, 1), borderpad=0.3,
                     labelspacing=0.4, columnspacing=0.1, frameon=False,
                 )
-                ax.set_title("ClusterID", fontsize=10, loc="center")
+                ax.set_title(str(cluster_key), fontsize=10, loc="center")
                 ax.set_xticks([])
                 ax.set_yticks([])
                 ax.set_xticklabels([])
@@ -308,7 +306,7 @@ def plot_feature_umap(
                 ax.set_xlabel("")
                 ax.set_ylabel("")
                 if plot_results:
-                    plt.show()
+                    _maybe_show()
 
             remaining_axes = [
                 fig.add_subplot(gs[i, j])
@@ -364,6 +362,7 @@ def plot_clustering_feature_heatmap(
     point_alpha=0.5,
     point_size=8,
     mean_marker_size=60,
+    cluster_key="ClusterID",
 ):
     """
     Produce a PDF with:
@@ -372,6 +371,10 @@ def plot_clustering_feature_heatmap(
     """
     info_cols = list(info_cols) if info_cols is not None else []
     sample_cols = list(sample_cols) if sample_cols is not None else []
+    if str(cluster_key) != "ClusterID":
+        df_umap = df_umap.rename(columns={cluster_key: "ClusterID"})
+        info_cols = [("ClusterID" if str(c) == str(cluster_key) else c) for c in info_cols]
+        sample_cols = [("ClusterID" if str(c) == str(cluster_key) else c) for c in sample_cols]
 
     def _round_legend_ticks(max_val):
         try:
@@ -424,14 +427,15 @@ def plot_clustering_feature_heatmap(
     nr_pages = max(1, (rows_for_plots + rows_per_page - 1) // rows_per_page)
 
     with PdfPages(outpath) as pdf:
-        fig, ax = plt.subplots(figsize=figsize)
+        fig = _make_figure(figsize=figsize)
+        ax = fig.subplots()
         if not overall_heatmap_data.empty:
             try:
                 heatmap = sns.heatmap(
                     overall_heatmap_data, ax=ax, cmap="viridis", cbar=True, yticklabels=True,
                 )
                 ax.set_title("Min–Max Scaled Cluster Means", fontsize=14, pad=14)
-                ax.set_xlabel("ClusterID", fontsize=10)
+                ax.set_xlabel(str(cluster_key), fontsize=10)
                 ax.set_ylabel("", fontsize=10)
                 ax.tick_params(axis="y", labelsize=6)
                 ax.tick_params(axis="x", labelsize=8, rotation=0)
@@ -450,7 +454,7 @@ def plot_clustering_feature_heatmap(
 
         plot_idx = 0
         for page in range(nr_pages):
-            fig = plt.figure(figsize=figsize)
+            fig = _make_figure(figsize=figsize)
             gs = GridSpec(rows_per_page, nr_cols, figure=fig, hspace=1.5, wspace=0.3)
             remaining_axes = [
                 fig.add_subplot(gs[r, c])
@@ -498,7 +502,7 @@ def plot_clustering_feature_heatmap(
                 )
 
                 ax.set_title(feat, fontsize=9)
-                ax.set_xlabel("ClusterID", fontsize=8)
+                ax.set_xlabel(str(cluster_key), fontsize=8)
                 ax.set_ylabel("Value", fontsize=8)
                 ax.tick_params(axis="x", rotation=0, labelsize=7)
                 ax.tick_params(axis="y", labelsize=7)

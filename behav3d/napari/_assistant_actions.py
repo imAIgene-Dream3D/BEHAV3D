@@ -1466,7 +1466,9 @@ TOOL_SCHEMA = [
         "description": (
             "Set one exact field that exists in ui_state.controls. Use its id exactly. "
             "Never invent an id and never use internal configuration keys. Blank fields "
-            "may apply immediately; changing an existing value requires confirmation."
+            "may apply immediately; changing an existing value requires confirmation. "
+            "When the user explicitly asks to fill or change available values, emit the "
+            "corresponding calls now instead of only describing the intended changes."
         ),
         "parameters": {
             "type": "object",
@@ -1576,7 +1578,11 @@ TOOL_SCHEMA = [
         "description": (
             "Fill the ENTIRE Metadata Builder in ONE call. Use this (instead of "
             "many fill_metadata_builder calls) when the user gives lots of values "
-            "at once, provides a list of image files, or says 'fill everything'. "
+            "at once, describes a new multi-sample experiment, provides a list of image "
+            "files, or says 'fill everything'. Unknown fields may be omitted; include one "
+            "possibly partial sample object per described movie so the forms are created. "
+            "Never guess dimension_order, time_unit, image paths, sample names, or wells. "
+            "This action opens the Metadata Builder itself; do not call open_builder first. "
             "The app rebuilds the forms once and applies all values in a single "
             "pass with no per-field confirmation. Provide the population counts, "
             "cell-type name lists, and one dict per sample."

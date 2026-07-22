@@ -280,6 +280,14 @@ def _make_info_label(text: str) -> QLabel:
     return lbl
 
 
+def _fit_list_widget_height(list_widget, min_rows: int = 2, max_rows: int = 5) -> None:
+    """Size a QListWidget's height to its current item count instead of a fixed box,
+    so a short candidate-column list doesn't leave a lot of empty space."""
+    n = max(min_rows, min(list_widget.count(), max_rows))
+    row_h = list_widget.sizeHintForRow(0) if list_widget.count() else 18
+    list_widget.setFixedHeight(n * row_h + 2 * list_widget.frameWidth() + 4)
+
+
 def _make_browse_row(
     le: QLineEdit,
     btn: QPushButton,
@@ -421,9 +429,20 @@ class StateClassificationSubTab(QWidget):
     # ── UI ──────────────────────────────────────────────────────────────
 
     def _init_ui(self):
+        from behav3d.napari._guided import make_back_header
+
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
+
+        # Pinned above the scroll area (not inside it) so it stays visible
+        # regardless of how far the plotting page's content scrolls. Only
+        # shown while the plotting page (outer page 1) is active.
+        self._plotting_header, self._pipeline_title = make_back_header(
+            on_back=self._plotting_back, label="‹ Back"
+        )
+        self._plotting_header.hide()
+        outer.addWidget(self._plotting_header)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -431,10 +450,22 @@ class StateClassificationSubTab(QWidget):
         outer.addWidget(scroll)
 
         content = QWidget()
-        lay = QVBoxLayout(content)
+        content_lay = QVBoxLayout(content)
+        content_lay.setContentsMargins(0, 0, 0, 0)
+        content_lay.setSpacing(0)
+        scroll.setWidget(content)
+
+        # Outer per-subtab stack: page 0 = clustering settings (Steps 1/2/4 +
+        # the "Generate analysis and plots" trigger), page 1 = the fully
+        # isolated plotting page, reached only via that trigger.
+        self._subtab_stack = QStackedWidget()
+        content_lay.addWidget(self._subtab_stack)
+
+        settings_page = QWidget()
+        lay = QVBoxLayout(settings_page)
         lay.setContentsMargins(6, 6, 6, 6)
         lay.setSpacing(6)
-        scroll.setWidget(content)
+        self._subtab_stack.addWidget(settings_page)  # outer page 0
 
         # ── Warning label (prerequisite check) ──────────────────────────
         self.warning_label = QLabel("")
@@ -786,33 +817,138 @@ class StateClassificationSubTab(QWidget):
         g2.addLayout(rename_full_row)
         lay.addWidget(self.grp2)
 
-        # ── Step 3: Reports ──────────────────────────────────────────────
-        self.grp3 = QGroupBox("Step 3 — Reports")
-        g3 = QVBoxLayout(self.grp3)
-        g3.setSpacing(4)
-
-        g3.addWidget(QLabel("Group composition plots by (Ctrl/Cmd click for multiple):"))
+        # ── Step 3: Reports (built directly into per-pipeline group boxes) ──
+        self.grp_state_composition = QGroupBox("State Composition Report")
+        g_state_composition = QVBoxLayout(self.grp_state_composition)
+        g_state_composition.setSpacing(4)
+        composition_axis_form = QFormLayout()
+        composition_axis_form.setSpacing(3)
+        self.combo_composition_group_x = QComboBox()
+        self.combo_composition_group_x.setMinimumWidth(160)
+        composition_axis_form.addRow("Group in X:", self.combo_composition_group_x)
+        self.combo_composition_group_y = QComboBox()
+        self.combo_composition_group_y.setMinimumWidth(160)
+        composition_axis_form.addRow("Group in Y:", self.combo_composition_group_y)
+        g_state_composition.addLayout(composition_axis_form)
+        g_state_composition.addWidget(QLabel("Group per page (Ctrl/Cmd click for multiple):"))
         self.list_composition_group_cols = QListWidget()
         self.list_composition_group_cols.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.list_composition_group_cols.setMaximumHeight(80)
-        g3.addWidget(self.list_composition_group_cols)
-
+        g_state_composition.addWidget(self.list_composition_group_cols)
+        g_state_composition.addWidget(_make_info_label(
+            "Plots the proportion of each behavioral state per sample."
+        ))
         comp_row = QHBoxLayout()
         self.btn_state_composition = QPushButton("▶ State Composition Report")
         _style_secondary(self.btn_state_composition)
         comp_row.addWidget(self.btn_state_composition, stretch=1)
         self.btn_view_composition = _make_view_btn()
         comp_row.addWidget(self.btn_view_composition)
-        g3.addLayout(comp_row)
+        g_state_composition.addLayout(comp_row)
 
+        self.grp_state_transition = QGroupBox("State Transition Report")
+        g_state_transition = QVBoxLayout(self.grp_state_transition)
+        g_state_transition.setSpacing(4)
+        g_state_transition.addWidget(_make_info_label(
+            "Plots state-to-state transition probabilities."
+        ))
         trans_row = QHBoxLayout()
         self.btn_state_transition = QPushButton("▶ State Transition Report")
         _style_secondary(self.btn_state_transition)
         trans_row.addWidget(self.btn_state_transition, stretch=1)
         self.btn_view_transition = _make_view_btn()
         trans_row.addWidget(self.btn_view_transition)
-        g3.addLayout(trans_row)
-        lay.addWidget(self.grp3)
+        g_state_transition.addLayout(trans_row)
+
+        self.grp_state_comparison = QGroupBox("Condition Comparison Report")
+        g_state_comparison = QVBoxLayout(self.grp_state_comparison)
+        g_state_comparison.setSpacing(4)
+        g_state_comparison.addWidget(_make_info_label(
+            "Condition comparison (overall proportions, Welch's t-test): each row is one pairwise "
+            "comparison of \"Compare condition\"'s levels; \"Group in X\" splits it into side-by-side "
+            "columns from another condition."
+        ))
+        comparison_form = QFormLayout()
+        comparison_form.setSpacing(3)
+        self.combo_comparison_condition_col = QComboBox()
+        self.combo_comparison_condition_col.setMinimumWidth(200)
+        self.combo_comparison_condition_col.currentTextChanged.connect(
+            self._on_comparison_condition_col_changed
+        )
+        comparison_form.addRow("Compare condition:", self.combo_comparison_condition_col)
+        self.combo_comparison_group_x = QComboBox()
+        self.combo_comparison_group_x.setMinimumWidth(160)
+        comparison_form.addRow("Group in X:", self.combo_comparison_group_x)
+        self.line_comparison_group_y = QLineEdit()
+        self.line_comparison_group_y.setMinimumWidth(160)
+        self.line_comparison_group_y.setReadOnly(True)
+        comparison_form.addRow("Group in Y:", self.line_comparison_group_y)
+        g_state_comparison.addLayout(comparison_form)
+        g_state_comparison.addWidget(QLabel("Group per page (Ctrl/Cmd click for multiple):"))
+        self.list_comparison_group_cols = QListWidget()
+        self.list_comparison_group_cols.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        g_state_comparison.addWidget(self.list_comparison_group_cols)
+        comparison_row = QHBoxLayout()
+        self.btn_condition_comparison = QPushButton("▶ Condition Comparison Report")
+        _style_secondary(self.btn_condition_comparison)
+        comparison_row.addWidget(self.btn_condition_comparison, stretch=1)
+        self.btn_view_condition_comparison = _make_view_btn()
+        comparison_row.addWidget(self.btn_view_condition_comparison)
+        g_state_comparison.addLayout(comparison_row)
+
+        from behav3d.napari._guided import GuidedPanel
+        from behav3d.napari.analysis_guided_copy import (
+            STATE_REPORTS_ENTRY, STATE_REPORT_PIPELINES,
+        )
+
+        # Entry trigger stays inline on the clustering-settings page; Start
+        # navigates to the fully isolated plotting page (outer page 1) below.
+        lay.addWidget(
+            GuidedPanel([STATE_REPORTS_ENTRY],
+                        start_cb=lambda _id: self._open_plotting_page())
+        )
+
+        plotting_page = QWidget()
+        plotting_lay = QVBoxLayout(plotting_page)
+        plotting_lay.setContentsMargins(0, 0, 0, 0)
+        plotting_lay.setSpacing(0)
+
+        # Inner stack: page 0 = report list, page 1 = a report's settings.
+        self._plots_stack = QStackedWidget()
+
+        pipeline_page = QWidget()
+        pipeline_lay = QVBoxLayout(pipeline_page)
+        pipeline_lay.setContentsMargins(0, 0, 0, 0)
+        pipeline_lay.setSpacing(0)
+        pipeline_lay.addWidget(
+            GuidedPanel(STATE_REPORT_PIPELINES, start_cb=self._on_pipeline_start)
+        )
+        self._plots_stack.addWidget(pipeline_page)  # inner page 0
+
+        report_settings_page = QWidget()
+        report_settings_lay = QVBoxLayout(report_settings_page)
+        report_settings_lay.setContentsMargins(0, 0, 0, 0)
+        report_settings_lay.setSpacing(0)
+        self._pipeline_scroll = QScrollArea()
+        self._pipeline_scroll.setWidgetResizable(True)
+        self._pipeline_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        report_settings_lay.addWidget(self._pipeline_scroll)
+        self._plots_stack.addWidget(report_settings_page)  # inner page 1
+
+        pipeline_content = QWidget()
+        pipeline_content_lay = QVBoxLayout(pipeline_content)
+        pipeline_content_lay.setContentsMargins(6, 6, 6, 6)
+        pipeline_content_lay.setSpacing(6)
+        pipeline_content_lay.addWidget(self.grp_state_composition)
+        pipeline_content_lay.addWidget(self.grp_state_transition)
+        pipeline_content_lay.addWidget(self.grp_state_comparison)
+        pipeline_content_lay.addStretch()
+        self._pipeline_scroll.setWidget(pipeline_content)
+
+        self._plots_stack.setCurrentIndex(0)
+        plotting_lay.addWidget(self._plots_stack)
+        self._subtab_stack.addWidget(plotting_page)  # outer page 1
+
+        self._subtab_stack.setCurrentIndex(0)
 
         # ── Step 4: Backprojection ───────────────────────────────────────
         self.grp_bp = QGroupBox("Step 4 — Backprojection")
@@ -911,6 +1047,8 @@ class StateClassificationSubTab(QWidget):
         self.btn_view_composition.clicked.connect(lambda: self._on_view("state_composition"))
         self.btn_state_transition.clicked.connect(self._on_state_transition)
         self.btn_view_transition.clicked.connect(lambda: self._on_view("state_transition"))
+        self.btn_condition_comparison.clicked.connect(self._on_condition_comparison)
+        self.btn_view_condition_comparison.clicked.connect(lambda: self._on_view("state_condition_comparison"))
         self.btn_browse_hmm.clicked.connect(self._browse_hmm_artifact)
         self.btn_apply_hmm.clicked.connect(self._on_apply_hmm)
         self.btn_show_state_bp.clicked.connect(self._on_show_state_bp)
@@ -942,7 +1080,7 @@ class StateClassificationSubTab(QWidget):
 
         if csv_filtered.exists():
             self.warning_label.hide()
-            for grp in [self.grp_train, self.grp2, self.grp3, self.grp_bp]:
+            for grp in [self.grp_train, self.grp2, self._subtab_stack, self.grp_bp]:
                 grp.setEnabled(True)
             _apply_group_tracked_gate(self.warning_label, self.grp_bp, self.metadata_loader, ct)
             return True
@@ -953,7 +1091,7 @@ class StateClassificationSubTab(QWidget):
                 "Using unfiltered data as a fallback."
             )
             self.warning_label.show()
-            for grp in [self.grp_train, self.grp2, self.grp3, self.grp_bp]:
+            for grp in [self.grp_train, self.grp2, self._subtab_stack, self.grp_bp]:
                 grp.setEnabled(True)
             _apply_group_tracked_gate(self.warning_label, self.grp_bp, self.metadata_loader, ct)
             return True
@@ -963,9 +1101,60 @@ class StateClassificationSubTab(QWidget):
                 "Run Filtering first, then return here."
             )
             self.warning_label.show()
-            for grp in [self.grp_train, self.grp2, self.grp3, self.grp_bp]:
+            for grp in [self.grp_train, self.grp2, self._subtab_stack, self.grp_bp]:
                 grp.setEnabled(False)
             return False
+
+    # ── Guided pipeline dispatch (Step 3 reports) ────────────────────────
+    _STATE_PIPELINE_RUN_BUTTONS = {
+        "state_transition": "btn_state_transition",
+    }
+
+    def _on_pipeline_start(self, pipeline_id: str):
+        """Start from a pipeline card: run directly (no params) or open its settings."""
+        from behav3d.napari.analysis_guided_copy import STATE_REPORT_PIPELINES
+        spec = next((s for s in STATE_REPORT_PIPELINES if s["id"] == pipeline_id), None)
+        if spec is not None and not spec.get("has_params", True):
+            btn_name = self._STATE_PIPELINE_RUN_BUTTONS.get(pipeline_id)
+            if btn_name is not None:
+                getattr(self, btn_name).click()
+            return
+        self._focus_pipeline(pipeline_id)
+        self._plots_stack.setCurrentIndex(1)
+        self._pipeline_scroll.verticalScrollBar().setValue(0)
+
+    def _focus_pipeline(self, pipeline_id: str):
+        """Show only the group box relevant to ``pipeline_id``, hide the rest."""
+        from behav3d.napari.analysis_guided_copy import STATE_REPORT_PIPELINES
+        visible = {
+            "state_composition": {self.grp_state_composition},
+            "state_transition": {self.grp_state_transition},
+            "state_comparison": {self.grp_state_comparison},
+        }.get(pipeline_id, set())
+        for group in (self.grp_state_composition, self.grp_state_transition, self.grp_state_comparison):
+            group.setVisible(group in visible)
+        title = next(
+            (s["title"] for s in STATE_REPORT_PIPELINES if s["id"] == pipeline_id), ""
+        )
+        self._pipeline_title.setText(title)
+
+    def _open_plotting_page(self):
+        """Entry card Start: jump to the isolated plotting page, reset to the
+        report list."""
+        self._plots_stack.setCurrentIndex(0)
+        self._pipeline_title.setText("")
+        self._subtab_stack.setCurrentIndex(1)
+        self._plotting_header.show()
+
+    def _plotting_back(self):
+        """Contextual Back inside the plotting page: report settings → report
+        list; report list → clustering settings."""
+        if self._plots_stack.currentIndex() == 1:
+            self._plots_stack.setCurrentIndex(0)
+            self._pipeline_title.setText("")
+        else:
+            self._subtab_stack.setCurrentIndex(0)
+            self._plotting_header.hide()
 
     # ── Toggle helpers ───────────────────────────────────────────────────
 
@@ -1468,8 +1657,8 @@ class StateClassificationSubTab(QWidget):
 
         self._refresh_composition_group_cols()
 
-    def _refresh_composition_group_cols(self):
-        self.list_composition_group_cols.clear()
+    def _composition_candidate_columns(self):
+        cols = []
         added = set()
 
         # Prefer columns from the metadata CSV, but only surface the known
@@ -1478,7 +1667,7 @@ class StateClassificationSubTab(QWidget):
         if md is not None and hasattr(md, "columns"):
             for col in md.columns:
                 if col in ("exp_nr", "well") or col.endswith("_line_condition"):
-                    self.list_composition_group_cols.addItem(col)
+                    cols.append(col)
                     added.add(col)
 
         # Metadata CSV never carries per-cell columns like `origin_cell_type`
@@ -1490,24 +1679,75 @@ class StateClassificationSubTab(QWidget):
             ct = self._cell_type()
             full_path = self._full_adata_path(ct) if ct else None
             if not full_path or not full_path.exists():
-                return
+                return cols
             try:
                 import h5py
                 with h5py.File(str(full_path), "r") as f:
                     obs_cols = list(f.get("obs", {}).keys())
             except Exception:
-                return
+                return cols
         for col in obs_cols:
             if col in added or col.startswith("_") or col in _TECHNICAL_OBS_COLS:
                 continue
             if col in ("exp_nr", "well", "origin_cell_type") or col.endswith("_line_condition"):
-                self.list_composition_group_cols.addItem(col)
+                cols.append(col)
                 added.add(col)
+        return cols
+
+    def _refresh_composition_group_cols(self):
+        candidate_cols = self._composition_candidate_columns()
+        self.list_composition_group_cols.clear()
+        for col in candidate_cols:
+            self.list_composition_group_cols.addItem(col)
+        _fit_list_widget_height(self.list_composition_group_cols)
+
+        for combo in (self.combo_composition_group_x, self.combo_composition_group_y):
+            prev = combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("(none)")
+            combo.addItems(candidate_cols)
+            combo.setCurrentText(prev if prev in (["(none)"] + candidate_cols) else "(none)")
+            combo.blockSignals(False)
+
+        prev_cond = self.combo_comparison_condition_col.currentText()
+        self.combo_comparison_condition_col.blockSignals(True)
+        self.combo_comparison_condition_col.clear()
+        self.combo_comparison_condition_col.addItems(candidate_cols)
+        if prev_cond in candidate_cols:
+            self.combo_comparison_condition_col.setCurrentText(prev_cond)
+        self.combo_comparison_condition_col.blockSignals(False)
+
+        self.list_comparison_group_cols.clear()
+        for col in candidate_cols:
+            self.list_comparison_group_cols.addItem(col)
+        _fit_list_widget_height(self.list_comparison_group_cols)
+
+        prev = self.combo_comparison_group_x.currentText()
+        self.combo_comparison_group_x.blockSignals(True)
+        self.combo_comparison_group_x.clear()
+        self.combo_comparison_group_x.addItem("(none)")
+        self.combo_comparison_group_x.addItems(candidate_cols)
+        self.combo_comparison_group_x.setCurrentText(
+            prev if prev in (["(none)"] + candidate_cols) else "(none)"
+        )
+        self.combo_comparison_group_x.blockSignals(False)
+
+        self._sync_comparison_group_y_text()
+
+    def _sync_comparison_group_y_text(self):
+        self.line_comparison_group_y.setText(self.combo_comparison_condition_col.currentText())
+
+    def _on_comparison_condition_col_changed(self, _text):
+        self._sync_comparison_group_y_text()
 
     def _update_view_buttons(self):
         ct = self._cell_type()
         if not ct:
-            for btn in (self.btn_view_state, self.btn_view_composition, self.btn_view_transition):
+            for btn in (
+                self.btn_view_state, self.btn_view_composition, self.btn_view_transition,
+                self.btn_view_condition_comparison,
+            ):
                 btn.setEnabled(False)
             return
         model_path = self._model_adata_path(ct)
@@ -1516,6 +1756,9 @@ class StateClassificationSubTab(QWidget):
         self.btn_view_composition.setEnabled(bool(comp and comp.exists()))
         trans = self._report_path(ct, "state_transition_report")
         self.btn_view_transition.setEnabled(bool(trans and trans.exists()))
+        self.btn_view_condition_comparison.setEnabled(
+            len(self._get_view_candidates("state_condition_comparison", ct)) > 0
+        )
 
     def _update_bp_buttons(self):
         ct = self._cell_type()
@@ -1843,6 +2086,10 @@ class StateClassificationSubTab(QWidget):
         out = self._out_dir()
         self._log(f"▶ Generating state composition report for '{ct}'…")
         selected_cols = [item.text() for item in self.list_composition_group_cols.selectedItems()]
+        group_x = self.combo_composition_group_x.currentText()
+        group_x = None if group_x in ("", "(none)") else group_x
+        group_y = self.combo_composition_group_y.currentText()
+        group_y = None if group_y in ("", "(none)") else group_y
         _raw_md = getattr(self.metadata_loader, "metadata", None) if self.metadata_loader else None
         md_snapshot = _raw_md.copy() if _raw_md is not None else None
 
@@ -1879,6 +2126,7 @@ class StateClassificationSubTab(QWidget):
                             .fillna("(unknown)")
                         )
 
+            from behav3d.analysis.behavior.state.utils import _get_classification_state_colors
             composition_dir = _resolve_state_paths(out, ct).state_composition_outdir
             composition_dir.mkdir(parents=True, exist_ok=True)
             return save_state_composition_report(
@@ -1890,6 +2138,9 @@ class StateClassificationSubTab(QWidget):
                 sample_col="sample_name",
                 include_pooled_summary=True,
                 group_cols=selected_cols,
+                group_x=group_x,
+                group_y=group_y,
+                state_colors=_get_classification_state_colors(adata, FULL_STATE_COL),
                 verbose=True,
             )
 
@@ -1929,6 +2180,7 @@ class StateClassificationSubTab(QWidget):
             from behav3d.analysis.behavior.state.visualization.plots.state_transitions import (
                 save_state_transition_report,
             )
+            from behav3d.analysis.behavior.state.utils import _get_classification_state_colors
             adata = ad.read_h5ad(str(full_path))
             transition_dir = _resolve_state_paths(out, ct).state_transitions_outdir
             transition_dir.mkdir(parents=True, exist_ok=True)
@@ -1937,6 +2189,7 @@ class StateClassificationSubTab(QWidget):
                 output_dir=transition_dir,
                 state_col=FULL_STATE_COL,
                 time_col="position_t",
+                state_colors=_get_classification_state_colors(adata, FULL_STATE_COL),
                 verbose=True,
             )
 
@@ -1953,6 +2206,72 @@ class StateClassificationSubTab(QWidget):
                 self._notify_results(),
             ),
             on_failed=lambda e: self._log(f"❌ Transition report failed: {e}"),
+        )
+
+    def _on_condition_comparison(self):
+        ct = self._cell_type()
+        if not ct:
+            return
+        if self._bg.is_running():
+            QMessageBox.warning(self, "Busy", "Another operation is running.")
+            return
+        full_path = self._full_adata_path(ct)
+        if not full_path or not full_path.exists():
+            QMessageBox.warning(self, "No data", "Run state classification first.")
+            return
+        condition_col = self.combo_comparison_condition_col.currentText()
+        group_cols = [item.text() for item in self.list_comparison_group_cols.selectedItems()]
+        group_x = self.combo_comparison_group_x.currentText()
+        group_x = None if group_x in ("", "(none)") else group_x
+        if not condition_col:
+            QMessageBox.warning(self, "Missing selection", "Select a condition column to compare.")
+            return
+        out = self._out_dir()
+        self._log(f"▶ Generating condition comparison report for '{ct}'…")
+
+        def _run(**kw):
+            import anndata as ad
+            from behav3d.analysis.behavior.state.classification import FULL_STATE_COL
+            from behav3d.analysis.behavior.state.utils import (
+                _resolve_state_paths,
+                _get_classification_state_colors,
+            )
+            from behav3d.analysis.behavior.state.visualization.plots.state_composition import (
+                save_state_condition_comparison_report,
+            )
+            from behav3d.analysis.behavior.utils import _sanitize_filename_token
+            adata = ad.read_h5ad(str(full_path))
+            state_paths = _resolve_state_paths(out, ct)
+            comp_dir = state_paths.state_composition_outdir / "behavior_proportions"
+            comp_dir.mkdir(parents=True, exist_ok=True)
+            cond_token = _sanitize_filename_token(condition_col, fallback="condition")
+            out_pdf = comp_dir / f"condition_comparison_{cond_token}.pdf"
+            return save_state_condition_comparison_report(
+                adata=adata,
+                output_pdf_path=out_pdf,
+                output_csv_path=out_pdf.with_suffix(".csv"),
+                state_col=FULL_STATE_COL,
+                sample_col="sample_name",
+                condition_col=condition_col,
+                group_cols=group_cols or None,
+                group_x=group_x,
+                state_colors=_get_classification_state_colors(adata, FULL_STATE_COL),
+                verbose=True,
+            )
+
+        self._bg.run(
+            fn=_run,
+            desc=f"Condition comparison report ({ct})…",
+            progress_row=self.progress_row,
+            buttons=[self.btn_condition_comparison],
+            viewer=self.viewer,
+            inject_progress=False,
+            on_done=lambda r: (
+                self._log(f"✅ Condition comparison report done for '{ct}'."),
+                self._update_view_buttons(),
+                self._notify_results(),
+            ),
+            on_failed=lambda e: self._log(f"❌ Condition comparison report failed: {e}"),
         )
 
     # ── Backprojection ───────────────────────────────────────────────────
@@ -2167,6 +2486,14 @@ class StateClassificationSubTab(QWidget):
         if kind == "state_transition":
             p = self._report_path(ct, "state_transition_report")
             return [(f"Transition report ({ct})", p)] if p else []
+        if kind == "state_condition_comparison":
+            comp_dir = out / "analysis" / ct / "behavioral_states" / "state_composition" / "behavior_proportions"
+            if not comp_dir.exists():
+                return []
+            return [
+                (p.stem.replace("condition_comparison_", ""), p)
+                for p in sorted(comp_dir.glob("condition_comparison_*.pdf"))
+            ]
         return []
 
     def _open_pdf(self, path: Path):
@@ -2228,9 +2555,20 @@ class TrackClassificationSubTab(QWidget):
     # ── UI ───────────────────────────────────────────────────────────────
 
     def _init_ui(self):
+        from behav3d.napari._guided import make_back_header
+
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
+
+        # Pinned above the scroll area (not inside it) so it stays visible
+        # regardless of how far the plotting page's content scrolls. Only
+        # shown while the plotting page (outer page 1) is active.
+        self._plotting_header, self._pipeline_title = make_back_header(
+            on_back=self._plotting_back, label="‹ Back"
+        )
+        self._plotting_header.hide()
+        outer.addWidget(self._plotting_header)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -2238,10 +2576,22 @@ class TrackClassificationSubTab(QWidget):
         outer.addWidget(scroll)
 
         content = QWidget()
-        lay = QVBoxLayout(content)
+        content_lay = QVBoxLayout(content)
+        content_lay.setContentsMargins(0, 0, 0, 0)
+        content_lay.setSpacing(0)
+        scroll.setWidget(content)
+
+        # Outer per-subtab stack: page 0 = clustering settings (Steps 1/2/4 +
+        # the "Generate analysis and plots" trigger), page 1 = the fully
+        # isolated plotting page, reached only via that trigger.
+        self._subtab_stack = QStackedWidget()
+        content_lay.addWidget(self._subtab_stack)
+
+        settings_page = QWidget()
+        lay = QVBoxLayout(settings_page)
         lay.setContentsMargins(6, 6, 6, 6)
         lay.setSpacing(6)
-        scroll.setWidget(content)
+        self._subtab_stack.addWidget(settings_page)  # outer page 0
 
         # ── Warning label (prerequisite check) ──────────────────────────
         self.warning_label = QLabel("")
@@ -2382,6 +2732,14 @@ class TrackClassificationSubTab(QWidget):
             "How to trim each track to Trajectory size: "
             "'last' keeps each track's final N timepoints (removes leading/early ones); "
             "'first' keeps each track's first N timepoints (removes trailing/late ones)."
+        ))
+        self.chk_split_long_tracks = QCheckBox("Divide long tracks")
+        self.chk_split_long_tracks.setChecked(False)
+        dtw_form.addRow("", _make_chk_help_row(
+            self.chk_split_long_tracks, "Divide long tracks",
+            "Split tracks longer than Trajectory size into non-overlapping full-length "
+            "analysis windows. Leftover timepoints are discarded. Original TrackID values "
+            "are preserved for backprojection."
         ))
         self.adv1.addLayout(dtw_form)
 
@@ -2616,16 +2974,14 @@ class TrackClassificationSubTab(QWidget):
         g_apply_clf.addLayout(apply_clf_run_row)
         g3.addWidget(grp_apply_clf)
 
-        # ── Step 3: Create Plots ─────────────────────────────────────────
-        self.grp4 = QGroupBox("Step 3 — Create Plots")
-        g4 = QVBoxLayout(self.grp4)
-        g4.setSpacing(6)
-
-        # Diagnostic sub-section
-        grp_diag = QGroupBox("Diagnostic")
-        g_diag = QVBoxLayout(grp_diag)
+        # ── Step 3: Create Plots (built directly into per-pipeline group boxes) ──
+        self.grp_diag = QGroupBox("Diagnostic")
+        g_diag = QVBoxLayout(self.grp_diag)
         g_diag.setSpacing(4)
-
+        g_diag.addWidget(_make_info_label(
+            "Runs quality-control diagnostics on the trajectory clustering "
+            "(silhouette/distance plots)."
+        ))
         diag_row = QHBoxLayout()
         self.btn_diagnostics = QPushButton("▶ Create Diagnostics")
         _style_secondary(self.btn_diagnostics)
@@ -2633,13 +2989,115 @@ class TrackClassificationSubTab(QWidget):
         self.btn_view_diagnostics = _make_view_btn()
         diag_row.addWidget(self.btn_view_diagnostics)
         g_diag.addLayout(diag_row)
-        g4.addWidget(grp_diag)
 
-        # Exemplar Tracks sub-section
-        grp_exemplar = QGroupBox("Exemplar Tracks")
-        g_exemplar = QVBoxLayout(grp_exemplar)
+        self.grp_track_proportions = QGroupBox("Track Proportions")
+        g_prop = QVBoxLayout(self.grp_track_proportions)
+        g_prop.setSpacing(4)
+        g_prop.addWidget(_make_info_label(
+            "Plots how track cluster proportions vary across samples."
+        ))
+        track_proportion_axis_form = QFormLayout()
+        track_proportion_axis_form.setSpacing(3)
+        self.combo_track_proportion_group_x = QComboBox()
+        self.combo_track_proportion_group_x.setMinimumWidth(160)
+        track_proportion_axis_form.addRow("Group in X:", self.combo_track_proportion_group_x)
+        self.combo_track_proportion_group_y = QComboBox()
+        self.combo_track_proportion_group_y.setMinimumWidth(160)
+        track_proportion_axis_form.addRow("Group in Y:", self.combo_track_proportion_group_y)
+        g_prop.addLayout(track_proportion_axis_form)
+        g_prop.addWidget(QLabel("Group per page (Ctrl/Cmd click for multiple):"))
+        self.list_track_proportion_group_cols = QListWidget()
+        self.list_track_proportion_group_cols.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        g_prop.addWidget(self.list_track_proportion_group_cols)
+        prop_row = QHBoxLayout()
+        self.btn_track_proportions = QPushButton("▶ Create Track Proportion Plots")
+        _style_secondary(self.btn_track_proportions)
+        prop_row.addWidget(self.btn_track_proportions, stretch=1)
+        self.btn_view_track_proportions = _make_view_btn()
+        prop_row.addWidget(self.btn_view_track_proportions)
+        g_prop.addLayout(prop_row)
+
+        self.grp_track_comparison = QGroupBox("Condition Comparison Report")
+        g_track_comparison = QVBoxLayout(self.grp_track_comparison)
+        g_track_comparison.setSpacing(4)
+        g_track_comparison.addWidget(_make_info_label(
+            "Condition comparison (overall proportions, Welch's t-test): each row is one pairwise "
+            "comparison of \"Compare condition\"'s levels; \"Group in X\" splits it into side-by-side "
+            "columns from another condition."
+        ))
+        track_comparison_form = QFormLayout()
+        track_comparison_form.setSpacing(3)
+        self.combo_track_comparison_condition_col = QComboBox()
+        self.combo_track_comparison_condition_col.setMinimumWidth(200)
+        self.combo_track_comparison_condition_col.currentTextChanged.connect(
+            self._on_track_comparison_condition_col_changed
+        )
+        track_comparison_form.addRow("Compare condition:", self.combo_track_comparison_condition_col)
+        self.combo_track_comparison_group_x = QComboBox()
+        self.combo_track_comparison_group_x.setMinimumWidth(160)
+        track_comparison_form.addRow("Group in X:", self.combo_track_comparison_group_x)
+        self.line_track_comparison_group_y = QLineEdit()
+        self.line_track_comparison_group_y.setMinimumWidth(160)
+        self.line_track_comparison_group_y.setReadOnly(True)
+        track_comparison_form.addRow("Group in Y:", self.line_track_comparison_group_y)
+        g_track_comparison.addLayout(track_comparison_form)
+        g_track_comparison.addWidget(QLabel("Group per page (Ctrl/Cmd click for multiple):"))
+        self.list_track_comparison_group_cols = QListWidget()
+        self.list_track_comparison_group_cols.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        g_track_comparison.addWidget(self.list_track_comparison_group_cols)
+        track_comparison_row = QHBoxLayout()
+        self.btn_track_condition_comparison = QPushButton("▶ Condition Comparison Report")
+        _style_secondary(self.btn_track_condition_comparison)
+        track_comparison_row.addWidget(self.btn_track_condition_comparison, stretch=1)
+        self.btn_view_track_condition_comparison = _make_view_btn()
+        track_comparison_row.addWidget(self.btn_view_track_condition_comparison)
+        g_track_comparison.addLayout(track_comparison_row)
+
+        self.grp_contact_analysis = QGroupBox("Contact-based Grouping")
+        g_contact = QVBoxLayout(self.grp_contact_analysis)
+        g_contact.setSpacing(4)
+        g_contact.addWidget(QLabel(
+            "Contact-based grouping (tracks with vs. without a sufficiently long contact bout):"
+        ))
+        contact_form = QFormLayout()
+        contact_form.setSpacing(3)
+        self.combo_contact_col = QComboBox()
+        self.combo_contact_col.setMinimumWidth(200)
+        contact_form.addRow("Contact column:", self.combo_contact_col)
+        self.spin_contact_min_bout = QSpinBox()
+        self.spin_contact_min_bout.setRange(1, 100000)
+        self.spin_contact_min_bout.setValue(5)
+        self.spin_contact_min_bout.setMaximumWidth(100)
+        contact_form.addRow("Min. contiguous bout:", make_help_row(
+            self.spin_contact_min_bout, "Min. contiguous contact bout (timepoints)",
+            "A track counts as 'contact' if it has at least one unbroken run of this many "
+            "consecutive contact timepoints; otherwise it is 'no_contact'."
+        ))
+        self.combo_contact_group_x = QComboBox()
+        self.combo_contact_group_x.setMinimumWidth(160)
+        contact_form.addRow("Group in X:", self.combo_contact_group_x)
+        self.combo_contact_group_y = QComboBox()
+        self.combo_contact_group_y.setMinimumWidth(160)
+        contact_form.addRow("Group in Y:", self.combo_contact_group_y)
+        g_contact.addLayout(contact_form)
+        g_contact.addWidget(QLabel("Group per page (Ctrl/Cmd click for multiple):"))
+        self.list_contact_group_cols = QListWidget()
+        self.list_contact_group_cols.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        g_contact.addWidget(self.list_contact_group_cols)
+        contact_row = QHBoxLayout()
+        self.btn_contact_analysis = QPushButton("▶ Run Contact-vs-No-Contact Analysis")
+        _style_secondary(self.btn_contact_analysis)
+        contact_row.addWidget(self.btn_contact_analysis, stretch=1)
+        self.btn_view_contact_analysis = _make_view_btn()
+        contact_row.addWidget(self.btn_view_contact_analysis)
+        g_contact.addLayout(contact_row)
+
+        self.grp_exemplar = QGroupBox("Exemplar Tracks")
+        g_exemplar = QVBoxLayout(self.grp_exemplar)
         g_exemplar.setSpacing(4)
-
+        g_exemplar.addWidget(_make_info_label(
+            "Selects and renders representative example tracks per cluster."
+        ))
         ex_form = QFormLayout()
         ex_form.setSpacing(3)
         self.spin_n_per_cluster = QSpinBox()
@@ -2680,8 +3138,63 @@ class TrackClassificationSubTab(QWidget):
         self.btn_view_exemplars = _make_view_btn()
         exemplar_row.addWidget(self.btn_view_exemplars)
         g_exemplar.addLayout(exemplar_row)
-        g4.addWidget(grp_exemplar)
-        lay.addWidget(self.grp4)
+
+        from behav3d.napari._guided import GuidedPanel
+        from behav3d.napari.analysis_guided_copy import (
+            TRACK_PLOTS_ENTRY, TRACK_PLOT_PIPELINES,
+        )
+
+        # Entry trigger stays inline on the clustering-settings page; Start
+        # navigates to the fully isolated plotting page (outer page 1) below.
+        lay.addWidget(
+            GuidedPanel([TRACK_PLOTS_ENTRY],
+                        start_cb=lambda _id: self._open_plotting_page())
+        )
+
+        plotting_page = QWidget()
+        plotting_lay = QVBoxLayout(plotting_page)
+        plotting_lay.setContentsMargins(0, 0, 0, 0)
+        plotting_lay.setSpacing(0)
+
+        # Inner stack: page 0 = report list, page 1 = a report's settings.
+        self._plots_stack = QStackedWidget()
+
+        pipeline_page = QWidget()
+        pipeline_lay = QVBoxLayout(pipeline_page)
+        pipeline_lay.setContentsMargins(0, 0, 0, 0)
+        pipeline_lay.setSpacing(0)
+        pipeline_lay.addWidget(
+            GuidedPanel(TRACK_PLOT_PIPELINES, start_cb=self._on_pipeline_start)
+        )
+        self._plots_stack.addWidget(pipeline_page)  # inner page 0
+
+        report_settings_page = QWidget()
+        report_settings_lay = QVBoxLayout(report_settings_page)
+        report_settings_lay.setContentsMargins(0, 0, 0, 0)
+        report_settings_lay.setSpacing(0)
+        self._pipeline_scroll = QScrollArea()
+        self._pipeline_scroll.setWidgetResizable(True)
+        self._pipeline_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        report_settings_lay.addWidget(self._pipeline_scroll)
+        self._plots_stack.addWidget(report_settings_page)  # inner page 1
+
+        pipeline_content = QWidget()
+        pipeline_content_lay = QVBoxLayout(pipeline_content)
+        pipeline_content_lay.setContentsMargins(6, 6, 6, 6)
+        pipeline_content_lay.setSpacing(6)
+        pipeline_content_lay.addWidget(self.grp_diag)
+        pipeline_content_lay.addWidget(self.grp_track_proportions)
+        pipeline_content_lay.addWidget(self.grp_track_comparison)
+        pipeline_content_lay.addWidget(self.grp_contact_analysis)
+        pipeline_content_lay.addWidget(self.grp_exemplar)
+        pipeline_content_lay.addStretch()
+        self._pipeline_scroll.setWidget(pipeline_content)
+
+        self._plots_stack.setCurrentIndex(0)
+        plotting_lay.addWidget(self._plots_stack)
+        self._subtab_stack.addWidget(plotting_page)  # outer page 1
+
+        self._subtab_stack.setCurrentIndex(0)
 
         # ── Step 5: Backprojection ───────────────────────────────────────
         self.grp_bp = QGroupBox("Step 4 — Backprojection")
@@ -2778,6 +3291,14 @@ class TrackClassificationSubTab(QWidget):
         self.btn_view_exemplars.clicked.connect(lambda: self._on_view("track_exemplars"))
         self.btn_diagnostics.clicked.connect(self._on_diagnostics)
         self.btn_view_diagnostics.clicked.connect(lambda: self._on_view("track_diagnostics"))
+        self.btn_track_proportions.clicked.connect(self._on_track_proportions)
+        self.btn_view_track_proportions.clicked.connect(lambda: self._on_view("track_proportions"))
+        self.btn_track_condition_comparison.clicked.connect(self._on_track_condition_comparison)
+        self.btn_view_track_condition_comparison.clicked.connect(
+            lambda: self._on_view("track_condition_comparison")
+        )
+        self.btn_contact_analysis.clicked.connect(self._on_contact_analysis)
+        self.btn_view_contact_analysis.clicked.connect(lambda: self._on_view("contact_analysis"))
         self.btn_browse_pretrained_clf.clicked.connect(self._browse_pretrained_clf)
         self.btn_browse_pretrained_states.clicked.connect(self._browse_pretrained_states)
         self.btn_run_apply_pretrained.clicked.connect(self._on_apply_pretrained)
@@ -2814,7 +3335,7 @@ class TrackClassificationSubTab(QWidget):
 
             # Step 1 stays available, but lock into 'original DTW' mode.
             self.grp1.setEnabled(True)
-            for grp in [self.grp2, self.grp3, self.grp4, self.grp_bp]:
+            for grp in [self.grp2, self.grp3, self._subtab_stack, self.grp_bp]:
                 grp.setEnabled(False)
 
             # Force 'use original' on and prevent the user from unchecking it.
@@ -2828,19 +3349,77 @@ class TrackClassificationSubTab(QWidget):
             return False
         else:
             self.warning_label.hide()
-            for grp in [self.grp1, self.grp2, self.grp3, self.grp4, self.grp_bp]:
+            for grp in [self.grp1, self.grp2, self.grp3, self._subtab_stack, self.grp_bp]:
                 grp.setEnabled(True)
 
-            # Re-enable the checkboxes and revert to standard mode automatically.
+            # Only revert to standard mode if the checkbox was previously force-locked
+            # (i.e. disabled because state adata was missing). Otherwise preserve the
+            # user's/config's current choice.
+            was_force_locked = not self.chk_use_original.isEnabled()
             for chk in (self.chk_use_original, self.chk_use_original_top):
                 chk.blockSignals(True)
-                chk.setChecked(False)
+                if was_force_locked:
+                    chk.setChecked(False)
                 chk.setEnabled(True)
                 chk.blockSignals(False)
-            self._apply_original_mode(False)
+            self._apply_original_mode(self.chk_use_original.isChecked())
 
             _apply_group_tracked_gate(self.warning_label, self.grp_bp, self.metadata_loader, ct)
             return True
+
+    # ── Guided pipeline dispatch (Step 3 create plots) ───────────────────
+    _TRACK_PIPELINE_RUN_BUTTONS = {
+        "track_diagnostics": "btn_diagnostics",
+    }
+
+    def _on_pipeline_start(self, pipeline_id: str):
+        """Start from a pipeline card: run directly (no params) or open its settings."""
+        from behav3d.napari.analysis_guided_copy import TRACK_PLOT_PIPELINES
+        spec = next((s for s in TRACK_PLOT_PIPELINES if s["id"] == pipeline_id), None)
+        if spec is not None and not spec.get("has_params", True):
+            btn_name = self._TRACK_PIPELINE_RUN_BUTTONS.get(pipeline_id)
+            if btn_name is not None:
+                getattr(self, btn_name).click()
+            return
+        self._focus_pipeline(pipeline_id)
+        self._plots_stack.setCurrentIndex(1)
+        self._pipeline_scroll.verticalScrollBar().setValue(0)
+
+    def _focus_pipeline(self, pipeline_id: str):
+        """Show only the group box relevant to ``pipeline_id``, hide the rest."""
+        from behav3d.napari.analysis_guided_copy import TRACK_PLOT_PIPELINES
+        visible = {
+            "track_diagnostics": {self.grp_diag},
+            "track_proportions": {self.grp_track_proportions},
+            "track_comparison": {self.grp_track_comparison},
+            "track_contact": {self.grp_contact_analysis},
+            "track_exemplars": {self.grp_exemplar},
+        }.get(pipeline_id, set())
+        for group in (self.grp_diag, self.grp_track_proportions, self.grp_track_comparison,
+                      self.grp_contact_analysis, self.grp_exemplar):
+            group.setVisible(group in visible)
+        title = next(
+            (s["title"] for s in TRACK_PLOT_PIPELINES if s["id"] == pipeline_id), ""
+        )
+        self._pipeline_title.setText(title)
+
+    def _open_plotting_page(self):
+        """Entry card Start: jump to the isolated plotting page, reset to the
+        report list."""
+        self._plots_stack.setCurrentIndex(0)
+        self._pipeline_title.setText("")
+        self._subtab_stack.setCurrentIndex(1)
+        self._plotting_header.show()
+
+    def _plotting_back(self):
+        """Contextual Back inside the plotting page: report settings → report
+        list; report list → clustering settings."""
+        if self._plots_stack.currentIndex() == 1:
+            self._plots_stack.setCurrentIndex(0)
+            self._pipeline_title.setText("")
+        else:
+            self._subtab_stack.setCurrentIndex(0)
+            self._plotting_header.hide()
 
     # ── Toggle helpers ───────────────────────────────────────────────────
 
@@ -2940,6 +3519,7 @@ class TrackClassificationSubTab(QWidget):
             "n_clusters":                 int(self.spin_n_clusters.value()),
             "linkage":                    self.combo_linkage.currentText(),
             "trajectory_trim_mode":       self.combo_trim.currentText(),
+            "split_long_tracks":          self.chk_split_long_tracks.isChecked(),
             "parallel":                   self.chk_parallel.isChecked(),
             "save_distance_matrix":       self.chk_save_dist.isChecked(),
             "random_state":               int(self.spin_seed.value()),
@@ -2974,6 +3554,8 @@ class TrackClassificationSubTab(QWidget):
             self.combo_linkage.setCurrentText(cfg["linkage"])
         if "trajectory_trim_mode" in cfg:
             self.combo_trim.setCurrentText(cfg["trajectory_trim_mode"])
+        if "split_long_tracks" in cfg:
+            self.chk_split_long_tracks.setChecked(bool(cfg["split_long_tracks"]))
         if "parallel" in cfg:
             self.chk_parallel.setChecked(bool(cfg["parallel"]))
         if "save_distance_matrix" in cfg:
@@ -3000,9 +3582,10 @@ class TrackClassificationSubTab(QWidget):
             self.spin_track_n_jobs.setValue(int(cfg["rf_n_jobs"]))
         if "use_original" in cfg:
             val = bool(cfg["use_original"])
-            self.chk_use_original.blockSignals(True)
-            self.chk_use_original.setChecked(val)
-            self.chk_use_original.blockSignals(False)
+            for chk in (self.chk_use_original, self.chk_use_original_top):
+                chk.blockSignals(True)
+                chk.setChecked(val)
+                chk.blockSignals(False)
             self._apply_original_mode(val)
 
     # ── Metadata / reload ────────────────────────────────────────────────
@@ -3121,6 +3704,17 @@ class TrackClassificationSubTab(QWidget):
                 return f
         return None
 
+    def _track_diagnostics_qc_dirs(self, traj_dir: Optional[Path]) -> list:
+        """Both possible diagnostics output folders: dtaidistance's shared
+        quality_control/, and the original-BEHAV3D method's own
+        original_behav3d/ folder (root — Create Diagnostics writes there)."""
+        if not traj_dir:
+            return []
+        return [
+            traj_dir / "quality_control",
+            traj_dir / "original_behav3d",
+        ]
+
     def _sync_track_cluster_combo(self, adata_tracks) -> None:
         """Repopulate the 'Color by' combo from actual obs columns in adata_tracks."""
         from behav3d.napari._rename_dialog import _track_cluster_col
@@ -3184,6 +3778,7 @@ class TrackClassificationSubTab(QWidget):
         self.btn_rename_track.setEnabled(has_adata)
         self.btn_train_track.setEnabled(has_adata)
         self.btn_apply_track.setEnabled(has_adata)
+        self.btn_track_proportions.setEnabled(has_adata)
         if has_adata:
             self.rename_track_status.setText(
                 f"✅ Track adata loaded: {self._track_adata.n_obs} rows."
@@ -3194,6 +3789,103 @@ class TrackClassificationSubTab(QWidget):
             )
         else:
             self.rename_track_status.setText("ℹ Run clustering first to enable renaming.")
+        self._refresh_track_proportion_group_cols()
+        self._refresh_contact_columns()
+
+    def _track_proportion_candidate_columns(self):
+        cols = []
+        added = set()
+        md = getattr(self.metadata_loader, "metadata", None) if self.metadata_loader else None
+        if md is not None and hasattr(md, "columns"):
+            for col in md.columns:
+                if col in ("exp_nr", "well") or col.endswith("_line_condition"):
+                    cols.append(col)
+                    added.add(col)
+        if self._track_adata is not None:
+            for col in self._track_adata.obs.columns:
+                if col in added or col.startswith("_") or col in _TECHNICAL_OBS_COLS:
+                    continue
+                if col in ("exp_nr", "well", "origin_cell_type") or col.endswith("_line_condition"):
+                    cols.append(col)
+                    added.add(col)
+        return cols
+
+    def _refresh_track_proportion_group_cols(self):
+        candidate_cols = self._track_proportion_candidate_columns()
+        self.list_track_proportion_group_cols.clear()
+        for col in candidate_cols:
+            self.list_track_proportion_group_cols.addItem(col)
+        _fit_list_widget_height(self.list_track_proportion_group_cols)
+
+        self.list_contact_group_cols.clear()
+        for col in candidate_cols:
+            self.list_contact_group_cols.addItem(col)
+        _fit_list_widget_height(self.list_contact_group_cols)
+
+        self.list_track_comparison_group_cols.clear()
+        for col in candidate_cols:
+            self.list_track_comparison_group_cols.addItem(col)
+        _fit_list_widget_height(self.list_track_comparison_group_cols)
+
+        for combo in (
+            self.combo_track_proportion_group_x, self.combo_track_proportion_group_y,
+            self.combo_contact_group_x, self.combo_contact_group_y,
+            self.combo_track_comparison_group_x,
+        ):
+            prev = combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("(none)")
+            combo.addItems(candidate_cols)
+            combo.setCurrentText(prev if prev in (["(none)"] + candidate_cols) else "(none)")
+            combo.blockSignals(False)
+
+        prev_cond = self.combo_track_comparison_condition_col.currentText()
+        self.combo_track_comparison_condition_col.blockSignals(True)
+        self.combo_track_comparison_condition_col.clear()
+        self.combo_track_comparison_condition_col.addItems(candidate_cols)
+        if prev_cond in candidate_cols:
+            self.combo_track_comparison_condition_col.setCurrentText(prev_cond)
+        self.combo_track_comparison_condition_col.blockSignals(False)
+        self._sync_track_comparison_group_y_text()
+
+    def _sync_track_comparison_group_y_text(self):
+        self.line_track_comparison_group_y.setText(self.combo_track_comparison_condition_col.currentText())
+
+    def _on_track_comparison_condition_col_changed(self, _text):
+        self._sync_track_comparison_group_y_text()
+
+    def _track_features_csv_path(self, ct: str) -> Optional[Path]:
+        out = self._out_dir()
+        if not out:
+            return None
+        base = out / "analysis" / ct / "track_features"
+        filtered = base / f"BEHAV3D_{ct}_combined_track_features_filtered.csv"
+        if filtered.exists():
+            return filtered
+        return base / f"BEHAV3D_{ct}_combined_track_features.csv"
+
+    def _refresh_contact_columns(self):
+        import pandas as pd
+        from behav3d.analysis.behavior.track.contact_grouping import list_available_contact_columns
+        ct = self._cell_type()
+        contact_cols = []
+        if ct:
+            csv_path = self._track_features_csv_path(ct)
+            if csv_path and csv_path.exists():
+                try:
+                    contact_cols = list_available_contact_columns(pd.read_csv(csv_path, nrows=0))
+                except Exception:
+                    contact_cols = []
+        prev = self.combo_contact_col.currentText()
+        self.combo_contact_col.blockSignals(True)
+        self.combo_contact_col.clear()
+        self.combo_contact_col.addItems(contact_cols)
+        if prev in contact_cols:
+            self.combo_contact_col.setCurrentText(prev)
+        self.combo_contact_col.blockSignals(False)
+        self.combo_contact_col.setEnabled(len(contact_cols) > 0)
+        self.btn_contact_analysis.setEnabled(len(contact_cols) > 0 and self._track_adata is not None)
 
     def _update_view_buttons(self):
         ct = self._cell_type()
@@ -3201,7 +3893,8 @@ class TrackClassificationSubTab(QWidget):
             for btn in (
                 self.btn_view_track, self.btn_view_train_track,
                 self.btn_view_apply_track, self.btn_view_exemplars,
-                self.btn_view_diagnostics,
+                self.btn_view_diagnostics, self.btn_view_track_proportions,
+                self.btn_view_track_condition_comparison, self.btn_view_contact_analysis,
             ):
                 btn.setEnabled(False)
             return
@@ -3216,9 +3909,33 @@ class TrackClassificationSubTab(QWidget):
         self.btn_view_exemplars.setEnabled(
             bool(traj_dir and any(traj_dir.glob("exemplar_tracks*.pdf")))
         )
-        qc_dir = traj_dir / "quality_control" if traj_dir else None
+        qc_dirs = self._track_diagnostics_qc_dirs(traj_dir)
         self.btn_view_diagnostics.setEnabled(
-            bool(qc_dir and any(qc_dir.glob("*diagnostics*.pdf")))
+            any(any(qc_dir.glob("*.pdf")) for qc_dir in qc_dirs)
+        )
+        proportions_dir = traj_dir / "behavior_proportions" if traj_dir else None
+        self.btn_view_track_proportions.setEnabled(
+            bool(
+                proportions_dir
+                and proportions_dir.exists()
+                and any(proportions_dir.glob("*.pdf"))
+            )
+        )
+        comparisons_dir = traj_dir / "behavior_comparisons" if traj_dir else None
+        self.btn_view_track_condition_comparison.setEnabled(
+            bool(
+                comparisons_dir
+                and comparisons_dir.exists()
+                and any(comparisons_dir.glob("condition_comparison_*.pdf"))
+            )
+        )
+        contact_dir = traj_dir / "contact_analysis" if traj_dir else None
+        self.btn_view_contact_analysis.setEnabled(
+            bool(
+                contact_dir
+                and contact_dir.exists()
+                and any(contact_dir.glob("*/*.pdf"))
+            )
         )
 
     def _update_bp_buttons(self):
@@ -3260,6 +3977,7 @@ class TrackClassificationSubTab(QWidget):
             "random_state": int(self.spin_seed.value()),
             "linkage": self.combo_linkage.currentText(),
             "trajectory_trim_mode": self.combo_trim.currentText(),
+            "split_long_tracks": self.chk_split_long_tracks.isChecked(),
             "parallel": self.chk_parallel.isChecked(),
             "save_distance_matrix": self.chk_save_dist.isChecked(),
             "plot_results": True,
@@ -3279,7 +3997,11 @@ class TrackClassificationSubTab(QWidget):
             return run_categorical_dtaidistance_trajectory_clustering(**params, verbose=True)
 
         def _done(r):
-            self._log(f"✅ Track clustering done for '{ct}'.")
+            umap_error = (r.uns.get("visualization", {}) or {}).get("umap_error")
+            if umap_error:
+                self._log(f"⚠ Track clustering done for '{ct}', but UMAP was skipped: {umap_error}")
+            else:
+                self._log(f"✅ Track clustering done for '{ct}'.")
             self._persist_track_cfg(ct)
             self._reload()
             self._notify_results()
@@ -3383,7 +4105,7 @@ class TrackClassificationSubTab(QWidget):
                 umap_n_neighbors=n_neigh,
                 umap_minimal_distance=min_dist,
                 feature_scaling_preset="original_behav3d",
-                output_subdir_name="behavorial_trajectories/original_behav3d",
+                output_subdir_name="behavorial_trajectories/original_behav3d/raw",
             )
 
         def _done(_):
@@ -3428,6 +4150,57 @@ class TrackClassificationSubTab(QWidget):
             self._update_view_buttons()
             if self._track_adata is not None:
                 self._sync_track_cluster_combo(self._track_adata)
+                self._regenerate_track_reports_after_rename(ct)
+
+    def _regenerate_track_reports_after_rename(self, ct: str):
+        """Re-run diagnostics + proportion plots so plots reflect the just-renamed labels/colors."""
+        if self._track_adata is None or self._bg.is_running():
+            return
+        out = self._out_dir()
+        track_adata = self._track_adata
+        method = (track_adata.uns.get("dtai_trajectory_clustering", {}) or {}).get("method")
+        if method == "original_behav3d_feature_dtw":
+            # The old (feature-DTW) method has its own regenerate-after-rename path,
+            # driven by its dedicated rename UI (not this generic adata-based one).
+            return
+
+        def _run(**kw):
+            from behav3d.analysis.behavior.track.state_dtw import save_dtaidistance_diagnostics
+            from behav3d.analysis.behavior.track.visualization.plots.reports import (
+                save_track_class_proportions_by_sample_plot,
+            )
+            from behav3d.analysis.behavior.track.utils import _resolve_dtaidistance_paths
+            from behav3d.napari._rename_dialog import _track_cluster_col
+            cluster_col = _track_cluster_col(track_adata) or "ClusterID"
+            diag = save_dtaidistance_diagnostics(
+                adata_tracks=track_adata,
+                output_dir=str(out) if out else "",
+                cell_type=ct,
+                verbose=True,
+            )
+            paths = _resolve_dtaidistance_paths(str(out) if out else "", ct)
+            prop = save_track_class_proportions_by_sample_plot(
+                track_adata,
+                paths["behavior_proportions_outfolder"],
+                sample_col="sample_name",
+                class_col=cluster_col,
+                verbose=True,
+            )
+            return {"diagnostics": diag, "proportions": prop}
+
+        self._bg.run(
+            fn=_run,
+            desc=f"Refreshing track reports after rename ({ct})…",
+            progress_row=self.progress_row,
+            buttons=[self.btn_rename_track],
+            viewer=self.viewer,
+            inject_progress=False,
+            on_done=lambda r: (
+                self._log("✅ Track reports refreshed after rename."),
+                self._update_view_buttons(),
+            ),
+            on_failed=lambda e: self._log(f"⚠ Could not refresh track reports after rename: {e}"),
+        )
 
     def _on_train_track(self):
         ct = self._cell_type()
@@ -3757,6 +4530,7 @@ class TrackClassificationSubTab(QWidget):
             from matplotlib.backends.backend_pdf import PdfPages
             import matplotlib.pyplot as plt
             import anndata as _ad
+            from behav3d.analysis.behavior.state.classification import FULL_STATE_COL
 
             if state_adata_path is None or not state_adata_path.exists():
                 raise FileNotFoundError(
@@ -3766,7 +4540,9 @@ class TrackClassificationSubTab(QWidget):
             full_adata = _ad.read_h5ad(str(state_adata_path))
 
             out_path = _Path(out) if out else _Path(".")
-            exemplar_root = out_path / "example_tracks"
+            exemplar_root = (
+                out_path / "analysis" / ct / "behavorial_trajectories" / "example_tracks"
+            )
             exemplar_root.mkdir(parents=True, exist_ok=True)
             results = {}
 
@@ -3778,7 +4554,7 @@ class TrackClassificationSubTab(QWidget):
                     sample_key="sample_name",
                     track_key="TrackID",
                     time_key="position_t",
-                    state_key="ClusterID",
+                    state_key=FULL_STATE_COL,
                     cluster_key="ClusterID",
                     tmin_key="position_t_min",
                     tmax_key="position_t_max",
@@ -3797,7 +4573,7 @@ class TrackClassificationSubTab(QWidget):
                     sample_key="sample_name",
                     track_key="TrackID",
                     time_key="position_t",
-                    state_key="ClusterID",
+                    state_key=FULL_STATE_COL,
                     cluster_key="ClusterID",
                     tmin_key="position_t_min",
                     tmax_key="position_t_max",
@@ -3816,7 +4592,7 @@ class TrackClassificationSubTab(QWidget):
                     sample_key="sample_name",
                     track_key="TrackID",
                     time_key="position_t",
-                    state_key="ClusterID",
+                    state_key=FULL_STATE_COL,
                     cluster_key="ClusterID",
                     tmin_key="position_t_min",
                     tmax_key="position_t_max",
@@ -3835,7 +4611,7 @@ class TrackClassificationSubTab(QWidget):
                     sample_key="sample_name",
                     track_key="TrackID",
                     time_key="position_t",
-                    state_key="ClusterID",
+                    state_key=FULL_STATE_COL,
                     cluster_key="ClusterID",
                     tmin_key="position_t_min",
                     tmax_key="position_t_max",
@@ -3879,12 +4655,26 @@ class TrackClassificationSubTab(QWidget):
                 save_dtaidistance_diagnostics,
                 save_dtaidistance_exemplar_overview,
             )
-            result = save_dtaidistance_diagnostics(
-                adata_tracks=track_adata,
-                output_dir=str(out) if out else "",
-                cell_type=ct,
-                verbose=True,
-            )
+            method = (track_adata.uns.get("dtai_trajectory_clustering", {}) or {}).get("method")
+            if method == "original_behav3d_feature_dtw":
+                from behav3d.analysis.behavior.track.feature_dtw import (
+                    _save_feature_dtw_quality_control,
+                )
+                from behav3d.analysis.behavior.track.utils import _resolve_dtaidistance_paths
+                result = _save_feature_dtw_quality_control(
+                    output_dir=str(out) if out else "",
+                    cell_type=ct,
+                    proportions_outfolder=_resolve_dtaidistance_paths(
+                        str(out) if out else "", ct
+                    )["behavior_proportions_outfolder"],
+                )
+            else:
+                result = save_dtaidistance_diagnostics(
+                    adata_tracks=track_adata,
+                    output_dir=str(out) if out else "",
+                    cell_type=ct,
+                    verbose=True,
+                )
             try:
                 save_dtaidistance_exemplar_overview(
                     track_adata,
@@ -3903,12 +4693,210 @@ class TrackClassificationSubTab(QWidget):
             buttons=[self.btn_diagnostics],
             viewer=self.viewer,
             inject_progress=False,
+            on_done=lambda r: self._on_diagnostics_done(r, ct),
+            on_failed=lambda e: self._log(f"❌ Diagnostics failed: {e}"),
+        )
+
+    def _on_diagnostics_done(self, result, ct):
+        umap_error = (result or {}).get("umap_error")
+        if umap_error:
+            self._log(f"⚠ Diagnostics done for '{ct}', but UMAP was skipped: {umap_error}")
+        else:
+            self._log(f"✅ Diagnostics done for '{ct}'.")
+        self._update_view_buttons()
+        self._notify_results()
+
+    def _on_track_proportions(self):
+        ct = self._cell_type()
+        if not ct:
+            return
+        if self._track_adata is None:
+            QMessageBox.warning(self, "No data", "Run track clustering first.")
+            return
+        if self._bg.is_running():
+            QMessageBox.warning(self, "Busy", "Another operation is running.")
+            return
+        out = self._out_dir()
+        self._log(f"▶ Creating track proportion plots for '{ct}'…")
+        track_adata = self._track_adata
+        selected_cols = [item.text() for item in self.list_track_proportion_group_cols.selectedItems()]
+        group_x = self.combo_track_proportion_group_x.currentText()
+        group_x = None if group_x in ("", "(none)") else group_x
+        group_y = self.combo_track_proportion_group_y.currentText()
+        group_y = None if group_y in ("", "(none)") else group_y
+        md = getattr(self.metadata_loader, "metadata", None) if self.metadata_loader else None
+
+        def _run(**kw):
+            from behav3d.analysis.behavior.track.utils import _resolve_dtaidistance_paths
+            from behav3d.analysis.behavior.track.visualization.plots.reports import (
+                save_track_class_proportions_by_sample_plot,
+            )
+            from behav3d.core.metadata import merge_condition_columns_into_obs
+            from behav3d.napari._rename_dialog import _track_cluster_col
+            cluster_col = _track_cluster_col(track_adata) or "ClusterID"
+            prop_dir = _resolve_dtaidistance_paths(str(out) if out else "", ct)["behavior_proportions_outfolder"]
+            all_cols = selected_cols + [c for c in (group_x, group_y) if c]
+            cols_to_merge = [c for c in all_cols if c not in track_adata.obs.columns]
+            if cols_to_merge and md is not None:
+                merge_condition_columns_into_obs(track_adata, md, cols_to_merge)
+            return save_track_class_proportions_by_sample_plot(
+                track_adata,
+                prop_dir,
+                sample_col="sample_name",
+                class_col=cluster_col,
+                group_cols=selected_cols or None,
+                group_x=group_x,
+                group_y=group_y,
+                verbose=True,
+            )
+
+        self._bg.run(
+            fn=_run,
+            desc=f"Track proportion plots ({ct})…",
+            progress_row=self.progress_row,
+            buttons=[self.btn_track_proportions],
+            viewer=self.viewer,
+            inject_progress=False,
             on_done=lambda r: (
-                self._log(f"✅ Diagnostics done for '{ct}'."),
+                self._log(f"✅ Track proportion plots done for '{ct}'."),
                 self._update_view_buttons(),
                 self._notify_results(),
             ),
-            on_failed=lambda e: self._log(f"❌ Diagnostics failed: {e}"),
+            on_failed=lambda e: self._log(f"❌ Track proportion plots failed: {e}"),
+        )
+
+    def _on_track_condition_comparison(self):
+        ct = self._cell_type()
+        if not ct:
+            return
+        if self._track_adata is None:
+            QMessageBox.warning(self, "No data", "Run track clustering first.")
+            return
+        if self._bg.is_running():
+            QMessageBox.warning(self, "Busy", "Another operation is running.")
+            return
+        condition_col = self.combo_track_comparison_condition_col.currentText()
+        group_cols = [item.text() for item in self.list_track_comparison_group_cols.selectedItems()]
+        group_x = self.combo_track_comparison_group_x.currentText()
+        group_x = None if group_x in ("", "(none)") else group_x
+        if not condition_col:
+            QMessageBox.warning(self, "Missing selection", "Select a condition column to compare.")
+            return
+        out = self._out_dir()
+        self._log(f"▶ Creating track condition comparison plot for '{ct}'…")
+        track_adata = self._track_adata
+        md = getattr(self.metadata_loader, "metadata", None) if self.metadata_loader else None
+
+        def _run(**kw):
+            from behav3d.analysis.behavior.track.utils import _resolve_dtaidistance_paths
+            from behav3d.analysis.behavior.track.visualization.plots.reports import (
+                save_track_condition_comparison_report,
+            )
+            from behav3d.core.metadata import merge_condition_columns_into_obs
+            from behav3d.napari._rename_dialog import _track_cluster_col
+            cluster_col = _track_cluster_col(track_adata) or "ClusterID"
+            comparison_dir = _resolve_dtaidistance_paths(str(out) if out else "", ct)["behavior_comparisons_outfolder"]
+            all_cols = [condition_col] + group_cols + [c for c in (group_x,) if c]
+            cols_to_merge = [c for c in all_cols if c not in track_adata.obs.columns]
+            if cols_to_merge and md is not None:
+                merge_condition_columns_into_obs(track_adata, md, cols_to_merge)
+            return save_track_condition_comparison_report(
+                track_adata,
+                comparison_dir,
+                sample_col="sample_name",
+                class_col=cluster_col,
+                condition_col=condition_col,
+                group_cols=group_cols or None,
+                group_x=group_x,
+                verbose=True,
+            )
+
+        self._bg.run(
+            fn=_run,
+            desc=f"Track condition comparison ({ct})…",
+            progress_row=self.progress_row,
+            buttons=[self.btn_track_condition_comparison],
+            viewer=self.viewer,
+            inject_progress=False,
+            on_done=lambda r: (
+                self._log(f"✅ Track condition comparison plot done for '{ct}'."),
+                self._update_view_buttons(),
+                self._notify_results(),
+            ),
+            on_failed=lambda e: self._log(f"❌ Track condition comparison failed: {e}"),
+        )
+
+    def _on_contact_analysis(self):
+        ct = self._cell_type()
+        if not ct:
+            return
+        if self._track_adata is None:
+            QMessageBox.warning(self, "No data", "Run track clustering first.")
+            return
+        if self._bg.is_running():
+            QMessageBox.warning(self, "Busy", "Another operation is running.")
+            return
+        contact_col = self.combo_contact_col.currentText()
+        if not contact_col:
+            QMessageBox.warning(self, "Missing selection", "Select a contact column to group tracks by.")
+            return
+        min_bout_length = int(self.spin_contact_min_bout.value())
+        csv_path = self._track_features_csv_path(ct)
+        if not csv_path or not csv_path.exists():
+            QMessageBox.warning(self, "No data", "Track-features CSV not found. Run feature extraction first.")
+            return
+        out = self._out_dir()
+        self._log(f"▶ Running contact-vs-no-contact analysis for '{ct}'…")
+        track_adata = self._track_adata
+        selected_extra_cols = [item.text() for item in self.list_contact_group_cols.selectedItems()]
+        group_x = self.combo_contact_group_x.currentText()
+        group_x = None if group_x in ("", "(none)") else group_x
+        group_y = self.combo_contact_group_y.currentText()
+        group_y = None if group_y in ("", "(none)") else group_y
+        md = getattr(self.metadata_loader, "metadata", None) if self.metadata_loader else None
+
+        def _run(**kw):
+            import pandas as pd
+            from behav3d.analysis.behavior.track.utils import _resolve_dtaidistance_paths
+            from behav3d.analysis.behavior.track.visualization.plots.reports import (
+                save_track_contact_group_analysis,
+            )
+            from behav3d.core.metadata import merge_condition_columns_into_obs
+            from behav3d.napari._rename_dialog import _track_cluster_col
+            cluster_col = _track_cluster_col(track_adata) or "ClusterID"
+            df_timepoints = pd.read_csv(csv_path)
+            contact_dir = _resolve_dtaidistance_paths(str(out) if out else "", ct)["outfolder"]
+            all_extra_cols = selected_extra_cols + [c for c in (group_x, group_y) if c]
+            cols_to_merge = [c for c in all_extra_cols if c not in track_adata.obs.columns]
+            if cols_to_merge and md is not None:
+                merge_condition_columns_into_obs(track_adata, md, cols_to_merge)
+            return save_track_contact_group_analysis(
+                track_adata,
+                df_timepoints,
+                contact_dir,
+                contact_col=contact_col,
+                min_bout_length=min_bout_length,
+                sample_col="sample_name",
+                class_col=cluster_col,
+                extra_group_cols=selected_extra_cols or None,
+                group_x=group_x,
+                group_y=group_y,
+                verbose=True,
+            )
+
+        self._bg.run(
+            fn=_run,
+            desc=f"Contact-vs-no-contact analysis ({ct})…",
+            progress_row=self.progress_row,
+            buttons=[self.btn_contact_analysis],
+            viewer=self.viewer,
+            inject_progress=False,
+            on_done=lambda r: (
+                self._log(f"✅ Contact-vs-no-contact analysis done for '{ct}'."),
+                self._update_view_buttons(),
+                self._notify_results(),
+            ),
+            on_failed=lambda e: self._log(f"❌ Contact-vs-no-contact analysis failed: {e}"),
         )
 
     # ── Backprojection ───────────────────────────────────────────────────
@@ -4123,10 +5111,35 @@ class TrackClassificationSubTab(QWidget):
             if p:
                 candidates = [(f"Track clusters CSV ({ct})", p)]
         elif kind == "track_exemplars" and traj_dir:
-            candidates = [(f.stem, f) for f in sorted(traj_dir.glob("exemplar_tracks*.pdf"))]
+            exemplar_dir = traj_dir / "example_tracks"
+            candidates = [
+                (f.relative_to(exemplar_dir).as_posix(), f)
+                for f in sorted(exemplar_dir.glob("**/*.pdf"))
+            ]
         elif kind == "track_diagnostics" and traj_dir:
-            qc_dir = traj_dir / "quality_control"
-            candidates = [(f.stem, f) for f in sorted(qc_dir.glob("*diagnostics*.pdf"))]
+            candidates = [
+                (f.stem, f)
+                for qc_dir in self._track_diagnostics_qc_dirs(traj_dir)
+                for f in sorted(qc_dir.glob("*.pdf"))
+            ]
+        elif kind == "track_proportions" and traj_dir:
+            proportions_dir = traj_dir / "behavior_proportions"
+            candidates = [
+                (f.stem, f)
+                for f in sorted(proportions_dir.glob("*.pdf"))
+            ]
+        elif kind == "track_condition_comparison" and traj_dir:
+            comparisons_dir = traj_dir / "behavior_comparisons"
+            candidates = [
+                (f.stem.replace("condition_comparison_", ""), f)
+                for f in sorted(comparisons_dir.glob("condition_comparison_*.pdf"))
+            ]
+        elif kind == "contact_analysis" and traj_dir:
+            contact_dir = traj_dir / "contact_analysis"
+            candidates = [
+                (f"{f.parent.name}/{f.stem}", f)
+                for f in sorted(contact_dir.glob("*/*.pdf"))
+            ]
 
         existing = [(lbl, p) for lbl, p in candidates if p and p.exists()]
         if not existing:
@@ -4220,18 +5233,11 @@ class SingleCellTab(QWidget):
         hdr_lay.addWidget(self.status_lbl)
         outer.addLayout(hdr_lay)
 
-        # ── Guided / Advanced switch + stacked pages ─────────────────────
-        from behav3d.napari._guided import (
-            ModeSwitch, GuidedPanel, load_guided_mode,
-        )
+        # ── Guided overview + isolated settings pages ────────────────────
+        from behav3d.napari._guided import GuidedPanel, make_back_header
         from behav3d.napari.analysis_guided_copy import (
             SINGLE_CELL_ANALYSES, GUIDED_INTRO,
         )
-
-        guided_default = load_guided_mode()
-        self._mode_switch = ModeSwitch(guided=guided_default)
-        self._mode_switch.modeChanged.connect(self._on_mode_changed)
-        outer.addWidget(self._mode_switch)
 
         self._stack = QStackedWidget()
         outer.addWidget(self._stack, stretch=1)
@@ -4244,9 +5250,23 @@ class SingleCellTab(QWidget):
         )
         self._stack.addWidget(self._guided_panel)
 
-        # Page 1 — the existing inner sub-tabs (settings forms).
+        # Page 1 — the existing inner sub-tabs (settings forms), with a Back
+        # header above them. The tab bar is hidden so only the sub-tab
+        # selected via Start is visible — this is an isolated settings view,
+        # not a tab switcher between the two analyses.
+        settings_page = QWidget()
+        settings_lay = QVBoxLayout(settings_page)
+        settings_lay.setContentsMargins(0, 0, 0, 0)
+        settings_lay.setSpacing(0)
+        back_bar, self._focus_title = make_back_header(
+            on_back=lambda: self._stack.setCurrentIndex(0)
+        )
+        settings_lay.addWidget(back_bar)
+
         self.inner_tabs = QTabWidget()
-        self._stack.addWidget(self.inner_tabs)
+        self.inner_tabs.tabBar().setVisible(False)
+        settings_lay.addWidget(self.inner_tabs)
+        self._stack.addWidget(settings_page)
 
         self.state_tab = StateClassificationSubTab(
             viewer=self.viewer,
@@ -4272,21 +5292,26 @@ class SingleCellTab(QWidget):
         # so the behavioral-states path auto-fills from disk if it exists.
         self.inner_tabs.currentChanged.connect(self._on_inner_tab_changed)
 
-        self._stack.setCurrentIndex(0 if guided_default else 1)
+        # Always land on the Guided overview; a specific analysis's settings
+        # are only reached via that analysis's Start button.
+        self._stack.setCurrentIndex(0)
 
-    # ── Guided / Advanced mode ─────────────────────────────────────────────
-    def _on_mode_changed(self, guided: bool):
-        from behav3d.napari._guided import save_guided_mode
-
-        self._stack.setCurrentIndex(0 if guided else 1)
-        save_guided_mode(guided)
-
+    # ── Guided overview / focused settings ──────────────────────────────────
     def _on_guided_start(self, analysis_id: str):
-        """Start from a Guided card: reveal the form and focus its sub-tab."""
-        self._mode_switch.set_guided(False)  # → _on_mode_changed flips the page
+        """Start from a Guided card: show only that analysis's settings."""
+        from behav3d.napari.analysis_guided_copy import (
+            BEHAVIORAL_STATE, STATE_TRAJECTORY,
+        )
+
         index = {"state": 0, "track": 1}.get(analysis_id)
         if index is not None:
             self.inner_tabs.setCurrentIndex(index)
+        title = {
+            "state": BEHAVIORAL_STATE["title"],
+            "track": STATE_TRAJECTORY["title"],
+        }.get(analysis_id, "")
+        self._focus_title.setText(title)
+        self._stack.setCurrentIndex(1)
 
     def _on_inner_tab_changed(self, index: int):
         """Auto-fill path fields when switching to Track Classification tab."""

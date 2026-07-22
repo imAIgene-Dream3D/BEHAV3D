@@ -133,11 +133,12 @@ class BackprojectionPanel:
         fdir = Path(self.output_dir, "analysis", ct, "track_features")
         
         # Check for filtered features first, then advanced
+        from behav3d.features.advanced_timepoint_features import find_advanced_features_csv
         p_filtered = fdir / f"BEHAV3D_{ct}_combined_track_features_filtered.csv"
-        p_advanced = Path(self.output_dir, "analysis", ct, "active_killing", f"BEHAV3D_{ct}_advanced_track_features.csv")
-        
+        p_advanced = find_advanced_features_csv(self.output_dir, ct)
+
         available_cols = []
-        if p_advanced.exists():
+        if p_advanced is not None:
             try: available_cols = pd.read_csv(p_advanced, nrows=0).columns.tolist()
             except Exception: pass
         elif p_filtered.exists():

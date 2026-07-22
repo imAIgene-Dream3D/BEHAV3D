@@ -22,6 +22,13 @@ Each analysis spec is a dict with:
 - ``what_get``  — one line: what the user receives
 - ``decide``    — list of {"label", "tag", "kind"} the user will choose
 - ``seed``      — the question sent to the assistant by "Ask the assistant"
+- ``start_label`` — optional override for the Start button text (defaults to
+  "Start — open the settings  ▸" in AnalysisExplainer)
+- ``has_params``  — optional; only meaningful for the nested pipeline cards
+  consumed by StateClassificationSubTab / TrackClassificationSubTab. False
+  means the pipeline has no configurable settings, so its Start button
+  triggers the existing run button directly instead of opening an isolated
+  settings view.
 
 ``kind`` is one of ``required`` / ``suggested`` / ``estimated`` / ``default``
 and controls how honestly each choice is labelled and coloured.
@@ -174,6 +181,273 @@ STATE_TRAJECTORY = {
         "number of clusters."
     ),
 }
+
+
+# ── Single-cell "extendable plotting" sub-sections ──────────────────────────
+# These are nested one level deeper than the top-level cards above: an entry
+# card (Level 0) leads to a list of per-pipeline cards (Level 1); pipeline
+# cards with configurable parameters lead to that pipeline's isolated
+# settings (Level 2), while parameter-free pipelines run immediately from
+# Level 1. See `has_params` below — StateClassificationSubTab and
+# TrackClassificationSubTab read it to decide whether Start opens settings
+# or triggers the existing run button directly.
+
+STATE_REPORTS_ENTRY = {
+    "id": "state_reports",
+    "title": "Reports & Plots",
+    "subtitle": "Turn your classified behavioral states into shareable figures.",
+    "color": "#4a90d9",
+    "show_explainer": False,
+    "what_does": (
+        "State composition, state transition, and condition comparison "
+        "reports are all built from the behavioral states you classified in "
+        "Step 2 — pick which one(s) you need."
+    ),
+    "concept": None,
+    "what_get": (
+        "A choice of report PDFs: state composition, state transitions, "
+        "and/or a two-condition statistical comparison."
+    ),
+    "decide": [],
+    "start_label": "Generate analysis and plots  ▸",
+    "seed": (
+        "Explain what reports are available after BEHAV3D behavioral state "
+        "classification and when to use each one."
+    ),
+}
+
+STATE_COMPOSITION_REPORT = {
+    "id": "state_composition",
+    "title": "State Composition Report",
+    "subtitle": "How much time does each condition spend in each state?",
+    "color": "#4a90d9",
+    "what_does": (
+        "Plots the proportion of each behavioral state per sample, "
+        "optionally grouped by one or more metadata columns."
+    ),
+    "concept": None,
+    "what_get": "A composition PDF showing the state breakdown per sample/group.",
+    "decide": [
+        _decide("Which column(s) to group composition plots by", _SUGGESTED),
+    ],
+    "has_params": True,
+    "seed": (
+        "Explain the BEHAV3D State Composition Report: what it plots and "
+        "how to choose grouping columns."
+    ),
+}
+
+STATE_TRANSITION_REPORT = {
+    "id": "state_transition",
+    "title": "State Transition Report",
+    "subtitle": "Which states do cells switch between, and how often?",
+    "color": "#4a90d9",
+    "what_does": (
+        "Plots state-to-state transition probabilities, showing which "
+        "behavioral states cells move into and out of."
+    ),
+    "concept": None,
+    "what_get": "A transition-probability plot — no further configuration needed.",
+    "decide": [],
+    "has_params": False,
+    "start_label": "Generate State Transition plots  ▸",
+    "seed": (
+        "Explain the BEHAV3D State Transition Report: what a state-to-state "
+        "transition probability plot shows."
+    ),
+}
+
+STATE_COMPARISON_REPORT = {
+    "id": "state_comparison",
+    "title": "Condition Comparison Report",
+    "subtitle": "Does state proportion differ significantly between two conditions?",
+    "color": "#4a90d9",
+    "what_does": (
+        "Compares overall state proportions between two levels of a "
+        "condition column using Welch's t-test, optionally faceted by "
+        "another column."
+    ),
+    "concept": {
+        "term": "Welch's t-test",
+        "text": (
+            "compares two group means without assuming equal variances — "
+            "safer than a standard t-test when group sizes or spreads differ."
+        ),
+    },
+    "what_get": "A condition-comparison PDF with significance annotations.",
+    "decide": [
+        _decide("Which condition column and levels to compare", _ONLY_YOU),
+        _decide("Column to facet by", _SUGGESTED),
+    ],
+    "has_params": True,
+    "seed": (
+        "Explain the BEHAV3D state Condition Comparison Report: what "
+        "Welch's t-test compares here and how to choose condition/levels/facet."
+    ),
+}
+
+TRACK_PLOTS_ENTRY = {
+    "id": "track_plots",
+    "title": "Create Plots",
+    "subtitle": "Turn your track clustering into diagnostics and figures.",
+    "color": "#c98a2c",
+    "show_explainer": False,
+    "what_does": (
+        "Diagnostics, track proportions, condition comparison, "
+        "contact-based grouping, and exemplar tracks are all built from the "
+        "track clustering above — pick which one(s) you need."
+    ),
+    "concept": None,
+    "what_get": (
+        "A choice of diagnostic and summary PDFs, plus optional "
+        "exemplar-track PDFs/MP4s, for your track clustering."
+    ),
+    "decide": [],
+    "start_label": "Generate analysis and plots  ▸",
+    "seed": (
+        "Explain what plots and reports are available after BEHAV3D "
+        "track/state-trajectory clustering and when to use each one."
+    ),
+}
+
+TRACK_DIAGNOSTICS = {
+    "id": "track_diagnostics",
+    "title": "Diagnostic",
+    "subtitle": "How well-separated are your trajectory clusters?",
+    "color": "#c98a2c",
+    "what_does": (
+        "Runs quality-control diagnostics on the trajectory clustering "
+        "(silhouette/distance plots), so you can judge whether the clusters "
+        "are well separated."
+    ),
+    "concept": None,
+    "what_get": "Diagnostic PDF(s) with silhouette and distance plots.",
+    "decide": [],
+    "has_params": False,
+    "start_label": "Generate Diagnostics plots  ▸",
+    "seed": (
+        "Explain the BEHAV3D track-clustering diagnostics: what a "
+        "silhouette plot tells you about cluster quality."
+    ),
+}
+
+TRACK_PROPORTIONS = {
+    "id": "track_proportions",
+    "title": "Track Proportions",
+    "subtitle": "How do movement-type proportions vary across samples?",
+    "color": "#c98a2c",
+    "what_does": (
+        "Plots how track cluster proportions vary across samples, "
+        "optionally grouped by one or more metadata columns."
+    ),
+    "concept": None,
+    "what_get": "A track-proportion PDF per grouping.",
+    "decide": [
+        _decide("Which column(s) to group proportion plots by", _SUGGESTED),
+    ],
+    "has_params": True,
+    "seed": (
+        "Explain the BEHAV3D Track Proportions plot: what it shows and how "
+        "to choose grouping columns."
+    ),
+}
+
+TRACK_COMPARISON_REPORT = {
+    "id": "track_comparison",
+    "title": "Condition Comparison Report",
+    "subtitle": "Does track-cluster proportion differ significantly between two conditions?",
+    "color": "#c98a2c",
+    "what_does": (
+        "Compares overall track cluster proportions between two levels of "
+        "a condition column using Welch's t-test, optionally faceted by "
+        "another column."
+    ),
+    "concept": {
+        "term": "Welch's t-test",
+        "text": (
+            "compares two group means without assuming equal variances — "
+            "safer than a standard t-test when group sizes or spreads differ."
+        ),
+    },
+    "what_get": "A condition-comparison PDF with significance annotations.",
+    "decide": [
+        _decide("Which condition column and levels to compare", _ONLY_YOU),
+        _decide("Column to facet by", _SUGGESTED),
+    ],
+    "has_params": True,
+    "seed": (
+        "Explain the BEHAV3D track Condition Comparison Report: what "
+        "Welch's t-test compares here and how to choose condition/levels/facet."
+    ),
+}
+
+TRACK_CONTACT_GROUPING = {
+    "id": "track_contact",
+    "title": "Contact-based Grouping",
+    "subtitle": "Do tracks with a sustained contact behave differently?",
+    "color": "#c98a2c",
+    "what_does": (
+        "Splits tracks into 'contact' vs 'no_contact' groups based on "
+        "whether each track has at least one sufficiently long unbroken run "
+        "of contact timepoints, then compares them (optionally split "
+        "further by other columns)."
+    ),
+    "concept": {
+        "term": "Contiguous bout",
+        "text": (
+            "a track counts as 'contact' only if it has an unbroken run of "
+            "consecutive contact timepoints at least as long as the minimum "
+            "you set — brief, isolated contacts don't count."
+        ),
+    },
+    "what_get": "A contact-vs-no-contact comparison PDF.",
+    "decide": [
+        _decide("Which column marks contact", _ONLY_YOU),
+        _decide("Minimum contiguous contact bout length", _ESTIMATED),
+        _decide("Additional column(s) to split by", _SUGGESTED),
+    ],
+    "has_params": True,
+    "seed": (
+        "Explain the BEHAV3D Contact-based Grouping analysis: how the "
+        "contact/no-contact split works and how to choose the minimum bout "
+        "length."
+    ),
+}
+
+TRACK_EXEMPLAR_TRACKS = {
+    "id": "track_exemplars",
+    "title": "Exemplar Tracks",
+    "subtitle": "What does a typical track from each cluster actually look like?",
+    "color": "#c98a2c",
+    "what_does": (
+        "Selects and renders representative example tracks per cluster, so "
+        "you can sanity-check what each movement-type cluster looks like in "
+        "practice."
+    ),
+    "concept": None,
+    "what_get": (
+        "A statebar overview PDF and/or backprojection PDFs/MP4s of "
+        "exemplar tracks, depending on which outputs you enable."
+    ),
+    "decide": [
+        _decide("Number of exemplars per cluster", _DEFAULTS),
+        _decide("Which output(s) to generate (statebars / PDFs / MP4)", _SUGGESTED),
+    ],
+    "has_params": True,
+    "seed": (
+        "Explain BEHAV3D Exemplar Tracks: how exemplar tracks are chosen "
+        "per cluster and what the statebar/backprojection outputs show."
+    ),
+}
+
+# Level-1 pipeline lists, in display order (matches existing widget order).
+STATE_REPORT_PIPELINES = [
+    STATE_COMPOSITION_REPORT, STATE_TRANSITION_REPORT, STATE_COMPARISON_REPORT,
+]
+TRACK_PLOT_PIPELINES = [
+    TRACK_DIAGNOSTICS, TRACK_PROPORTIONS, TRACK_COMPARISON_REPORT,
+    TRACK_CONTACT_GROUPING, TRACK_EXEMPLAR_TRACKS,
+]
 
 
 # Grouped per sub-tab, in display order.

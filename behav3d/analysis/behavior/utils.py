@@ -79,6 +79,14 @@ def _handle_nan_in_distance_matrix(distance_matrix, context="distance matrix"):
         return np.nan_to_num(distance_matrix, nan=max_val)
 
 
+def _save_adata_obs_csv(adata, h5ad_path):
+    """Write adata.obs to a .csv file next to the given h5ad path (same stem)."""
+    h5ad_path = Path(h5ad_path)
+    csv_path = h5ad_path.with_suffix(".csv")
+    adata.obs.to_csv(csv_path, index=True)
+    return csv_path
+
+
 def _to_numpy_2d(X):
     if hasattr(X, "toarray"):
         X = X.toarray()

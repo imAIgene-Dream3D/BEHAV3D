@@ -550,13 +550,14 @@ def _load_active_killing_data(
     dict
         Dictionary with 'Active_Killing' and optionally 'Killing_Efficiency' layers
     """
-    active_killing_outdir = Path(output_dir, "analysis", cell_type, "active_killing")
-    advanced_features_path = active_killing_outdir / f"BEHAV3D_{cell_type}_advanced_track_features.csv"
-    
+    from behav3d.features.advanced_timepoint_features import find_advanced_features_csv
+
+    advanced_features_path = find_advanced_features_csv(output_dir, cell_type)
+
     result = {}
-    
-    if not advanced_features_path.exists():
-        print(f"  Active killing data not found at {advanced_features_path}")
+
+    if advanced_features_path is None:
+        print(f"  Active killing data not found for cell type '{cell_type}' in {output_dir}")
         return result
     
     print(f"  Loading active killing data from {advanced_features_path}")

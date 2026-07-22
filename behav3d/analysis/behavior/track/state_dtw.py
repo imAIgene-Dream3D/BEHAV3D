@@ -12,6 +12,11 @@ from sklearn.metrics import silhouette_score
 from scipy.stats import chi2_contingency, ttest_rel, wilcoxon
 
 from behav3d.analysis.behavior.state.classification import FULL_STATE_COL
+from behav3d.analysis.behavior.state.utils import (
+    _get_classification_state_colors,
+    _normalize_label_color_map,
+)
+from behav3d.features.state_descriptive_features import extract_descibing_track_state_features
 from behav3d.analysis.behavior.track.dtw import (
     _add_cluster_medoids,
     _cluster_precomputed_distances,
@@ -33,7 +38,7 @@ from behav3d.analysis.behavior.track.bouts import (
     _resolve_track_classifier_path,
     train_track_classifier,
 )
-from behav3d.analysis.behavior.utils import _sanitize_filename_token
+from behav3d.analysis.behavior.utils import _sanitize_filename_token, _save_adata_obs_csv
 from behav3d.analysis.behavior.track.visualization.plots.exemplar_coordinate_utils import (
     ensure_exemplar_coordinate_columns as _ensure_exemplar_coordinate_columns,
 )
@@ -270,7 +275,16 @@ def _save_diagnostics(
 
     medoid_cols = [
         c
-        for c in ["sample_name", "TrackID", cluster_key, f"{cluster_key}_medoid", f"{cluster_key}_medoid_rank"]
+        for c in [
+            "sample_name",
+            "TrackID",
+            "trajectory_window_id",
+            "position_t_min",
+            "position_t_max",
+            cluster_key,
+            f"{cluster_key}_medoid",
+            f"{cluster_key}_medoid_rank",
+        ]
         if c in adata_tracks.obs.columns
     ]
     adata_tracks.obs.loc[adata_tracks.obs[f"{cluster_key}_medoid"].astype(bool), medoid_cols].to_csv(
@@ -296,8 +310,9 @@ def _save_diagnostics(
         if umap_embedding is not None:
             fig, ax = plt.subplots(figsize=(7, 6))
             cluster_order = sorted(labels.unique().tolist(), key=lambda x: (0, int(x)) if str(x).isdigit() else (1, str(x)))
-            cmap = plt.get_cmap("tab20")
-            color_map = {cluster: cmap(i % cmap.N) for i, cluster in enumerate(cluster_order)}
+            color_map = _normalize_label_color_map(
+                cluster_order, colors=_get_classification_state_colors(adata_tracks, cluster_key),
+            )
             for cluster in cluster_order:
                 mask = labels.to_numpy() == str(cluster)
                 ax.scatter(
@@ -412,8 +427,9 @@ def _save_diagnostics(
             if replicate_group_counts is not None:
                 replicate_order = sorted(replicate_group_counts[resolved_replicate_col].unique().tolist())
                 group_order_rep = sorted(replicate_group_counts[resolved_group_col].unique().tolist())
-                cluster_cmap = plt.get_cmap("tab20")
-                cluster_color_map = {c: cluster_cmap(i % cluster_cmap.N) for i, c in enumerate(cluster_order)}
+                cluster_color_map = _normalize_label_color_map(
+                    cluster_order, colors=_get_classification_state_colors(adata_tracks, cluster_key),
+                )
 
                 fig, axes = plt.subplots(
                     1, len(replicate_order), figsize=(3.2 * len(replicate_order) + 1, 5), sharey=True
@@ -551,6 +567,7 @@ def _write_model_if_requested(adata_tracks, output_dir, cell_type, *, save_outpu
     )
     if bool(save_outputs):
         adata_tracks.write(output_path, compression="gzip")
+        _save_adata_obs_csv(adata_tracks, output_path)
     return output_path
 
 
@@ -574,6 +591,12 @@ def save_dtaidistance_diagnostics(
     """
     paths = _resolve_dtaidistance_paths(output_dir, cell_type)
     resolved_cluster_key = _resolve_cluster_key(adata_tracks, cluster_key=cluster_key)
+    if _dtai_meta(adata_tracks).get("method") == "original_behav3d_feature_dtw":
+        raise ValueError(
+            "Diagnostics are not available for the 'Original BEHAV3D' feature-DTW model — "
+            "no pairwise distance matrix is stored for this clustering method. Use "
+            "_save_feature_dtw_quality_control() instead."
+        )
     distances = _validate_distance_matrix(adata_tracks.X, adata_tracks.n_obs)
     plot_paths = _save_diagnostics(
         adata_tracks,
@@ -672,6 +695,8 @@ def _load_filtered_state_adata_for_model(
     if min_track_length is not None:
         min_track_length = int(min_track_length)
     trim_mode = str(meta.get("trajectory_trim_mode", "last"))
+    split_long_tracks = bool(meta.get("split_long_tracks", False))
+    window_col = str(meta.get("trajectory_window_col", "trajectory_window_id"))
     if bool(verbose):
         _winfo("trajectory-dtai", f"loading behavioral states for exemplar plots: {adata_full_path}")
     adata_full = sc.read_h5ad(adata_full_path)
@@ -682,6 +707,8 @@ def _load_filtered_state_adata_for_model(
         trajectory_size=behavioral_trajectory_size,
         min_length=min_track_length,
         trim_mode=trim_mode,
+        split_long_tracks=split_long_tracks,
+        window_col=window_col,
     )
 
 
@@ -885,6 +912,8 @@ def run_categorical_dtaidistance_trajectory_clustering(
     behavioral_trajectory_size=100,
     min_track_length=None,
     trajectory_trim_mode="last",
+    split_long_tracks=False,
+    trajectory_window_col="trajectory_window_id",
     max_tracks=None,
     n_clusters=6,
     window=None,
@@ -929,6 +958,11 @@ def run_categorical_dtaidistance_trajectory_clustering(
     trajectory_size = None if behavioral_trajectory_size is None else int(behavioral_trajectory_size)
     min_length = trajectory_size if min_track_length is None else int(min_track_length)
     trim_mode = str(trajectory_trim_mode).strip().lower()
+    split_long_tracks = bool(split_long_tracks)
+    trajectory_window_col = str(trajectory_window_col)
+    sequence_groupby_cols = list(groupby_cols)
+    if split_long_tracks and trajectory_size is not None:
+        sequence_groupby_cols = list(groupby_cols) + [trajectory_window_col]
 
     if bool(verbose):
         _winfo("trajectory-dtai", f"loading behavioral states: {adata_full_path}")
@@ -936,9 +970,10 @@ def run_categorical_dtaidistance_trajectory_clustering(
 
     if bool(verbose):
         length_text = "all timepoints" if trajectory_size is None else f"{trim_mode} {trajectory_size} timepoints"
+        action_text = "dividing" if split_long_tracks and trajectory_size is not None else "keeping"
         _winfo(
             "trajectory-dtai",
-            f"filtering tracks with min_length={min_length}, keeping {length_text} | "
+            f"filtering tracks with min_length={min_length}, {action_text} {length_text} | "
             f"state_col={FULL_STATE_COL}",
         )
     adata_filt = _filter_tracks_for_dtaidistance(
@@ -948,15 +983,18 @@ def run_categorical_dtaidistance_trajectory_clustering(
         trajectory_size=trajectory_size,
         min_length=min_length,
         trim_mode=trim_mode,
+        split_long_tracks=split_long_tracks,
+        window_col=trajectory_window_col,
     )
 
+    line_condition_cols = [c for c in adata_filt.obs.columns if c.endswith("_line_condition")]
     sequences, track_obs = extract_categorical_track_sequences(
         adata_filt,
         state_cols=state_cols,
-        groupby_cols=groupby_cols,
+        groupby_cols=sequence_groupby_cols,
         time_col=time_col,
         missing_policy=missing_policy,
-        extra_meta_cols=("origin_cell_type", "well"),
+        extra_meta_cols=("origin_cell_type", "well", *line_condition_cols),
     )
 
     if max_tracks is not None and int(max_tracks) > 0 and len(sequences) > int(max_tracks):
@@ -1016,12 +1054,15 @@ def run_categorical_dtaidistance_trajectory_clustering(
         "inner_dist": "squared euclidean",
         "one_hot_categories": [str(c) for c in categories],
         "groupby_cols": [str(c) for c in list(groupby_cols)],
+        "sequence_groupby_cols": [str(c) for c in list(sequence_groupby_cols)],
         "time_col": str(time_col),
         "state_col": str(FULL_STATE_COL),
         "state_cols": list(state_cols),
         "behavioral_trajectory_size": None if trajectory_size is None else int(trajectory_size),
         "min_track_length": None if min_length is None else int(min_length),
         "trajectory_trim_mode": trim_mode,
+        "split_long_tracks": bool(split_long_tracks),
+        "trajectory_window_col": str(trajectory_window_col),
         "max_tracks": None if max_tracks is None else int(max_tracks),
         "n_clusters": int(n_clusters),
         "window": None if window is None else int(window),
@@ -1143,6 +1184,7 @@ def run_categorical_dtaidistance_trajectory_clustering(
                 _winfo("trajectory-dtai", f"skipping exemplar PDFs due to error: {exc}")
 
     if bool(save_distance_matrix):
+        paths["clustering_outfolder"].mkdir(parents=True, exist_ok=True)
         distance_csv = paths["clustering_outfolder"] / "categorical_dtai_distance_matrix.csv"
         pd.DataFrame(distances, index=adata_tracks.obs.index, columns=adata_tracks.obs.index).to_csv(distance_csv)
         adata_tracks.uns.setdefault("dtai_trajectory_clustering", {})
@@ -1151,6 +1193,7 @@ def run_categorical_dtaidistance_trajectory_clustering(
     output_path = paths["outfolder"] / get_dtaidistance_track_trajectories_filename(cell_type)
     if bool(save_outputs):
         adata_tracks.write(output_path, compression="gzip")
+        _save_adata_obs_csv(adata_tracks, output_path)
         if bool(verbose):
             _winfo("trajectory-dtai", f"saved one-hot dtaidistance model: {output_path}")
 
@@ -1196,6 +1239,13 @@ def train_dtaidistance_trajectory_classifier(
         raise FileNotFoundError(f"Source behavioral-states file not found: {adata_full_path}")
 
     trajectory_size = meta.get("behavioral_trajectory_size") or 100
+    groupby_cols = list(meta.get("groupby_cols", ["sample_name", "TrackID"]))
+    sequence_groupby_cols = list(meta.get("sequence_groupby_cols", groupby_cols))
+    time_col = str(meta.get("time_col", "position_t"))
+    min_track_length = meta.get("min_track_length", trajectory_size)
+    trim_mode = str(meta.get("trajectory_trim_mode", "last"))
+    split_long_tracks = bool(meta.get("split_long_tracks", False))
+    window_col = str(meta.get("trajectory_window_col", "trajectory_window_id"))
 
     if bool(verbose):
         _winfo("trajectory-dtai-clf", f"loading behavioral states: {adata_full_path}")
@@ -1203,20 +1253,54 @@ def train_dtaidistance_trajectory_classifier(
 
     if bool(verbose):
         _winfo("trajectory-dtai-clf", f"building track features (trajectory_size={trajectory_size})")
-    feature_adata = _build_track_feature_adata(
-        adata_full,
-        state_col=str(FULL_STATE_COL),
-        behavioral_trajectory_size=int(trajectory_size),
-    )
+    if split_long_tracks:
+        adata_filt = _filter_tracks_for_dtaidistance(
+            adata_full,
+            groupby_cols=groupby_cols,
+            time_col=time_col,
+            trajectory_size=int(trajectory_size),
+            min_length=None if min_track_length is None else int(min_track_length),
+            trim_mode=trim_mode,
+            split_long_tracks=True,
+            window_col=window_col,
+        )
+        feature_adata, _ = extract_descibing_track_state_features(
+            adata_filt,
+            state_col=str(FULL_STATE_COL),
+            group_col=sequence_groupby_cols,
+        )
+        feature_adata.uns["track_filtering"] = {
+            "groupby_cols": [str(c) for c in list(groupby_cols)],
+            "sequence_groupby_cols": [str(c) for c in list(sequence_groupby_cols)],
+            "time_col": str(time_col),
+            "state_col": str(FULL_STATE_COL),
+            "behavioral_trajectory_size": int(trajectory_size),
+            "min_track_length": None if min_track_length is None else int(min_track_length),
+            "trajectory_trim_mode": trim_mode,
+            "split_long_tracks": True,
+            "trajectory_window_col": str(window_col),
+        }
+    else:
+        feature_adata = _build_track_feature_adata(
+            adata_full,
+            state_col=str(FULL_STATE_COL),
+            behavioral_trajectory_size=int(trajectory_size),
+        )
 
-    # Transfer ClusterID from dtaidistance model to feature adata by (sample_name, TrackID)
-    dtai_obs = model_adata.obs[[cluster_col, "sample_name", "TrackID"]].copy()
+    # Transfer ClusterID from dtaidistance model to feature adata by the
+    # analysis trajectory key. Split windows keep original TrackID and add
+    # trajectory_window_id, so TrackID alone is not unique in that mode.
+    transfer_cols = [str(c) for c in sequence_groupby_cols if str(c) in model_adata.obs.columns]
+    missing_transfer = [str(c) for c in transfer_cols if str(c) not in feature_adata.obs.columns]
+    if missing_transfer:
+        raise ValueError(f"Feature adata is missing dtaidistance transfer columns: {missing_transfer}")
+    dtai_obs = model_adata.obs[[cluster_col] + transfer_cols].copy()
     dtai_obs = dtai_obs.reset_index(drop=True)
-    dtai_obs = dtai_obs.set_index(["sample_name", "TrackID"])[cluster_col]
+    dtai_obs = dtai_obs.set_index(transfer_cols)[cluster_col]
 
     feat_obs = feature_adata.obs.copy()
     feat_obs["_cluster"] = (
-        pd.MultiIndex.from_frame(feat_obs[["sample_name", "TrackID"]])
+        pd.MultiIndex.from_frame(feat_obs[transfer_cols])
         .map(dtai_obs.to_dict())
     )
     has_label = feat_obs["_cluster"].notna()

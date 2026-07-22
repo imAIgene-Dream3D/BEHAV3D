@@ -939,7 +939,8 @@ class CellTypeFeaturePanel(QWidget):
         # -- Death threshold spinner (ALL panels own one; organoid panels sync)
         dead_desc = QLabel(
             f"Percentage of dead-mask pixels overlapping a segment\n"
-            f"above which {self.cell_type} cells are classified as 'dead'."
+            f"above which {self.cell_type} cells are classified as 'dead'.\n"
+            f"Shown here as a %, saved to config as a fraction (e.g. 3 % → 0.03)."
         )
         dead_desc.setWordWrap(True)
         dead_desc.setMinimumWidth(0)
@@ -965,14 +966,19 @@ class CellTypeFeaturePanel(QWidget):
         self.spin_dead_threshold = QDoubleSpinBox()
         self.spin_dead_threshold.setRange(0.0, 100.0)
         self.spin_dead_threshold.setSingleStep(0.1)
-        self.spin_dead_threshold.setDecimals(3)
+        self.spin_dead_threshold.setDecimals(1)
+        # ``dead_mask_percentage_threshold`` is persisted as a FRACTION
+        # (0.0-1.0), matching the scale of the ``percentage_dead_mask``
+        # feature it's thresholded against. The spinbox only displays it
+        # as a percentage for readability, so convert on load/save.
         saved_thr = fcfg.get("dead_mask_percentage_threshold", 0.1)
-        self.spin_dead_threshold.setValue(float(saved_thr) if saved_thr else 0.1)
+        self.spin_dead_threshold.setValue(float(saved_thr) * 100.0 if saved_thr else 10.0)
         self.spin_dead_threshold.setSuffix(" %")
         self.spin_dead_threshold.setMaximumWidth(100)
 
         # Track the threshold that is currently baked into the combined CSV
-        # on disk. ``None`` means feature extraction has never run for this
+        # on disk, as a FRACTION (same scale as the persisted config value).
+        # ``None`` means feature extraction has never run for this
         # cell type (or no death classification was performed). Updated by
         # ``_persist()`` and by ``_on_rerun_death_clicked``.
         self._last_persisted_threshold = (
@@ -1001,7 +1007,8 @@ class CellTypeFeaturePanel(QWidget):
             "any timepoint, it is marked 'dead' from that timepoint onward for\n"
             "the rest of the track, even if the percentage later drops again.\n\n"
             "Set to 0 to skip dead classification.\n"
-            "Typical range: 0.05\u20130.5 %.",
+            "Entered as a percentage here; saved to behav3d_parameters.yml\n"
+            "as a fraction (e.g. 3 % is saved as 0.03).",
         )
         spinner_row.addWidget(self.btn_rerun_death)
         dead_form.addRow("Dead mask % threshold:", spinner_row)
@@ -1145,12 +1152,20 @@ class CellTypeFeaturePanel(QWidget):
 
     # ── Helpers ──────────────────────────────────────────────────────────────
     def _get_threshold(self) -> float:
-        """Return the effective dead-mask percentage threshold for this panel."""
+        """Return the effective dead-mask threshold as shown in the UI (percent, 0-100)."""
         if self.spin_dead_threshold is not None:
             return round(float(self.spin_dead_threshold.value()), 2)
         if self._threshold_getter is not None:
             return round(float(self._threshold_getter()), 2)
         return 0.0
+
+    def _threshold_as_fraction(self, pct: float | None = None) -> float:
+        """Convert a UI percent-scale threshold to the fraction (0.0-1.0)
+        that ``percentage_dead_mask`` is measured in. This is the scale
+        persisted to config and passed into ``calculate_death``/
+        ``rerun_death_classification``."""
+        value = self._get_threshold() if pct is None else float(pct)
+        return round(value / 100.0, 4)
 
     def _disconnect_preview_dead_hover(self):
         """Remove this panel's own previously-attached hover callback, if any."""
@@ -1573,7 +1588,9 @@ class CellTypeFeaturePanel(QWidget):
         return {
             "features_choice": self._selected_features(),
             "contact_threshold": float(self._contact_unit_mgr.get_native(self.contact_threshold)),
-            "dead_mask_percentage_threshold": thr if thr > 0 else None,
+            # Persisted/consumed as a fraction (0.0-1.0); ``thr`` is the
+            # percent-scale value shown in the spinbox.
+            "dead_mask_percentage_threshold": self._threshold_as_fraction(thr) if thr > 0 else None,
             "n_workers": int(self.spin_workers.value()),
         }
 
@@ -1596,10 +1613,11 @@ class CellTypeFeaturePanel(QWidget):
                     cb.setChecked(f in settings["features_choice"])
                 p._contact_unit_mgr.set_native(p.contact_threshold, settings["contact_threshold"])
                 p.spin_workers.setValue(settings["n_workers"])
-                # Only sync dead threshold for non-organoid panels that own a spinner
+                # Only sync dead threshold for non-organoid panels that own a spinner.
+                # Use the percent-scale UI value directly (not the fraction
+                # stored in ``settings``, which is scaled for persistence).
                 if not p._is_organoid and p.spin_dead_threshold is not None:
-                    thr_val = settings.get("dead_mask_percentage_threshold")
-                    p.spin_dead_threshold.setValue(thr_val if thr_val is not None else 0.0)
+                    p.spin_dead_threshold.setValue(self._get_threshold())
                 count += 1
         scope = "category" if category_only else "all"
         self.log(f"Applied feature settings to {count} other cell type(s) ({scope}).")
@@ -1619,9 +1637,10 @@ class CellTypeFeaturePanel(QWidget):
                 self.log(f"Warning: Could not save parameters: {e}")
 
         # Remember the threshold value that is now baked into the on-disk
-        # config (and, after run, into the combined CSV).
+        # config (and, after run, into the combined CSV), as a fraction
+        # (same scale as the persisted config value).
         thr = self._get_threshold()
-        self._last_persisted_threshold = thr if thr > 0 else None
+        self._last_persisted_threshold = self._threshold_as_fraction(thr) if thr > 0 else None
         self._refresh_rerun_death_button()
 
     def _combined_csv_path(self, cell_type: str | None = None) -> Path:
@@ -1646,13 +1665,14 @@ class CellTypeFeaturePanel(QWidget):
         if not self._has_combined_csv():
             return False
         try:
-            current = round(self._get_threshold(), 2)
+            # Compare on the same (fraction) scale as ``_last_persisted_threshold``.
+            current = self._threshold_as_fraction()
         except Exception:
             return False
         persisted = self._last_persisted_threshold
         if persisted is None:
             return current > 0
-        return abs(current - round(float(persisted), 2)) > 1e-6
+        return abs(current - round(float(persisted), 4)) > 1e-6
 
     def _refresh_rerun_death_button(self):
         """Show/hide and enable/disable the Re-run death button per current state."""
@@ -1725,12 +1745,12 @@ class CellTypeFeaturePanel(QWidget):
                 rerun_death_classification(
                     output_dir=str(Path(self.metadata_loader.output_dir).expanduser()),
                     cell_type=ct,
-                    new_threshold=float(new_thr),
+                    new_threshold=self._threshold_as_fraction(new_thr),
                 )
                 panel._persist()
                 self.log(
                     f"\u2705 Re-ran death classification for {ct} "
-                    f"with threshold={new_thr}."
+                    f"with threshold={new_thr}%."
                 )
                 ran_any = True
             except Exception as e:
@@ -1779,7 +1799,7 @@ class CellTypeFeaturePanel(QWidget):
         if params is not None:
             new_thr = params["dead_mask_percentage_threshold"] or 0.0
         else:
-            new_thr = self._get_threshold()
+            new_thr = self._threshold_as_fraction()
         if new_thr <= 0:
             self.log(
                 f"\u26a0\ufe0f Skipping death-only re-run for {cell_type}: "
@@ -3918,13 +3938,14 @@ class FeatureExtractionTab(QWidget):
     def _sync_global_threshold_to_params(self):
         """Write the organoid dead threshold into behav3d_parameters
         for every organoid cell type, then save to YAML."""
-        # Read from first available organoid panel spinner
+        # Read from first available organoid panel spinner (percent, as shown in the UI)
         thr = 0.0
         for ct in self._org_types:
             if ct in self.panels and self.panels[ct].spin_dead_threshold is not None:
                 thr = float(self.panels[ct].spin_dead_threshold.value())
                 break
-        thr_val = thr if thr > 0 else None
+        # Persist as a fraction (0.0-1.0), matching ``percentage_dead_mask``'s scale.
+        thr_val = round(thr / 100.0, 4) if thr > 0 else None
         params = self.metadata_loader.behav3d_parameters
         features = params.setdefault("features", {})
         for ct in self._org_types:

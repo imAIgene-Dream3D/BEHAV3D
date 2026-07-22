@@ -44,6 +44,147 @@ _TOOL_NAMES = (
     "summarize_track_counts",
 )
 _TOOL_NAME_PATTERN = "|".join(re.escape(name) for name in _TOOL_NAMES)
+CONTROL_CONTRACT_VERSION = "2.5"
+
+
+def tools_for_context(tools: list[dict], context: dict) -> list[dict]:
+    """Remove destructive setup tools once metadata or sample forms exist."""
+    metadata = context.get("metadata", {}) or {}
+    builder = context.get("metadata_builder", {}) or {}
+    controls = (context.get("ui_state", {}) or {}).get("controls", []) or []
+    has_sample_forms = any(
+        str(control.get("id") or "").startswith("metadata.samples.")
+        for control in controls
+    )
+    existing_metadata = bool(metadata.get("loaded")) or (
+        metadata.get("record_source") == "metadata_builder_draft"
+    )
+    if existing_metadata or (builder.get("open") and has_sample_forms):
+        return [tool for tool in tools if tool.get("name") != "bulk_fill_metadata"]
+    return list(tools)
+
+
+def should_force_bulk_metadata(context: dict, user_message: str, tools: list[dict]) -> bool:
+    """Require the bulk builder for a substantive new-experiment description."""
+    if not any(tool.get("name") == "bulk_fill_metadata" for tool in tools):
+        return False
+    metadata = context.get("metadata", {}) or {}
+    if metadata.get("loaded") or metadata.get("record_source") == "metadata_builder_draft":
+        return False
+    text = str(user_message or "").lower()
+    setup_intent = any(phrase in text for phrase in (
+        "set up", "setup", "build metadata", "create metadata", "fill metadata",
+    ))
+    sample_count = bool(re.search(
+        r"\b(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+        r"(?:movies?|samples?|fields? of view|acquisitions?)\b",
+        text,
+    ))
+    fact_groups = [
+        ("pixel size", "resolution", "um/pixel", "µm/pixel"),
+        ("z spacing", "z-spacing", "z step", "optical sections"),
+        ("time-lapse", "time lapse", "time interval", "acquired every"),
+        ("channel", "ch0", "ch1", "ch2", "ch3"),
+        ("immune type", "cell type", "organoid", "collagen"),
+    ]
+    supplied_facts = sum(any(marker in text for marker in group) for group in fact_groups)
+    return setup_intent and sample_count and supplied_facts >= 2
+
+
+def model_tool_policy(force_bulk: bool, has_tools: bool) -> tuple[object, dict | None]:
+    """Return a DeepSeek-compatible tool choice and thinking override."""
+    if force_bulk:
+        # V4 intermittently rejects named tool_choice even when thinking is
+        # disabled. Supplying only the bulk tool plus the system contract keeps
+        # selection unambiguous without sending tool_choice at all.
+        return None, {"thinking": {"type": "disabled"}}
+    return ("auto" if has_tools else None), None
+
+
+def sanitize_bulk_metadata_arguments(arguments: dict, user_message: str) -> dict:
+    """Drop per-sample identifiers that were not actually supplied by the user."""
+    cleaned = json.loads(json.dumps(arguments or {}))
+    text = str(user_message or "").lower()
+    normalized_text = re.sub(r"[^a-z0-9]+", "", text)
+    uncertainty = any(phrase in text for phrase in (
+        "do not know", "don't know", "not sure", "unsure", "seconds or minutes",
+    ))
+
+    def was_supplied(value) -> bool:
+        normalized = re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+        return bool(normalized) and normalized in normalized_text
+
+    for sample in cleaned.get("samples") or []:
+        if not isinstance(sample, dict):
+            continue
+        for field in ("sample_name", "dimension_order", "raw_image_path", "well", "exp_nr"):
+            if field in sample and not was_supplied(sample[field]):
+                sample.pop(field, None)
+        if uncertainty:
+            sample.pop("time_unit", None)
+        elif "time_unit" in sample and not was_supplied(sample["time_unit"]):
+            sample.pop("time_unit", None)
+        cell_types = sample.get("cell_types")
+        if isinstance(cell_types, dict):
+            sample["cell_types"] = {
+                name: values for name, values in cell_types.items() if values
+            }
+            if not sample["cell_types"]:
+                sample.pop("cell_types", None)
+    return cleaned
+
+
+def recover_single_control_action(
+    calls: list[dict], context: dict, user_message: str, response_text: str,
+) -> list[dict]:
+    """Recover a missed confirmable edit when exactly one control can be targeted."""
+    if calls or not re.search(
+        r"\b(?:adjust|apply|change|correct|fill|fix|set|update)\b",
+        str(user_message or ""), re.IGNORECASE,
+    ):
+        return calls
+    controls = [
+        control for control in ((context.get("ui_state", {}) or {}).get("controls", []) or [])
+        if control.get("id") and control.get("visible") and control.get("enabled")
+    ]
+    if len(controls) != 1:
+        return calls
+    control = controls[0]
+    text = str(response_text or "")
+    value = None
+    choices = control.get("choices") or []
+    if choices:
+        matches = [
+            choice for choice in choices
+            if re.search(rf"\b{re.escape(str(choice))}\b", text, re.IGNORECASE)
+            and str(choice).lower() != str(control.get("value")).lower()
+        ]
+        if len(matches) == 1:
+            value = matches[0]
+    elif isinstance(control.get("value"), bool):
+        lowered = text.lower()
+        if any(word in lowered for word in ("enable", "turn on")):
+            value = True
+        elif any(word in lowered for word in ("disable", "turn off")):
+            value = False
+    else:
+        patterns = (
+            r"(?:set|change|adjust|update)[^\n.]{0,180}?\bto\s*\**(-?\d+(?:\.\d+)?)",
+            r"(?:->|→)\s*\**(-?\d+(?:\.\d+)?)",
+        )
+        candidates = []
+        for pattern in patterns:
+            candidates.extend(re.findall(pattern, text, re.IGNORECASE))
+        if candidates:
+            number = float(candidates[-1])
+            current = control.get("value")
+            value = int(number) if isinstance(current, int) and number.is_integer() else number
+    if value is None:
+        return calls
+    return [{
+        "name": "set_ui_value",
+        "arguments": {"control_id": control["id"], "value": value},
+    }]
 
 
 def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict]) -> str:
@@ -79,6 +220,20 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "- To edit a visible field, call set_ui_value with an exact id from LIVE CONTROLS. Never invent "
         "an id. Same-value requests are complete: acknowledge briefly and move to the next relevant "
         "decision without calling the tool again.\n"
+        "- An explicit request to fill, set, update, fix, or adjust available values is incomplete without "
+        "the matching tool calls in that same response. Apply known shared values to every relevant sample "
+        "or exact cell type; do not narrate an action you have not called.\n"
+        "- bulk_fill_metadata is only for creating a new builder before metadata or sample forms exist. Once "
+        "metadata is loaded or draft sample controls exist, use set_ui_value for the latest requested fields; "
+        "never rebuild the form from values mentioned earlier in the conversation.\n"
+        "- When metadata is not loaded and the user provides a multi-field experiment description, call "
+        "bulk_fill_metadata directly; that single action opens and builds the Metadata Builder, so do not "
+        "call fill_metadata_builder with open_builder first. Include "
+        "one sample object per described movie, populate every unambiguous count, cell-type name, and shared "
+        "acquisition value, and omit unknown fields. Calling only open_builder or waiting to collect every "
+        "field is a failure. Do not wait for an output directory or one ambiguous unit before preparing the "
+        "known metadata; ask one focused follow-up after proposing those values. Never infer a dimension "
+        "order, time unit, image path, sample name, or well that the user did not provide.\n"
         "- Use only controls matching the selected method and exact cell type. Do not apply a change to "
         "a broad cell category.\n"
         "- Navigation and read-only result/preview actions may happen immediately. Filling a blank field "
@@ -90,6 +245,29 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "- For EDT advice, use recommend_edt so the conversion comes from metadata. Use a 10 um cell "
         "diameter by default. For an organoid, first ask how many cell widths span its diameter. Treat "
         "the returned values as preview starting points, not ground truth.\n"
+        "- For touching objects that remain merged, read the active instance strategy before advising. With "
+        "Probability Map + Watershed, raise Mask threshold and Seed threshold in small increments and keep "
+        "Seed threshold at least as high as Mask threshold. With plain Mask + EDT/Watershed, raise EDT "
+        "threshold. With Peak EDT/Watershed, lower EDT threshold because that field is a peak-height filter. "
+        "Reverse the relevant direction for over-splitting, change only controls present in LIVE CONTROLS, "
+        "and ask the user to inspect a preview after each small change.\n"
+        "- Before recommending a tracking method, establish how much that exact structure moves between "
+        "consecutive frames; do not infer motion from a label such as immune, organoid, or collagen. If it "
+        "stays spatially overlapping from frame to frame, recommend Propagation. For visibly moving objects, "
+        "choose among LAP, TrackPy, and btrack based on density, gaps, crossings, and divisions.\n"
+        "- Before recommending a tracking distance, read Time interval and Time unit from every metadata "
+        "record. Convert any stated speed to displacement per frame; for example, 60 um/min at 15 seconds "
+        "per frame is 15 um/frame. Use the fastest plausible one-frame displacement plus a modest 10-25% "
+        "margin. Never invent a typical speed or recommend 50/100 um without motion evidence.\n"
+        "- When movement has not been quantified, ask for observed displacement and stop. Do not provide a "
+        "numeric example speed, a supposed typical range, or a numeric search radius.\n"
+        "- Ignore populated child values of disabled options. In particular, do not suggest enabling btrack "
+        "global optimization merely because its inherited thresholds contain defaults; discuss it only when "
+        "the user reports gaps, false links, merges, or divisions that require it.\n"
+        "- Minimum track length and common output track length may validly be equal: the minimum removes "
+        "shorter tracks and the maximum trims retained longer tracks to a comparable fixed window. Never call "
+        "that combination contradictory. Do not call a chosen minimum reasonable or recommended before reading "
+        "the track-length distribution and the user's downstream analysis; explain its effect neutrally.\n"
         "- For cell counts under minimum track-length filters or at a requested timepoint, always use "
         "summarize_track_counts. Never estimate counts or calculate them from prose.\n"
         "- Produce at most the actions needed for this one user turn. There is no hidden continuation turn."
@@ -365,7 +543,7 @@ if modal is not None:
         @api.get("/health")
         def health():
             return {"ok": True, "chunks": len(index.chunks), "model": deepseek_model,
-                    "control_contract_version": "2.0",
+                    "control_contract_version": CONTROL_CONTRACT_VERSION,
                     "knowledge_version": KNOWLEDGE_VERSION}
 
         @api.post("/chat")
@@ -373,10 +551,13 @@ if modal is not None:
             body = await request.json()
             messages = body.get("messages", [])
             context = body.get("context", {})
-            tools = body.get("tools", [])
+            tools = tools_for_context(body.get("tools", []), context)
 
             user_msg = next((m["content"] for m in reversed(messages)
                              if m.get("role") == "user"), "")
+            force_bulk = should_force_bulk_metadata(context, user_msg, tools)
+            if force_bulk:
+                tools = [tool for tool in tools if tool.get("name") == "bulk_fill_metadata"]
             query = f"{context.get('current_step','')} {user_msg}"
             try:
                 retrieved = index.search(embedder.encode([query])[0], k=6)
@@ -394,6 +575,9 @@ if modal is not None:
                            (context.get("ui_state", {}) or {}).get("controls", [])
                            if item.get("id") and item.get("enabled") and item.get("visible")]
             oai_tools = to_openai_tools(tools, key_enum=control_ids)
+            tool_choice, thinking_override = model_tool_policy(
+                force_bulk, bool(oai_tools)
+            )
 
             def sse(obj):
                 return "data: " + json.dumps(obj) + "\n\n"
@@ -402,11 +586,19 @@ if modal is not None:
                 content = ""
                 tool_frags = []
                 try:
+                    request_options = {
+                        "model": deepseek_model,
+                        "messages": convo,
+                        "tools": oai_tools or None,
+                        "temperature": 0.3,
+                        "stream": True,
+                    }
+                    if tool_choice is not None:
+                        request_options["tool_choice"] = tool_choice
+                    if thinking_override is not None:
+                        request_options["extra_body"] = thinking_override
                     stream = client.chat.completions.create(
-                        model=deepseek_model, messages=convo,
-                        tools=oai_tools or None,
-                        tool_choice="auto" if oai_tools else None,
-                        temperature=0.3, stream=True,
+                        **request_options
                     )
                     for chunk in stream:
                         delta = chunk.choices[0].delta
@@ -428,6 +620,15 @@ if modal is not None:
                 calls = assemble_tool_calls(tool_frags)
                 if not calls:                       # fallback: call embedded in text
                     _, calls = parse_tool_calls(content)
+                calls = recover_single_control_action(
+                    calls, context, user_msg, content
+                )
+                if force_bulk:
+                    for call in calls:
+                        if call.get("name") == "bulk_fill_metadata":
+                            call["arguments"] = sanitize_bulk_metadata_arguments(
+                                call.get("arguments", {}), user_msg
+                            )
                 if calls:
                     yield sse({"type": "tool_calls", "calls": calls})
                 yield sse({"type": "done"})

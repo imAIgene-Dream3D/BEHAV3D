@@ -23,6 +23,12 @@ from behav3d.analysis.behavior.state.visualization.videos.track_max_projection i
     resolve_tracked_zarr_path,
 )
 from behav3d.io.images import load_zarr
+from behav3d.analysis.behavior.state.utils import (
+    _apply_state_order,
+    _get_classification_state_colors,
+    _get_classification_state_order,
+    _normalize_label_color_map,
+)
 
 def _validate_required_columns(df_like, required_cols, name):
     missing = [str(c) for c in required_cols if str(c) not in df_like.columns]
@@ -42,9 +48,11 @@ def _build_state_color_map(adata_full, state_key, cmap_name="tab20"):
     else:
         uniq = [str(v) for v in pd.unique(states_series)]
         state_values = sorted(uniq, key=_mixed_label_sort_key)
+    state_values = _apply_state_order(state_values, _get_classification_state_order(adata_full, state_key))
 
-    cmap = colormaps.get_cmap(cmap_name).resampled(max(1, len(state_values)))
-    color_map = {str(st): cmap(i) for i, st in enumerate(state_values)}
+    stored_colors = _get_classification_state_colors(adata_full, state_key)
+    color_map_hex = _normalize_label_color_map(state_values, colors=stored_colors, cmap_name=cmap_name)
+    color_map = {str(st): color_map_hex[str(st)] for st in state_values}
     return state_values, color_map
 
 
@@ -129,6 +137,13 @@ def plot_tracks_bars_on_ax(
     key_cols = [sample_key, track_key]
 
     obs = adata_full.obs[[sample_key, track_key, time_key, state_key]].copy()
+    obs[sample_key] = obs[sample_key].astype("string")
+    obs[track_key] = obs[track_key].astype("string")
+
+    chosen_df = chosen_df.copy()
+    chosen_df[sample_key] = chosen_df[sample_key].astype("string")
+    chosen_df[track_key] = chosen_df[track_key].astype("string")
+
     chosen_keys = chosen_df[key_cols].drop_duplicates()
     obs = obs.merge(chosen_keys, on=key_cols, how="inner")
 

@@ -435,7 +435,7 @@ def _step_readiness(main_widget, ctx: dict) -> dict:
 
 
 def _segmentation_state(main_widget) -> dict:
-    """Snapshot the visible segmentation method selector."""
+    """Snapshot the visible method and per-cell instance strategies."""
     seg = _safe(lambda: getattr(main_widget, "segmentation_tab", None))
     combo = _safe(lambda: getattr(seg, "method_combo", None))
     if combo is None:
@@ -444,11 +444,32 @@ def _segmentation_state(main_widget) -> dict:
         methods = [combo.itemText(i) for i in range(combo.count())]
     except Exception:
         methods = []
-    return {
+    state = {
         "method": _safe(lambda: combo.currentText(), ""),
         "method_index": _safe(lambda: combo.currentIndex(), 0),
         "available_methods": methods,
     }
+    for token, page_attr in (("apoc", "apoc_page"), ("convpaint", "convpaint_page")):
+        page = getattr(seg, page_attr, None)
+        training = getattr(page, "_training_widget", None) if page is not None else None
+        if training is None:
+            continue
+        global_combo = getattr(training, "strategy_combo", None)
+        global_strategy = (
+            _safe(lambda c=global_combo: c.currentText(), "") if global_combo is not None else ""
+        )
+        by_cell_type = {}
+        for cell_type, tab in (getattr(training, "tabs", {}) or {}).items():
+            per_tab = getattr(tab, "_per_tab_strategy_combo", None)
+            by_cell_type[str(cell_type)] = (
+                _safe(lambda c=per_tab: c.currentText(), "")
+                if per_tab is not None else global_strategy
+            )
+        state[token] = {
+            "global_strategy": global_strategy or None,
+            "cell_type_strategies": by_cell_type,
+        }
+    return state
 
 
 def _required_params_at_default(

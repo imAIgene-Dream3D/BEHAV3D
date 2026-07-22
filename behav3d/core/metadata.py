@@ -647,3 +647,36 @@ def check_behav3d_metadata(
         print("✅ Metadata file is complete and correct")
     else:
         print("⚠️ Some processing steps need to be run (see warnings above)")
+
+
+METADATA_TECHNICAL_PATTERNS = (
+    "_path", "_dir", "pixel_distance", "time_interval", "unit_",
+    "channel_", "dead_channel", "zarr", "dimension_order",
+)
+
+
+def list_grouping_candidate_columns(metadata):
+    """Return metadata columns usable as grouping/condition columns, excluding
+    technical columns (paths, dirs, pixel/time units, channel/zarr internals)."""
+    if metadata is None or not hasattr(metadata, "columns"):
+        return []
+    exclude = METADATA_TECHNICAL_PATTERNS
+    return [c for c in metadata.columns if not any(pat in c.lower() for pat in exclude)]
+
+
+def merge_condition_columns_into_obs(adata, metadata, columns, key_col="sample_name"):
+    """Left-join `columns` from `metadata` into `adata.obs` on `key_col`, for any
+    column not already present in `adata.obs`. Returns adata (mutated in place)."""
+    if adata is None or not hasattr(adata, "obs"):
+        return adata
+    if metadata is None or key_col not in getattr(metadata, "columns", []):
+        return adata
+    cols_to_add = [c for c in columns if c not in adata.obs.columns and c in metadata.columns]
+    if not cols_to_add:
+        return adata
+    meta_subset = metadata[[key_col] + cols_to_add].drop_duplicates(subset=[key_col])
+    orig_index = adata.obs.index
+    merged = adata.obs.merge(meta_subset, on=key_col, how="left")
+    merged.index = orig_index
+    adata.obs = merged
+    return adata

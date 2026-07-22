@@ -27,6 +27,7 @@ from behav3d.core.metadata import (
     filter_multicolor_inputs,
     has_dead_channel,
     is_multicolor_celltype,
+    list_grouping_candidate_columns,
 )
 from behav3d.core.utils import expand_column_patterns
 from behav3d.io.formats.zarr import load_zarr
@@ -39,6 +40,10 @@ from behav3d.analysis.behavior.track.visualization.plots.feature_dtw import (
     plot_clustering_feature_heatmap,
     plot_feature_umap,
 )
+from behav3d.analysis.behavior.general.visualization.plots.proportion_bars import (
+    hash_stable_label_color_map,
+)
+from behav3d.analysis.behavior.track.utils import _resolve_dtaidistance_paths
 from behav3d.analysis.behavior.track.visualization.plots.exemplar_track_per_cluster import (
     save_exemplar_statebar_backprojection_pdf,
     save_exemplar_statebar_backprojection_video_per_cluster,
@@ -869,10 +874,6 @@ class TrackFilterPanel:
         self.has_dead_channel_in_metadata = has_dead_channel(self.metadata_loader.metadata)
         self.category = detect_cell_type_category(self.cell_type, metadata_loader.metadata)
         
-        active_killing_dir = Path(self.output_dir, "analysis", self.cell_type, "active_killing")
-        self._advanced_features_path = Path(active_killing_dir, f"BEHAV3D_{self.cell_type}_advanced_track_features.csv")
-        self._use_advanced_features = self._advanced_features_path.exists()
-        
         params = self.metadata_loader.behav3d_parameters
         cfg = params.setdefault("track_filtering", {}).setdefault(self.cell_type, {})
         
@@ -961,13 +962,18 @@ class TrackFilterPanel:
         w_list = [self.en_exp_duration, self.exp_duration, self.en_min_length, self.min_track_length, self.en_max_length, self.max_track_length, self.en_min_size, self.min_size_val, self.filter_t0_dead, self.time_type, self.btn_run, self.btn_preview_lengths]
         for w in w_list: w.disabled = locked
 
+    def _get_advanced_features_path(self):
+        from behav3d.features.advanced_timepoint_features import find_advanced_features_csv
+        return find_advanced_features_csv(self.output_dir, self.cell_type)
+
     def _on_preview_lengths_clicked(self, *_):
         self._lock(True)
         self.out_preview.clear_output()
         self.spinner_html.layout.display = None
         with self.out_preview:
             try:
-                df_input_path = str(self._advanced_features_path) if self._use_advanced_features else None
+                adv_path = self._get_advanced_features_path()
+                df_input_path = str(adv_path) if adv_path is not None else None
                 preview_track_length_before_filtering(
                     metadata=self.metadata_loader.metadata,
                     output_dir=self.output_dir,
@@ -1000,7 +1006,8 @@ class TrackFilterPanel:
                 })
                 with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f: yaml.safe_dump(self.metadata_loader.behav3d_parameters, f, sort_keys=False)
 
-                df_input_path = str(self._advanced_features_path) if self._use_advanced_features else None
+                adv_path = self._get_advanced_features_path()
+                df_input_path = str(adv_path) if adv_path is not None else None
                 filter_tracks(
                     metadata=self.metadata_loader.metadata,
                     output_dir=self.output_dir,
@@ -2157,6 +2164,23 @@ class DeathDynamicsPanel:
         self.spinner_html.layout.display = "none"
         self.out = widgets.Output()
 
+        # Condition columns to group/color the mean +/- SEM plots by (e.g.
+        # organoid_line + macrophage_line), mirroring the state-composition
+        # "group by" multi-select pattern.
+        md = self.metadata_loader.metadata
+        group_col_options = []
+        if md is not None and hasattr(md, "columns"):
+            group_col_options = [
+                c for c in md.columns
+                if c in ("exp_nr", "well") or c.endswith("_line_condition")
+            ]
+        self.select_group_cols = widgets.SelectMultiple(
+            options=group_col_options,
+            value=[],
+            layout=widgets.Layout(width="360px", height="80px"),
+            disabled=len(group_col_options) == 0,
+        )
+
         if not self.has_dead_channel_in_metadata:
             self.ui = widgets.VBox([
                 widgets.HTML(f'<b>{self.cell_type} Death Dynamics</b>'),
@@ -2170,6 +2194,8 @@ class DeathDynamicsPanel:
         else:
             self.ui = widgets.VBox([
                 widgets.HTML(f'<b>{self.cell_type} Death Dynamics</b>'),
+                widgets.HTML('Group plots by condition column(s) (hold Ctrl/Cmd to select multiple):'),
+                self.select_group_cols,
                 widgets.HBox([self.btn_run, self.spinner_html]),
                 self.out
             ])
@@ -2184,7 +2210,8 @@ class DeathDynamicsPanel:
                     output_dir=self.output_dir,
                     df_tracks_path=None,
                     org_type=self.cell_type,
-                    metadata=self.metadata_loader.metadata
+                    metadata=self.metadata_loader.metadata,
+                    group_cols=list(self.select_group_cols.value) or None,
                 )
                 print(f"{self.cell_type} death dynamics complete!")
             except Exception:
@@ -3148,6 +3175,14 @@ class MotileCellAnalysisPanel:
         self.spinner_html = widgets.HTML(value=spinning_loader)
         self.spinner_html.layout.display = "none"
         self.out = widgets.Output()
+        group_col_options = list_grouping_candidate_columns(getattr(self.metadata_loader, "metadata", None))
+        self.group_cols_select = widgets.SelectMultiple(
+            options=group_col_options,
+            value=[],
+            description="",
+            layout=widgets.Layout(width="360px", height="80px"),
+            disabled=len(group_col_options) == 0,
+        )
 
         self.backproj_pdf = widgets.Checkbox(
             description="Backprojection PDFs",
@@ -3202,6 +3237,15 @@ class MotileCellAnalysisPanel:
         self.rename_spinner = widgets.HTML(value=spinning_loader)
         self.rename_spinner.layout.display = "none"
         self.out_rename_feature_dtw = widgets.Output()
+        self.btn_track_proportions = widgets.Button(
+            description="Create track proportion plots",
+            button_style="info",
+            layout=widgets.Layout(width="260px"),
+        )
+        self.btn_track_proportions.on_click(self._on_track_proportions_clicked)
+        self.track_proportions_spinner = widgets.HTML(value=spinning_loader)
+        self.track_proportions_spinner.layout.display = "none"
+        self.out_track_proportions = widgets.Output()
         self.napari_sample_dd = widgets.Dropdown(
             description="Sample",
             options=[],
@@ -3255,6 +3299,12 @@ class MotileCellAnalysisPanel:
             feature_section,
             widgets.HBox([self.umap_dist, self.umap_neigh, self.clusters]),
             widgets.HBox([self.en_min_track_length, self.min_track_length, self.en_max_track_length, self.max_track_length]),
+            widgets.HTML(
+                "<b>Group classification plots by:</b><br>"
+                "<span style='color:#555;'>Select 1-2 metadata columns to arrange the cluster "
+                "percentage grid by condition. Hold Ctrl/Cmd to select multiple.</span>"
+            ),
+            self.group_cols_select,
             widgets.HBox([self.btn_run, self.spinner_html]),
             self.out,
             widgets.HTML("<b>Track backprojection:</b>"),
@@ -3267,6 +3317,19 @@ class MotileCellAnalysisPanel:
             self.rename_rows,
             widgets.HBox([self.btn_refresh_rename, self.btn_rename_feature_dtw, self.rename_spinner]),
             self.out_rename_feature_dtw,
+            widgets.HTML(
+                "<b>Track-class proportions:</b><br>"
+                "<span style='color:#555;'>Regenerate the per-sample cluster-percentage plot (and the "
+                "grouped grid) using the current renamed cluster names.</span>"
+            ),
+            widgets.HTML(
+                "<b>Group classification plots by:</b><br>"
+                "<span style='color:#555;'>Select 1-2 metadata columns to arrange the cluster "
+                "percentage grid by condition. Hold Ctrl/Cmd to select multiple.</span>"
+            ),
+            self.group_cols_select,
+            widgets.HBox([self.btn_track_proportions, self.track_proportions_spinner]),
+            self.out_track_proportions,
             widgets.HTML("<b>Napari backprojection:</b>"),
             widgets.HBox([self.napari_sample_dd, self.napari_workers, self.btn_refresh_napari_samples]),
             widgets.HBox([self.btn_open_napari_backprojection, self.napari_spinner]),
@@ -3347,6 +3410,20 @@ class MotileCellAnalysisPanel:
         except Exception:
             return {}
 
+    def _load_feature_dtw_cluster_colors(self):
+        mapping_path = self._feature_dtw_rename_mapping_path()
+        if not mapping_path.exists():
+            return {}
+        try:
+            with mapping_path.open("r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            colors = data.get("cluster_colors", {})
+            if not isinstance(colors, dict):
+                return {}
+            return {str(k): str(v) for k, v in colors.items()}
+        except Exception:
+            return {}
+
     def _feature_dtw_output_csv_paths(self):
         outdir = Path(self.output_dir, "analysis", self.cell_type, "timepoint_feature_dtw")
         return [
@@ -3357,6 +3434,9 @@ class MotileCellAnalysisPanel:
 
     def _feature_dtw_outdir(self):
         return Path(self.output_dir, "analysis", self.cell_type, "timepoint_feature_dtw")
+
+    def _feature_dtw_behavior_proportions_outdir(self):
+        return _resolve_dtaidistance_paths(self.output_dir, self.cell_type)["behavior_proportions_outfolder"]
 
     def _snapshot_feature_dtw_before_renaming(self):
         outdir = self._feature_dtw_outdir()
@@ -3445,6 +3525,7 @@ class MotileCellAnalysisPanel:
 
         sample_cols = self._feature_dtw_sample_cols(df_plot)
         info_cols = self._feature_dtw_plot_info_cols(df_plot)
+        cluster_colors = self._load_feature_dtw_cluster_colors()
 
         cluster_UMAP_path = outdir / f"BEHAV3D_{self.cell_type}_UMAP_clusters.pdf"
         plot_feature_umap(
@@ -3457,6 +3538,7 @@ class MotileCellAnalysisPanel:
             rows_first_img=2,
             figsize=(8.27, 11.69),
             plot_results=True,
+            cluster_colors=cluster_colors,
         )
 
         heatmap_path = outdir / f"BEHAV3D_{self.cell_type}_UMAP_cluster_feature_heatmap.pdf"
@@ -3472,15 +3554,18 @@ class MotileCellAnalysisPanel:
         )
 
         df_clust_perc = self._feature_dtw_cluster_percentage_groups(df_plot)
-        perc_prefix = outdir / f"BEHAV3D_{self.cell_type}_UMAP_cluster_percentages"
+        prop_outdir = self._feature_dtw_behavior_proportions_outdir()
+        prop_outdir.mkdir(parents=True, exist_ok=True)
+        perc_prefix = prop_outdir / f"BEHAV3D_{self.cell_type}_UMAP_cluster_percentages"
         if df_clust_perc is not None:
             perc_csv = perc_prefix.with_suffix(".csv")
             df_clust_perc.to_csv(perc_csv, index=False)
             plot_cluster_percentage_bars(
                 df_clust_perc,
                 perc_prefix,
-                group_by_columns=None,
+                group_cols=list(self.group_cols_select.value) or None,
                 plot_results=True,
+                cluster_colors=cluster_colors,
             )
 
         return {
@@ -3496,6 +3581,7 @@ class MotileCellAnalysisPanel:
             self.rename_rows.children = []
             self.rename_status.value = "<i>Run Feature DTW first to rename clusters.</i>"
             self.btn_rename_feature_dtw.disabled = True
+            self.btn_track_proportions.disabled = True
             return
 
         try:
@@ -3504,6 +3590,7 @@ class MotileCellAnalysisPanel:
             self.rename_rows.children = []
             self.rename_status.value = f"<i>Could not load Feature DTW clusters: {exc}</i>"
             self.btn_rename_feature_dtw.disabled = True
+            self.btn_track_proportions.disabled = True
             return
 
         clusters = sorted(df["ClusterID"].dropna().astype(str).unique().tolist())
@@ -3523,6 +3610,7 @@ class MotileCellAnalysisPanel:
         self.rename_rows.children = rows
         self.rename_status.value = f"<b>Feature DTW clusters:</b> {len(rows)}"
         self.btn_rename_feature_dtw.disabled = len(rows) == 0
+        self.btn_track_proportions.disabled = len(rows) == 0
 
     def _on_refresh_feature_dtw_rename_clicked(self, *_):
         self._rebuild_feature_dtw_rename_rows()
@@ -3541,6 +3629,9 @@ class MotileCellAnalysisPanel:
                 copied = self._snapshot_feature_dtw_before_renaming()
                 mapping_path = self._feature_dtw_rename_mapping_path()
                 mapping_path.parent.mkdir(parents=True, exist_ok=True)
+                existing_colors = self._load_feature_dtw_cluster_colors()
+                new_names = sorted(set(str(v) for v in mapping.values()))
+                cluster_colors = hash_stable_label_color_map(new_names, colors=existing_colors)
                 with mapping_path.open("w", encoding="utf-8") as f:
                     yaml.safe_dump(
                         {
@@ -3548,6 +3639,7 @@ class MotileCellAnalysisPanel:
                             "cluster_id_column": "ClusterID",
                             "cluster_name_column": "ClusterName",
                             "cluster_names": mapping,
+                            "cluster_colors": cluster_colors,
                         },
                         f,
                         sort_keys=False,
@@ -3587,6 +3679,22 @@ class MotileCellAnalysisPanel:
             finally:
                 self.rename_spinner.layout.display = "none"
                 self.btn_rename_feature_dtw.disabled = False
+
+    def _on_track_proportions_clicked(self, *_):
+        self.btn_track_proportions.disabled = True
+        self.track_proportions_spinner.layout.display = None
+        self.out_track_proportions.clear_output()
+        with self.out_track_proportions:
+            try:
+                regenerated = self._regenerate_feature_dtw_renamed_plots()
+                print("Regenerated track-class proportion plots:")
+                for path in regenerated.values():
+                    print(f"  - {path}")
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self.track_proportions_spinner.layout.display = "none"
+                self.btn_track_proportions.disabled = False
 
     @staticmethod
     def _adata_like_from_obs(obs):
@@ -3871,7 +3979,7 @@ class MotileCellAnalysisPanel:
             try:
                 self._panel_cfg.update({"seed": int(self.seed_widget.value), "umap_min_dist": float(self.umap_dist.value), "umap_n_neighbors": int(self.umap_neigh.value), "nr_of_clusters": int(self.clusters.value), "dtw_features_input": sel, "feature_scaling_preset": scaling_preset, "min_track_length_enabled": bool(self.en_min_track_length.value), "min_track_length": int(self.min_track_length.value), "max_track_length_enabled": bool(self.en_max_track_length.value), "max_track_length": int(self.max_track_length.value)})
                 with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f: yaml.safe_dump(self._params, f, sort_keys=False)
-                run_tcell_analysis(cell_type=self.cell_type, output_dir=self.output_dir, df_tracks_path=str(self.df_tracks_path), columns_to_use=sel, columns_to_normalize=sel, umap_minimal_distance=float(self.umap_dist.value), umap_n_neighbors=int(self.umap_neigh.value), nr_of_clusters=int(self.clusters.value), plot_results=True, seed=int(self.seed_widget.value), output_subdir_name="timepoint_feature_dtw", feature_scaling_preset=scaling_preset, min_track_length=min_track_length, max_track_length=max_track_length)
+                run_tcell_analysis(cell_type=self.cell_type, output_dir=self.output_dir, df_tracks_path=str(self.df_tracks_path), columns_to_use=sel, columns_to_normalize=sel, umap_minimal_distance=float(self.umap_dist.value), umap_n_neighbors=int(self.umap_neigh.value), nr_of_clusters=int(self.clusters.value), plot_results=True, seed=int(self.seed_widget.value), output_subdir_name="timepoint_feature_dtw", feature_scaling_preset=scaling_preset, min_track_length=min_track_length, max_track_length=max_track_length, cluster_percentage_group_by=list(self.group_cols_select.value) or None)
                 self._rebuild_feature_dtw_rename_rows()
                 self._refresh_feature_dtw_napari_samples()
                 print(f"✅ {self.cell_type} analysis complete!")

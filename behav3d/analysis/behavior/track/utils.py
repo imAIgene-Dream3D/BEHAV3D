@@ -29,8 +29,9 @@ def _resolve_dtaidistance_paths(output_dir, cell_type, output_subdir_name="behav
     outfolder = analysis_outdir / str(output_subdir_name)
     clustering_outfolder = outfolder / "clustering"
     quality_control_outfolder = outfolder / "quality_control"
+    behavior_proportions_outfolder = outfolder / "behavior_proportions"
+    behavior_comparisons_outfolder = outfolder / "behavior_comparisons"
     outfolder.mkdir(parents=True, exist_ok=True)
-    clustering_outfolder.mkdir(parents=True, exist_ok=True)
     quality_control_outfolder.mkdir(parents=True, exist_ok=True)
     return {
         "root": root,
@@ -39,6 +40,8 @@ def _resolve_dtaidistance_paths(output_dir, cell_type, output_subdir_name="behav
         "outfolder": outfolder,
         "clustering_outfolder": clustering_outfolder,
         "quality_control_outfolder": quality_control_outfolder,
+        "behavior_proportions_outfolder": behavior_proportions_outfolder,
+        "behavior_comparisons_outfolder": behavior_comparisons_outfolder,
     }
 
 
@@ -75,13 +78,24 @@ def _filter_tracks_for_dtaidistance(
     trajectory_size=None,
     min_length=None,
     trim_mode="last",
+    split_long_tracks=False,
+    window_col="trajectory_window_id",
 ):
+    """Filter trajectories for one-hot dtaidistance clustering.
+
+    When ``split_long_tracks`` is enabled, over-length tracks are divided into
+    fixed-size, non-overlapping windows while keeping the original ``TrackID``.
+    The added ``window_col`` can be included in downstream grouping to treat
+    each window as an independent analysis trajectory.
+    """
     groupby_cols = [str(c) for c in list(groupby_cols)]
     missing = [col for col in groupby_cols if col not in adata.obs.columns]
     if missing:
         raise KeyError(f"Missing groupby_cols in adata.obs: {missing}")
     if str(time_col) not in adata.obs.columns:
         raise KeyError(f"'{time_col}' not found in adata.obs.")
+    if str(window_col) in groupby_cols:
+        raise ValueError("window_col must not already be present in groupby_cols.")
 
     obs = adata.obs.copy()
     obs["_orig_idx"] = np.arange(len(obs))
@@ -102,14 +116,25 @@ def _filter_tracks_for_dtaidistance(
             raise ValueError("trim_mode must be 'first' or 'last'.")
         obs["_rank"] = obs.groupby(groupby_cols, observed=True).cumcount()
         sizes = obs.groupby(groupby_cols, observed=True)["_rank"].transform("max") + 1
-        if trim_mode == "first":
+        if bool(split_long_tracks):
+            n_windows = sizes // trajectory_size
+            full_window_rows = n_windows * trajectory_size
+            if trim_mode == "first":
+                obs["_window_rank"] = obs["_rank"]
+            else:
+                obs["_window_rank"] = obs["_rank"] - (sizes - full_window_rows)
+            obs = obs.loc[(obs["_window_rank"] >= 0) & (obs["_window_rank"] < full_window_rows)].copy()
+            obs[window_col] = (obs["_window_rank"] // trajectory_size).astype(int)
+        elif trim_mode == "first":
             obs = obs.loc[obs["_rank"] < trajectory_size]
         else:
             obs = obs.loc[obs["_rank"] >= (sizes - trajectory_size)]
 
     idx = obs.index
     adata_out = adata[idx].copy()
-    for col in ["_orig_idx", "_keep", "_rank"]:
+    if bool(split_long_tracks) and trajectory_size is not None:
+        adata_out.obs[window_col] = obs.loc[idx, window_col].to_numpy()
+    for col in ["_orig_idx", "_keep", "_rank", "_window_rank"]:
         if col in adata_out.obs.columns:
             adata_out.obs.drop(columns=[col], inplace=True)
     return adata_out

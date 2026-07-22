@@ -86,13 +86,20 @@ ConvPaint uses [CatBoost](https://catboost.ai), a gradient-boosted decision-tree
 | **Learning rate** | 0.001–1.0 | 0.1 | Shrinkage applied to each new tree's contribution. Lower values need more iterations but generalise better. |
 | **Class weights** | None, Balanced (default), SqrtBalanced | Balanced | How to handle class imbalance when some classes have far fewer painted pixels. `Balanced` uses inverse-frequency weights; `SqrtBalanced` is a milder version. |
 
-Below the classifier group are three global performance checkboxes (all **OFF** by default):
+At the bottom of the Classifier group is **Tile annotations** (**OFF** by default). It's a *training*-only setting, so it's disabled together with the rest of the classifier controls whenever no training images are loaded:
 
 | Checkbox | Effect |
 |---|---|
-| **Tile annotations** | During *training*, only extract features inside annotated regions. Faster when annotations are sparse. |
-| **Tile image** | During *prediction*, extract features in tiles. Reduces peak memory on large images. |
-| **Use Dask** | Parallelises tiled prediction with Dask. Only takes effect when **Tile image** is also on. Beta feature — may not be fully optimised. |
+| **Tile annotations** | During *training*, only extract features inside bounding boxes around annotated regions, instead of the whole image. Faster when annotations are small/sparse relative to the image. No effect on prediction. |
+
+Separately, a **Prediction Performance (large images)** group holds **Tile image** and **Use Dask** (both **OFF** by default). These control *prediction* (Run instance segmentation / Re-run preview / batch processing), so — unlike Tile annotations — they stay enabled even when no training images are loaded, e.g. when using an already-trained/loaded classifier:
+
+| Checkbox | Effect |
+|---|---|
+| **Tile image** | During *prediction*, splits the image into ~1000×1000 px blocks (50 px overlap margin), extracting and classifying each block separately, then stitching results back together. Lower peak memory than processing the whole image at once, at the cost of some recomputation in the overlap margins — somewhat slower when the image already fits comfortably in memory. |
+| **Use Dask** | Parallelises the block-wise predictions from **Tile image** across worker processes. Checking it automatically enables **Tile image**, since Dask has no effect without tiling. Can speed up tiled prediction on machines with several free CPU cores; does not reduce memory further (several blocks are held at once, so peak memory can be *higher* than Tile image alone). Runs every CPU core at once for a sustained period, so on machines prone to power-delivery issues under combined CPU+GPU load, watch long batch jobs. Beta feature — may not be fully optimised. |
+
+**Rule of thumb:** without tiling, ConvPaint processes the whole image in a single pass — fastest when the image fits comfortably in memory, but peak memory usage is highest (the full feature map is held at once). Turn on **Tile image** only once large images start running out of memory or crashing; turn on **Use Dask** on top of that only if you have free CPU cores to spare, since it trades (potentially) higher memory and CPU load for parallel speed.
 
 ### 5 · Per cell-type tab — Instance-preview parameters
 
