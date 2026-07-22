@@ -25,6 +25,10 @@ When checked, propagation runs **once on merged organoid masks** so track IDs ar
 - Multiple organoid types coexist in the same well (e.g. `or_organoidA`, `or_organoidB`) and your main analysis is the combined **`all_organoids`** output (one cohort, one set of paths).
 - You want a unified "any organoid" view without running separate tracking jobs per type.
 
+```{tip}
+The strongest reason to track all organoids together is **signal bleed-through**: when organoid types don't have a cleanly separated colour and one channel leaks into another, tracking each type in isolation can double-count or mis-assign the overlapping regions. Tracking them jointly (while preserving each type of origin) resolves that in one shared scene. As a rule of thumb, **use this whenever you have more than one organoid type in the same well.**
+```
+
 You **can still analyse each organoid type separately** after a combined run: BEHAV3D also writes the usual per-type tracked zarr and CSV (`<sample>_<organoidA>_tracked.zarr`, etc.), filtered from that same propagation. Use those files for type-specific feature extraction — use `all_organoids` only when you want everything in one cohort. For **fully independent** tracking (separate propagation per type, no shared ID space), untick the checkbox instead.
 
 **Unticking** rebuilds one independent sub-tab per organoid type. Each sub-tab has its own "Track all organoids together" checkbox (unchecked there) so you can switch back; the choice is saved in `behav3d_parameters.yml`.
@@ -51,7 +55,7 @@ There are no parameters to change. Tuning Propagation means **improving the segm
 **Tracks are lost as soon as the organoid moves a bit**
 
 - Cause: Propagation assumes the foreground mask of frame `t+1` overlaps the labels of frame `t` (after a 2-pixel dilation). If your organoids actually drift more than ~2 pixels between frames, the overlap fails.
-- Fix: switch to **LAP** (with a small `Track cost`) or **btrack** (with a small `Max search radius`). Both handle organoid-scale motion via centroid distance instead of pixel overlap.
+- Fix: switch to **btrack** (with a small `Max search radius`), which handles organoid-scale motion via a centroid motion model instead of pixel overlap.
 
 **Two organoids that briefly touch end up sharing a track ID**
 
@@ -78,7 +82,7 @@ Metadata columns for each organoid type point at the **per-type** tracked files,
 
 ## Good practices & tips
 
-- **Propagation assumes very low motion.** If applied to fast-moving cells it will lose tracks as soon as a label in frame `t` no longer overlaps with itself in frame `t+1`. Use [LAP](lap), [TrackPy](trackpy), or [btrack](btrack) for fast cells.
+- **Propagation assumes very low motion.** If applied to fast-moving cells it will lose tracks as soon as a label in frame `t` no longer overlaps with itself in frame `t+1`. Use [btrack](btrack) for fast cells.
 - **Because it is overlap-based, segmentation quality dominates.** If the same organoid is over-segmented into two pieces in one frame, those pieces get different track IDs from then on. Fix the segmentation first, or correct with [Manual Editing](manual_editing) after tracking.
 - **The 2-pixel dilation handles small motion drifts** — even slowly-drifting organoids that move a few pixels per frame still propagate cleanly.
 - **Choose *Track all organoids together* based on how tracking should run**, not whether you can analyse types separately afterward. Per-type outputs are still written; the difference is **one merged propagation** (checkbox on) vs **one propagation per type** (checkbox off). Prefer **off** if organoid types must not affect each other during tracking.

@@ -1,6 +1,12 @@
 # 🔬 Cellpose
 
-Cellpose is the **deep-learning instance segmenter** option in BEHAV3D EXPLORER. Unlike the other three methods, Cellpose is *not* a pixel classifier — it outputs cell-level instance labels directly from raw intensities, using a pretrained convolutional neural network ([Stringer et al., Nature Methods 2021](https://www.nature.com/articles/s41592-020-01018-x)). Pick it when:
+Cellpose is the **classic deep-learning instance segmenter** (cellpose v3) in BEHAV3D EXPLORER. Unlike the pixel-classifier methods, Cellpose is *not* a pixel classifier — it outputs cell-level instance labels directly from raw intensities, using a pretrained convolutional neural network ([Stringer et al., Nature Methods 2021](https://www.nature.com/articles/s41592-020-01018-x)).
+
+```{note}
+This page covers **classic Cellpose (v3)**, where you load a pretrained or retrained model file. If you want the newer zero-shot foundation model that needs **no model and no training**, see [Cellpose-SAM (zero-shot)](cellpose_sam) instead — it runs cellpose v4 in a separate sidecar environment.
+```
+
+Pick classic Cellpose when:
 
 - The objects are **roughly round** with **clear boundaries**.
 - A pretrained model already exists for your sample type.

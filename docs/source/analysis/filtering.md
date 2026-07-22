@@ -6,6 +6,10 @@ Tab 6 of the BEHAV3D EXPLORER dock widget. The Filtering tab drops or trims trac
 2. A **summarised per-track table** with one row per surviving track. *Currently consumed only by the legacy DTW-based BEHAV3D analysis (see [below](#what-the-summarised-csv-is-for)).*
 3. A set of **quality-control PDFs** that let you check at a glance how many tracks each filter removed and what the surviving tracks look like.
 
+```{important}
+**Filtering must be run even if you apply no filters at all.** Beyond dropping tracks, this step generates the filtered per-timepoint CSV (and interpolates missing timepoints) that every downstream analysis reads — the pipeline will not proceed to Death Dynamics, Interaction, Invasiveness or Single-Cell classification without it. The downstream state analysis is built to tolerate tracks of uneven length, so the length filters are genuinely optional; running Filtering with everything off still produces the CSV those steps need.
+```
+
 ![Filtering tab](../_static/screenshots/filtering_tab.png)
 
 ```{note}
@@ -58,10 +62,14 @@ Typical values:
 ### 3 · Trim long tracks to max length
 
 > ☑ **Trim tracks to maximum length** — *Max length:* `30`
+> &nbsp;&nbsp;☑ **Split long tracks into chunks** *(sub-option, on by default)*
 
-For each track, keeps only the rows up to the chosen number of frames (or hours) after the track's first appearance. Tracks shorter than the threshold are untouched.
+For each track longer than the threshold, this controls what happens to the extra frames, via the **Split long tracks into chunks** sub-option:
 
-This used to be important for DTW-based behavioural analysis, which needs all tracks to be the same length. Today the main use is when you want to compare conditions of different experiment lengths and need every track aligned to the same observation window.
+- **Split on (default):** the track is cut into **consecutive full-length chunks** rather than cropped. The first chunk keeps the original `TrackID`; each following full-length chunk becomes a **new** track (a leftover remainder shorter than the max length is discarded). Every row keeps an `original_TrackID` so backprojection can still paint the real, unsplit track. E.g. a 100-timepoint track at max length 30 yields three 30-frame tracks.
+- **Split off:** the track is simply **cropped** to the first *max-length* frames; the rest is dropped.
+
+This used to be important for DTW-based behavioural analysis, which needs all tracks to be the same length. Today the main use is when you want to compare conditions of different experiment lengths and need every track aligned to the same observation window. (The [Track Classification](single_cell/track_classification.md) step offers an equivalent trajectory-size / split control, so you can decide whether to do this here or there.)
 
 ### 4 · Filter by minimum size at the first timepoint
 

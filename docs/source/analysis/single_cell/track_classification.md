@@ -180,7 +180,8 @@ The folder name on disk is `behavorial_trajectories`. The easiest way to reopen 
 ## Tips & best practices
 
 - **Run State Classification first** (for the categorical method). The default clustering compares behavioural-state sequences, so it needs the per-timepoint states to exist for the cell type.
-- **Start with fewer clusters.** Begin around the default *N clusters* and increase only if distinct trajectory types are being merged.
+- **Start with fewer clusters.** Begin around the default *N clusters* and increase only if distinct trajectory types are being merged. Clusters can always be **merged afterwards** during renaming (give two clusters the same name), so err on the side of a few too many rather than too few.
+- **Leave Linkage on `average`.** `complete` gives comparable results and is worth trying; **`single` rarely works well** for these distances. Agglomerative clustering is preferred over k-means here, with the caveat that the resulting UMAP embedding can look poor even when the clusters themselves are sensible.
 - **Use Variable-length mode for uneven tracks.** If your tracks differ a lot in length and resampling distorts them, switch *Trajectory size* to its minimum (Variable-length) so DTW compares native lengths.
 - **Save the distance matrix only when you need it.** It grows with the square of the number of tracks and is rarely needed for routine analysis.
 - **Queue the heavy steps.** DTW clustering and classifier training are CPU-intensive — use the **+🛒** buttons to run them unattended behind your other pipeline steps.

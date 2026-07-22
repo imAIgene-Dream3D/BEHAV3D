@@ -1,11 +1,12 @@
-# 💀 Death Dynamics & Interaction
+# 💀 Death Dynamics, Interaction & Invasiveness
 
-The first sub-tab of the **📊 Analysis** tab. It answers two related questions about your **target** cells (organoids, or any "other" cell type) and the **effector** cells that contact them (immune cells, or "other"):
+The first sub-tab of the **📊 Analysis** tab. It answers three related questions about your **target** cells (organoids, or any "other" cell type) and the **effector** cells that contact them (immune cells, or "other"):
 
 1. **Death Dynamics** — how, and how fast, does each target population die over the course of the movie?
 2. **Interaction Analysis** — how do contacts between targets and effectors relate to target death and effector behaviour?
+3. **Invasiveness Analysis** — how deeply do the immune cells engage the organoid surface (from the *immune* cell's perspective)?
 
-Both steps read the **filtered** per-timepoint feature tables produced by the [Filtering](filtering.md) tab, so you must run Feature Extraction and Filtering for every cell type involved before anything here will turn on.
+All three steps read the **filtered** per-timepoint feature tables produced by the [Filtering](filtering.md) tab, so you must run Feature Extraction and Filtering for every cell type involved before anything here will turn on.
 
 ![Death Dynamics sub-tab](../_static/screenshots/death_dynamics_tab.png)
 
@@ -49,6 +50,16 @@ Select your target(s) **first**. The interaction-cell list only becomes meaningf
 ## Step 1 — Death Dynamics
 
 Quantifies the death progression of the selected target population(s) over time, using the sticky `dead` flag and the dead-mask signal computed during Feature Extraction.
+
+The headline curve is the **percentage of dead targets at each timepoint**, and the death-signal traces are **baseline-normalised** (shifted so each starts at 0) so an already-dead baseline doesn't skew the trend:
+
+$$
+\%\text{dead}(t) = 100 \times \frac{\#\{\text{targets flagged dead at } t\}}{\#\{\text{tracked targets}\}}
+\qquad
+\Delta D(t) = D(t) - D(t_0)
+$$
+
+where $D$ is the dead-mask signal (`percentage_dead_mask` or `nr_dead_mask_pixels`) and $t_0$ is the track's first timepoint.
 
 | Button | What it does | Enabled when |
 |---|---|---|
@@ -141,6 +152,46 @@ A per-pair statistics CSV is written next to each per-pair PDF in `interaction_a
 ```{note}
 The death-aware panels (alive-vs-dead, cumulative-to-death, active-killing dashboard) only appear when the death classification exists. With no dead channel, the PDF simply contains the contact-accumulation plots.
 ```
+
+## Step 3 — Invasiveness Analysis
+
+Where Interaction Analysis looks at *contact*, Invasiveness measures how much of each **immune** cell's surface is engaging an organoid — the same **Organoid Invasiveness** feature computed during [Feature Extraction](feature_extraction) (percentage of the immune cell's surface within contact distance of an organoid; "invasive" once that reaches ≥ 50 %). This step has its **own** immune-cell picker and target checkboxes, independent of the target/effector selectors above.
+
+```{important}
+Invasiveness Analysis only works if you ran Feature Extraction for the immune cell type with the **Organoid Invasiveness** family enabled (which also requires **Contact**). Without the `{target}_invasiveness_perc` columns there is nothing to plot.
+```
+
+| Control | Default | Meaning |
+|---|---|---|
+| **Immune cell type(s)** | — | Which immune types to analyse (checkboxes). |
+| **🎯 Targets to compare** | — | Which organoid targets to measure invasiveness against. |
+| **Per-movie summary stat** | mean | How to collapse each movie's over-time curve to a single dot per movie: `mean`, `median`, `max`, or `AUC`. |
+| **Separate by immune line condition** | OFF | Split results by the immune cell's `line_condition` instead of pooling all conditions. |
+| **Timepoint range** | All timepoints | Restrict the analysis to a custom `Start T` – `End T` window. |
+
+The analysis produces three views:
+
+- **Fraction invasive over time** — the % of immune cells flagged invasive (≥ 50 % surface contact) at each timepoint.
+- **Mean / median % over time** — the average / typical surface-contact percentage across *all* cells (including non-invasive 0 % ones) at each timepoint.
+- **Per-movie summary** — the chosen over-time curve collapsed to one dot per movie using the summary stat.
+
+```{note}
+**mean vs. AUC for the per-movie summary.** `mean` is the plain average of the per-timepoint values; **AUC** is the area under the per-timepoint curve normalized by the time span (a trapezoidal integral ÷ duration), which keeps it on the same 0–100 scale but weights *sustained* engagement over brief spikes. Both the per-timepoint trace and a per-movie summary are usually worth reporting together.
+```
+
+Buttons mirror the other steps: **▶ Run Invasiveness Analysis**, **+🛒** to queue, and **👁** to reopen the result PDF.
+
+### Invasiveness outputs
+
+Written under `<output_dir>/analysis/<immune_type>/invasiveness_analysis/`:
+
+| File | Contents |
+|---|---|
+| `BEHAV3D_<immune_type>_invasiveness_analysis.pdf` | All the figures: the **fraction-invasive-over-time** curve, the **mean/median surface-contact-% over time** curve, the **per-movie summary** (one dot per movie, using the chosen stat), and — if organoid targets with death data are selected — **fate violins** comparing contact-% / invasive-cell counts on organoids that died vs. survived. |
+| `invasiveness_fraction_over_time_<immune_type>.csv` | The per-timepoint fraction of invasive cells (the boolean-≥50 % curve), per sample / target. |
+| `invasiveness_perc_over_time_<immune_type>.csv` | The per-timepoint mean/median surface-contact percentage. |
+| `invasiveness_per_movie_summary_<immune_type>.csv` | One row per movie: the over-time curve collapsed with the chosen summary stat. |
+| `invasiveness_by_fate_<target>_<immune_type>.csv` | Per-organoid contact-%/invasive counts split by whether that organoid died (only when organoid targets with death data are selected). |
 
 ## Run All Available
 

@@ -18,6 +18,7 @@ extensions = [
     "sphinx.ext.napoleon",
     "sphinx.ext.viewcode",
     "sphinx.ext.intersphinx",
+    "sphinx.ext.mathjax",
     "myst_parser",
     "sphinx_copybutton",
     "sphinx_design",
@@ -74,6 +75,7 @@ myst_enable_extensions = [
     "substitution",
     "attrs_inline",
     "attrs_block",
+    "dollarmath",
 ]
 
 # Auto-generate anchor slugs for headings (h1–h4) so in-page and cross-page
