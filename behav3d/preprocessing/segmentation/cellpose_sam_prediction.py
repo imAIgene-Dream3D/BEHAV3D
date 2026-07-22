@@ -409,7 +409,7 @@ def run_cellpose_sam_segmentation(
     size_filter: Optional[dict] = None,
     overwrite_existing: bool = True,
     skip_existing: bool = False,
-    resume: bool = False,
+    resume: bool = True,
     n_threads: Optional[int] = None,
     cooldown_s: float = 0.0,
     progress_cb: Optional[Callable] = None,

@@ -3632,6 +3632,11 @@ class CellposeSAMWidget(QWidget):
         # Advanced settings: nested inside this same section, collapsed and
         # scrollable so the long list of normalization/filter knobs doesn't
         # dominate the page until someone actually wants them.
+        from behav3d.preprocessing.segmentation.cellpose_sam_prediction import (
+            power_safe_settings,
+        )
+        self._power_safe_preset = power_safe_settings()
+
         adv_section = CollapsibleSection("Advanced (normalization, filters)", expanded=False)
         adv_scroll = QScrollArea()
         adv_scroll.setWidgetResizable(True)
@@ -3753,6 +3758,36 @@ class CellposeSAMWidget(QWidget):
             "relies on the size filter below instead."
         ))
 
+        self.spin_n_threads = QSpinBox()
+        self.spin_n_threads.setRange(0, 256)
+        self.spin_n_threads.setValue(int(cfg.get("n_threads", 0)))
+        adv_form.addRow("CPU threads (0=all):", make_help_row(
+            self.spin_n_threads,
+            "CPU Threads",
+            "Cap on CPU threads used for mask post-processing and compression. "
+            "0 = use every logical core.\n\n"
+            "A full Cellpose-SAM run saturates the GPU and every CPU core at "
+            "once, which on some laptops draws more power than the machine's "
+            "power delivery can sustain, causing an abrupt shutdown mid-run. "
+            f"If that happens, try capping this around "
+            f"{self._power_safe_preset['n_threads']} threads."
+        ))
+
+        self.spin_cooldown = QDoubleSpinBox()
+        self.spin_cooldown.setRange(0.0, 120.0)
+        self.spin_cooldown.setSingleStep(1.0)
+        self.spin_cooldown.setValue(float(cfg.get("cooldown_s", 0.0)))
+        adv_form.addRow("Cooldown between frames (s):", make_help_row(
+            self.spin_cooldown,
+            "Cooldown Between Frames",
+            "Idle time inserted after each timepoint, letting the voltage "
+            "regulators and battery recover between GPU bursts. 0 = no pause.\n\n"
+            "Combine with a lower batch size and a capped CPU-thread count if "
+            "the machine powers off part-way through a run; "
+            f"{self._power_safe_preset['cooldown_s']:g}s is a reasonable "
+            "starting point."
+        ))
+
         set_outer.addWidget(adv_section)
         content_layout.addWidget(set_group)
 
@@ -3834,82 +3869,6 @@ class CellposeSAMWidget(QWidget):
         preview_row.addWidget(self.btn_preview, stretch=1)
         filt_layout.addLayout(preview_row)
         content_layout.addWidget(filt_group)
-
-        # --- Section 6: Reliability on long runs -------------------------
-        # A full Cellpose-SAM run saturates the GPU and every CPU core at once for
-        # a long time. Machines whose power delivery cannot sustain both rails
-        # shut down mid-run - abruptly, with no traceback to catch. These two
-        # options work from opposite ends: survive it, or stop provoking it.
-        from behav3d.preprocessing.segmentation.cellpose_sam_prediction import (
-            power_safe_settings,
-        )
-        self._power_safe_preset = power_safe_settings()
-
-        rel_group = QGroupBox("6. Reliability on long runs")
-        rel_layout = QVBoxLayout()
-        rel_group.setLayout(rel_layout)
-
-        resume_row = QHBoxLayout()
-        self.check_resume = QCheckBox("Resume interrupted run")
-        self.check_resume.setChecked(bool(cfg.get("resume", False)))
-        resume_row.addWidget(self.check_resume)
-        resume_row.addWidget(HelpButton(
-            "Resume Interrupted Run",
-            "Keeps the timepoints already segmented and processes only the "
-            "missing ones, using the progress journal written beside the output "
-            "zarr.\n\n"
-            "Without this, re-running a full range starts from scratch and "
-            "discards everything the interrupted run produced.\n\n"
-            "It refuses to run if any setting that affects the result has "
-            "changed since the interrupted run, so a single output can never "
-            "mix frames from two different segmentations."
-        ))
-        resume_row.addStretch()
-        rel_layout.addLayout(resume_row)
-
-        ps_row = QHBoxLayout()
-        self.check_power_safe = QCheckBox("Power-safe mode")
-        self.check_power_safe.setChecked(bool(cfg.get("power_safe", False)))
-        ps_row.addWidget(self.check_power_safe)
-        ps_row.addWidget(HelpButton(
-            "Power-Safe Mode",
-            "Runs slower but with a much flatter power draw: batch size "
-            f"{self._power_safe_preset['batch_size']}, "
-            f"{self._power_safe_preset['n_threads']} CPU threads, and a "
-            f"{self._power_safe_preset['cooldown_s']:g}s pause between "
-            "timepoints.\n\n"
-            "Use this if the machine freezes, reboots or powers off part-way "
-            "through a run. That symptom is a power or thermal limit, not a "
-            "memory one -- Cellpose-SAM is unusual in loading the GPU and every "
-            "CPU core simultaneously for minutes at a time, and laptops in "
-            "particular are rarely built to sustain both at once."
-        ))
-        ps_row.addStretch()
-        rel_layout.addLayout(ps_row)
-
-        rel_form = QFormLayout()
-        self.spin_n_threads = QSpinBox()
-        self.spin_n_threads.setRange(0, 256)
-        self.spin_n_threads.setValue(int(cfg.get("n_threads", 0)))
-        self.spin_n_threads.setToolTip(
-            "Cap on CPU threads for mask post-processing and compression. "
-            "0 = use every logical core."
-        )
-        rel_form.addRow("CPU threads (0=all):", self.spin_n_threads)
-
-        self.spin_cooldown = QDoubleSpinBox()
-        self.spin_cooldown.setRange(0.0, 120.0)
-        self.spin_cooldown.setSingleStep(1.0)
-        self.spin_cooldown.setValue(float(cfg.get("cooldown_s", 0.0)))
-        self.spin_cooldown.setToolTip(
-            "Idle time after each timepoint, letting the voltage regulators and "
-            "battery recover between GPU bursts. 0 = no pause."
-        )
-        rel_form.addRow("Cooldown between frames (s):", self.spin_cooldown)
-        rel_layout.addLayout(rel_form)
-
-        self.check_power_safe.toggled.connect(self._on_power_safe_toggled)
-        content_layout.addWidget(rel_group)
 
         # --- Run ---------------------------------------------------------
         run_row = QHBoxLayout()
@@ -4067,29 +4026,6 @@ class CellposeSAMWidget(QWidget):
             return "cpu"
         return str(self.combo_gpu_device.currentData() or "auto")
 
-    def _on_power_safe_toggled(self, checked):
-        """Write the power-safe preset through to the individual knobs.
-
-        Writing through rather than shadowing keeps the panel honest: what the
-        run uses is always what is displayed, and anyone who wants a different
-        trade-off can still adjust a single value afterwards.
-        """
-        if checked:
-            self._pre_power_safe = {
-                "batch_size": int(self.spin_batch_size.value()),
-                "n_threads": int(self.spin_n_threads.value()),
-                "cooldown_s": float(self.spin_cooldown.value()),
-            }
-            self.spin_batch_size.setValue(int(self._power_safe_preset["batch_size"]))
-            self.spin_n_threads.setValue(int(self._power_safe_preset["n_threads"]))
-            self.spin_cooldown.setValue(float(self._power_safe_preset["cooldown_s"]))
-        else:
-            previous = getattr(self, "_pre_power_safe", None)
-            if previous:
-                self.spin_batch_size.setValue(previous["batch_size"])
-                self.spin_n_threads.setValue(previous["n_threads"])
-                self.spin_cooldown.setValue(previous["cooldown_s"])
-
     def _persist_params(self):
         cfg = self.metadata_loader.behav3d_parameters.setdefault("cellpose_sam", {})
         cfg.update(self._collect_sam_params())
@@ -4103,8 +4039,6 @@ class CellposeSAMWidget(QWidget):
         cfg["tp_end"] = int(self.spin_t_end.value())
         cfg["preview_sample"] = self.combo_preview_sample.currentText()
         cfg["preview_timepoint"] = int(self.spin_preview_t.value())
-        cfg["resume"] = bool(self.check_resume.isChecked())
-        cfg["power_safe"] = bool(self.check_power_safe.isChecked())
         cfg["n_threads"] = int(self.spin_n_threads.value())
         cfg["cooldown_s"] = float(self.spin_cooldown.value())
 
@@ -4329,7 +4263,6 @@ class CellposeSAMWidget(QWidget):
             "model_name": self.combo_model.currentText(),
             "device": str(self.combo_gpu_device.currentData() or "auto"),
             "force_cpu": bool(self.btn_force_cpu.isChecked()),
-            "resume": bool(self.check_resume.isChecked()),
             "n_threads": int(self.spin_n_threads.value()) or None,
             "cooldown_s": float(self.spin_cooldown.value()),
         }
@@ -4436,7 +4369,6 @@ class CellposeSAMWidget(QWidget):
         device = self._selected_device()
         force_cpu = bool(self.btn_force_cpu.isChecked())
         size_filters = (self._cfg().get("size_filter") or {})
-        resume = bool(self.check_resume.isChecked())
         n_threads = int(self.spin_n_threads.value()) or None
         cooldown_s = float(self.spin_cooldown.value())
 
@@ -4475,7 +4407,7 @@ class CellposeSAMWidget(QWidget):
                     force_cpu=force_cpu,
                     sam_params=params,
                     size_filter=size_filters.get(ct),
-                    resume=resume,
+                    resume=True,
                     n_threads=n_threads,
                     cooldown_s=cooldown_s,
                     overwrite_existing=overwrite,

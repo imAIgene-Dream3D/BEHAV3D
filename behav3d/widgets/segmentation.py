@@ -2255,6 +2255,11 @@ class CellposeSAMInferencePanel:
             description="Remove flat (single-slice) segments", indent=False,
         )
 
+        from behav3d.preprocessing.segmentation.cellpose_sam_prediction import (
+            power_safe_settings,
+        )
+        self._power_safe_preset = power_safe_settings()
+
         # Advanced / normalization
         self.norm_low = widgets.FloatText(value=float(cfg.get("norm_percentile_low", 1.0)),
                                           description="Norm pct low:",
@@ -2287,6 +2292,14 @@ class CellposeSAMInferencePanel:
         self.tile_norm_smooth3D = widgets.FloatText(
             value=float(cfg.get("tile_norm_smooth3D", 0.0)),
             description="Tile norm smooth3D:", style={"description_width": "initial"})
+        self.n_threads = widgets.IntText(
+            value=int(cfg.get("n_threads", 0)), description="CPU threads (0=all):",
+            style={"description_width": "initial"},
+        )
+        self.cooldown_s = widgets.FloatText(
+            value=float(cfg.get("cooldown_s", 0.0)), description="Cooldown between frames (s):",
+            style={"description_width": "initial"},
+        )
         advanced = widgets.Accordion(children=[widgets.VBox([
             self.norm_low, self.norm_high, self.norm3d, self.niter,
             self.flow3d_smooth, self.max_size_fraction,
@@ -2296,6 +2309,16 @@ class CellposeSAMInferencePanel:
                 "<i>max_size_fraction: cellpose's own default is 0.4, which silently "
                 "deletes any object covering &gt;40% of the frame (large organoids). "
                 "BEHAV3D defaults to 1.0 and filters by size instead.</i>"
+            ),
+            widgets.HBox([self.n_threads, self.cooldown_s]),
+            widgets.HTML(
+                "<i>CPU threads caps mask post-processing/compression threads; "
+                "cooldown pauses between timepoints to let voltage regulators and "
+                "battery recover. A full Cellpose-SAM run saturates the GPU and every "
+                "CPU core at once, which on some laptops draws more power than the "
+                "machine can sustain and causes an abrupt shutdown mid-run. If that "
+                f"happens, try around {self._power_safe_preset['n_threads']} threads "
+                f"and a {self._power_safe_preset['cooldown_s']:g}s cooldown.</i>"
             ),
         ])])
         advanced.set_title(0, "Advanced / normalization")
@@ -2327,55 +2350,6 @@ class CellposeSAMInferencePanel:
         self.show_napari_btn.on_click(self._on_show_napari_clicked)
         self._load_size_filter_for_cell_type()
 
-        # ── Reliability ──────────────────────────────────────────────
-        # A full Cellpose-SAM run is long and saturates the GPU and every CPU core
-        # at once. On machines whose power delivery cannot sustain both rails the
-        # result is an abrupt shutdown mid-run, which these two options address
-        # from opposite ends: survive one, or avoid provoking it.
-        from behav3d.preprocessing.segmentation.cellpose_sam_prediction import (
-            power_safe_settings,
-        )
-        self._power_safe_preset = power_safe_settings()
-
-        self.resume_cb = widgets.Checkbox(
-            value=bool(cfg.get("resume", False)),
-            description="Resume interrupted run (keep timepoints already segmented)",
-            indent=False,
-        )
-        self.power_safe_cb = widgets.Checkbox(
-            value=bool(cfg.get("power_safe", False)),
-            description="Power-safe mode (slower, much lower peak power draw)",
-            indent=False,
-        )
-        self.power_safe_cb.observe(self._on_power_safe_changed, names="value")
-        self.n_threads = widgets.IntText(
-            value=int(cfg.get("n_threads", 0)), description="CPU threads (0=all):",
-            style={"description_width": "initial"},
-        )
-        self.cooldown_s = widgets.FloatText(
-            value=float(cfg.get("cooldown_s", 0.0)), description="Cooldown between frames (s):",
-            style={"description_width": "initial"},
-        )
-        reliability = widgets.VBox([
-            self.resume_cb,
-            widgets.HTML(
-                "<i>Resume re-reads the progress journal written beside the output "
-                "and segments only the missing timepoints. It refuses to run if the "
-                "settings changed since the interrupted run, so one array can never "
-                "mix two segmentations.</i>"
-            ),
-            self.power_safe_cb,
-            widgets.HBox([self.n_threads, self.cooldown_s]),
-            widgets.HTML(
-                f"<i>Power-safe sets batch size "
-                f"{self._power_safe_preset['batch_size']}, "
-                f"{self._power_safe_preset['n_threads']} CPU threads and a "
-                f"{self._power_safe_preset['cooldown_s']:g}s pause between frames. "
-                "Use it if the machine freezes, reboots or powers off during long "
-                "runs - that is a power/thermal limit, not a memory one.</i>"
-            ),
-        ])
-
         # ── Apply ────────────────────────────────────────────────────
         self.apply_btn = widgets.Button(description="Apply Cellpose-SAM Segmentation",
                                         button_style="success", layout={"width": "max-content"})
@@ -2401,8 +2375,6 @@ class CellposeSAMInferencePanel:
             self.preview_btn,
             widgets.HBox([self.size_min, self.size_max]),
             self.filter_stats, self.hist_out, self.show_napari_btn,
-            widgets.HTML("<hr><b>6. Reliability on long runs</b>"),
-            reliability,
             widgets.HTML("<hr>"),
             widgets.HBox([self.apply_btn, self.spinner]),
             self.out,
@@ -2478,29 +2450,6 @@ class CellposeSAMInferencePanel:
         )
         self.stitch_threshold.disabled = is_3d
 
-    def _on_power_safe_changed(self, change):
-        """Apply the power-safe preset to the individual knobs, and back again.
-
-        The preset writes through to the real controls rather than shadowing them,
-        so what the run uses is always what the panel shows - and a user who wants
-        a different trade-off can still adjust any one value afterwards.
-        """
-        if bool(change.get("new")):
-            self._pre_power_safe = {
-                "batch_size": int(self.batch_size.value),
-                "n_threads": int(self.n_threads.value),
-                "cooldown_s": float(self.cooldown_s.value),
-            }
-            self.batch_size.value = int(self._power_safe_preset["batch_size"])
-            self.n_threads.value = int(self._power_safe_preset["n_threads"])
-            self.cooldown_s.value = float(self._power_safe_preset["cooldown_s"])
-        else:
-            previous = getattr(self, "_pre_power_safe", None)
-            if previous:
-                self.batch_size.value = previous["batch_size"]
-                self.n_threads.value = previous["n_threads"]
-                self.cooldown_s.value = previous["cooldown_s"]
-
     def _on_cell_type_changed(self, _change):
         self._load_size_filter_for_cell_type()
 
@@ -2550,8 +2499,6 @@ class CellposeSAMInferencePanel:
         cfg["tp_start"] = int(self.tp_start.value)
         cfg["tp_end"] = int(self.tp_end.value)
         cfg["preview_timepoint"] = int(self.preview_tp.value)
-        cfg["resume"] = bool(self.resume_cb.value)
-        cfg["power_safe"] = bool(self.power_safe_cb.value)
         cfg["n_threads"] = int(self.n_threads.value)
         cfg["cooldown_s"] = float(self.cooldown_s.value)
         cfg.setdefault("size_filter", {})[self.label_selector.value] = {
@@ -2692,7 +2639,7 @@ class CellposeSAMInferencePanel:
                         force_cpu=bool(self.force_cpu_cb.value),
                         sam_params=self._collect_sam_params(),
                         size_filter=size_filters.get(ct),
-                        resume=bool(self.resume_cb.value),
+                        resume=True,
                         n_threads=int(self.n_threads.value) or None,
                         cooldown_s=float(self.cooldown_s.value),
                     )
