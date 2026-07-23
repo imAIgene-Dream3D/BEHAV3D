@@ -2,7 +2,6 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
-import hashlib
 import multiprocessing
 import re
 import threading
@@ -10,8 +9,13 @@ import warnings
 from io import BytesIO
 from pathlib import Path
 from matplotlib.backends.backend_pdf import PdfPages
-from behav3d.analysis.behavior.utils import _sanitize_filename_token
-from behav3d.analysis.behavior.state.utils import _apply_state_order
+from behav3d.analysis.behavior.utils import _natural_sort_key, _sanitize_filename_token
+from behav3d.analysis.behavior.state.utils import (
+    _apply_state_order,
+    _get_classification_state_colors,
+    _get_classification_state_order,
+    _normalize_label_color_map,
+)
 
 # -----------------------------
 # Plot timepoint>timepoint state transition matrix
@@ -190,6 +194,9 @@ def compute_cluster_transition_matrix(
         Row-normalized transition matrix.
         If only_transitions=True, this is P(next | current, next != current).
     """
+    if state_order is None:
+        state_order = _get_classification_state_order(adata, cluster_key)
+
     df = adata.obs[list(id_cols) + [cluster_key, time_key]].copy()
     df = df.sort_values(list(id_cols) + [time_key])
 
@@ -583,14 +590,6 @@ def plot_sankey_diagram_between_states(
     if df.empty:
         raise ValueError("No rows left after filtering by min_count/relative_count")
 
-    def stable_rgba(label, a=1.0):
-        h = hashlib.md5(str(label).encode("utf-8")).hexdigest()
-        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-        r = int(0.55 * r + 0.45 * 255)
-        g = int(0.55 * g + 0.45 * 255)
-        b = int(0.55 * b + 0.45 * 255)
-        return f"rgba({r},{g},{b},{a})"
-
     def to_rgba(color, a):
         if color is None:
             return None
@@ -635,7 +634,8 @@ def plot_sankey_diagram_between_states(
 
     n_spots = max_len
 
-    # Build color map (optional)
+    # Build color map, filling in any state missing from `state_colors` with the same
+    # hash-stable default used by every other state report (instead of a local hash scheme).
     color_map = {}
     if isinstance(state_colors, dict):
         color_map = {str(k): str(v) for k, v in state_colors.items()}
@@ -644,16 +644,12 @@ def plot_sankey_diagram_between_states(
         if cols:
             for i, st in enumerate(category_order):
                 color_map[st] = cols[i % len(cols)]
-    elif state_colors is None:
-        color_map = {}
-    else:
+    elif state_colors is not None:
         raise TypeError("state_colors must be a dict, list/tuple, or None")
+    color_map = _normalize_label_color_map(category_order, colors=color_map)
 
     def base_color(state):
-        st = str(state)
-        if st in color_map:
-            return to_rgba(color_map[st], 1.0)
-        return stable_rgba(st, 1.0)
+        return to_rgba(color_map[str(state)], 1.0)
 
     def link_color(key):
         if key is None:
@@ -823,11 +819,6 @@ def plot_sankey_diagram_between_states(
     )
 
     return fig
-
-
-def _natural_sort_key(value):
-    parts = re.split(r"(\d+)", str(value))
-    return [int(p) if p.isdigit() else p.lower() for p in parts]
 
 
 def _plot_transition_heatmap_page(df_matrix, title, colorbar_label, normalized, mask_diagonal=False):
@@ -1081,6 +1072,11 @@ def save_state_transition_report(
     verbose=True,
 ):
     """Save transition matrix + all-pairs Sankey report for one state column."""
+    if state_order is None:
+        state_order = _get_classification_state_order(adata, state_col)
+    if state_colors is None:
+        state_colors = _get_classification_state_colors(adata, state_col)
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     matrix_dir = output_dir / "transition_matrix"

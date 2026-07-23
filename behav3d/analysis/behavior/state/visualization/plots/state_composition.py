@@ -8,12 +8,15 @@ from matplotlib.patches import Patch
 
 from behav3d.analysis.behavior.state.utils import (
     _apply_state_order,
+    _get_classification_state_colors,
     _get_classification_state_order,
     _normalize_label_color_map,
 )
+from behav3d.analysis.behavior.utils import _natural_sort_key
 from behav3d.analysis.behavior.general.visualization.plots.proportion_bars import (
     draw_thin_stacked_proportion_barh,
     compute_condition_diff_stats_pairwise,
+    legend_layout,
     plot_condition_diff_grid,
     plot_page_stacked_proportion_barh_grid,
     stacked_proportion_barh_rows_per_page,
@@ -269,7 +272,7 @@ def _prepare_state_composition_df(
     df[state_col] = df[state_col].astype(str)
     df[sample_col] = df[sample_col].astype(str)
 
-    observed_states = df[state_col].value_counts().index.tolist()
+    observed_states = sorted(df[state_col].unique().tolist(), key=_natural_sort_key)
     if state_order is None:
         state_order = [str(s) for s in observed_states]
     else:
@@ -534,15 +537,16 @@ def _plot_page_relative_stacked_grid(
         ax_empty.axis("off")
 
     if len(first_labels) > 0:
+        legend_ncol, _, legend_margin_in = legend_layout(len(first_labels), base_margin_in=0.82)
         fig.legend(
             first_handles,
             first_labels,
             loc="lower center",
-            ncol=min(len(first_labels), 8),
+            ncol=legend_ncol,
             frameon=False,
             fontsize=7,
         )
-        fig.tight_layout(rect=(0.03, 0.07, 1, 0.93))
+        fig.tight_layout(rect=(0.03, legend_margin_in / A4_PORTRAIT[1], 1, 0.93))
     else:
         fig.tight_layout(rect=(0.03, 0, 1, 0.93))
     fig.suptitle("Relative State Composition (Stacked) by Sample", y=0.97, fontsize=12, fontweight="bold")
@@ -587,7 +591,7 @@ def save_state_condition_comparison_report(
     if len(df) == 0:
         raise ValueError("No valid rows remain after filtering NaNs in required columns.")
 
-    observed_states = df[state_col].value_counts().index.tolist()
+    observed_states = sorted(df[state_col].unique().tolist(), key=_natural_sort_key)
     if state_order is None:
         resolved_state_order = _apply_state_order(
             [str(s) for s in observed_states], _get_classification_state_order(adata, state_col)
@@ -613,6 +617,8 @@ def save_state_condition_comparison_report(
         df[metadata_cols].drop_duplicates(subset=[sample_col]).set_index(sample_col)
     )
 
+    if state_colors is None:
+        state_colors = _get_classification_state_colors(adata, state_col)
     resolved_colors = _normalize_label_color_map(resolved_state_order, colors=state_colors, cmap_name="tab20")
 
     diff_stats_by_group = compute_condition_diff_stats_pairwise(
@@ -728,15 +734,16 @@ def _plot_page_grouped_stacked_grid(
         ax_empty.axis("off")
 
     if len(first_labels) > 0:
+        legend_ncol, _, legend_margin_in = legend_layout(len(first_labels), base_margin_in=0.82)
         fig.legend(
             first_handles,
             first_labels,
             loc="lower center",
-            ncol=min(len(first_labels), 8),
+            ncol=legend_ncol,
             frameon=False,
             fontsize=7,
         )
-        fig.tight_layout(rect=(0.03, 0.07, 1, 0.93))
+        fig.tight_layout(rect=(0.03, legend_margin_in / A4_PORTRAIT[1], 1, 0.93))
     else:
         fig.tight_layout(rect=(0.03, 0, 1, 0.93))
     fig.suptitle(
@@ -940,15 +947,16 @@ def _plot_page_grouped_2d_grid(
             title_str += f"\n(groups {row_slice[0]+1}–{row_slice[1]} of {total_rows})"
 
     if len(first_labels) > 0:
+        legend_ncol, _, legend_margin_in = legend_layout(len(first_labels), base_margin_in=0.82)
         fig.legend(
             first_handles,
             first_labels,
             loc="lower center",
-            ncol=min(len(first_labels), 8),
+            ncol=legend_ncol,
             frameon=False,
             fontsize=7,
         )
-        fig.tight_layout(rect=(0.03, 0.07, 1, 0.92))
+        fig.tight_layout(rect=(0.03, legend_margin_in / page_size[1], 1, 0.92))
     else:
         fig.tight_layout(rect=(0.03, 0, 1, 0.92))
     fig.suptitle(title_str, y=0.97, fontsize=11, fontweight="bold")
@@ -1061,6 +1069,8 @@ def save_state_composition_report(
     )
     auc_table.to_csv(output_auc_csv_path, index=False)
 
+    if state_colors is None:
+        state_colors = _get_classification_state_colors(adata, state_col)
     state_colors = _normalize_label_color_map(
         state_order,
         colors=state_colors,

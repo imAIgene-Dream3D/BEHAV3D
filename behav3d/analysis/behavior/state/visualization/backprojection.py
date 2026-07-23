@@ -10,7 +10,7 @@ import zarr
 
 from behav3d.io.formats.zarr import append_to_zarr
 from behav3d.io.images import load_image
-from behav3d.analysis.behavior.utils import _mixed_label_sort_key
+from behav3d.analysis.behavior.utils import _natural_sort_key
 from behav3d.analysis.behavior.state.utils import (
     _apply_state_order,
     _coerce_hex_color,
@@ -88,7 +88,7 @@ def _build_code_map(obs, state_col, state_order=None):
         .str.strip()
     )
     labels = labels[labels != ""]
-    unique_labels = sorted(labels.unique().tolist(), key=_mixed_label_sort_key)
+    unique_labels = sorted(labels.unique().tolist(), key=_natural_sort_key)
     unique_labels = _apply_state_order(unique_labels, state_order)
     return {str(label): int(idx + 1) for idx, label in enumerate(unique_labels)}
 

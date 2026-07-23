@@ -1494,16 +1494,17 @@ class TrackClassificationPanel:
         for old_label, new_label in mapping.items():
             new_colors.setdefault(str(new_label), old_colors.get(str(old_label)))
         new_colors = _normalize_label_color_map(list(new_colors.keys()), colors=new_colors)
+        new_order = list(dict.fromkeys(
+            mapping.get(n, n) for n in getattr(self, "_track_row_order", [])
+        ))
         rename_track_clusters(
             adata=adata_tracks,
             mapping=mapping,
             cluster_col="ClusterID",
             keep_unmapped=True,
+            categories=new_order,
         )
         _set_classification_state_colors(adata_tracks, "ClusterID", new_colors)
-        new_order = list(dict.fromkeys(
-            mapping.get(n, n) for n in getattr(self, "_track_row_order", [])
-        ))
         _set_classification_state_order(adata_tracks, "ClusterID", new_order)
         adata_tracks.write(self._model_adata_path(), compression="lzf")
         qc_dir = _resolve_dtaidistance_paths(self.output_dir, self._current_cell_type())[

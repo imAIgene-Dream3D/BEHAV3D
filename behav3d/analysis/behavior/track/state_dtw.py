@@ -13,7 +13,9 @@ from scipy.stats import chi2_contingency, ttest_rel, wilcoxon
 
 from behav3d.analysis.behavior.state.classification import FULL_STATE_COL
 from behav3d.analysis.behavior.state.utils import (
+    _apply_state_order,
     _get_classification_state_colors,
+    _get_classification_state_order,
     _normalize_label_color_map,
 )
 from behav3d.features.state_descriptive_features import extract_descibing_track_state_features
@@ -38,7 +40,11 @@ from behav3d.analysis.behavior.track.bouts import (
     _resolve_track_classifier_path,
     train_track_classifier,
 )
-from behav3d.analysis.behavior.utils import _sanitize_filename_token, _save_adata_obs_csv
+from behav3d.analysis.behavior.utils import (
+    _mixed_label_sort_key,
+    _sanitize_filename_token,
+    _save_adata_obs_csv,
+)
 from behav3d.analysis.behavior.track.visualization.plots.exemplar_coordinate_utils import (
     ensure_exemplar_coordinate_columns as _ensure_exemplar_coordinate_columns,
 )
@@ -193,6 +199,13 @@ def _save_diagnostics(
     umap_csv = outfolder / "dtaidistance_umap_clusters.csv"
 
     labels = pd.Series(adata_tracks.obs[cluster_key]).astype(str)
+    resolved_cluster_order = _apply_state_order(
+        sorted(labels.unique().tolist(), key=_mixed_label_sort_key),
+        _get_classification_state_order(adata_tracks, cluster_key),
+    )
+    color_map = _normalize_label_color_map(
+        resolved_cluster_order, colors=_get_classification_state_colors(adata_tracks, cluster_key),
+    )
     counts = labels.value_counts().rename_axis(cluster_key).reset_index(name="n_tracks")
     counts.to_csv(counts_csv, index=False)
 
@@ -309,11 +322,7 @@ def _save_diagnostics(
     with PdfPages(pdf_path) as pdf:
         if umap_embedding is not None:
             fig, ax = plt.subplots(figsize=(7, 6))
-            cluster_order = sorted(labels.unique().tolist(), key=lambda x: (0, int(x)) if str(x).isdigit() else (1, str(x)))
-            color_map = _normalize_label_color_map(
-                cluster_order, colors=_get_classification_state_colors(adata_tracks, cluster_key),
-            )
-            for cluster in cluster_order:
+            for cluster in resolved_cluster_order:
                 mask = labels.to_numpy() == str(cluster)
                 ax.scatter(
                     umap_embedding[mask, 0],
@@ -364,8 +373,15 @@ def _save_diagnostics(
             pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
 
-        fig, ax = plt.subplots(figsize=(8, max(4, 0.4 * len(counts) + 1.5)))
-        ax.barh(counts[cluster_key].astype(str), counts["n_tracks"], color="#2E6FBA")
+        counts_by_cluster = counts.set_index(counts[cluster_key].astype(str))["n_tracks"].reindex(
+            resolved_cluster_order, fill_value=0
+        )
+        fig, ax = plt.subplots(figsize=(8, max(4, 0.4 * len(counts_by_cluster) + 1.5)))
+        ax.barh(
+            resolved_cluster_order,
+            counts_by_cluster.to_numpy(),
+            color=[color_map[c] for c in resolved_cluster_order],
+        )
         ax.invert_yaxis()
         ax.set_xlabel("N tracks")
         ax.set_ylabel(str(cluster_key))
@@ -376,7 +392,7 @@ def _save_diagnostics(
         plt.close(fig)
 
         if group_counts is not None:
-            cluster_order = counts[cluster_key].astype(str).tolist()
+            cluster_order = resolved_cluster_order
             group_order = sorted(group_counts[resolved_group_col].unique().tolist())
             gcmap = plt.get_cmap("Set2")
             gcolor_map = {grp: gcmap(i % gcmap.N) for i, grp in enumerate(group_order)}
@@ -427,9 +443,7 @@ def _save_diagnostics(
             if replicate_group_counts is not None:
                 replicate_order = sorted(replicate_group_counts[resolved_replicate_col].unique().tolist())
                 group_order_rep = sorted(replicate_group_counts[resolved_group_col].unique().tolist())
-                cluster_color_map = _normalize_label_color_map(
-                    cluster_order, colors=_get_classification_state_colors(adata_tracks, cluster_key),
-                )
+                cluster_color_map = color_map
 
                 fig, axes = plt.subplots(
                     1, len(replicate_order), figsize=(3.2 * len(replicate_order) + 1, 5), sharey=True

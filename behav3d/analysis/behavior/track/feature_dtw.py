@@ -795,6 +795,12 @@ def _save_feature_dtw_quality_control(
     The cluster-percentage (proportion) plot is written into `proportions_outfolder`
     when given (e.g. the shared behavorial_trajectories/behavior_proportions folder),
     falling back to `qc_outdir` otherwise.
+
+    Known limitation: colors/order come from this pipeline's standalone YAML mapping
+    (`_load_feature_dtw_cluster_colors`/`_load_feature_dtw_cluster_order`), not from
+    `adata.uns["classification"]` used by every other state/track report — renaming via
+    the napari "Rename Track Clusters" dialog updates the latter but not this YAML, so
+    colors/order here can go stale relative to other reports until fixed separately.
     """
     outdir = _feature_dtw_outdir(output_dir, cell_type)
     qc_outdir = outdir if outfolder is None else Path(outfolder)

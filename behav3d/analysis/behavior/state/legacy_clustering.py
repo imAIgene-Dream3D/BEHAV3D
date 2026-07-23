@@ -45,9 +45,12 @@ from behav3d.analysis.behavior.state.utils import (
     _apply_log1p_to_feature_matrix,
     _apply_log_scaling_to_continuous_matrix,
     _coerce_log_scaling_params,
+    _get_classification_state_colors,
+    _get_classification_state_order,
     _infer_binary_group_constraints,
     _invert_log_scaling_in_continuous_matrix,
     _mixed_label_sort_key,
+    _normalize_label_color_map,
     _normalize_log_scale_feature_selectors,
     _rebuild_full_behavioral_cluster_from_intrinsic,
     _require_columns,
@@ -1744,6 +1747,19 @@ def apply_state_classifiers_to_full_dataset(
         None if full_label_classifier_selected is None else str(full_model_variant)
     )
 
+    report_state_colors = {}
+    report_state_order = []
+    if full_output_col in adata_full.obs.columns:
+        report_labels = sorted(
+            pd.Series(adata_full.obs[full_output_col]).dropna().astype(str).unique().tolist(),
+            key=_mixed_label_sort_key,
+        )
+        report_state_colors = _normalize_label_color_map(
+            report_labels,
+            colors=_get_classification_state_colors(adata_full, full_output_col),
+        )
+        report_state_order = _get_classification_state_order(adata_full, full_output_col)
+
     state_composition_report_pdf = None
     state_composition_report_pdfs = []
     state_composition_report_auc_csv = None
@@ -1768,6 +1784,7 @@ def apply_state_classifiers_to_full_dataset(
                 state_col=str(full_output_col),
                 sample_col="sample_name",
                 include_pooled_summary=True,
+                state_colors=report_state_colors,
                 verbose=verbose,
             )
             pdf_paths = report_out.get("pdf_paths", {})
@@ -1845,6 +1862,8 @@ def apply_state_classifiers_to_full_dataset(
                     rows_per_page=max(1, int(state_transitions_rows_per_page)),
                     sankey_min_count=int(state_transitions_min_count),
                     sankey_relative_count=float(state_transitions_relative_count),
+                    state_colors=report_state_colors,
+                    state_order=report_state_order,
                     verbose=verbose,
                 )
                 state_transition_report_dir = str(transition_out.get("output_dir", transitions_outdir))

@@ -61,6 +61,21 @@ def hash_stable_label_color_map(labels, colors=None, cmap_name="tab20"):
     return {label: saved.get(label, hash_stable_label_color(label, cmap_name=cmap_name)) for label in labels}
 
 
+def legend_layout(n_labels, *, max_ncol=8, row_height_in=0.22, base_margin_in):
+    """(ncol, nrows, margin_in) for a bottom-center fig.legend that scales with label count.
+
+    `base_margin_in` is the margin needed for a single legend row (i.e. today's
+    existing fixed constant at each call site); each extra wrapped row beyond the
+    first adds `row_height_in` so the reserved space keeps up with `ncol=min(n, 8)`
+    wrapping into more rows and doesn't get overlapped by the panel grid above it.
+    """
+    n_labels = max(0, int(n_labels))
+    ncol = max(1, min(n_labels, int(max_ncol))) if n_labels > 0 else 1
+    nrows = max(1, int(np.ceil(n_labels / ncol))) if n_labels > 0 else 1
+    margin_in = float(base_margin_in) + float(row_height_in) * (nrows - 1)
+    return ncol, nrows, margin_in
+
+
 def draw_thin_stacked_proportion_barh(
     ax,
     values,
@@ -206,8 +221,9 @@ def plot_page_stacked_proportion_barh_grid(
         axes[i].set_title(_wrap_row_label(key), fontsize=row_label_fontsize, pad=1, loc="left")
 
     handles = [Patch(facecolor=colors[c], label=str(c)) for c in class_order]
-    fig.legend(handles=handles, loc="lower center", ncol=min(len(handles), 8), frameon=False, fontsize=7)
-    fig.tight_layout(rect=(0.03, 0.05, 1, 0.94), h_pad=0.3)
+    legend_ncol, _, legend_margin_in = legend_layout(len(handles), base_margin_in=0.58)
+    fig.legend(handles=handles, loc="lower center", ncol=legend_ncol, frameon=False, fontsize=7)
+    fig.tight_layout(rect=(0.03, legend_margin_in / fig_h, 1, 0.94), h_pad=0.3)
     fig.suptitle(title, y=0.97, fontsize=12, fontweight="bold")
     return fig
 

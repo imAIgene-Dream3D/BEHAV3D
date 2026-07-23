@@ -406,6 +406,8 @@ class StateClassificationSubTab(QWidget):
         self.metadata_loader = metadata_loader
         self._get_cell_type = cell_type_getter
         self._model_adata = None
+        self._hmm_model = None
+        self._hmm_model_cell_type = None
         self._bg = BackgroundOperation(self)
         self._preload_bg = BackgroundOperation(self)
         self._last_features_key: tuple = ()
@@ -1799,6 +1801,7 @@ class StateClassificationSubTab(QWidget):
             from behav3d.analysis.behavior.state.classification import run_hmm_state_clustering
             res = run_hmm_state_clustering(**params, verbose=True, return_details=True)
             self._hmm_model = res["hmm_model"]
+            self._hmm_model_cell_type = ct
             return res["model_adata"]
 
         self._bg.run(
@@ -1920,6 +1923,7 @@ class StateClassificationSubTab(QWidget):
             from behav3d.analysis.behavior.state.classification import run_hmm_state_clustering
             res = run_hmm_state_clustering(**params, verbose=True, return_details=True)
             self._hmm_model = res["hmm_model"]
+            self._hmm_model_cell_type = ct
             return res["model_adata"]
 
         def _done(result):
@@ -2005,14 +2009,26 @@ class StateClassificationSubTab(QWidget):
             apply_hmm_deployment_artifact_to_full_dataset,
             _resolve_hmm_deployment_artifact_path,
         )
+        from behav3d.analysis.behavior.state.utils import (
+            _get_classification_state_colors,
+            _get_classification_state_order,
+            _set_classification_state_colors,
+            _set_classification_state_order,
+        )
 
         artifact_path = _resolve_hmm_deployment_artifact_path(output_dir=str(out), cell_type=ct)
 
-        hmm_model = self._hmm_model
+        hmm_model = (
+            getattr(self, "_hmm_model", None)
+            if getattr(self, "_hmm_model_cell_type", None) == ct
+            else None
+        )
         if hmm_model is None and artifact_path.exists():
             try:
                 _stored = load_hmm_deployment_artifact(str(artifact_path))
                 hmm_model = _stored.get("model")
+                self._hmm_model = hmm_model
+                self._hmm_model_cell_type = ct
             except Exception:
                 pass
 
@@ -2032,6 +2048,23 @@ class StateClassificationSubTab(QWidget):
             self._model_adata.obs[FULL_STATE_COL] = (
                 self._model_adata.obs["full_behavioral_cluster"].copy()
             )
+
+        # Sync saved colors/order too — the rename dialog saves them under the raw
+        # dialog obs-column names, not the classification-constant column names the
+        # deployment artifact/full-dataset pipeline looks them up under.
+        raw_intrinsic_colors = _get_classification_state_colors(self._model_adata, "intrinsic_behavioral_cluster")
+        raw_intrinsic_order = _get_classification_state_order(self._model_adata, "intrinsic_behavioral_cluster")
+        if raw_intrinsic_colors:
+            _set_classification_state_colors(self._model_adata, INTRINSIC_STATE_COL, raw_intrinsic_colors)
+        if raw_intrinsic_order:
+            _set_classification_state_order(self._model_adata, INTRINSIC_STATE_COL, raw_intrinsic_order)
+
+        raw_full_colors = _get_classification_state_colors(self._model_adata, "full_behavioral_cluster")
+        raw_full_order = _get_classification_state_order(self._model_adata, "full_behavioral_cluster")
+        if raw_full_colors:
+            _set_classification_state_colors(self._model_adata, FULL_STATE_COL, raw_full_colors)
+        if raw_full_order:
+            _set_classification_state_order(self._model_adata, FULL_STATE_COL, raw_full_order)
 
         try:
             save_hmm_deployment_artifact(
@@ -2126,7 +2159,10 @@ class StateClassificationSubTab(QWidget):
                             .fillna("(unknown)")
                         )
 
-            from behav3d.analysis.behavior.state.utils import _get_classification_state_colors
+            from behav3d.analysis.behavior.state.utils import (
+                _get_classification_state_colors,
+                _get_classification_state_order,
+            )
             composition_dir = _resolve_state_paths(out, ct).state_composition_outdir
             composition_dir.mkdir(parents=True, exist_ok=True)
             return save_state_composition_report(
@@ -2141,6 +2177,7 @@ class StateClassificationSubTab(QWidget):
                 group_x=group_x,
                 group_y=group_y,
                 state_colors=_get_classification_state_colors(adata, FULL_STATE_COL),
+                state_order=_get_classification_state_order(adata, FULL_STATE_COL),
                 verbose=True,
             )
 
@@ -2239,6 +2276,7 @@ class StateClassificationSubTab(QWidget):
             from behav3d.analysis.behavior.state.utils import (
                 _resolve_state_paths,
                 _get_classification_state_colors,
+                _get_classification_state_order,
             )
             from behav3d.analysis.behavior.state.visualization.plots.state_composition import (
                 save_state_condition_comparison_report,
@@ -2260,6 +2298,7 @@ class StateClassificationSubTab(QWidget):
                 group_cols=group_cols or None,
                 group_x=group_x,
                 state_colors=_get_classification_state_colors(adata, FULL_STATE_COL),
+                state_order=_get_classification_state_order(adata, FULL_STATE_COL),
                 verbose=True,
             )
 
@@ -4260,8 +4299,11 @@ class TrackClassificationSubTab(QWidget):
         track_adata = self._track_adata
         method = (track_adata.uns.get("dtai_trajectory_clustering", {}) or {}).get("method")
         if method == "original_behav3d_feature_dtw":
-            # The old (feature-DTW) method has its own regenerate-after-rename path,
-            # driven by its dedicated rename UI (not this generic adata-based one).
+            # Known limitation: renaming feature-DTW clusters via this generic dialog updates
+            # adata.uns["classification"], but diagnostics for this method read colors/order from
+            # a separate YAML store (see `_save_feature_dtw_quality_control`) that isn't refreshed
+            # here, so its own reports can go stale after a rename. Regenerate manually via
+            # "Create diagnostics" if needed.
             return
 
         def _run(**kw):
@@ -4631,6 +4673,9 @@ class TrackClassificationSubTab(QWidget):
             import matplotlib.pyplot as plt
             import anndata as _ad
             from behav3d.analysis.behavior.state.classification import FULL_STATE_COL
+            from behav3d.napari._rename_dialog import _track_cluster_col
+
+            cluster_col = _track_cluster_col(track_adata) or "ClusterID"
 
             if state_adata_path is None or not state_adata_path.exists():
                 raise FileNotFoundError(
@@ -4655,7 +4700,7 @@ class TrackClassificationSubTab(QWidget):
                     track_key="TrackID",
                     time_key="position_t",
                     state_key=FULL_STATE_COL,
-                    cluster_key="ClusterID",
+                    cluster_key=cluster_col,
                     tmin_key="position_t_min",
                     tmax_key="position_t_max",
                 )
@@ -4674,7 +4719,7 @@ class TrackClassificationSubTab(QWidget):
                     track_key="TrackID",
                     time_key="position_t",
                     state_key=FULL_STATE_COL,
-                    cluster_key="ClusterID",
+                    cluster_key=cluster_col,
                     tmin_key="position_t_min",
                     tmax_key="position_t_max",
                 )
@@ -4692,7 +4737,7 @@ class TrackClassificationSubTab(QWidget):
                     track_key="TrackID",
                     time_key="position_t",
                     state_key=FULL_STATE_COL,
-                    cluster_key="ClusterID",
+                    cluster_key=cluster_col,
                     tmin_key="position_t_min",
                     tmax_key="position_t_max",
                     verbose=True,
@@ -4711,7 +4756,7 @@ class TrackClassificationSubTab(QWidget):
                     track_key="TrackID",
                     time_key="position_t",
                     state_key=FULL_STATE_COL,
-                    cluster_key="ClusterID",
+                    cluster_key=cluster_col,
                     tmin_key="position_t_min",
                     tmax_key="position_t_max",
                     verbose=True,
@@ -5651,9 +5696,8 @@ class SingleCellTab(QWidget):
             details = "; ".join(f"{n} track(s) missing from {label}" for label, n in mismatches)
             self.data_consistency_warning_label.setText(
                 f"⚠ Filtered track data no longer matches the behavioral-analysis h5ad output "
-                f"for cell type '{ct}' ({details}). Contact/no-contact plots will error — "
-                f"re-run Behavioral Analysis (Track / State Classification) to refresh the h5ad "
-                f"from the current filtered data."
+                f"for cell type '{ct}' ({details}). Re-run Track / State Classification to "
+                f"refresh the h5ad from the current filtered data."
             )
             self.data_consistency_warning_label.show()
 
