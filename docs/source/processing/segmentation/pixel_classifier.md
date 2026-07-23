@@ -6,11 +6,7 @@ The Pixel Classifier is the **CPU-only** pixel classification method bundled wit
 The Pixel Classifier is **binary per cell type**: foreground vs. background. If you have N cell types, you train N separate classifiers, one per cell type. Multi-class single-model training is the job of [ConvPaint](convpaint).
 ```
 
-Pick it when:
-
-- You don't have a GPU (or no working OpenCL / CUDA driver).
-- You want a classical, fully scriptable classifier with no deep-learning dependencies.
-- Your experiment is small enough that CPU inference time is acceptable.
+The Pixel Classifier runs entirely on the CPU. For method choice across all six segmentation options, see the [segmentation overview](./index.md#how-to-pick-a-method).
 
 ![Pixel Classifier tab](../../_static/screenshots/segmentation_tab_pixel_classifier.png)
 

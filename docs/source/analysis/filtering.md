@@ -41,10 +41,7 @@ Drops every row past the chosen experiment duration. Use the **Unit for time-bas
 - In `frames` mode, this is a 0-based timepoint cutoff applied to `position_t`.
 - In `hours` mode, this is applied to the `time` column that Feature Extraction already computed from your metadata's frame interval.
 
-Typical uses:
-
-- An experiment ran longer than the biologically meaningful window — cut it off here so downstream stats aren't dragged out by drift / phototoxicity.
-- You want to compare two conditions of different lengths on equal footing — trim both to the shorter one.
+Typical use: cut off the tail of a movie where the dye has bleached or the signal has degraded, so downstream stats don't include the unreliable late timepoints.
 
 ### 2 · Filter short tracks
 
@@ -69,7 +66,7 @@ For each track longer than the threshold, this controls what happens to the extr
 - **Split on (default):** the track is cut into **consecutive full-length chunks** rather than cropped. The first chunk keeps the original `TrackID`; each following full-length chunk becomes a **new** track (a leftover remainder shorter than the max length is discarded). Every row keeps an `original_TrackID` so backprojection can still paint the real, unsplit track. E.g. a 100-timepoint track at max length 30 yields three 30-frame tracks.
 - **Split off:** the track is simply **cropped** to the first *max-length* frames; the rest is dropped.
 
-This used to be important for DTW-based behavioural analysis, which needs all tracks to be the same length. Today the main use is when you want to compare conditions of different experiment lengths and need every track aligned to the same observation window. (The [Track Classification](single_cell/track_classification.md) step offers an equivalent trajectory-size / split control, so you can decide whether to do this here or there.)
+This is needed for track-level analyses that require uniform-length inputs. The [Track Classification](single_cell/track_classification.md) step offers an equivalent trajectory-size / split control, so this can be done here or there.
 
 ### 4 · Filter by minimum size at the first timepoint
 

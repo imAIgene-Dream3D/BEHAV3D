@@ -6,11 +6,7 @@ ConvPaint is the **deep-features pixel classifier**. Instead of computing classi
 ConvPaint is **multi-class single-model**: one classifier maps each pixel to either background or *any* of the cell types. This is different from [APOC](apoc) and [Pixel Classifier](pixel_classifier), where you train one binary classifier per cell type. In practice you paint all classes onto a single Labels layer (the *legend tab* below the per-cell-type tabs assigns label index → cell type).
 ```
 
-Pick it when:
-
-- Your cells have **subtle textures or weak boundaries** that classical features struggle with.
-- You have a **PyTorch-compatible device** — CUDA GPU is strongly recommended; the widget also exposes a CPU fallback but inference is much slower.
-- You want a single model that handles all your cell types together.
+ConvPaint runs on a PyTorch-compatible device (the widget exposes a CPU fallback and one entry per CUDA GPU). For method choice across all six segmentation options, see the [segmentation overview](./index.md#how-to-pick-a-method).
 
 ![ConvPaint tab](../../_static/screenshots/segmentation_tab_convpaint.png)
 
@@ -67,9 +63,9 @@ This group controls how raw pixels are turned into per-pixel feature vectors *be
 |---|---|---|---|
 | **Model** | VGG16 (default), VGG16 Medium, VGG16 Large, DINOv2, JAFAR DINOv2, Gaussian, Cellpose, Ilastik | VGG16 | Pretrained network used to extract features. VGG16 is fast and lightweight; DINOv2 / JAFAR DINOv2 are transformer-based and often more expressive (slower). `Gaussian` falls back to a classical filter bank — useful for a quick non-DL baseline. |
 | **Channels** | Single channel, Multichannel, RGB (3-ch color images) | Multichannel | How the input is fed to the extractor. `Multichannel` runs the extractor on each raw channel separately and concatenates the resulting features. `Single` averages the channels first. |
-| **Normalize** | No normalization, Normalize stack, Normalize per plane | Normalize stack | Per-image intensity normalisation applied before feature extraction. |
-| **Downsample** | -4 to 16 (integer) | 1 | Spatial downsampling factor before extraction. `1` = native resolution. Values > 1 make inference faster but coarser; negative values upsample. |
-| **Smoothen** | 0 to 20 | 1 | Number of post-classification smoothing iterations applied to the predicted label map. Reduces single-pixel noise but can erode thin structures. |
+| **Normalize** | No normalization, Normalize stack, Normalize per plane | Normalize stack | napari-convpaint's normalization mode: *"1 = no normalization; 2 = normalize stack; 3 = normalize each image."* The three dropdown entries map to those three modes. |
+| **Downsample** | -4 to 16 (integer) | 1 | napari-convpaint's `image_downsample`: *"Factor for downscaling the image right after input (predicted classes are upsampled accordingly for output)."* `1` = native resolution. |
+| **Smoothen** | 0 to 20 | 1 | napari-convpaint's `seg_smoothening`: *"Factor for smoothening the segmentation output with a Majority filter."* |
 
 ```{warning}
 Changing the Feature Extractor model **invalidates the trained classifier** — you must retrain after switching backbones.
@@ -90,16 +86,16 @@ At the bottom of the Classifier group is **Tile annotations** (**OFF** by defaul
 
 | Checkbox | Effect |
 |---|---|
-| **Tile annotations** | During *training*, only extract features inside bounding boxes around annotated regions, instead of the whole image. Faster when annotations are small/sparse relative to the image. No effect on prediction. |
+| **Tile annotations** | napari-convpaint: *"If True, extract only features of bounding boxes around annotated areas when training."* A training-only setting; no effect on prediction. |
 
 Separately, a **Prediction Performance (large images)** group holds **Tile image** and **Use Dask** (both **OFF** by default). These control *prediction* (Run instance segmentation / Re-run preview / batch processing), so — unlike Tile annotations — they stay enabled even when no training images are loaded, e.g. when using an already-trained/loaded classifier:
 
 | Checkbox | Effect |
 |---|---|
-| **Tile image** | During *prediction*, splits the image into ~1000×1000 px blocks (50 px overlap margin), extracting and classifying each block separately, then stitching results back together. Lower peak memory than processing the whole image at once, at the cost of some recomputation in the overlap margins — somewhat slower when the image already fits comfortably in memory. |
-| **Use Dask** | Parallelises the block-wise predictions from **Tile image** across worker processes. Checking it automatically enables **Tile image**, since Dask has no effect without tiling. Can speed up tiled prediction on machines with several free CPU cores; does not reduce memory further (several blocks are held at once, so peak memory can be *higher* than Tile image alone). Runs every CPU core at once for a sustained period, so on machines prone to power-delivery issues under combined CPU+GPU load, watch long batch jobs. Beta feature — may not be fully optimised. |
+| **Tile image** | napari-convpaint: *"If True, extract features in tiles when running predictions (for large images)."* |
+| **Use Dask** | napari-convpaint: *"If True, use dask for parallel processing (currently only used when tiling images)."* Checking it enables **Tile image**, since Dask only applies to tiled prediction. |
 
-**Rule of thumb:** without tiling, ConvPaint processes the whole image in a single pass — fastest when the image fits comfortably in memory, but peak memory usage is highest (the full feature map is held at once). Turn on **Tile image** only once large images start running out of memory or crashing; turn on **Use Dask** on top of that only if you have free CPU cores to spare, since it trades (potentially) higher memory and CPU load for parallel speed.
+Both default to **off**. napari-convpaint documents **Tile image** as being for large images, and **Use Dask** as applying only when tiling is on.
 
 ### 5 · Per cell-type tab — Instance-preview parameters
 
@@ -127,21 +123,12 @@ Use the per cell-type **Run instance segmentation** button between every change 
 - Use `Single channel` only when one channel alone is highly discriminative and others add noise.
 - Use `RGB` only for true 3-channel colour images (rare in fluorescence microscopy).
 
-**Feature Extractor — `Normalize`**
-
-- `Normalize stack` (default) computes one global intensity normalisation per stack — usually right for fluorescent data with consistent staining.
-- Switch to `Normalize per plane` if your samples have strong Z-direction intensity gradients (e.g. attenuation deep in the tissue).
-- Use `No normalization` only when intensity values are already comparable across samples.
-
-**Feature Extractor — `Downsample`**
-
-- Inference is too slow or VRAM-bound → raise `Downsample` to 2 (4× less work in 2D, 8× less in 3D). Predictions are upsampled back at the end, so the practical quality cost is small for organoid-scale objects.
-- Subtle textures matter for small cells (e.g. T cells) → keep `Downsample` at 1 or use a negative value (e.g. -2) to upsample first.
-
-**Feature Extractor — `Smoothen`**
-
-- Speckly mask with single-pixel noise → raise `Smoothen` (1 → 3 or 5).
-- Thin structures are eroded → lower `Smoothen` to 0.
+```{note}
+The behaviour of **Normalize**, **Downsample** and **Smoothen** beyond the
+napari-convpaint definitions above has not been independently verified for BEHAV3D's
+data, so no BEHAV3D-specific tuning guidance is given for them. See the
+[napari-convpaint documentation](https://guiwitz.github.io/napari-convpaint/book/Params_settings.html).
+```
 
 **CatBoost — `Iterations`**
 
