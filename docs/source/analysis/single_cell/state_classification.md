@@ -29,8 +29,8 @@ This section is populated **from the actual feature columns** found in the selec
 
 - **Timepoint features** — checkboxes for the per-timepoint measurements from Feature Extraction, grouped by family (movement, intensity, morphology, contact, death, …). Tick the ones that define the behaviour you care about. If no features appear, run [Feature Extraction](../feature_extraction) for this cell type first.
 - **Window features** — features computed over a short rolling window rather than a single frame:
-  - **Window size** (default `5`, range 1–500) — how many timepoints each window spans.
-  - **net_displacement**, **straightness**, **mean_square_displacement** — tick the window-based motility summaries you want added.
+  - **Window size** (default `5`, range 1–500) — how many timepoints each window spans. Keep it around 5 for motility behaviour; **set it to 1 when the events you care about happen at a single timepoint** (e.g. calcium-intensity peaks), so a window doesn't smear them out. The HMM still assigns a state *per timepoint* regardless of this setting — that is what a hidden Markov model does; the window only controls how the window-based features are aggregated.
+  - **net_displacement**, **straightness**, **mean_square_displacement** — tick the window-based motility summaries you want added. These are computed here, from the per-timepoint feature table — they are **not** columns in the Feature Extraction CSV.
 
 ```{tip}
 Start small and biological. A handful of well-chosen features (e.g. speed, a contact column, and one window feature such as straightness) usually gives cleaner, more interpretable states than throwing in every available column.
@@ -42,10 +42,14 @@ Optional clean-up applied to the chosen features before fitting:
 
 | Control | Default | Meaning | When to use |
 |---|---|---|---|
-| **Log scaling** (per-feature checkboxes) | selected skewed features | Optionally apply `log1p` to the ticked features before the model standardises all continuous features. | Use for strongly right-skewed non-negative measurements; it is not required merely because features have different numeric ranges. |
-| **Smooth window** | 5 | Rolling-average smoothing applied to features (1 = no smoothing). | Increase slightly to damp frame-to-frame noise before fitting. |
+| **Log scaling** (per-feature checkboxes) | none | Optionally apply `log1p` to the ticked features before the model standardises all continuous features. | Use **selectively** for strongly right-skewed non-negative measurements, not blanket across all features. Use **📊 Preview feature distributions** to see which features are skewed first. |
+| **Smooth window** | 5 | Rolling-average smoothing applied to features (1 = no smoothing). Usually matched to the Window size. | Damps single-frame segmentation errors (e.g. a cell that looks elongated for one frame through under-segmentation). Since no sticky HMM is used by default, this smoothing does that job. |
 | **Low percentile cap** | 0.00 | Clip values below this quantile (0 = off). | Tame extreme low outliers. |
-| **High percentile cap** | 0.99 | Clip values above this quantile (1 = off). | Tame extreme high outliers (e.g. tracking spikes). |
+| **High percentile cap** | 1.00 | Clip values above this quantile (1 = off). | Off by default — in practice percentile clipping tended to hurt the HMM more than it helped. Reach for it only when tracking errors produce large outliers; inspect the distribution first. |
+
+```{tip}
+**Log scaling — `speed` is the classic case.** Speed is heavily zero-inflated (most tracked objects barely move most of the time) with a few high-speed excursions. Left untransformed, that skew lets the rare large values dominate any distance-based clustering and drown out the common near-zero values. Log-transforming compresses the long tail and gives the low-speed majority proportionally more influence. Check the histogram (📊 button) before deciding — don't apply it to features that aren't skewed.
+```
 
 ### Binary Group Selection
 
@@ -63,7 +67,7 @@ Collapsed by default. Most users never need to touch these — sensible defaults
 |---|---|---|
 | **State selection mode** | fixed | `fixed` uses your **n_states**; `auto` searches a range and picks the best number of states automatically. |
 | **k_min / k_max** | 2 / 8 | The range of state counts searched in `auto` mode (shown only when `auto` is selected). |
-| **Start offset** | 0 | Number of leading timepoints to skip per track before classifying (e.g. a settling / acquisition-warm-up period). |
+| **Start offset** | 1 | Number of leading timepoints to skip per track before classifying, backfilling the skipped frames from the next timepoint's state. **Leave at 1; changing it is not recommended.** The first timepoint of a track has no speed by definition (there is no previous position), so without this offset every track would start in a "static" state. Window features also use an *expanding* rolling window (timepoints 1–2, then 1–3, …) until the full window is available. |
 | **Skipped frames** | backfill | What to do with those skipped frames: `backfill` assigns them the first classified state; `leave_unassigned` leaves them out. |
 | **Covariance type** | full | Shape of each state's feature distribution (`full`, `diag`, `spherical`, `tied`). `full` is the most flexible; `diag` is a lighter, more stable choice when you have many features or few cells. |
 | **n_iter** | 200 | Maximum training iterations. Increase if the model reports it has not converged. |
@@ -76,6 +80,20 @@ Collapsed by default. Most users never need to touch these — sensible defaults
 ```{tip}
 If your states flicker rapidly along a track (a cell flips state every frame), enable **Sticky HMM** and/or raise the **Smooth window** rather than reducing the number of states.
 ```
+
+### How the states are computed
+
+After the chosen per-timepoint and window features are assembled, smoothed and standardised, they are modelled with a **Gaussian Hidden Markov Model**. An HMM treats each track as a sequence that occupies one of `n_states` hidden behavioural states at every timepoint, where each state has its own multivariate-Gaussian feature distribution (shape set by *Covariance type*) and a transition matrix gives the probability of switching between states. Because transitions are penalised, the model naturally produces **temporally coherent** state assignments — a cell tends to stay in a behaviour for a while rather than flickering — which is exactly what makes it suited to behaviour over time rather than clustering each frame independently. The fitted model then assigns every timepoint its most likely state (Viterbi decoding).
+
+The **window features** summarise motion over each rolling window of length $w$. With $\mathbf{p}(t)$ the position and $\mathbf{s}(i)=\mathbf{p}(i)-\mathbf{p}(i-1)$ the steps inside the window:
+
+$$
+\text{net\_displacement} = \lVert \mathbf{p}(t) - \mathbf{p}(t-w+1) \rVert
+\qquad
+\text{straightness} = \frac{\text{net\_displacement}}{\sum_i \lVert \mathbf{s}(i) \rVert}
+$$
+
+**Straightness** ranges from 0 (a cell that wanders but ends where it started) to 1 (perfectly straight travel), and the window **mean_square_displacement** is the mean squared distance of each in-window position from the window's start — together these separate directed migration from local scanning.
 
 ### Running it
 

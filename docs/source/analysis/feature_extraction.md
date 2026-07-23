@@ -115,24 +115,70 @@ The collapsible **▶ Extended Analysis — Active Killing (Immune Cells)** sect
 
 ### How it works in plain terms
 
-For each sample, the detector first measures the **background death rate** — how fast organoids die on average when no immune cell is around (computed from the first-to-last change in the death signal of every organoid track). Then it looks at each immune cell's contact events with organoids, and for every contact timepoint it asks:
+For each contact event, the detector looks at every organoid the immune cell actually touched, independently, anchored at the moment contact started:
 
-> *Over the next N timepoints, does the death signal on the organoid this immune cell is touching rise faster than the background rate?*
+> *From the start of contact to N timepoints later, does the death signal on this specific organoid rise enough to count as killing?*
 
-If yes (and contact lasted long enough), that timepoint is flagged `is_active_killing = True`.
+Whichever touched organoid clears its own threshold by the largest margin is reported as the event's target. There is no sample-wide or cross-organoid averaging involved — each organoid is judged only against its own signal.
+
+If yes (and contact lasted long enough), the whole observed contact duration is flagged `is_active_killing = True`.
+
+```{note}
+**Caveat:** when several immune cells contact the same organoid at once, all of them may be flagged as active killers for that death, even if only one actually did the killing — the detector attributes a death rise to every qualifying contact, not to a single culprit.
+```
+
+#### The killing rule (how it is computed)
+
+For each sample, the **background death rate** is the mean, over all target (organoid) tracks, of the death-signal change per timepoint:
+
+$$
+r_{\text{bg}} = \operatorname{mean}_{\text{tracks}} \frac{D_{\text{final}} - D_{\text{initial}}}{\text{track duration}}
+$$
+
+where $D$ is the chosen death-signal column. At a contact timepoint $t$, the **observed increase** over the observation window $W$ on the touched organoid is $\Delta D = D(t+W) - D(t)$, and the **expected** background increase is $r_{\text{bg}} \cdot W$. The timepoint is flagged as active killing when the observed increase beats the threshold:
+
+$$
+\Delta D > \theta
+\qquad
+\theta =
+\begin{cases}
+\theta_{\text{abs}} & \text{absolute-threshold mode} \\
+r_{\text{bg}} \cdot W \cdot m & \text{multiplier mode (multiplier } m\text{)}
+\end{cases}
+$$
+
+and the contact has lasted at least the **minimum contact duration**. The reported `killing_efficiency` is how far the observed increase exceeds background, $\ \Delta D / (r_{\text{bg}} \cdot W)$.
 
 ### Parameters
 
 | Control | Default | Range | Meaning |
 |---|---|---|---|
 | **Immune cell type** | first immune type | dropdown | Which immune tracks to analyse. |
-| **Observation window** | 5 | 1 – 100 timepoints | How many frames after each contact to measure the death-signal rise on the touched organoid. |
+| **Observation window** | 5 | 1 – 100 timepoints | How many frames after contact starts to measure the death-signal rise on each touched organoid. |
 | **Death signal column** | `percentage_dead_mask` | dropdown of `percentage_dead_mask`, `mean_dead_dye`, `nr_dead_mask_pixels` | Which organoid column is read as the "death signal". |
-| **Killing threshold multiplier** | 1.5 | 0.1 – 20.0 | If absolute mode is off: the observed death-signal increase must exceed `background_rate × observation_window × multiplier` to count as killing. More robust to staining variation than an absolute number. |
-| **Use absolute threshold instead of multiplier** | OFF | checkbox | When on, the multiplier is replaced by a fixed value (next field). |
+| **Killing threshold multiplier** | 1.5 | 0.1 – 20.0 | If absolute mode is off: an organoid's death signal must reach at least `signal_at_contact_start × multiplier` by the end of the window to count as killing. Scales with each organoid's own starting signal (a signal of exactly 0 is treated as 0.1 to avoid a trivial threshold). |
+| **Use absolute threshold instead of multiplier** | OFF | checkbox | When on, the multiplier is replaced by a fixed value (next field). Recommended together with `nr_dead_mask_pixels`, since a flat pixel-count cutoff is easier to reason about than one on a fraction/intensity scale. |
 | **Absolute threshold** | 0.0 | 0.0 – 100.0 | Fixed minimum death-signal increase (only used when "Use absolute threshold" is on). |
 | **Min contact duration** | 1 | 1 – 50 timepoints | Minimum consecutive timepoints an immune cell must be in contact with the same target before a killing event can be counted. |
 | **Top-N killers to display** | 5 | 1 – 50 | Used by the preview button below. |
+
+### Choosing the window and threshold
+
+None of these values are universal — they depend on your **biology** and your **imaging cadence**.
+
+- **Observation window** — how long, after contact, you expect a kill to register. A 5-timepoint window means something very different at 1-minute vs. 30-minute intervals. Try a few window lengths and check which gives sensible results for your time interval.
+- **Minimum contact duration** — is a single-timepoint touch enough for killing to plausibly begin, or must contact persist to count as a real attempt rather than a passing brush? Again, judge against your interval.
+- **Absolute threshold vs. multiplier** — the **absolute** threshold (a fixed increase in the death signal, e.g. +20–30 dead pixels) is the general recommendation and pairs naturally with the pixel-count death signals. The **multiplier** (fold-change over each cell's own pre-contact baseline) is for two situations: a single target line where baseline differences don't matter, or wells with a mix of dying and non-dying cells where cell-to-cell baseline variation makes a single fixed threshold unreliable. With **two target lines that have different baseline death rates the multiplier becomes unreliable** — the same fold-change is a very different absolute increase per line — so prefer the absolute threshold there.
+
+```{tip}
+**Calibrating an absolute pixel threshold to "one dead cell".** The right absolute value depends directly on cell size and pixel resolution, so recompute it for your own setup rather than reusing someone else's number. As a worked estimate, a cell of diameter $d$ imaged at resolution $r$ (µm/pixel) fills roughly
+
+$$
+\text{area} \approx \frac{\pi}{r^{2}} \left(\frac{d}{2}\right)^{2} \ \text{pixels}
+$$
+
+e.g. a ~10 µm cell at 1 µm/pixel is about $\pi \times 5^2 \approx 80$ pixels if the whole cell fills with dye. "One dead cell" could therefore mean anywhere from ~20 pixels (partial/rim staining, smaller cells, coarser resolution) to ~80+ pixels (full-cell fill, larger cells, finer resolution). Use this as a starting point, then fine-tune by eye against a timepoint you trust.
+```
 
 ### Buttons
 
@@ -147,8 +193,8 @@ Written under `<output_dir>/analysis/<immune_type>/active_killing/`:
 | File | Contents |
 |---|---|
 | `BEHAV3D_<immune_type>_advanced_track_features.csv` | The full immune feature table with extra columns: `is_active_killing`, `killing_efficiency`, `targeted_track_id`, `contact_event_id`, and a `death_signal_increase_<N>tp` column where N is your observation window. |
-| `active_killing_per_timepoint_<immune_type>.csv` | One row per contact-event timepoint, with the per-timepoint classification and the background rate used. |
-| `active_killing_summary_<immune_type>.csv` | Per-sample aggregates: number of active-killing timepoints, mean killing efficiency, active-killing rate, background rate. |
+| `active_killing_per_timepoint_<immune_type>.csv` | One row per contact-event timepoint, with the event's classification and the threshold used. |
+| `active_killing_summary_<immune_type>.csv` | Per-sample aggregates: number of active-killing timepoints, mean killing efficiency, active-killing rate. |
 | `contact_events_<immune_type>.csv` | One row per contact event (start / end timepoint, duration, target track IDs). |
 | `plots/combined_killing_efficiency_distribution.png` | Histogram of killing efficiency across all active-killing timepoints. |
 
@@ -194,12 +240,44 @@ All measurements are in µm and hours. Movement is computed only after missing t
 | Column | Meaning |
 |---|---|
 | `displacement` | Step length from the previous timepoint (µm) |
-| `cumulative_displacement` | Running total of step lengths |
+| `cumulative_displacement` | Running total of step lengths up to this timepoint |
 | `displacement_from_origin` | Straight-line distance from the cell's first position |
-| `mean_square_displacement` | Squared distance from origin |
-| `directional_persistence` | Cosine similarity of consecutive step vectors (−1 = U-turn, +1 = straight) |
+| `mean_square_displacement` | Mean squared distance between the current position and every earlier position on the track (a diffusion measure) |
+| `directional_persistence` | Cosine of the angle between consecutive step vectors (−1 = U-turn, 0 = right-angle turn, +1 = straight ahead) |
 | `speed` | Step length divided by the time between frames (µm/h) |
-| `mean_speed` | Speed averaged over the last 10 frames (rolling window) |
+| `mean_speed` | Speed averaged over the last 10 frames (rolling window); also used to decide `active_*_contact` |
+
+#### How the movement features are computed
+
+Let $\mathbf{p}(t) = (x, y, z)$ be a cell's centroid at timepoint $t$ (in µm), $\Delta t$ the frame interval (in hours), and $\mathbf{s}(t) = \mathbf{p}(t) - \mathbf{p}(t-1)$ the step vector between consecutive frames.
+
+$$
+\text{displacement}(t) = \lVert \mathbf{s}(t) \rVert
+\qquad
+\text{speed}(t) = \frac{\lVert \mathbf{s}(t) \rVert}{\Delta t}
+$$
+
+$$
+\text{cumulative\_displacement}(t) = \sum_{i \le t} \lVert \mathbf{s}(i) \rVert
+\qquad
+\text{displacement\_from\_origin}(t) = \lVert \mathbf{p}(t) - \mathbf{p}(0) \rVert
+$$
+
+The **mean square displacement** at timepoint $t$ averages the squared distance from the current position to *every* position up to and including $t$:
+
+$$
+\text{MSD}(t) = \frac{1}{t+1} \sum_{j=0}^{t} \lVert \mathbf{p}(j) - \mathbf{p}(t) \rVert^{2}
+$$
+
+MSD grows roughly linearly in time for random (diffusive) motion and quadratically for directed motion, so its shape distinguishes wandering cells from cells under a directional cue.
+
+**Directional persistence** is the cosine similarity of successive step vectors (clipped to $[-1, 1]$, and 0 wherever a step has zero length):
+
+$$
+\text{persistence}(t) = \frac{\mathbf{s}(t-1) \cdot \mathbf{s}(t)}{\lVert \mathbf{s}(t-1) \rVert \, \lVert \mathbf{s}(t) \rVert}
+$$
+
+A value near +1 means the cell keeps heading the same way (persistent, directed migration); near 0 means each step's direction is independent of the last (random walk); near −1 means it reverses.
 
 ```{note}
 The Feature Extraction tab does not produce the broader rolling-window motility statistics used by the state classifier (e.g. straightness, net displacement over a window, median turning angle, run-length summaries). Those are computed later from this table by [State Classification](single_cell/state_classification) when you run the HMM — they are not extra columns in the Feature Extraction CSV.
@@ -222,24 +300,53 @@ When Morphology is on, the following are added. Units: volumes in µm³, lengths
 
 | Column | Meaning |
 |---|---|
-| `nr_pixels` | Voxel count |
-| `volume` | Physical volume |
+| `nr_pixels` | Voxel count of the mask |
+| `volume` | Physical volume = voxel count × voxel volume (µm³) |
 | `bbox_volume` | Volume of the axis-aligned bounding box |
-| `elongation` | `major_axis_length / minor_axis_length` |
-| `extent` | Volume divided by oriented bounding-box volume |
 | `equivalent_diameter` | Diameter of a sphere with the same volume |
-| `major_axis_length`, `minor_axis_length` | From the inertia tensor |
-| `axis1_length` / `axis2_length` / `axis3_length` | Longest / middle / shortest principal axis |
-| `oblateness` | Flatness measure based on principal axes |
-| `prolateness` | Elongation measure based on principal axes |
-| `surface_area` | Marching-cubes mesh area |
-| `sphericity` | Sphericity computed from volume and surface area |
-| `convex_volume` | Convex hull volume |
-| `solidity` | Volume / convex volume |
-| `surface_to_volume_ratio` | Surface area / volume |
-| `orientation_vector` | The cell's principal-axis direction as a 3-vector |
+| `axis1_length` / `axis2_length` / `axis3_length` | Longest / middle / shortest principal-axis length (from PCA of the mask's voxel coordinates, spacing-aware) |
+| `major_axis_length`, `minor_axis_length` | The longest (`axis1`) and shortest (`axis3`) principal axis |
+| `elongation` | `axis1_length / axis2_length` — longest over middle axis |
+| `extent` | Volume divided by the **oriented** bounding-box volume (`axis1 × axis2 × axis3`) |
+| `oblateness` | Flatness: `1 − axis3/axis1` (0 = not flattened, →1 = disc-like) |
+| `prolateness` | Elongation: `1 − axis2/axis1` (0 = not elongated, →1 = cigar-like) |
+| `surface_area` | Physical surface area from exposed voxel faces (µm²) |
+| `sphericity` | How sphere-like the object is (1 = perfect sphere); from volume and surface area |
+| `surface_to_volume_ratio` | `surface_area / volume` |
+| `convex_volume` | Volume of the convex hull (`volume / solidity`) |
+| `solidity` | `volume / convex_volume` — how much the object fills its convex hull (1 = convex) |
+| `orientation_vector` | Unit vector of the longest principal axis (the cell's 3-D orientation) |
+| `border_touching_segment` | `True` when the mask touches the edge of the image volume (a QC flag — border objects are partially cropped, so their morphology is unreliable) |
 
 When Morphology is **unchecked**, only the cheap `nr_pixels` and `volume` columns are kept (the others are skipped to save time).
+
+#### How the morphology features are computed
+
+Let $V$ be the object's physical volume and $A$ its surface area. **Surface area** is measured directly from the voxelised mask by counting the exposed faces (each internal face between a foreground and a background voxel), weighted by the physical area of that face — not a smoothed mesh. **Sphericity** compares the object's surface area to that of a sphere of equal volume:
+
+$$
+\Psi = \frac{\pi^{1/3}\,(6V)^{2/3}}{A}
+\qquad
+\text{surface\_to\_volume\_ratio} = \frac{A}{V}
+\qquad
+\text{equivalent\_diameter} = \left(\frac{6V}{\pi}\right)^{1/3}
+$$
+
+$\Psi = 1$ for a perfect sphere and decreases as the object becomes more irregular or elongated.
+
+The three **principal axes** ($a \ge b \ge c$ = `axis1` ≥ `axis2` ≥ `axis3`) come from a principal-component analysis of the mask's voxel coordinates in physical units. The shape descriptors are then:
+
+$$
+\text{elongation} = \frac{a}{b}
+\qquad
+\text{oblateness} = 1 - \frac{c}{a}
+\qquad
+\text{prolateness} = 1 - \frac{b}{a}
+\qquad
+\text{extent} = \frac{V}{a\,b\,c}
+$$
+
+**Solidity** ($V / V_{\text{convex}}$) measures how much of the object's convex hull it actually fills — low solidity flags protrusions or concavities.
 
 ### Contact (always on — mandatory)
 
@@ -254,7 +361,9 @@ For each other cell type `{type}` present in the metadata, two contact columns a
 | `any_immune_cell_contact` / `any_immune_cell_contact_on_distance` | Aggregated over every immune type |
 
 ```{tip}
-The `*_contact` columns answer **"is it touching?"** and the `*_contact_on_distance` columns answer **"is it close enough to interact?"**. The default Contact Threshold is 0 µm, which makes the two equivalent. Increase it to 1–5 µm if you care about short-range signalling between cells that don't physically touch.
+The `*_contact` columns answer **"is it touching?"** (pixel-adjacency, ~1.73 px diagonal — always computed) and the `*_contact_on_distance` columns answer **"is it close enough to interact?"** (within the **Contact Threshold** in µm). The default Contact Threshold is 0 µm, which makes the two nearly equivalent — masks essentially have to touch. Increase it to 1–5 µm to capture near-contact / proximity relationships between cells that don't physically touch.
+
+**Contact Threshold is not a cheap parameter to sweep interactively:** it feeds the downstream interaction analysis, and changing it requires **re-running Feature Extraction** (it changes the contact columns themselves). Plan any tuning as a batch/offline step rather than trial-and-error in a live session.
 ```
 
 ### Organoid Invasiveness (immune only, optional)
@@ -268,16 +377,35 @@ When checked (and Contact is also on), for each organoid type `{org}`:
 | `any_org_invasiveness_perc` | Maximum across all organoid types |
 | `any_org_invasiveness` | `True` when any organoid type's invasiveness is ≥ 50% |
 
-This is a **surface-contact fraction**, not a strict "immune voxels inside organoid volume" check — it measures how much of the immune cell's boundary is wrapped by organoid tissue.
+This is a **surface-contact fraction**, not a strict "immune voxels inside organoid volume" check — it measures how much of the immune cell's boundary is wrapped by organoid tissue:
+
+$$
+\text{invasiveness\_perc} = 100 \times \frac{\#\{\text{immune surface voxels within Contact Threshold of the organoid}\}}{\#\{\text{immune surface voxels}\}}
+\qquad
+\text{invasive} = \big(\text{invasiveness\_perc} \ge 50\%\big)
+$$
+
+where "surface voxels" are the immune cell's boundary shell (within ~2 µm of its edge).
 
 ### Death (when a dead channel exists and the family is checked)
 
 | Column | Meaning |
 |---|---|
 | `percentage_dead_mask` | Fraction (0–1) of the cell's voxels that overlap the dead mask |
-| `nr_dead_mask_pixels` | Absolute voxel count of overlap |
+| `nr_dead_mask_pixels` | Absolute voxel count of overlap = `nr_pixels × percentage_dead_mask` |
 | `increase_dead_mask` | Change in `nr_dead_mask_pixels` compared to the same cell 10 timepoints earlier — a simple death-rate proxy |
+| `smoothed_percentage_dead_mask`, `smoothed_nr_dead_mask_pixels`, `smoothed_increase_dead_mask` | Rolling-mean-smoothed versions of the death signals (≈10-minute window), used by Death Dynamics to damp single-frame segmentation noise |
 | `dead` | Boolean flag. Once `percentage_dead_mask` crosses the threshold for the first time, the cell is marked dead from that timepoint onward — the flag is **sticky** and never flips back to alive |
+
+`percentage_dead_mask` is the fraction of the cell's own voxels that overlap the dead mask, and the pixel count scales it by the cell size:
+
+$$
+\text{percentage\_dead\_mask} = \frac{\#\{\text{cell voxels overlapping the dead mask}\}}{\#\{\text{cell voxels}\}}
+\qquad
+\text{nr\_dead\_mask\_pixels} = \text{nr\_pixels} \times \text{percentage\_dead\_mask}
+$$
+
+The three death signals capture death differently: `percentage_dead_mask` is **size-independent** (good when organoids differ in size) but saturates; `nr_dead_mask_pixels` is an **absolute** count (cannot go negative, pairs well with an absolute threshold — see [Active Killing](#active-killing-detection-immune-cells-only)); and `mean_dead_dye` (from the Intensity family) is the **mean dead-channel intensity** across the whole mask, which is the right choice when you have no dead-cell segmentation, or when the dye is diffuse and fills the whole cell (e.g. a **calcium reporter** rather than a discrete dead region).
 
 If you set the threshold to 0, the `dead` column is not added.
 

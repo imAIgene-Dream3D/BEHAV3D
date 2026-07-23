@@ -721,8 +721,13 @@ def run_feature_extraction(
                     )
             else:
                 print(f"{get_current_time()} - Skipping image-based features as none requested in features_choice (morphology, intensity, contact, death)")
-                
-            
+
+            if "intensity" in features_choice:
+                intensity_cols = [c for c in df_tracks.columns if c.startswith("mean_intensity_ch")]
+                if intensity_cols:
+                    print(f"{get_current_time()} - Calculating fold change over baseline for intensity features...")
+                    df_tracks = calculate_fold_change_over_baseline(df_tracks, intensity_cols)
+
             print(f"{get_current_time()} - Interpolating missing timepoints based on time interval")
             # As sometimes 1 or several timepoints are missing in a track, interpolate these missing rows
             # Values are interpolated linearly, forward filled or left blank based on the column
@@ -1245,23 +1250,19 @@ def calculate_death(
     # print(f"- Calculating cell death based on defined dead_dye_threshold {dead_dye_threshold}")
     df_tracks["dead"] = False
 
-    # ``percentage_dead_mask`` is stored as the *fraction* of dead-mask-positive
-    # voxels per segment (mean of a 0/1 mask -> range 0.0-1.0), but the GUI dead
-    # threshold is entered as a percentage (0-100, matching the death preview
-    # overlay which computes coverage on a 0-100 scale). Convert the percentage
-    # threshold to a fraction here so the analysis "dead" classification matches
-    # what the preview shows. Other threshold columns (e.g. mean_dead_dye) are
-    # compared on their own native scale.
-    effective_threshold = threshold
-    if threshold_column == "percentage_dead_mask" and threshold is not None:
-        effective_threshold = float(threshold) / 100.0
+    # ``threshold`` is always on the same scale as ``threshold_column``.
+    # For ``percentage_dead_mask`` that means a fraction (0.0-1.0), matching
+    # how that column is computed (mean of a 0/1 mask). Callers (napari's
+    # ``_threshold_as_fraction`` / the notebook's fraction-scale widget)
+    # already convert the percent-scale UI value to a fraction before it
+    # reaches this function - do not convert again here.
 
     # For any cell crossing the dead_dye_threshold, set the cell to dead. Any timepoint after this timepoint are
     # Also set to dead, even if the mean dead dye intensity goes under the threshold again
     for track_id in df_tracks["TrackID"].unique():
         track_df = df_tracks[df_tracks["TrackID"] == track_id]
         track_df_reset = track_df.reset_index(drop=True)
-        threshold_indices = track_df_reset.reset_index(drop=True)[track_df_reset[threshold_column] >= effective_threshold].index
+        threshold_indices = track_df_reset.reset_index(drop=True)[track_df_reset[threshold_column] >= threshold].index
         
         if not threshold_indices.empty:
             first_threshold_index = threshold_indices.min()
@@ -1972,6 +1973,27 @@ def calculate_relative_increase(df, column, nr_timepoints_back, groupby="TrackID
 #         result.index = result.index.droplevel(0)
 
 #     return result
+
+def calculate_fold_change_over_baseline(df, intensity_cols, baseline_percentile=10, groupby=("sample_name", "TrackID")):
+    """Per-track fold change of each intensity column over that track's own baseline.
+
+    The baseline is a robust low percentile of the track's own intensity
+    history (not its minimum, so a single noisy low dip doesn't set an
+    artificially low denominator, and not its mean/std, which would collapse
+    for a constant, non-flickering track and amplify ordinary noise into a
+    false signal). Dividing by each track's own baseline level makes cells
+    with different absolute intensities comparable, while a constant track
+    stays at fold-change ~1 throughout.
+    """
+    df = df.sort_values(list(groupby) + ["position_t"]).copy()
+    grouped = df.groupby(list(groupby), sort=False, observed=True)
+    for col in intensity_cols:
+        if col not in df.columns:
+            continue
+        baseline = grouped[col].transform(lambda s: np.nanpercentile(s, baseline_percentile))
+        baseline = baseline.where(baseline > 0, np.nan)
+        df[f"{col}_fold_change"] = df[col] / baseline
+    return df
 
 def _zero_dead_mask_under_segments(dead_mask_t, immune_arrays_t):
     """Return a copy of ``dead_mask_t`` with voxels set to 0 wherever any

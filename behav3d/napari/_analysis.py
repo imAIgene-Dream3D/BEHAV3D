@@ -1100,7 +1100,7 @@ class DeathDynamicsTab(QWidget):
             for ct in target_types:
                 thr = features.get(ct, {}).get("dead_mask_percentage_threshold")
                 thr_str = (
-                    f"{float(thr):.4g} %" if thr not in (None, 0, 0.0)
+                    f"{float(thr) * 100.0:.4g} %" if thr not in (None, 0, 0.0)
                     else "<not configured>"
                 )
                 lbl = QLabel(thr_str)

@@ -14,7 +14,7 @@ The zarr is a 4-D `(T, Z, Y, X)` `uint16` array; pixel value `0` is background; 
 In a hurry? [Troubleshooting](troubleshooting) is a one-page, symptom → fix quick reference for method choice, classifier issues, and instance-processing parameters.
 ```
 
-## The five methods
+## The six methods
 
 A top dropdown lets you pick the segmentation method. The body of the tab swaps to show that method's parameters.
 
@@ -23,8 +23,13 @@ A top dropdown lets you pick the segmentation method. The body of the tab swaps 
 | **APOC (GPU)** | GPU pixel classifier — random forest trained on classical image features (Gaussian, edges, Laplacian, …) | OpenCL GPU |
 | **ConvPaint (DL pixel classifier)** | Pixel classifier where features come from a pretrained deep network (VGG / DINOv2 / …) and a gradient-boosted classifier predicts every class at once | PyTorch (CUDA GPU recommended; CPU possible) |
 | **Pixel Classifier (Random Forest)** | CPU equivalent of APOC — same family of classifier, classical features computed on the CPU | CPU |
-| **Cellpose (Deep Learning)** | Pretrained deep-learning instance segmenter — outputs cell-level masks directly | PyTorch (CUDA GPU strongly recommended) |
+| **Cellpose (Deep Learning)** | Pretrained / retrainable deep-learning instance segmenter (cellpose v3) — outputs cell-level masks directly | PyTorch (CUDA GPU strongly recommended) |
+| **Cellpose-SAM (zero-shot)** | Foundation-model instance segmenter (cellpose v4) — segments many cell shapes with no training or annotation. Most accurate, most expensive. | PyTorch (good CUDA GPU or HPC) |
 | **Import segmentation** | Validates and copies segmentations produced outside BEHAV3D EXPLORER into the canonical layout | n/a |
+
+```{note}
+**Two Cellpose entries.** **Cellpose (Deep Learning)** is the classic cellpose v3 backbone you load a pretrained/retrained model into (see [Cellpose](cellpose)). **Cellpose-SAM (zero-shot)** is the newer cellpose v4 foundation model that needs no model file and no training (see [Cellpose-SAM](cellpose_sam)). They run in separate Python environments — Cellpose-SAM sets up a one-time sidecar env on first use.
+```
 
 ## How to pick a method
 
@@ -39,9 +44,10 @@ flowchart TD
     A --> C["Subtle texture or weak boundaries"]
     A --> E["Other shapes<br/>(elongated, irregular, clustered, …)"]
 
-    B --> F{"Pretrained Cellpose<br/>model fits?"}
-    F -- "Yes" --> Cellpose["Cellpose<br/>(no pixel labeling)"]
-    F -- "No" --> L
+    B --> G{"Strong GPU / HPC and<br/>accuracy is the priority?"}
+    G -- "Yes, zero-shot" --> SAM["Cellpose-SAM<br/>(no training, no labels)"]
+    G -- "Pretrained model fits" --> Cellpose["Cellpose v3<br/>(load a model)"]
+    G -- "Neither" --> L
 
     C --> L
     E --> L
@@ -52,7 +58,7 @@ flowchart TD
 ```
 
 ```{note}
-**Cellpose** appears only on the *roundish, well-separated* branch because the lab's pretrained models target roughly convex cells.
+The **Cellpose** methods appear on the *roundish, well-separated* branch because their models target roughly convex cells. **Cellpose-SAM** is zero-shot (works out of the box); classic **Cellpose v3** needs a pretrained or retrained model.
 ```
 
 Practical rules:
@@ -61,12 +67,14 @@ Practical rules:
 - **APOC** is the right pixel classifier when you have a GPU with working OpenCL drivers and you can paint a few foreground/background pixels per cell type (same labeling step as Pixel Classifier; ConvPaint paints all classes on one layer instead — see [Labeling foreground and background](#labeling-foreground-and-background)). Training is quick; inference is fast on a modern GPU.
 - **ConvPaint** uses pretrained deep features (VGG-16 or DINOv2), useful when APOC's classical filter bank cannot separate cells with subtle intensity differences, ambiguous boundaries, or texture-based contrast. Requires a PyTorch-compatible device (CUDA GPU strongly preferred; the widget exposes a CPU fallback).
 - **Pixel Classifier (Random Forest)** is the CPU-only fallback, same family of classifier as APOC, but features are computed with `scikit-image` instead of `pyclesperanto`. Use it when no GPU is available.
-- **Cellpose** is the *only* method that performs **true instance segmentation in one shot**, it directly outputs separated cell labels for roughly-spherical / convex cells. The other three methods are *pixel classifiers* (foreground vs. background / per-class probability), and BEHAV3D EXPLORER turns their output into instance labels by post-processing (watershed). When the lab already has a pretrained Cellpose model for your sample type (see [Cellpose page](cellpose) and [Zenodo](https://zenodo.org/records/18872978), check description to decide if fits your data).
+- **Cellpose** and **Cellpose-SAM** perform **true instance segmentation in one shot** — they directly output separated cell labels for roughly-spherical / convex cells, no pixel labeling and no watershed post-processing. The three pixel classifiers (APOC, ConvPaint, Pixel Classifier) instead output foreground/background or per-class probability, which BEHAV3D EXPLORER turns into instance labels by watershed post-processing.
+  - Use **Cellpose (v3)** when the lab already has a pretrained model for your sample type (see [Cellpose page](cellpose) and [Zenodo](https://zenodo.org/records/18872978)), or when you can retrain one on your own masks.
+  - Use **Cellpose-SAM (v4, zero-shot)** when you have a strong GPU/HPC and want maximum accuracy with **no training and no annotation** — at the cost of being the slowest, most compute-heavy method (see [Cellpose-SAM page](cellpose_sam)).
 - **Import segmentation** is *not* a way to create segmentations, it validates existing masks (.tiff/ .tif) into BEHAV3D EXPLORER's canonical zarr layout so the rest of the pipeline can consume them.
 
 ## Common structure of every method page
 
-The four trainable methods all follow the same three-section UI inside the BEHAV3D EXPLORER dock widget:
+The three pixel-classifier methods (APOC, ConvPaint, Pixel Classifier) all follow the same three-section UI inside the BEHAV3D EXPLORER dock widget:
 
 1. **Training / configuration** — pick a strategy, generate training data (loads a few timepoints into the napari viewer with empty Labels layers to paint into), train the classifier.
 2. **Preview / fine-tune** — run the trained model on the currently displayed timepoint to check quality before committing to a batch run.
@@ -191,6 +199,7 @@ apoc
 convpaint
 pixel_classifier
 cellpose
+cellpose_sam
 import
 troubleshooting
 ```

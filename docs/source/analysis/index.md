@@ -15,13 +15,13 @@ flowchart LR
 |---|---|---|
 | [Feature Extraction](feature_extraction) | 🧪 Feature Extraction | ✅ Documented |
 | [Filtering](filtering.md) | 🧹 Filtering | ✅ Documented |
-| [Death Dynamics & Interaction](death_dynamics) | 📊 Analysis → 💀 Death Dynamics | ✅ Documented |
+| [Death Dynamics, Interaction & Invasiveness](death_dynamics) | 📊 Analysis → 💀 Death Dynamics | ✅ Documented |
 | [Single Cell](single_cell/index) | 📊 Analysis → 🧬 Single Cell | ✅ State Classification · ✅ Track Classification |
 
 ```{note}
 The **📊 Analysis** tab has two sub-tabs:
 
-- **💀 Death Dynamics** — population death dynamics and target–effector interaction analysis (organoid/other vs immune/other).
+- **💀 Death Dynamics** — population death dynamics, target–effector interaction analysis, and immune-cell invasiveness analysis (organoid/other vs immune/other).
 - **🧬 Single Cell** — per-cell behavioural classification: **🔬 State Classification** (per-timepoint HMM states) and **🛤️ Track Classification** (whole-trajectory DTW clustering with a trainable classifier).
 
 **Backprojection** — painting state / track-cluster labels back onto the raw images — is  the final step inside each Single Cell workflow (**State Classification → Step 4** and **Track Classification → Step 5**).

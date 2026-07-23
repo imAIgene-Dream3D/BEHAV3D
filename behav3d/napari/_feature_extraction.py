@@ -966,7 +966,7 @@ class CellTypeFeaturePanel(QWidget):
         self.spin_dead_threshold = QDoubleSpinBox()
         self.spin_dead_threshold.setRange(0.0, 100.0)
         self.spin_dead_threshold.setSingleStep(0.1)
-        self.spin_dead_threshold.setDecimals(3)
+        self.spin_dead_threshold.setDecimals(1)
         # ``dead_mask_percentage_threshold`` is persisted as a FRACTION
         # (0.0-1.0), matching the scale of the ``percentage_dead_mask``
         # feature it's thresholded against. The spinbox only displays it
@@ -2386,16 +2386,16 @@ class ActiveKillingPanel(QWidget):
             make_help_row(
                 self.spin_obs_window,
                 "Observation Window",
-                "Number of timepoints after each contact timepoint over which the\n"
-                "death-signal change is measured (signal at t+window minus signal\n"
-                "at t, for the touched target with the largest increase).\n\n"
-                "A contact timepoint is 'active killing' when this increase exceeds\n"
-                "the killing threshold:\n"
-                "  killing_threshold = background_rate x observation_window x threshold_multiplier\n"
+                "Number of timepoints after a contact's start timepoint over which\n"
+                "each touched target's death-signal change is measured (signal at\n"
+                "contact_start+window minus signal at contact_start), evaluated\n"
+                "independently per touched target organoid.\n\n"
+                "A contact event is 'active killing' when the best-touched target's\n"
+                "increase exceeds its own killing threshold:\n"
+                "  killing_threshold = signal_at_contact_start x (threshold_multiplier - 1)\n"
                 "  (or the fixed Absolute Threshold, if 'Use absolute threshold' is checked)\n\n"
-                "Near the end of a timelapse, once fewer than 'observation window'\n"
-                "timepoints remain, the last fully-computed value is forward-filled\n"
-                "instead of being recalculated.",
+                "If the window runs past the end of a timelapse, the last available\n"
+                "frame is used instead of extrapolating.",
             ),
         )
 
@@ -2405,18 +2405,21 @@ class ActiveKillingPanel(QWidget):
         )
         self.death_signal_combo.setCurrentText("percentage_dead_mask")
         self.death_signal_combo.setMaximumWidth(220)
+        self.death_signal_combo.currentTextChanged.connect(lambda _: self._update_abs_hint())
         params_form.addRow(
             "Death signal column:",
             make_help_row(
                 self.death_signal_combo,
                 "Death Signal Column",
-                "Target-cell column used to measure death-signal increase, for both\n"
-                "the background death rate and the per-contact killing check.\n\n"
+                "Target-cell column used to measure death-signal increase for the\n"
+                "per-contact killing check.\n\n"
                 "  percentage_dead_mask  - fraction of dead-mask pixels in the segment\n"
                 "  mean_dead_dye         - mean dead-dye channel intensity\n"
                 "  nr_dead_mask_pixels   - raw count of dead-mask pixels\n\n"
-                "Changing this changes the units of the background rate and of the\n"
-                "Absolute Threshold below, so re-check that value if you switch.",
+                "Changing this changes the units of the Absolute Threshold below, so\n"
+                "re-check that value if you switch. When using an absolute threshold,\n"
+                "nr_dead_mask_pixels is recommended - a flat pixel-count cutoff is\n"
+                "easier to reason about than one on a fraction or intensity scale.",
             ),
         )
 
@@ -2431,17 +2434,16 @@ class ActiveKillingPanel(QWidget):
             make_help_row(
                 self.spin_threshold_mult,
                 "Killing Threshold Multiplier",
-                "Multiplier applied to the expected background death-signal increase\n"
-                "for a contact.\n\n"
-                "The 'background rate' is a per-sample baseline: for every target\n"
-                "(organoid) track in the sample, (final - initial death signal) /\n"
-                "track duration is computed, and these per-track rates are averaged\n"
-                "across ALL target tracks in that sample (immune cells excluded).\n"
-                "It reflects passive/expected signal drift with no immune contact.\n\n"
-                "A contact timepoint is classified as 'active killing' only when:\n"
-                "  death_increase > background_rate x observation_window x multiplier\n\n"
-                "Default: 1.5  (signal must exceed 150% of the expected background "
-                "increase over the observation window).\n\n"
+                "Multiplier applied to a touched target organoid's OWN death signal\n"
+                "at the moment contact starts (no sample-wide or cross-organoid\n"
+                "averaging is involved).\n\n"
+                "A contact event is classified as 'active killing' for a target when:\n"
+                "  signal_at_contact_start+window >= signal_at_contact_start x multiplier\n\n"
+                "Default: 1.5  (signal must at least reach 150% of its value at the\n"
+                "moment of contact, by the end of the observation window).\n\n"
+                "If the signal is exactly 0 at contact start, 0.1 is substituted so the\n"
+                "threshold isn't trivially 0 (which would flag any nonzero signal as\n"
+                "active killing).\n\n"
                 "Ignored when 'Use absolute threshold' is checked.",
             ),
         )
@@ -2454,15 +2456,21 @@ class ActiveKillingPanel(QWidget):
             "Use Absolute Threshold",
             "When checked, active killing is decided using the fixed 'Absolute "
             "threshold' value below instead of the multiplier-based threshold\n"
-            "(background_rate x observation_window x multiplier).\n\n"
-            "Useful when the per-sample background death rate is near zero, which "
-            "would make the multiplier-based threshold near zero (and therefore "
-            "unreliable / oversensitive) regardless of the multiplier chosen.\n\n"
+            "(signal_at_contact_start x multiplier).\n\n"
+            "Useful when touched organoids tend to start near-zero death signal, "
+            "which makes the multiplier-based threshold overly sensitive to small "
+            "absolute changes.\n\n"
             "When unchecked, the 'Absolute threshold' field is disabled and the "
             "Killing Threshold Multiplier is used instead.",
         ))
         abs_threshold_row.addStretch()
         params_form.addRow("", abs_threshold_row)
+
+        self.abs_hint_label = QLabel("")
+        self.abs_hint_label.setWordWrap(True)
+        self.abs_hint_label.setStyleSheet("color: #8a6d00; font-size: 10px;")
+        self.abs_hint_label.setVisible(False)
+        params_form.addRow("", self.abs_hint_label)
 
         self.spin_abs_threshold = QDoubleSpinBox()
         self.spin_abs_threshold.setRange(0.0, 100.0)
@@ -2477,13 +2485,15 @@ class ActiveKillingPanel(QWidget):
                 self.spin_abs_threshold,
                 "Absolute Killing Threshold",
                 "Fixed minimum death-signal increase (in the units of the Death\n"
-                "Signal Column, over the Observation Window) required to classify a\n"
-                "contact timepoint as active killing.\n\n"
+                "Signal Column, from contact start to the end of the Observation\n"
+                "Window) required to classify a contact event as active killing.\n\n"
                 "Only used when 'Use absolute threshold' is checked; it then\n"
-                "replaces the multiplier-based threshold\n"
-                "(background_rate x observation_window x multiplier) entirely.\n\n"
-                "Useful when the per-sample background death rate is near zero, "
-                "which makes the multiplier-based threshold unreliable.",
+                "replaces the multiplier-based threshold entirely.\n\n"
+                "Useful when touched organoids tend to start near-zero death "
+                "signal, which makes the multiplier-based threshold unreliable.\n\n"
+                "Recommended: use this together with the nr_dead_mask_pixels death "
+                "signal column - a flat pixel-count cutoff is easier to reason "
+                "about than one on a fraction or intensity scale.",
             ),
         )
 
@@ -2567,12 +2577,28 @@ class ActiveKillingPanel(QWidget):
         layout.addStretch()
 
         self._validate()
+        self._update_abs_hint()
 
     # ── Helpers ──────────────────────────────────────────────────────────────
     def _on_abs_toggle(self, state):
         enabled = (state == Qt.Checked)
         self.spin_abs_threshold.setEnabled(enabled)
         self.spin_threshold_mult.setEnabled(not enabled)
+        self._update_abs_hint()
+
+    def _update_abs_hint(self):
+        """Show a non-blocking recommendation to use nr_dead_mask_pixels with an absolute threshold."""
+        using_absolute = self.check_abs_threshold.isChecked()
+        wrong_column = self.death_signal_combo.currentText() != "nr_dead_mask_pixels"
+        if using_absolute and wrong_column:
+            self.abs_hint_label.setText(
+                "💡 Recommended: use nr_dead_mask_pixels as the death signal when using "
+                "an absolute threshold - a flat pixel-count cutoff is easier to reason "
+                "about than one expressed in a fraction or intensity scale."
+            )
+            self.abs_hint_label.setVisible(True)
+        else:
+            self.abs_hint_label.setVisible(False)
 
     def _get_immune_type(self) -> str:
         return self.immune_combo.currentText()

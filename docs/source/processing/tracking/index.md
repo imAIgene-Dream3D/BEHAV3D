@@ -28,46 +28,40 @@ Special cases:
 - **Multicolor cell types** (e.g. `tcell_1_multicolor`, `tcell_2_multicolor`) get a single combined panel that tracks each channel separately and then merges them into `{base}_merged`.
 - **Track all organoids together**: by **default** all organoid cell types are collapsed into a single combined **🟣 All Organoids** sub-tab (Propagation only), with the "Track all organoids together" checkbox enabled — useful when you have multiple organoid types in the same well but want one unified track set. Unticking the checkbox rebuilds one independent sub-tab per organoid type.
 
-## The five methods
+## The tracking methods
 
-Each sub-tab exposes a method dropdown with these options:
+Each cell type is tracked with one of the following methods, picked from the method dropdown in its sub-tab:
 
 | Method | Algorithm | Best for |
 |---|---|---|
-| **LAP (laptrack)** | Linear Assignment Problem (Hungarian) on centroid distances, with gap closing + optional merge/split. | Dense, fast-moving cells where small disappearances need to be recovered (immune cells). |
-| **TrackPy** | Crocker-Grier nearest-neighbour linking with adaptive search radius. | Sparse, stochastically-moving cells where a simpler & faster linker is preferred. |
-| **Propagation** | Watershed propagation of the previous timepoint's labels onto the current timepoint's mask. | Slow, stable structures whose segments overlap themselves across frames (organoids). |
-| **btrack (Bayesian)** | Bayesian tracker with a Kalman-filter motion model, optionally followed by a global integer-programming hypothesis optimiser. | Datasets where motility statistics or division/death modelling matters; immune cells with crossing trajectories. |
+| **Propagation** | Watershed propagation of the previous timepoint's labels onto the current timepoint's mask (overlap-based, not centroid distance). | Slow, non-dividing, non-touching structures whose segments overlap themselves across frames — **organoids** (and, in practice, microglia). |
+| **btrack (Bayesian)** | Bayesian tracker with a Kalman-filter motion model, optionally followed by a global integer-programming hypothesis optimiser. | **Motile cells** — immune cells with fast motion, short disappearances, crossing trajectories, divisions or death. The default and only tracker in routine use for moving objects. |
 | **Import tracking** | Validates + re-chunks an externally-produced tracked zarr / TIFF into BEHAV3D EXPLORER's canonical layout. | Track data produced by Imaris or any external pipeline. |
 
 ```{tip}
 **Starting points that we generally recommend:**
 
 - **Propagation** for organoids — they are large, slow, and overlap themselves across consecutive frames.
-- **btrack** for immune cells — in our hands it consistently gives the best results, handling fast motion, short disappearances, divisions, and cell death. **LAP** is a good alternative if btrack is too slow or you want simpler parameter tuning.
-- **TrackPy** when btrack or LAP over-links, you have very sparse data, or you want a fast first pass.
+- **btrack** for immune / motile cells — in our hands it consistently gives the best results, handling fast motion, short disappearances, divisions, and cell death.
 
 These are starting points, not endpoints — every method needs to be checked visually on at least one sample before committing to a batch run.
 ```
 
 ## How to choose
 
-Three questions usually settle the choice:
+Two questions usually settle the choice:
 
 1. **How much do the cells move between frames, relative to their size?**
-   - Almost no motion (organoids): Propagation works well because the previous-frame segment still overlaps itself in the current frame.
-   - Visible motion (immune cells, motile cancer cells): centroid-based methods (LAP / TrackPy / btrack) are needed.
-2. **Do you need to recover short disappearances?**
-   - If segmentation occasionally drops a cell for 1–3 frames, LAP and btrack are designed for that (gap closing / track termination hypotheses). TrackPy supports it via `Memory`.
-3. **Do you care about divisions / merges?**
-   - LAP can model splitting and merging events (off by default — see [LAP](lap)).
-   - btrack can model branching (division), death, and merging via its global optimiser — see [btrack](btrack).
-   - TrackPy and Propagation have no built-in support for divisions.
+   - Almost no motion (organoids): **Propagation** works well because the previous-frame segment still overlaps itself in the current frame.
+   - Visible motion (immune cells, motile cancer cells): **btrack** — its Kalman-filter motion model links detections across frames by predicted position.
+2. **Do you need to recover short disappearances, or model divisions / death?**
+   - btrack's global hypothesis optimiser bridges short gaps and can model branching (division), death, and merging — see [btrack](btrack).
+   - Propagation has no built-in support for gaps or divisions; it relies purely on frame-to-frame overlap.
 
 ## Generic workflow per sub-tab
 
 1. **Method dropdown** — pick the method.
-2. **Method-specific parameter panel** appears below (LAP exposes 5 numeric parameters, TrackPy 4, Propagation has none, btrack has a two-step layout, Import has a per-sample status table).
+2. **Method-specific parameter panel** appears below (Propagation has no tunable parameters, btrack has a two-step layout, Import has a per-sample status table).
 3. **Apply to all *Category* / Apply to all** — two buttons that propagate the current sub-tab's settings to other sub-tabs (same category, or all cell types).
 4. **Run *Cell type* Tracking** — the green button at the bottom of the sub-tab (e.g. *Run Tcell Tracking*). It runs the selected method for **every sample** in the metadata for this one cell type, immediately, and blocks the GUI until it finishes.
 
@@ -101,7 +95,7 @@ Every tracking method writes a CSV with the same schema:
 | `pixel_position_x`, `pixel_position_y`, `pixel_position_z` | float | Centroid coordinates in **pixel units**. |
 
 ```{note}
-The tracks CSV stores each cell’s position twice: in **pixels** (`pixel_position_*`) and in **physical units** (`position_*`, usually µm, from `pixel_distance_xy/z` in your metadata). Distance limits in the Tracking tab (e.g. LAP track cost, TrackPy search range, btrack max search radius) are labeled “(px)” but are compared to the **physical** `position_*` values — enter them in those same units (typically µm), not as a pixel count.
+The tracks CSV stores each cell’s position twice: in **pixels** (`pixel_position_*`) and in **physical units** (`position_*`, usually µm, from `pixel_distance_xy/z` in your metadata). Distance limits in the Tracking tab (e.g. btrack max search radius) are labeled “(px)” but are compared to the **physical** `position_*` values — enter them in those same units (typically µm), not as a pixel count.
 ```
 
 ## Outputs
@@ -133,8 +127,6 @@ Full step-by-step instructions, all six tools, and tips: **[Manual editing of tr
 :hidden:
 :maxdepth: 1
 
-lap
-trackpy
 propagation
 btrack
 import

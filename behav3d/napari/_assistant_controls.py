@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 
-CONTROL_CONTRACT_VERSION = "2.0"
+CONTROL_CONTRACT_VERSION = "2.5"
 
 
 def _safe(fn: Callable, default=None):
@@ -98,6 +98,7 @@ def _binding(
     default: Any = None,
     unit: str | None = None,
     method: str | None = None,
+    strategy: str | None = None,
     cell_type: str | None = None,
     visible: bool | None = None,
     getter: Callable | None = None,
@@ -118,6 +119,7 @@ def _binding(
         "enabled": _is_enabled(widget),
         "step": step,
         "method": method,
+        "strategy": strategy,
         "cell_type": cell_type,
         "_widget": widget,
         "_getter": get,
@@ -252,45 +254,83 @@ def _segmentation_bindings(main_widget) -> list[dict]:
                 persist=getattr(page, persist_name, None),
             ))
 
-    # EDT fields are created dynamically per cell type and per strategy. Expose
-    # only fields that currently exist, using the same binding for context and
-    # application so recommendations can be applied to the exact visible method.
+    def instance_strategy(training, tab) -> str | None:
+        per_tab = getattr(tab, "_per_tab_strategy_combo", None)
+        global_combo = getattr(training, "strategy_combo", None)
+        combo = per_tab if per_tab is not None else global_combo
+        return _safe(combo.currentText, None) if combo is not None else None
+
+    # Instance-segmentation fields are created dynamically for the selected
+    # strategy. Expose only controls that actually exist so advice and edits are
+    # grounded in the active method, cell type, and watershed strategy.
     apoc = getattr(seg, "apoc_page", None)
     apoc_training = getattr(apoc, "_training_widget", None) if apoc is not None else None
     for cell_type, tab in (getattr(apoc_training, "tabs", {}) or {}).items():
-        widget = getattr(tab, "edt_threshold_spin", None)
-        if widget is None:
-            continue
-
         def persist_apoc(page=apoc):
             page._save_apoc_params_to_yaml(
                 updated_apoc_params=page._collect_apoc_tab_config()
             )
 
-        out.append(_binding(
-            f"segmentation.apoc.{cell_type}.edt_threshold",
-            f"{cell_type}: APOC EDT threshold", widget,
-            step="segmentation", unit="pixels", method="APOC",
-            cell_type=str(cell_type), visible=current_index == 0,
-            persist=persist_apoc,
-        ))
+        strategy = instance_strategy(apoc_training, tab)
+        strategy_combo = getattr(tab, "_per_tab_strategy_combo", None)
+        if strategy_combo is not None:
+            out.append(_binding(
+                f"segmentation.apoc.{cell_type}.strategy",
+                f"{cell_type}: APOC instance segmentation strategy",
+                strategy_combo, step="segmentation", method="APOC",
+                strategy=strategy, cell_type=str(cell_type),
+                visible=current_index == 0, persist=persist_apoc,
+            ))
+        for suffix, label, attr, unit in (
+            ("mask_threshold", "mask threshold", "prob_mask_threshold_spin", None),
+            ("seed_threshold", "seed threshold", "prob_seed_threshold_spin", None),
+            ("edt_threshold", "EDT threshold", "edt_threshold_spin", "pixels"),
+        ):
+            widget = getattr(tab, attr, None)
+            if widget is None:
+                continue
+            out.append(_binding(
+                f"segmentation.apoc.{cell_type}.{suffix}",
+                f"{cell_type}: APOC {label}", widget,
+                step="segmentation", unit=unit, method="APOC",
+                strategy=strategy, cell_type=str(cell_type),
+                visible=current_index == 0, persist=persist_apoc,
+            ))
 
     convpaint = getattr(seg, "convpaint_page", None)
     conv_training = (
         getattr(convpaint, "_training_widget", None) if convpaint is not None else None
     )
     for cell_type, tab in (getattr(conv_training, "tabs", {}) or {}).items():
-        widget = getattr(tab, "edt_threshold_spin", None)
-        if widget is None:
-            continue
-        out.append(_binding(
-            f"segmentation.convpaint.{cell_type}.edt_threshold",
-            f"{cell_type}: ConvPaint EDT threshold", widget,
-            step="segmentation", unit="pixels", method="ConvPaint",
-            cell_type=str(cell_type), visible=current_index == 1,
-            persist=(lambda page=convpaint, training_tab=tab:
-                     page._save_params_to_yaml(training_tab.collect_params())),
-        ))
+        strategy = instance_strategy(conv_training, tab)
+
+        def persist_convpaint(page=convpaint, training_tab=tab):
+            page._save_params_to_yaml(training_tab.collect_params())
+
+        strategy_combo = getattr(tab, "_per_tab_strategy_combo", None)
+        if strategy_combo is not None:
+            out.append(_binding(
+                f"segmentation.convpaint.{cell_type}.strategy",
+                f"{cell_type}: ConvPaint instance segmentation strategy",
+                strategy_combo, step="segmentation", method="ConvPaint",
+                strategy=strategy, cell_type=str(cell_type),
+                visible=current_index == 1, persist=persist_convpaint,
+            ))
+        for suffix, label, attr, unit in (
+            ("mask_threshold", "mask threshold", "prob_mask_threshold_spin", None),
+            ("seed_threshold", "seed threshold", "prob_seed_threshold_spin", None),
+            ("edt_threshold", "EDT threshold", "edt_threshold_spin", "pixels"),
+        ):
+            widget = getattr(tab, attr, None)
+            if widget is None:
+                continue
+            out.append(_binding(
+                f"segmentation.convpaint.{cell_type}.{suffix}",
+                f"{cell_type}: ConvPaint {label}", widget,
+                step="segmentation", unit=unit, method="ConvPaint",
+                strategy=strategy, cell_type=str(cell_type),
+                visible=current_index == 1, persist=persist_convpaint,
+            ))
 
     random_forest = getattr(seg, "pixel_classifier_page", None)
     for cell_type, widgets in (getattr(random_forest, "param_widgets", {}) or {}).items():
@@ -344,7 +384,14 @@ def _tracking_bindings(main_widget) -> list[dict]:
     ]
     for cell_type, panel in panels.items():
         method_index = _safe(panel.combo_method.currentIndex, 0)
+        optimizer_enabled = bool(_safe(
+            getattr(panel, "bt_use_optimize", None).isChecked, False
+        )) if getattr(panel, "bt_use_optimize", None) is not None else False
         for suffix, label, attr, unit, method in specs:
+            if suffix in {
+                "btrack.distance_threshold", "btrack.time_threshold",
+            } and not optimizer_enabled:
+                continue
             widget = getattr(panel, attr, None)
             if widget is None:
                 continue
@@ -360,12 +407,13 @@ def _tracking_bindings(main_widget) -> list[dict]:
                                 unit=unit, method=method, cell_type=str(cell_type),
                                 visible=visible, persist=getattr(panel, "_persist", None)))
         checks = getattr(panel, "bt_hyp_checks", {}) or {}
-        if checks:
+        if checks and optimizer_enabled:
             out.append(_checkset_binding(
                 f"tracking.{cell_type}.btrack.hypotheses",
                 f"{cell_type}: btrack optimization hypotheses", checks,
                 step="tracking", method="btrack", cell_type=str(cell_type),
-                visible=method_index == 3, persist=getattr(panel, "_persist", None),
+                visible=method_index == 3,
+                persist=getattr(panel, "_persist", None),
             ))
     return out
 
@@ -404,8 +452,8 @@ def _filter_bindings(main_widget) -> list[dict]:
         ("trim_to_maximum.timepoints", "Maximum timepoints", "spin_exp_duration", "timepoints"),
         ("minimum_length.enabled", "Filter short tracks", "en_min_length", None),
         ("minimum_length.timepoints", "Minimum track length", "spin_min_length", "timepoints"),
-        ("maximum_length.enabled", "Trim long tracks", "en_max_length", None),
-        ("maximum_length.timepoints", "Maximum track length", "spin_max_length", "timepoints"),
+        ("maximum_length.enabled", "Trim retained tracks to a common length", "en_max_length", None),
+        ("maximum_length.timepoints", "Common output track length", "spin_max_length", "timepoints"),
         ("minimum_initial_size.enabled", "Filter by initial size", "check_filter_min_size", None),
         ("minimum_initial_size.pixels", "Minimum initial size", "spin_min_size_t1", "pixels"),
         ("dead_at_first_timepoint.enabled", "Filter dead cells at first timepoint", "check_filter_dead_t0", None),

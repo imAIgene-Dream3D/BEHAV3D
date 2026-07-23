@@ -1749,9 +1749,9 @@ class CellposeChannelConfigPanel:
                     sample_row.append(dropdown)
 
                 children.append(widgets.HBox(sample_row))
-        
+
         self.channel_config_container.children = children
-    
+
     def _persist_params(self):
         """Save channel configuration to config file"""
         cellpose_cfg = self.metadata_loader.behav3d_parameters.setdefault("cellpose", {})
@@ -1763,7 +1763,7 @@ class CellposeChannelConfigPanel:
         self.n_channels_display.value = self._channels_summary_html()
 
         cellpose_cfg["labels_mode"] = self.labels_mode.value
-        
+
         if self.labels_mode.value == 'same_for_all':
             # Save global channel labels
             channel_labels = {}
@@ -1780,7 +1780,7 @@ class CellposeChannelConfigPanel:
                     per_sample_labels[sample_name] = {i: dd.value for i, dd in dropdowns.items()}
             cellpose_cfg["per_sample_channel_labels"] = per_sample_labels
             cellpose_cfg["channel_labels"] = {}
-        
+
         # Save to file
         if hasattr(self.metadata_loader, "behav3d_parameters_path"):
             yaml.safe_dump(
@@ -1788,7 +1788,7 @@ class CellposeChannelConfigPanel:
                 self.metadata_loader.behav3d_parameters_path.open("w"),
                 sort_keys=False
             )
-    
+
     def _on_save(self, btn):
         """Save channel configuration"""
         with self.out:
@@ -1796,7 +1796,7 @@ class CellposeChannelConfigPanel:
             try:
                 self._persist_params()
                 print("Channel configuration saved successfully!")
-                
+
                 # Show summary
                 mode = self.labels_mode.value
                 if mode == 'same_for_all' and 'global' in self.channel_dropdowns:
@@ -2013,6 +2013,651 @@ class CellposeInferencePanel:
                 print("Metadata updated.")
             except Exception:
                 traceback.print_exc()
+
+    def display(self):
+        display(self.ui)
+
+
+class SAMChannelSelectorBox(widgets.VBox):
+    """Per-cell-type channel picker for Cellpose-SAM.
+
+    Notebook twin of ``behav3d.napari._segmentation.SAMChannelSelector``: one
+    checkbox per raw channel, for whichever cell type is currently selected in
+    ``cell_type_dropdown`` - "which channels feed this cell type", separate
+    from classic Cellpose's per-channel :class:`CellposeChannelConfigPanel`.
+    Stores to its own config block, ``cellpose_sam.channel_selection:
+    {cell_type: [channel_idx, ...]}``, uniform across samples (like the
+    existing ``cellpose_sam.size_filter``).
+    """
+
+    def __init__(self, metadata_loader, cell_type_dropdown, get_cell_types):
+        self.metadata_loader = metadata_loader
+        self._cell_type_dropdown = cell_type_dropdown
+        self._get_cell_types = get_cell_types
+        self._checkboxes = []
+
+        self.hint = widgets.HTML(
+            "<i>Select which raw channels feed Cellpose-SAM for the cell type "
+            "chosen above. Multiple channels are stacked as separate planes "
+            "(up to 3).</i>"
+        )
+        self.checkbox_box = widgets.VBox()
+        super().__init__([self.hint, self.checkbox_box])
+
+        self._detect_channels()
+        self._build_checkboxes()
+        cell_type_dropdown.observe(lambda _c: self._load_for_current_cell_type(), names="value")
+
+    # ── channel count + label hints (read-only reference to classic Cellpose config) ──
+    def _detect_channels(self):
+        from behav3d.core.metadata import (
+            detect_organoid_types_from_metadata,
+            detect_immune_cell_types_from_metadata,
+            detect_other_cell_types_from_metadata,
+            has_dead_channel,
+        )
+        metadata = self.metadata_loader.metadata
+        if metadata is None:
+            self._n_channels = 0
+            return
+        n = (len(detect_organoid_types_from_metadata(metadata))
+             + len(detect_immune_cell_types_from_metadata(metadata))
+             + len(detect_other_cell_types_from_metadata(metadata)))
+        if has_dead_channel(metadata):
+            n += 1
+        classic_cfg = _cfg_get(self.metadata_loader.behav3d_parameters, "cellpose", {}) or {}
+        manual_n = classic_cfg.get("manual_n_channels")
+        self._n_channels = manual_n if manual_n is not None else n
+
+    # ── UI ──────────────────────────────────────────────────────────────
+    def _build_checkboxes(self):
+        self._checkboxes = []
+        if self._n_channels == 0:
+            self.checkbox_box.children = [widgets.HTML(
+                '<span style="color: orange;">No channels detected. Load metadata first.</span>'
+            )]
+            return
+
+        self._ensure_migrated()
+
+        boxes = []
+        for i in range(self._n_channels):
+            cb = widgets.Checkbox(value=False, description=f"Channel {i}", indent=False)
+            cb.observe(lambda _c: self._sync_current_cell_type_to_memory(), names="value")
+            boxes.append(cb)
+            self._checkboxes.append(cb)
+        self.checkbox_box.children = boxes
+
+        self._load_for_current_cell_type()
+
+    # ── config: cellpose_sam.channel_selection ────────────────────────────
+    def _current_cell_type(self):
+        v = self._cell_type_dropdown.value
+        return v if v and v != "None detected" else None
+
+    def _ensure_migrated(self):
+        """Seed a default for any cell type that has no channel_selection
+        entry yet, from classic Cellpose's single-channel assignment (if
+        any) - so a working config exists immediately for users who already
+        configured channel labels there, without visiting every cell type."""
+        from behav3d.preprocessing.segmentation.cellpose_prediction import (
+            _label_to_channel_from_stored_map,
+        )
+        cfg = self.metadata_loader.behav3d_parameters.setdefault("cellpose_sam", {})
+        selection = cfg.setdefault("channel_selection", {})
+        classic_cfg = _cfg_get(self.metadata_loader.behav3d_parameters, "cellpose", {}) or {}
+        label_to_channel = _label_to_channel_from_stored_map(classic_cfg.get("channel_labels", {}))
+        for ct in self._get_cell_types():
+            if ct not in selection:
+                ch = label_to_channel.get(ct)
+                selection[ct] = [ch] if ch is not None else []
+
+    def _load_for_current_cell_type(self):
+        cell_type = self._current_cell_type()
+        if cell_type is None or not self._checkboxes:
+            return
+        selected = set(self.channels_for(cell_type))
+        for i, cb in enumerate(self._checkboxes):
+            cb.value = i in selected
+
+    def channels_for(self, cell_type) -> list:
+        """Return the persisted channel indices for *cell_type*."""
+        cfg = _cfg_get(self.metadata_loader.behav3d_parameters, "cellpose_sam", {}) or {}
+        return [int(c) for c in ((cfg.get("channel_selection") or {}).get(cell_type) or [])]
+
+    def _sync_current_cell_type_to_memory(self):
+        cell_type = self._current_cell_type()
+        if cell_type is None:
+            return
+        cfg = self.metadata_loader.behav3d_parameters.setdefault("cellpose_sam", {})
+        selection = cfg.setdefault("channel_selection", {})
+        selection[cell_type] = [i for i, cb in enumerate(self._checkboxes) if cb.value]
+
+    # ── refresh ──────────────────────────────────────────────────────────
+    def refresh(self):
+        """Re-detect channel count/hints and rebuild - e.g. when metadata
+        changes or classic Cellpose's channel config is edited elsewhere."""
+        self._detect_channels()
+        self._build_checkboxes()
+
+
+class CellposeSAMInferencePanel:
+    """Notebook panel for Cellpose-SAM (cellpose v4) zero-shot segmentation.
+
+    Notebook twin of ``behav3d.napari._segmentation.CellposeSAMWidget``; both call
+    ``run_cellpose_sam_and_sync_metadata``, so they stay behaviourally identical.
+
+    There is no model to load or train. Channel selection is its own,
+    Cellpose-SAM-specific per-cell-type checkbox picker
+    (:class:`SAMChannelSelectorBox`), separate from classic Cellpose's
+    per-channel ``CellposeChannelConfigPanel``.
+    """
+
+    def __init__(self, metadata_loader, category=None):
+        """*category* optionally restricts the cell-type dropdown to
+        ``'organoid'`` or ``'immune/other cell types'``; ``None`` offers all.
+        """
+        self.metadata_loader = metadata_loader
+        self.category = category
+        self._preview_labels = None
+        self._preview_sizes = None
+        self._detect_cell_types()
+
+        cfg = _cfg_get(self.metadata_loader.behav3d_parameters, "cellpose_sam", {}) or {}
+
+        # ── Environment ──────────────────────────────────────────────
+        self.env_status = widgets.HTML("Checking Cellpose-SAM environment…")
+        self.setup_btn = widgets.Button(
+            description="Set up Cellpose-SAM",
+            icon="wrench",
+            layout={"width": "max-content"},
+        )
+        self.setup_btn.on_click(self._on_setup_clicked)
+
+        # ── What to segment ──────────────────────────────────────────
+        self.label_selector = widgets.Dropdown(
+            description="Cell type to segment:",
+            options=self.cell_types or ["None detected"],
+            style={"description_width": "initial"},
+            layout={"width": "max-content"},
+        )
+        self.label_selector.observe(self._on_cell_type_changed, names="value")
+
+        self.all_cell_types_cb = widgets.Checkbox(
+            value=bool(cfg.get("all_cell_types", False)),
+            description="Run all cell types in one batch",
+            indent=False,
+        )
+
+        self.channel_panel = SAMChannelSelectorBox(
+            self.metadata_loader, self.label_selector,
+            get_cell_types=lambda: self.cell_types,
+        )
+
+        self.use_all_tp = widgets.Checkbox(
+            value=bool(cfg.get("use_all_timepoints", True)),
+            description="Process all timepoints",
+            indent=False,
+        )
+        self.tp_start = widgets.IntText(value=int(cfg.get("tp_start", 0)),
+                                        description="From:", layout={"width": "150px"})
+        self.tp_end = widgets.IntText(value=int(cfg.get("tp_end", 0)),
+                                      description="To:", layout={"width": "150px"})
+
+        # ── Device ───────────────────────────────────────────────────
+        from behav3d.preprocessing.segmentation.convpaint_train import _detect_torch_devices
+        self._devices = _detect_torch_devices()
+        self.device_selector = widgets.Dropdown(
+            description="GPU device:",
+            options=[(label, value) for label, value in self._devices],
+            value=cfg.get("device", "auto") if any(
+                v == cfg.get("device", "auto") for _l, v in self._devices
+            ) else "auto",
+            style={"description_width": "initial"},
+            layout={"width": "max-content"},
+        )
+        self.force_cpu_cb = widgets.Checkbox(
+            value=bool(cfg.get("force_cpu", False)),
+            description="Force CPU-only processing",
+            indent=False,
+        )
+
+        # ── Segmentation settings ────────────────────────────────────
+        from behav3d.preprocessing.segmentation.cellpose_sam_prediction import CPSAM_MODELS
+        self.model_selector = widgets.Dropdown(
+            description="Model:", options=list(CPSAM_MODELS),
+            value=cfg.get("model_name", "cpsam") if cfg.get("model_name", "cpsam") in CPSAM_MODELS else "cpsam",
+            style={"description_width": "initial"}, layout={"width": "max-content"},
+        )
+        self.diameter = widgets.FloatText(value=float(cfg.get("diameter", 0.0)),
+                                          description="Diameter (0=auto):",
+                                          style={"description_width": "initial"})
+        self.do_3d = widgets.Checkbox(value=bool(cfg.get("do_3D", True)),
+                                      description="3D segmentation (do_3D)", indent=False)
+        self.do_3d.observe(self._on_do_3d_changed, names="value")
+        self.stitch_threshold = widgets.FloatSlider(
+            value=float(cfg.get("stitch_threshold", 0.0)), min=0.0, max=1.0, step=0.05,
+            description="Stitch threshold:", style={"description_width": "initial"},
+        )
+        self.flow_threshold = widgets.FloatSlider(
+            value=float(cfg.get("flow_threshold", 0.4)), min=0.0, max=3.0, step=0.1,
+            description="Flow threshold:", style={"description_width": "initial"},
+        )
+        self.cellprob_threshold = widgets.FloatSlider(
+            value=float(cfg.get("cellprob_threshold", 0.0)), min=-6.0, max=6.0, step=0.5,
+            description="Cell prob threshold:", style={"description_width": "initial"},
+        )
+        self.batch_size = widgets.IntText(value=int(cfg.get("batch_size", 8)),
+                                          description="Batch size:",
+                                          style={"description_width": "initial"})
+        self.drop_2d_cb = widgets.Checkbox(
+            value=bool(cfg.get("drop_2d_segments", True)),
+            description="Remove flat (single-slice) segments", indent=False,
+        )
+
+        from behav3d.preprocessing.segmentation.cellpose_sam_prediction import (
+            power_safe_settings,
+        )
+        self._power_safe_preset = power_safe_settings()
+
+        # Advanced / normalization
+        self.norm_low = widgets.FloatText(value=float(cfg.get("norm_percentile_low", 1.0)),
+                                          description="Norm pct low:",
+                                          style={"description_width": "initial"})
+        self.norm_high = widgets.FloatText(value=float(cfg.get("norm_percentile_high", 99.0)),
+                                           description="Norm pct high:",
+                                           style={"description_width": "initial"})
+        self.norm3d = widgets.Checkbox(value=bool(cfg.get("norm3D", True)),
+                                       description="Normalize across whole Z stack (norm3D)",
+                                       indent=False)
+        self.niter = widgets.IntText(value=int(cfg.get("niter", 0)), description="niter:",
+                                     style={"description_width": "initial"})
+        self.flow3d_smooth = widgets.FloatText(value=float(cfg.get("flow3D_smooth", 0.0)),
+                                               description="flow3D smooth:",
+                                               style={"description_width": "initial"})
+        self.max_size_fraction = widgets.FloatText(
+            value=float(cfg.get("max_size_fraction", 1.0)),
+            description="Max size fraction:", style={"description_width": "initial"},
+        )
+        # Cellpose GUI's "custom filter settings" group.
+        self.sharpen_radius = widgets.FloatText(value=float(cfg.get("sharpen_radius", 0.0)),
+                                                description="Sharpen radius:",
+                                                style={"description_width": "initial"})
+        self.smooth_radius = widgets.FloatText(value=float(cfg.get("smooth_radius", 0.0)),
+                                               description="Smooth radius:",
+                                               style={"description_width": "initial"})
+        self.tile_norm_blocksize = widgets.FloatText(
+            value=float(cfg.get("tile_norm_blocksize", 0.0)),
+            description="Tile norm blocksize:", style={"description_width": "initial"})
+        self.tile_norm_smooth3D = widgets.FloatText(
+            value=float(cfg.get("tile_norm_smooth3D", 0.0)),
+            description="Tile norm smooth3D:", style={"description_width": "initial"})
+        self.n_threads = widgets.IntText(
+            value=int(cfg.get("n_threads", 0)), description="CPU threads (0=all):",
+            style={"description_width": "initial"},
+        )
+        self.cooldown_s = widgets.FloatText(
+            value=float(cfg.get("cooldown_s", 0.0)), description="Cooldown between frames (s):",
+            style={"description_width": "initial"},
+        )
+        advanced = widgets.Accordion(children=[widgets.VBox([
+            self.norm_low, self.norm_high, self.norm3d, self.niter,
+            self.flow3d_smooth, self.max_size_fraction,
+            self.sharpen_radius, self.smooth_radius,
+            self.tile_norm_blocksize, self.tile_norm_smooth3D,
+            widgets.HTML(
+                "<i>max_size_fraction: cellpose's own default is 0.4, which silently "
+                "deletes any object covering &gt;40% of the frame (large organoids). "
+                "BEHAV3D defaults to 1.0 and filters by size instead.</i>"
+            ),
+            widgets.HBox([self.n_threads, self.cooldown_s]),
+            widgets.HTML(
+                "<i>CPU threads caps mask post-processing/compression threads; "
+                "cooldown pauses between timepoints to let voltage regulators and "
+                "battery recover. A full Cellpose-SAM run saturates the GPU and every "
+                "CPU core at once, which on some laptops draws more power than the "
+                "machine can sustain and causes an abrupt shutdown mid-run. If that "
+                f"happens, try around {self._power_safe_preset['n_threads']} threads "
+                f"and a {self._power_safe_preset['cooldown_s']:g}s cooldown.</i>"
+            ),
+        ])])
+        advanced.set_title(0, "Advanced / normalization")
+        advanced.selected_index = None
+
+        # ── Size filter + preview ────────────────────────────────────
+        self.preview_sample = widgets.Dropdown(
+            description="Preview sample:", options=self._sample_names() or ["(no samples)"],
+            style={"description_width": "initial"}, layout={"width": "max-content"},
+        )
+        self.preview_tp = widgets.IntText(value=int(cfg.get("preview_timepoint", 0)),
+                                          description="t:", layout={"width": "120px"})
+        self.preview_btn = widgets.Button(description="Preview segmentation", icon="search",
+                                          button_style="info", layout={"width": "max-content"})
+        self.preview_btn.on_click(self._on_preview_clicked)
+
+        self.size_min = widgets.IntText(value=0, description="Min size (voxels):",
+                                        style={"description_width": "initial"})
+        self.size_max = widgets.IntText(value=0, description="Max size (voxels):",
+                                        style={"description_width": "initial"})
+        self.size_min.observe(self._on_size_changed, names="value")
+        self.size_max.observe(self._on_size_changed, names="value")
+        self.filter_stats = widgets.HTML("<i>Run a preview to see object sizes.</i>")
+        self.hist_out = widgets.Output()
+        self.show_napari_btn = widgets.Button(
+            description="Show preview in napari", icon="eye",
+            layout={"width": "max-content"},
+        )
+        self.show_napari_btn.on_click(self._on_show_napari_clicked)
+        self._load_size_filter_for_cell_type()
+
+        # ── Apply ────────────────────────────────────────────────────
+        self.apply_btn = widgets.Button(description="Apply Cellpose-SAM Segmentation",
+                                        button_style="success", layout={"width": "max-content"})
+        self.apply_btn.on_click(self._on_apply_clicked)
+        self.spinner = widgets.HTML(value=spinning_loader)
+        self.spinner.layout.display = "none"
+        self.out = widgets.Output()
+
+        self.ui = widgets.VBox([
+            widgets.HTML("<b>1. Environment</b>"),
+            self.env_status, self.setup_btn,
+            widgets.HTML("<hr><b>2. What to segment</b>"),
+            self.label_selector, self.channel_panel, self.all_cell_types_cb,
+            self.use_all_tp, widgets.HBox([self.tp_start, self.tp_end]),
+            widgets.HTML("<hr><b>3. Device</b>"),
+            self.device_selector, self.force_cpu_cb,
+            widgets.HTML("<hr><b>4. Segmentation settings</b>"),
+            self.model_selector, self.diameter, self.do_3d, self.stitch_threshold,
+            self.flow_threshold, self.cellprob_threshold, self.batch_size, self.drop_2d_cb,
+            advanced,
+            widgets.HTML("<hr><b>5. Size filter (preview before batch)</b>"),
+            widgets.HBox([self.preview_sample, self.preview_tp]),
+            self.preview_btn,
+            widgets.HBox([self.size_min, self.size_max]),
+            self.filter_stats, self.hist_out, self.show_napari_btn,
+            widgets.HTML("<hr>"),
+            widgets.HBox([self.apply_btn, self.spinner]),
+            self.out,
+        ], layout=widgets.Layout(grid_gap="6px"))
+
+        self._on_do_3d_changed({"new": self.do_3d.value})
+        self._refresh_env_status()
+
+    # ── helpers ─────────────────────────────────────────────────────
+    def _detect_cell_types(self):
+        from behav3d.core.metadata import (
+            detect_organoid_types_from_metadata,
+            detect_immune_cell_types_from_metadata,
+            detect_other_cell_types_from_metadata,
+        )
+        metadata = self.metadata_loader.metadata
+        self.organoid_types = _filter_merge_types(detect_organoid_types_from_metadata(metadata))
+        self.immune_types = _filter_merge_types(detect_immune_cell_types_from_metadata(metadata))
+        self.other_types = _filter_merge_types(detect_other_cell_types_from_metadata(metadata))
+        if self.category == "organoid":
+            self.cell_types = self.organoid_types
+        elif self.category:
+            self.cell_types = self.immune_types + self.other_types
+        else:
+            self.cell_types = self.organoid_types + self.immune_types + self.other_types
+
+    def _sample_names(self):
+        md = self.metadata_loader.metadata
+        return list(md["sample_name"].unique()) if md is not None else []
+
+    def _cfg(self):
+        return _cfg_get(self.metadata_loader.behav3d_parameters, "cellpose_sam", {}) or {}
+
+    def _refresh_env_status(self):
+        from behav3d.preprocessing.segmentation.cpsam_env import cpsam_env_status
+        status = cpsam_env_status(self.metadata_loader.behav3d_parameters)
+        if status["available"]:
+            gpus = ", ".join(status.get("gpus") or []) or "no CUDA GPU"
+            self.env_status.value = (
+                f"<span style='color:green'>&#10003; Ready — cellpose "
+                f"{status['cellpose_version']}, torch {status.get('torch_version')} ({gpus})</span>"
+            )
+            self.setup_btn.disabled = True
+            self.apply_btn.disabled = False
+            self.preview_btn.disabled = False
+        else:
+            self.env_status.value = f"<span style='color:#b8860b'>&#9888; {status['error']}</span>"
+            self.setup_btn.disabled = False
+            self.apply_btn.disabled = True
+            self.preview_btn.disabled = True
+
+    def _on_setup_clicked(self, _b):
+        from behav3d.preprocessing.segmentation.cpsam_env import create_cpsam_env
+        self.setup_btn.disabled = True
+        self.spinner.layout.display = None
+        with self.out:
+            self.out.clear_output()
+            try:
+                create_cpsam_env(progress_cb=print)
+                print("Cellpose-SAM environment ready.")
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self.spinner.layout.display = "none"
+                self._refresh_env_status()
+
+    def _on_do_3d_changed(self, change):
+        # cellpose ignores flow_threshold entirely when do_3D=True.
+        is_3d = bool(change.get("new"))
+        self.flow_threshold.disabled = is_3d
+        self.flow_threshold.description = (
+            "Flow threshold (ignored in 3D):" if is_3d else "Flow threshold:"
+        )
+        self.stitch_threshold.disabled = is_3d
+
+    def _on_cell_type_changed(self, _change):
+        self._load_size_filter_for_cell_type()
+
+    def _load_size_filter_for_cell_type(self):
+        entry = (self._cfg().get("size_filter") or {}).get(self.label_selector.value, {})
+        self.size_min.unobserve(self._on_size_changed, names="value")
+        self.size_max.unobserve(self._on_size_changed, names="value")
+        self.size_min.value = int(entry.get("size_min", 0) or 0)
+        self.size_max.value = int(entry.get("size_max", 0) or 0)
+        self.size_min.observe(self._on_size_changed, names="value")
+        self.size_max.observe(self._on_size_changed, names="value")
+
+    def _collect_sam_params(self):
+        diameter = float(self.diameter.value)
+        return {
+            "diameter": diameter if diameter > 0 else None,
+            "flow_threshold": float(self.flow_threshold.value),
+            "cellprob_threshold": float(self.cellprob_threshold.value),
+            "niter": int(self.niter.value),
+            "do_3D": bool(self.do_3d.value),
+            "stitch_threshold": float(self.stitch_threshold.value),
+            "flow3D_smooth": float(self.flow3d_smooth.value),
+            "batch_size": int(self.batch_size.value),
+            "max_size_fraction": float(self.max_size_fraction.value),
+            "norm_percentile_low": float(self.norm_low.value),
+            "norm_percentile_high": float(self.norm_high.value),
+            "norm3D": bool(self.norm3d.value),
+            "sharpen_radius": float(self.sharpen_radius.value),
+            "smooth_radius": float(self.smooth_radius.value),
+            "tile_norm_blocksize": float(self.tile_norm_blocksize.value),
+            "tile_norm_smooth3D": float(self.tile_norm_smooth3D.value),
+            "drop_2d_segments": bool(self.drop_2d_cb.value),
+        }
+
+    def _selected_device(self):
+        return "cpu" if self.force_cpu_cb.value else str(self.device_selector.value or "auto")
+
+    def _persist_params(self):
+        cfg = self.metadata_loader.behav3d_parameters.setdefault("cellpose_sam", {})
+        cfg.update(self._collect_sam_params())
+        cfg["diameter"] = float(self.diameter.value)
+        cfg["model_name"] = self.model_selector.value
+        cfg["device"] = str(self.device_selector.value or "auto")
+        cfg["force_cpu"] = bool(self.force_cpu_cb.value)
+        cfg["all_cell_types"] = bool(self.all_cell_types_cb.value)
+        cfg["use_all_timepoints"] = bool(self.use_all_tp.value)
+        cfg["tp_start"] = int(self.tp_start.value)
+        cfg["tp_end"] = int(self.tp_end.value)
+        cfg["preview_timepoint"] = int(self.preview_tp.value)
+        cfg["n_threads"] = int(self.n_threads.value)
+        cfg["cooldown_s"] = float(self.cooldown_s.value)
+        cfg.setdefault("size_filter", {})[self.label_selector.value] = {
+            "size_min": int(self.size_min.value),
+            "size_max": int(self.size_max.value),
+        }
+        if hasattr(self.metadata_loader, "behav3d_parameters_path"):
+            yaml.safe_dump(
+                self.metadata_loader.behav3d_parameters,
+                self.metadata_loader.behav3d_parameters_path.open("w"),
+                sort_keys=False,
+            )
+
+    # ── preview ─────────────────────────────────────────────────────
+    def _on_preview_clicked(self, _b):
+        from behav3d.preprocessing.segmentation.cellpose_sam_prediction import preview_cellpose_sam
+        from behav3d.preprocessing.segmentation.size_filter import compute_label_sizes
+
+        self.preview_btn.disabled = True
+        self.spinner.layout.display = None
+        with self.out:
+            self.out.clear_output()
+            try:
+                self._persist_params()
+                labels = preview_cellpose_sam(
+                    output_dir=self.metadata_loader.output_dir,
+                    metadata=self.metadata_loader.metadata,
+                    sample_name=self.preview_sample.value,
+                    cell_type=self.label_selector.value,
+                    timepoint=int(self.preview_tp.value),
+                    model_name=self.model_selector.value,
+                    device=self._selected_device(),
+                    force_cpu=bool(self.force_cpu_cb.value),
+                    sam_params=self._collect_sam_params(),
+                    config=self.metadata_loader.behav3d_parameters,
+                )
+                self._preview_labels = labels
+                _lbl, sizes = compute_label_sizes(labels)
+                self._preview_sizes = sizes
+                print(f"Preview complete: {sizes.size} objects.")
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self.spinner.layout.display = "none"
+                self.preview_btn.disabled = False
+        self._update_preview_filter()
+
+    def _on_size_changed(self, _change):
+        self._update_preview_filter()
+
+    def _update_preview_filter(self):
+        """Re-filter the cached preview. No inference re-run, so this is instant."""
+        if self._preview_sizes is None:
+            return
+        import matplotlib.pyplot as plt
+
+        sizes = self._preview_sizes
+        size_min = int(self.size_min.value) or None
+        size_max = int(self.size_max.value) or None
+        keep = np.ones(sizes.size, dtype=bool)
+        if size_min:
+            keep &= sizes >= size_min
+        if size_max:
+            keep &= sizes <= size_max
+        n_keep = int(keep.sum())
+
+        if sizes.size:
+            self.filter_stats.value = (
+                f"<b>{sizes.size}</b> objects &rarr; <b>{n_keep}</b> kept "
+                f"({sizes.size - n_keep} removed). Volumes: min={sizes.min()}, "
+                f"median={int(np.median(sizes))}, max={sizes.max()} voxels."
+            )
+        else:
+            self.filter_stats.value = "<i>No objects in the preview.</i>"
+            return
+
+        with self.hist_out:
+            self.hist_out.clear_output(wait=True)
+            fig, ax = plt.subplots(figsize=(6, 2.4))
+            ax.hist(sizes, bins=min(40, max(5, sizes.size)), color="#6699cc", edgecolor="white")
+            if size_min:
+                ax.axvline(size_min, color="crimson", ls="--", label=f"min={size_min}")
+            if size_max:
+                ax.axvline(size_max, color="darkorange", ls="--", label=f"max={size_max}")
+            ax.set_xlabel("object volume (voxels)")
+            ax.set_ylabel("count")
+            ax.set_title(f"{sizes.size} objects → {n_keep} kept")
+            if size_min or size_max:
+                ax.legend(fontsize=8)
+            fig.tight_layout()
+            plt.show()
+
+    def _on_show_napari_clicked(self, _b):
+        from behav3d.preprocessing.segmentation.size_filter import filter_labels_by_size
+        if self._preview_labels is None:
+            with self.out:
+                print("Run a preview first.")
+            return
+        filtered = filter_labels_by_size(
+            self._preview_labels,
+            size_min=int(self.size_min.value) or None,
+            size_max=int(self.size_max.value) or None,
+        )
+        viewer = napari.current_viewer() or napari.Viewer()
+        name = "Cellpose-SAM preview"
+        if name in viewer.layers:
+            viewer.layers[name].data = filtered
+        else:
+            viewer.add_labels(filtered, name=name)
+
+    # ── apply ───────────────────────────────────────────────────────
+    def _on_apply_clicked(self, _b):
+        from behav3d.preprocessing.segmentation.cellpose_sam_prediction import (
+            run_cellpose_sam_and_sync_metadata,
+        )
+        cell_types = (list(self.cell_types) if self.all_cell_types_cb.value
+                      else [self.label_selector.value])
+
+        self.apply_btn.disabled = True
+        self.spinner.layout.display = None
+        with self.out:
+            self.out.clear_output()
+            try:
+                self._persist_params()
+                timepoint_range = _mk_timepoint_range(
+                    self.use_all_tp.value, self.tp_start.value, self.tp_end.value
+                )
+                size_filters = self._cfg().get("size_filter") or {}
+                total = {"processed": [], "skipped": []}
+                for ct in cell_types:
+                    _, summary = run_cellpose_sam_and_sync_metadata(
+                        output_dir=self.metadata_loader.output_dir,
+                        metadata_loader=self.metadata_loader,
+                        label_name=ct,
+                        model_name=self.model_selector.value,
+                        timepoint_range=timepoint_range,
+                        device=self._selected_device(),
+                        force_cpu=bool(self.force_cpu_cb.value),
+                        sam_params=self._collect_sam_params(),
+                        size_filter=size_filters.get(ct),
+                        resume=True,
+                        n_threads=int(self.n_threads.value) or None,
+                        cooldown_s=float(self.cooldown_s.value),
+                    )
+                    total["processed"].extend(summary["processed"])
+                    total["skipped"].extend(summary["skipped"])
+
+                n_proc, n_skip = len(total["processed"]), len(total["skipped"])
+                if n_skip:
+                    print(f"Cellpose-SAM finished: {n_proc} processed, {n_skip} skipped.")
+                    print(f"Skipped: {', '.join(total['skipped'])}")
+                else:
+                    print(f"Cellpose-SAM finished: {n_proc} processed.")
+                print("Metadata updated.")
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self.spinner.layout.display = "none"
+                self.apply_btn.disabled = False
 
     def display(self):
         display(self.ui)

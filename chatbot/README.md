@@ -53,10 +53,16 @@ curl -N -X POST <url>/chat \
   -d '{"messages":[{"role":"user","content":"set the trackpy search range to 40 for immune"}],"context":{"current_step":"tracking"}}'
 ```
 
+Replay the PI feedback scenarios against the configured deployed endpoint:
+```bash
+conda run -n behav3d python chatbot/smoke_test.py
+```
+Use `--scenario merged_cell_thresholds` for one case or `--json-out /tmp/report.json`
+to retain the complete responses and tool calls.
+
 ## Refreshing the parameter schema
 `schema_cards.json` is generated from the live BEHAV3D config:
 ```bash
 conda run -n behav3d python -c "from behav3d.napari._assistant_schema import dump_cards_json; dump_cards_json('chatbot/schema_cards.json')"
 ```
 Re-run `python -m modal run chatbot/app.py::ingest` afterwards.
-

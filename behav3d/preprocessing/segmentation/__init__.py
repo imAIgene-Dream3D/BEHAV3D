@@ -28,7 +28,14 @@ def keep_largest_connected_components(segments):
         segments[(mask) & (relabeled_segments != biggest_segment)]=0
     return segments
 
-def segment_size_filter(segments, size_min=None, size_max=None):
+def segment_size_filter(segments, size_min=None, size_max=None, fill_holes=True):
+    """Remove labels outside ``[size_min, size_max]`` voxels.
+
+    Accepts a 3-D ``(Z, Y, X)`` volume or a 4-D ``(T, Z, Y, X)`` stack. When
+    *fill_holes* is True, holes left behind by removed segments that were
+    embedded inside a surviving segment are reassigned to the nearest kept label.
+    Either bound may be ``None`` to leave that side unbounded.
+    """
     def _filter_one_volume(vol):
         vol = np.asarray(vol).copy()
         if not np.any(vol):
@@ -50,7 +57,7 @@ def segment_size_filter(segments, size_min=None, size_max=None):
 
         to_remove_mask = np.isin(vol, remove_labels)
         kept_mask = (vol > 0) & ~to_remove_mask
-        if not np.any(kept_mask):
+        if not np.any(kept_mask) or not fill_holes:
             vol[to_remove_mask] = 0
             return vol
 

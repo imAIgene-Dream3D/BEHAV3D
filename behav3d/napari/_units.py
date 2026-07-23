@@ -137,9 +137,13 @@ class UnitGroupManager:
             self.xy, self.z, self.valid = float(xy_um), float(z_um), True
         else:
             self.xy, self.z, self.valid = resolution_from_metadata(metadata)
-        # Physical display only makes sense with a valid resolution.
+        # Physical display only makes sense with a valid resolution. The
+        # originally requested intent is kept separately so refresh() can
+        # re-apply it once a valid resolution shows up later (see refresh()).
+        self._default_physical = bool(default_physical)
         self.physical = bool(default_physical and self.valid)
         self._entries = []  # list of spinbox widgets (tagged with attrs)
+        self._note_label = None  # set by header_row(); toggled by refresh()
 
         self.switch = QSwitch()
         self.switch.setChecked(self.physical)
@@ -148,7 +152,7 @@ class UnitGroupManager:
         self.switch.toggled.connect(self._on_toggle)
 
     # -- widget construction -------------------------------------------
-    def header_row(self, label="Units:"):
+    def header_row(self, label="Units:", show_help=True):
         """Return a small ``QWidget`` row: ``label  px [switch] µm``."""
         row = QWidget()
         lay = QHBoxLayout(row)
@@ -159,24 +163,27 @@ class UnitGroupManager:
         lay.addWidget(QLabel("px"))
         lay.addWidget(self.switch)
         lay.addWidget(QLabel("µm"))
-        if not self.valid:
-            note = QLabel("(no resolution in metadata)")
-            note.setStyleSheet("color:#999; font-style:italic; font-size:10px;")
-            lay.addWidget(note)
-        lay.addWidget(HelpButton(
-            "Physical vs. Pixel Units",
-            "Toggle how the value(s) above are displayed:\n\n"
-            "- 'px' (off): the value is shown in native pixels/voxels — "
-            "the same units used for segmentation parameters.\n"
-            "- 'µm' (on): the value is shown converted to physical units "
-            "(µm for distances, µm³ for volumes) using this sample's pixel "
-            "size ('pixel_distance_xy' / 'pixel_distance_z' from metadata).\n\n"
-            "This only changes how the number is displayed — the value that "
-            "gets saved/used by the pipeline is always converted back to its "
-            "native unit automatically. If the toggle is disabled, the "
-            "metadata has no valid pixel size and only native units are "
-            "available."
-        ))
+        # Always created (not just when currently invalid) so refresh() can
+        # show/hide it in place once metadata loads, without rebuilding the row.
+        self._note_label = QLabel("(no resolution in metadata)")
+        self._note_label.setStyleSheet("color:#999; font-style:italic; font-size:10px;")
+        self._note_label.setVisible(not self.valid)
+        lay.addWidget(self._note_label)
+        if show_help:
+            lay.addWidget(HelpButton(
+                "Physical vs. Pixel Units",
+                "Toggle how the value(s) above are displayed:\n\n"
+                "- 'px' (off): the value is shown in native pixels/voxels — "
+                "the same units used for segmentation parameters.\n"
+                "- 'µm' (on): the value is shown converted to physical units "
+                "(µm for distances, µm³ for volumes) using this sample's pixel "
+                "size ('pixel_distance_xy' / 'pixel_distance_z' from metadata).\n\n"
+                "This only changes how the number is displayed — the value that "
+                "gets saved/used by the pipeline is always converted back to its "
+                "native unit automatically. If the toggle is disabled, the "
+                "metadata has no valid pixel size and only native units are "
+                "available."
+            ))
         lay.addStretch(1)
         return row
 
@@ -208,6 +215,42 @@ class UnitGroupManager:
         """Set ``widget``'s canonical native value and refresh its display."""
         widget._unit_native = float(native_value)
         self._set_display(widget)
+
+    def refresh(self, metadata=None, xy_um=None, z_um=None):
+        """Re-check resolution validity and redisplay every registered widget.
+
+        Widgets are frequently built before metadata is loaded (napari builds
+        every tab up front), so the resolution passed to ``__init__`` is often
+        invalid at construction time even though the eventually-loaded
+        metadata has valid ``pixel_distance_xy``/``_z`` columns. Call this
+        from the owning widget's metadata-updated handler to pick that up —
+        the switch permanently disables itself otherwise, and the note
+        ("no resolution in metadata") never revisits its own premise.
+        """
+        was_valid = self.valid
+        if xy_um is not None and z_um is not None and xy_um > 0 and z_um > 0:
+            self.xy, self.z, self.valid = float(xy_um), float(z_um), True
+        else:
+            self.xy, self.z, self.valid = resolution_from_metadata(metadata)
+
+        self.switch.setEnabled(self.valid)
+        if self._note_label is not None:
+            self._note_label.setVisible(not self.valid)
+
+        if self.valid and not was_valid:
+            # Just became valid - honor the originally requested display mode
+            # (the switch could not have been toggled by the user while
+            # disabled, so there is no manual choice to preserve here).
+            self.physical = self._default_physical
+            self.switch.blockSignals(True)
+            self.switch.setChecked(self.physical)
+            self.switch.blockSignals(False)
+        elif not self.valid:
+            self.physical = False
+
+        for w in self._entries:
+            self._set_display(w)
+            self._update_suffix(w)
 
     # -- internal -------------------------------------------------------
     def _display_to_native(self, value, kind, native_unit):

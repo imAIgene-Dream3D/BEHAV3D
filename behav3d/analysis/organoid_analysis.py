@@ -1625,12 +1625,15 @@ def plot_multi_organoid_death_dynamics(
     output_dir = Path(output_dir)
 
     # Threshold text for Plot 4a/4b annotations (from pipeline settings).
+    # ``dead_perc_threshold_map`` values are fractions (0.0-1.0), matching
+    # the ``dead_mask_percentage_threshold`` config scale; convert to
+    # percent (0-100) for display here.
     threshold_annotation = "Dead threshold (% mask): not provided"
     if isinstance(dead_perc_threshold_map, dict) and dead_perc_threshold_map:
         cleaned_thr = {}
         for k, v in dead_perc_threshold_map.items():
             try:
-                cleaned_thr[str(k)] = float(v)
+                cleaned_thr[str(k)] = float(v) * 100.0
             except Exception:
                 continue
         if cleaned_thr:

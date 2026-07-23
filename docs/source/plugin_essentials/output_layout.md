@@ -26,6 +26,7 @@ You pick it once, in **Data Preparation → Output Directory**. Every other tab 
     │   ├── track_features/                         # feature CSVs (raw, filtered, summarised)
     │   ├── quality_control/                        # filtering QC plots
     │   ├── active_killing/                         # immune cell types only — killing events
+    │   ├── invasiveness_analysis/                  # immune cell types only — surface-engagement analyses
     │   ├── results/                                # organoid-type dynamics analyses
     │   ├── interaction_analysis/                   # immune ↔ organoid contact analyses
     │   ├── behavioral_states/                      # state classification (.h5ad) + backprojection/ subfolder (state-labelled zarrs)

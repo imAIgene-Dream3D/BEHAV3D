@@ -494,6 +494,35 @@ def install_cellpose(conda_path, gpu_info, force_cpu=False):
         return False
 
 
+def install_cellpose_sam(conda_path):
+    """Install Cellpose-SAM (cellpose v4) into a sidecar environment.
+
+    Cellpose v4 is a SAM ViT-L and cannot load the v3 models BEHAV3D ships, so the
+    two versions cannot share an interpreter. The sidecar is a venv created with
+    ``--system-site-packages`` inside the BEHAV3D environment: cellpose 4 shadows
+    cellpose 3 there, while torch/numpy/scipy are reused rather than duplicated
+    (~13 MB instead of ~4 GB). See behav3d/preprocessing/segmentation/cpsam_env.py.
+    """
+    print_step("Installing Cellpose-SAM (cellpose v4) into a sidecar environment...")
+
+    run_prefix = get_conda_run_prefix(conda_path, ENV_NAME)
+    try:
+        cmd = (
+            f'{run_prefix} python -c '
+            f'"from behav3d.preprocessing.segmentation.cpsam_env import create_cpsam_env; '
+            f'create_cpsam_env(progress_cb=print)"'
+        )
+        print_info(f"Running: {cmd}")
+        run_command(cmd)
+        print_success("Cellpose-SAM installed (your cellpose 3 install is untouched)")
+        return True
+    except subprocess.CalledProcessError as e:
+        # Non-fatal: Cellpose-SAM is optional and the GUI can set it up on demand.
+        print_error(f"Failed to install Cellpose-SAM: {e}")
+        print_info("You can set it up later from the Cellpose-SAM segmentation panel.")
+        return False
+
+
 def install_convpaint(conda_path):
     """Install napari-convpaint"""
     print_step("Installing napari-convpaint (ConvPaint segmentation engine)...")
@@ -907,7 +936,10 @@ Examples:
                        help="Remove and reinstall environment if it exists (no prompt)")
     parser.add_argument("--keep-existing", action="store_true",
                        help="Keep existing environment and only update PyTorch/Cellpose (no prompt)")
-    
+    parser.add_argument("--with-cellpose-sam", action="store_true",
+                       help="Also install Cellpose-SAM (cellpose v4) into a sidecar env "
+                            "(~13 MB; leaves the pinned cellpose 3 untouched)")
+
     args = parser.parse_args()
     
     # Set global environment name from args
@@ -1082,7 +1114,13 @@ Examples:
                     print_warning("Plugin package installed, but npe2 did not discover the manifest. 'pip install -e .' might need to be run again manually.")
             except Exception as e:
                 print_warning(f"Plugin verification warning: {e}")
-    
+
+    # Optional: Cellpose-SAM sidecar. Must come after the BEHAV3D package install,
+    # because it is driven through behav3d.preprocessing.segmentation.cpsam_env.
+    if args.with_cellpose_sam:
+        print_header("CELLPOSE-SAM INSTALLATION")
+        install_cellpose_sam(conda_path)
+
     # Fix FreeType DLL name mismatch on Windows
     print_header("PLATFORM FIXES")
     fix_freetype_windows(conda_path)

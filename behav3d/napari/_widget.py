@@ -332,6 +332,10 @@ class BEHAV3DWidget(QWidget):
             lambda: self.queue_panel.add_step(StepType.DEAD_MASK)
         )
 
+        # Cellpose-SAM +🛒 button
+        cpsam = self.segmentation_tab.cellpose_sam_page
+        cpsam.btn_queue_cellpose_sam.clicked.connect(self._add_cellpose_sam_to_queue)
+
         # APOC +🛒 buttons
         apoc = self.segmentation_tab.apoc_page
         apoc.btn_queue_apoc_segment.clicked.connect(self._add_apoc_segment_to_queue)
@@ -515,6 +519,17 @@ class BEHAV3DWidget(QWidget):
             return
         params = cp.get_queue_params()
         self.queue_panel.add_step(StepType.CELLPOSE_SEGMENT, params=params)
+
+    def _add_cellpose_sam_to_queue(self):
+        """Validate Cellpose-SAM config and add a CELLPOSE_SAM_SEGMENT step to the queue."""
+        cpsam = self.segmentation_tab.cellpose_sam_page
+        ok, msg = cpsam.validate_for_queue()
+        if not ok:
+            from qtpy.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Cannot Add to Queue", msg)
+            return
+        params = cpsam.get_queue_params()
+        self.queue_panel.add_step(StepType.CELLPOSE_SAM_SEGMENT, params=params)
 
     def _add_apoc_segment_to_queue(self):
         """Validate APOC config and add an APOC_SEGMENT step to the queue."""

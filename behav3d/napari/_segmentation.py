@@ -36,6 +36,7 @@ import joblib
 
 from behav3d.core.utils import convert_distance
 from behav3d.napari._units import UnitGroupManager
+from behav3d.napari._analysis import CollapsibleSection
 from behav3d.io.images import load_image, get_image_shape, save_as_zarr, append_to_zarr, load_zarr, convert_label_file_to_zarr
 from behav3d.preprocessing import zeropad_image_to_match_shape
 from behav3d.preprocessing.segmentation.napari_pixelclassifier import (
@@ -99,11 +100,15 @@ class SegmentationTab(QWidget):
         method_layout = QHBoxLayout()
         self.method_combo = QComboBox()
 
+        # NOTE: this list is positionally coupled to _SEG_METHOD_MAP in
+        # behav3d/napari/_queue.py — the queue maps combo index -> StepType.
+        # Keep the two in the same order when adding a method.
         methods = [
             "APOC (GPU)",
             "ConvPaint (DL pixel classifier)",
             "Pixel Classifier (Random Forest)",
             "Cellpose (Deep Learning)",
+            "Cellpose-SAM (zero-shot)",
             "Import segmentation",
         ]
         self.method_combo.addItems(methods)
@@ -136,7 +141,7 @@ class SegmentationTab(QWidget):
         )
         self.param_stack.addWidget(self.convpaint_page)
 
-        # 2. Pixel Classifier Page
+        # 2. Pixel Classifier Page  ← matches combo index 2
         self.pixel_classifier_page = PixelClassifierWidget(
             self.viewer,
             self.metadata_loader,
@@ -145,7 +150,7 @@ class SegmentationTab(QWidget):
         )
         self.param_stack.addWidget(self.pixel_classifier_page)
 
-        # 2. Cellpose Page  ← matches combo index 2
+        # 3. Cellpose Page  ← matches combo index 3
         self.cellpose_page = CellposeWidget(
             self.viewer,
             self.metadata_loader,
@@ -153,8 +158,17 @@ class SegmentationTab(QWidget):
             tab_progress_row=self.progress_row,
         )
         self.param_stack.addWidget(self.cellpose_page)
-        
-        # 3. Import Page ← matches combo index 3
+
+        # 4. Cellpose-SAM Page  ← matches combo index 4
+        self.cellpose_sam_page = CellposeSAMWidget(
+            self.viewer,
+            self.metadata_loader,
+            log_callback=self._log,
+            tab_progress_row=self.progress_row,
+        )
+        self.param_stack.addWidget(self.cellpose_sam_page)
+
+        # 5. Import Page ← matches combo index 5
         self.import_page = ImportWidget(
             self.viewer,
             self.metadata_loader,
@@ -203,6 +217,8 @@ class SegmentationTab(QWidget):
         if hasattr(self, 'pixel_classifier_page'):
             self.pixel_classifier_page._on_metadata_updated()
         self.cellpose_page._on_metadata_updated()
+        if hasattr(self, 'cellpose_sam_page'):
+            self.cellpose_sam_page._on_metadata_updated()
         self.import_page._on_metadata_updated()
         if hasattr(self, 'apoc_page'):
             self.apoc_page._on_metadata_updated()
@@ -314,8 +330,18 @@ class SegmentationTab(QWidget):
             self.apoc_page._on_metadata_updated()
         elif index == 1:
             self.convpaint_page._on_metadata_updated()
-        # If switching to Import tab (index 4), refresh it to avoid outdated info
+        # Cellpose (index 3): re-read the channel config in case it was edited
+        # from the Cellpose-SAM page since this page was built -- both pages
+        # embed the same ChannelConfigPanel, writing to the same config block.
+        elif index == 3:
+            self.cellpose_page._on_metadata_updated()
+        # Cellpose-SAM (index 4): re-probe the sidecar env in case it was set up
+        # from elsewhere since this page was built, and re-read the channel
+        # config in case it was edited from the Cellpose page.
         elif index == 4:
+            self.cellpose_sam_page._on_metadata_updated()
+        # If switching to Import tab (index 5), refresh it to avoid outdated info
+        elif index == 5:
             self.import_page._on_metadata_updated()
 
     def request_tab_exit(self):
@@ -326,6 +352,7 @@ class SegmentationTab(QWidget):
         for page_name in (
             "pixel_classifier_page",
             "cellpose_page",
+            "cellpose_sam_page",
             "apoc_page",
             "convpaint_page",
         ):
@@ -2258,23 +2285,24 @@ class PixelClassifierWidget(QWidget):
 
 
 
-class CellposeWidget(QWidget):
-    """Napari widget for Cellpose channel configuration, model loading, and inference."""
+class ChannelConfigPanel(QGroupBox):
+    """Reusable 'channel index -> cell-type label' configuration panel.
 
-    def __init__(self, viewer, metadata_loader, log_callback=None,
-                 tab_progress_row=None):
-        super().__init__()
-        self.viewer = viewer
+    Persists to the shared ``cellpose`` config block in
+    ``behav3d_parameters.yml``, so an instance embedded on the Cellpose (v3)
+    page and one embedded on the Cellpose-SAM page read/write the exact same
+    channel assignments -- configure once, either page picks it up. Call
+    :meth:`refresh` when the page holding an instance becomes visible again,
+    to pick up edits saved from the other page.
+    """
+
+    def __init__(self, metadata_loader, log_callback=None, title="Channel Configuration"):
+        super().__init__(title)
         self.metadata_loader = metadata_loader
         self.log = log_callback or print
-        self.pretrained_model_dir = None
-        # Background-execution infrastructure (shared progress row comes
-        # from the parent SegmentationTab).
-        self.tab_progress_row = tab_progress_row
-        self._bg = BackgroundOperation(self)
+        cellpose_cfg = _cfg_get(self.metadata_loader.behav3d_parameters, "cellpose", {}) or {}
+        self._manual_n_channels = cellpose_cfg.get("manual_n_channels")
         self._detect_cell_types()
-        _cellpose_cfg = _cfg_get(self.metadata_loader.behav3d_parameters, "cellpose", {}) or {}
-        self._manual_n_channels = _cellpose_cfg.get("manual_n_channels")
         self._init_ui()
 
     # ── cell-type detection ─────────────────────────────────────────────
@@ -2292,13 +2320,11 @@ class CellposeWidget(QWidget):
             self.immune_types = []
             self.other_types = []
             self.has_death = False
-            self.all_cell_types = []
             return
         self.organoid_types = [ct for ct in detect_organoid_types_from_metadata(metadata) if not is_combined_multicolor_celltype(ct)]
         self.immune_types = [ct for ct in detect_immune_cell_types_from_metadata(metadata) if not is_combined_multicolor_celltype(ct)]
         self.other_types = [ct for ct in detect_other_cell_types_from_metadata(metadata) if not is_combined_multicolor_celltype(ct)]
         self.has_death = has_dead_channel(metadata)
-        self.all_cell_types = self.organoid_types + self.immune_types + self.other_types
 
     def _calculate_number_of_channels(self):
         n = len(self.organoid_types) + len(self.immune_types) + len(self.other_types)
@@ -2332,35 +2358,10 @@ class CellposeWidget(QWidget):
             return []
         return list(self.metadata_loader.metadata["sample_name"].unique())
 
-    # ── helpers ─────────────────────────────────────────────────────────
-    def _get_prefix(self, cell_type):
-        if cell_type in self.organoid_types:
-            return "or"
-        if cell_type in self.immune_types:
-            return "im"
-        return "ot"
-
     # ── UI ──────────────────────────────────────────────────────────────
     def _init_ui(self):
-        layout = QVBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
-        self.setLayout(layout)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        content = QWidget()
-        content_layout = QVBoxLayout()
-        content_layout.setContentsMargins(4, 4, 4, 4)
-        content_layout.setSpacing(4)
-        content.setLayout(content_layout)
-        scroll.setWidget(content)
-        layout.addWidget(scroll)
-
-        # ── Section 1: Channel Configuration ─────────────────────────
-        self.channel_group = QGroupBox("1. Channel Configuration")
         ch_layout = QVBoxLayout()
-        self.channel_group.setLayout(ch_layout)
+        self.setLayout(ch_layout)
 
         self.n_channels = self._calculate_number_of_channels()
         # Primary: compact channel count
@@ -2441,8 +2442,6 @@ class CellposeWidget(QWidget):
         self.btn_save_channels.clicked.connect(self._on_save_channels)
         ch_layout.addWidget(self.btn_save_channels)
 
-        content_layout.addWidget(self.channel_group)
-
         # Load saved mode and build dropdowns
         cellpose_cfg = _cfg_get(self.metadata_loader.behav3d_parameters, "cellpose", {})
         saved_mode = cellpose_cfg.get("labels_mode", "same_for_all") if cellpose_cfg else "same_for_all"
@@ -2454,6 +2453,227 @@ class CellposeWidget(QWidget):
         self.channel_dropdowns = {}
         self._build_channel_dropdowns()
         self.mode_group.buttonClicked.connect(lambda _btn: self._build_channel_dropdowns())
+
+    # ── channel dropdown builder ────────────────────────────────────────
+    def _build_channel_dropdowns(self):
+        """Rebuild the channel label dropdowns based on current mode."""
+        # Clear existing
+        while self.channel_container_layout.count():
+            item = self.channel_container_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+            elif item.layout():
+                while item.layout().count():
+                    child = item.layout().takeAt(0)
+                    if child.widget():
+                        child.widget().deleteLater()
+
+        self.channel_dropdowns = {}
+        n_channels = self._manual_n_channels if self._manual_n_channels is not None else self._calculate_number_of_channels()
+        channel_options = self._get_channel_options()
+        auto_n = self._calculate_number_of_channels()  # channels with a real label
+        if n_channels == 0:
+            self.channel_container_layout.addWidget(
+                QLabel('<span style="color: orange;">No channels detected. Load metadata first.</span>')
+            )
+            return
+
+        cellpose_cfg = _cfg_get(self.metadata_loader.behav3d_parameters, "cellpose", {}) or {}
+        is_per_sample = self.radio_per_sample.isChecked()
+
+        if not is_per_sample:
+            # ── Same for all ──
+            saved_labels = cellpose_cfg.get("channel_labels", {})
+            self.channel_dropdowns["global"] = {}
+            for i in range(n_channels):
+                row = QHBoxLayout()
+                row.addWidget(QLabel(f"Channel {i}:"))
+                combo = QComboBox()
+                combo.addItems(channel_options)
+                saved_val = saved_labels.get(str(i), saved_labels.get(i))
+                if saved_val and saved_val in channel_options:
+                    combo.setCurrentText(saved_val)
+                elif i < auto_n:
+                    combo.setCurrentIndex(i)  # auto channel — assign by position
+                elif "none" in channel_options:
+                    combo.setCurrentText("none")  # extra channel — default to none
+                row.addWidget(combo, stretch=1)
+                self.channel_dropdowns["global"][i] = combo
+                self.channel_container_layout.addLayout(row)
+        else:
+            # ── Per sample — same vertical layout as "same for all"
+            saved_per_sample = cellpose_cfg.get("per_sample_channel_labels", {})
+            for sample_name in self._get_sample_names():
+                header = QLabel(f"<b>{sample_name}</b>")
+                self.channel_container_layout.addWidget(header)
+                self.channel_dropdowns[sample_name] = {}
+                sample_saved = saved_per_sample.get(sample_name, {})
+                for i in range(n_channels):
+                    row = QHBoxLayout()
+                    row.addWidget(QLabel(f"Channel {i}:"))
+                    combo = QComboBox()
+                    combo.addItems(channel_options)
+                    saved_val = sample_saved.get(str(i), sample_saved.get(i))
+                    if saved_val and saved_val in channel_options:
+                        combo.setCurrentText(saved_val)
+                    elif i < auto_n:
+                        combo.setCurrentIndex(i)  # auto channel — assign by position
+                    elif "none" in channel_options:
+                        combo.setCurrentText("none")  # extra channel — default to none
+                    row.addWidget(combo, stretch=1)
+                    self.channel_dropdowns[sample_name][i] = combo
+                    self.channel_container_layout.addLayout(row)
+
+    # ── save / persist ──────────────────────────────────────────────────
+    def _persist_channel_config(self):
+        """Save channel configuration to behav3d_parameters.yml."""
+        cellpose_cfg = self.metadata_loader.behav3d_parameters.setdefault("cellpose", {})
+        cellpose_cfg["number_of_channels"] = self._manual_n_channels if self._manual_n_channels is not None else self._calculate_number_of_channels()
+        if self._manual_n_channels is not None:
+            cellpose_cfg["manual_n_channels"] = self._manual_n_channels
+        else:
+            cellpose_cfg.pop("manual_n_channels", None)
+
+        is_per_sample = self.radio_per_sample.isChecked()
+        cellpose_cfg["labels_mode"] = "per_sample" if is_per_sample else "same_for_all"
+
+        if not is_per_sample:
+            channel_labels = {}
+            if "global" in self.channel_dropdowns:
+                for i, combo in self.channel_dropdowns["global"].items():
+                    channel_labels[i] = combo.currentText()
+            cellpose_cfg["channel_labels"] = channel_labels
+            cellpose_cfg["per_sample_channel_labels"] = {}
+        else:
+            per_sample_labels = {}
+            for sample_name, combos in self.channel_dropdowns.items():
+                if sample_name != "global":
+                    per_sample_labels[sample_name] = {i: c.currentText() for i, c in combos.items()}
+            cellpose_cfg["per_sample_channel_labels"] = per_sample_labels
+            cellpose_cfg["channel_labels"] = {}
+
+        if hasattr(self.metadata_loader, "behav3d_parameters_path"):
+            yaml.safe_dump(
+                self.metadata_loader.behav3d_parameters,
+                self.metadata_loader.behav3d_parameters_path.open("w"),
+                sort_keys=False,
+            )
+
+    def _on_save_channels(self):
+        self._persist_channel_config()
+        self.log("✅ Cellpose channel configuration saved.")
+
+    # ── override channel count ──────────────────────────────────────────
+    def _on_show_override(self):
+        calc = self._calculate_number_of_channels()
+        self.spin_manual_channels.setRange(max(1, calc), 99)
+        self.spin_manual_channels.setValue(self._manual_n_channels or max(1, calc))
+        self.btn_override_channels.setVisible(False)
+        self._lbl_manual_ch.setVisible(True)
+        self.spin_manual_channels.setVisible(True)
+        self.btn_apply_override.setVisible(True)
+        self.btn_clear_override.setVisible(True)
+
+    def _on_apply_override(self):
+        self._manual_n_channels = self.spin_manual_channels.value()
+        self.n_channels_detail_label.setText(self._channel_detail_text())
+        self._build_channel_dropdowns()
+        self.log(f"✅ Channel count manually set to {self._manual_n_channels}.")
+
+    def _on_clear_override(self):
+        self._manual_n_channels = None
+        self._lbl_manual_ch.setVisible(False)
+        self.spin_manual_channels.setVisible(False)
+        self.btn_apply_override.setVisible(False)
+        self.btn_clear_override.setVisible(False)
+        self.btn_override_channels.setVisible(True)
+        self.n_channels_detail_label.setText(self._channel_detail_text())
+        self._build_channel_dropdowns()
+        self.log("↺ Channel count reset to auto-detected.")
+
+    # ── refresh ──────────────────────────────────────────────────────────
+    def refresh(self):
+        """Re-detect cell types and rebuild, e.g. when metadata changes or the
+        holding page becomes visible again (to pick up edits saved from the
+        other page sharing this same config block)."""
+        self._detect_cell_types()
+        self.n_channels = self._calculate_number_of_channels()
+        self.n_channels_label.setText(f"<b>Detected:</b> {self.n_channels} channel(s)")
+        self.n_channels_detail_label.setText(self._channel_detail_text())
+        self._build_channel_dropdowns()
+
+
+class CellposeWidget(QWidget):
+    """Napari widget for Cellpose channel configuration, model loading, and inference."""
+
+    def __init__(self, viewer, metadata_loader, log_callback=None,
+                 tab_progress_row=None):
+        super().__init__()
+        self.viewer = viewer
+        self.metadata_loader = metadata_loader
+        self.log = log_callback or print
+        self.pretrained_model_dir = None
+        # Background-execution infrastructure (shared progress row comes
+        # from the parent SegmentationTab).
+        self.tab_progress_row = tab_progress_row
+        self._bg = BackgroundOperation(self)
+        self._detect_cell_types()
+        self._init_ui()
+
+    # ── cell-type detection ─────────────────────────────────────────────
+    def _detect_cell_types(self):
+        from behav3d.core.metadata import (
+            detect_organoid_types_from_metadata,
+            detect_immune_cell_types_from_metadata,
+            detect_other_cell_types_from_metadata,
+            has_dead_channel,
+            is_combined_multicolor_celltype,
+        )
+        metadata = self.metadata_loader.metadata
+        if metadata is None:
+            self.organoid_types = []
+            self.immune_types = []
+            self.other_types = []
+            self.has_death = False
+            self.all_cell_types = []
+            return
+        self.organoid_types = [ct for ct in detect_organoid_types_from_metadata(metadata) if not is_combined_multicolor_celltype(ct)]
+        self.immune_types = [ct for ct in detect_immune_cell_types_from_metadata(metadata) if not is_combined_multicolor_celltype(ct)]
+        self.other_types = [ct for ct in detect_other_cell_types_from_metadata(metadata) if not is_combined_multicolor_celltype(ct)]
+        self.has_death = has_dead_channel(metadata)
+        self.all_cell_types = self.organoid_types + self.immune_types + self.other_types
+
+    # ── helpers ─────────────────────────────────────────────────────────
+    def _get_prefix(self, cell_type):
+        if cell_type in self.organoid_types:
+            return "or"
+        if cell_type in self.immune_types:
+            return "im"
+        return "ot"
+
+    # ── UI ──────────────────────────────────────────────────────────────
+    def _init_ui(self):
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.setLayout(layout)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        content = QWidget()
+        content_layout = QVBoxLayout()
+        content_layout.setContentsMargins(4, 4, 4, 4)
+        content_layout.setSpacing(4)
+        content.setLayout(content_layout)
+        scroll.setWidget(content)
+        layout.addWidget(scroll)
+
+        # ── Section 1: Channel Configuration ─────────────────────────
+        self.channel_panel = ChannelConfigPanel(
+            self.metadata_loader, log_callback=self.log, title="1. Channel Configuration",
+        )
+        content_layout.addWidget(self.channel_panel)
 
         # ── Section 2: Model & Cell Type ─────────────────────────────
         model_group = QGroupBox("2. Model & Cell Type")
@@ -2596,144 +2816,6 @@ class CellposeWidget(QWidget):
         else:
             self.btn_run_cellpose.setText("▶  Run Cellpose")
 
-    # ── channel dropdown builder ────────────────────────────────────────
-    def _build_channel_dropdowns(self):
-        """Rebuild the channel label dropdowns based on current mode."""
-        # Clear existing
-        while self.channel_container_layout.count():
-            item = self.channel_container_layout.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
-            elif item.layout():
-                while item.layout().count():
-                    child = item.layout().takeAt(0)
-                    if child.widget():
-                        child.widget().deleteLater()
-
-        self.channel_dropdowns = {}
-        n_channels = self._manual_n_channels if self._manual_n_channels is not None else self._calculate_number_of_channels()
-        channel_options = self._get_channel_options()
-        auto_n = self._calculate_number_of_channels()  # channels with a real label
-        if n_channels == 0:
-            self.channel_container_layout.addWidget(
-                QLabel('<span style="color: orange;">No channels detected. Load metadata first.</span>')
-            )
-            return
-
-        cellpose_cfg = _cfg_get(self.metadata_loader.behav3d_parameters, "cellpose", {}) or {}
-        is_per_sample = self.radio_per_sample.isChecked()
-
-        if not is_per_sample:
-            # ── Same for all ──
-            saved_labels = cellpose_cfg.get("channel_labels", {})
-            self.channel_dropdowns["global"] = {}
-            for i in range(n_channels):
-                row = QHBoxLayout()
-                row.addWidget(QLabel(f"Channel {i}:"))
-                combo = QComboBox()
-                combo.addItems(channel_options)
-                saved_val = saved_labels.get(str(i), saved_labels.get(i))
-                if saved_val and saved_val in channel_options:
-                    combo.setCurrentText(saved_val)
-                elif i < auto_n:
-                    combo.setCurrentIndex(i)  # auto channel — assign by position
-                elif "none" in channel_options:
-                    combo.setCurrentText("none")  # extra channel — default to none
-                row.addWidget(combo, stretch=1)
-                self.channel_dropdowns["global"][i] = combo
-                self.channel_container_layout.addLayout(row)
-        else:
-            # ── Per sample — same vertical layout as "same for all"
-            saved_per_sample = cellpose_cfg.get("per_sample_channel_labels", {})
-            for sample_name in self._get_sample_names():
-                header = QLabel(f"<b>{sample_name}</b>")
-                self.channel_container_layout.addWidget(header)
-                self.channel_dropdowns[sample_name] = {}
-                sample_saved = saved_per_sample.get(sample_name, {})
-                for i in range(n_channels):
-                    row = QHBoxLayout()
-                    row.addWidget(QLabel(f"Channel {i}:"))
-                    combo = QComboBox()
-                    combo.addItems(channel_options)
-                    saved_val = sample_saved.get(str(i), sample_saved.get(i))
-                    if saved_val and saved_val in channel_options:
-                        combo.setCurrentText(saved_val)
-                    elif i < auto_n:
-                        combo.setCurrentIndex(i)  # auto channel — assign by position
-                    elif "none" in channel_options:
-                        combo.setCurrentText("none")  # extra channel — default to none
-                    row.addWidget(combo, stretch=1)
-                    self.channel_dropdowns[sample_name][i] = combo
-                    self.channel_container_layout.addLayout(row)
-
-    # ── save / persist ──────────────────────────────────────────────────
-    def _persist_channel_config(self):
-        """Save channel configuration to behav3d_parameters.yml."""
-        cellpose_cfg = self.metadata_loader.behav3d_parameters.setdefault("cellpose", {})
-        cellpose_cfg["number_of_channels"] = self._manual_n_channels if self._manual_n_channels is not None else self._calculate_number_of_channels()
-        if self._manual_n_channels is not None:
-            cellpose_cfg["manual_n_channels"] = self._manual_n_channels
-        else:
-            cellpose_cfg.pop("manual_n_channels", None)
-
-        is_per_sample = self.radio_per_sample.isChecked()
-        cellpose_cfg["labels_mode"] = "per_sample" if is_per_sample else "same_for_all"
-
-        if not is_per_sample:
-            channel_labels = {}
-            if "global" in self.channel_dropdowns:
-                for i, combo in self.channel_dropdowns["global"].items():
-                    channel_labels[i] = combo.currentText()
-            cellpose_cfg["channel_labels"] = channel_labels
-            cellpose_cfg["per_sample_channel_labels"] = {}
-        else:
-            per_sample_labels = {}
-            for sample_name, combos in self.channel_dropdowns.items():
-                if sample_name != "global":
-                    per_sample_labels[sample_name] = {i: c.currentText() for i, c in combos.items()}
-            cellpose_cfg["per_sample_channel_labels"] = per_sample_labels
-            cellpose_cfg["channel_labels"] = {}
-
-        if hasattr(self.metadata_loader, "behav3d_parameters_path"):
-            yaml.safe_dump(
-                self.metadata_loader.behav3d_parameters,
-                self.metadata_loader.behav3d_parameters_path.open("w"),
-                sort_keys=False,
-            )
-
-    def _on_save_channels(self):
-        self._persist_channel_config()
-        self.log("✅ Cellpose channel configuration saved.")
-
-    # ── override channel count ──────────────────────────────────────────
-    def _on_show_override(self):
-        calc = self._calculate_number_of_channels()
-        self.spin_manual_channels.setRange(max(1, calc), 99)
-        self.spin_manual_channels.setValue(self._manual_n_channels or max(1, calc))
-        self.btn_override_channels.setVisible(False)
-        self._lbl_manual_ch.setVisible(True)
-        self.spin_manual_channels.setVisible(True)
-        self.btn_apply_override.setVisible(True)
-        self.btn_clear_override.setVisible(True)
-
-    def _on_apply_override(self):
-        self._manual_n_channels = self.spin_manual_channels.value()
-        self.n_channels_detail_label.setText(self._channel_detail_text())
-        self._build_channel_dropdowns()
-        self.log(f"✅ Channel count manually set to {self._manual_n_channels}.")
-
-    def _on_clear_override(self):
-        self._manual_n_channels = None
-        self._lbl_manual_ch.setVisible(False)
-        self.spin_manual_channels.setVisible(False)
-        self.btn_apply_override.setVisible(False)
-        self.btn_clear_override.setVisible(False)
-        self.btn_override_channels.setVisible(True)
-        self.n_channels_detail_label.setText(self._channel_detail_text())
-        self._build_channel_dropdowns()
-        self.log("↺ Channel count reset to auto-detected.")
-
     # ── browse / load model ─────────────────────────────────────────────
     def _on_browse(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select Cellpose Model File")
@@ -2759,10 +2841,7 @@ class CellposeWidget(QWidget):
     # ── metadata update ─────────────────────────────────────────────────
     def _on_metadata_updated(self, _metadata=None):
         self._detect_cell_types()
-        self.n_channels = self._calculate_number_of_channels()
-        self.n_channels_label.setText(f"<b>Detected:</b> {self.n_channels} channel(s)")
-        self.n_channels_detail_label.setText(self._channel_detail_text())
-        self._build_channel_dropdowns()
+        self.channel_panel.refresh()
         # Refresh cell type combo
         current = self.cell_type_combo.currentText()
         self.cell_type_combo.blockSignals(True)
@@ -2839,7 +2918,7 @@ class CellposeWidget(QWidget):
             self.log("⚠️ Cannot run Cellpose: No cell type selected.")
             return
 
-        self._persist_channel_config()
+        self.channel_panel._persist_channel_config()
 
         if interactive:
             from behav3d.napari._overwrite_prompt import prompt_overwrite_batch
@@ -2955,7 +3034,7 @@ class CellposeWidget(QWidget):
             fire_extra_callback(extra_callbacks, "on_failed", "already running")
             return
 
-        self._persist_channel_config()
+        self.channel_panel._persist_channel_config()
 
         # ---- Overwrite check ------------------------------------------------
         out_dir = Path(self.metadata_loader.output_dir)
@@ -3039,6 +3118,1367 @@ class CellposeWidget(QWidget):
             on_done=_on_done_async,
             on_failed=_on_failed,
         )
+
+
+class SAMChannelSelector(QGroupBox):
+    """Per-cell-type channel picker for Cellpose-SAM.
+
+    One checkbox per raw channel, for whichever cell type is currently
+    selected in the owning widget's cell-type combo - "which channels feed
+    this cell type", mirroring how the APOC pixel classifier lets a user pick
+    channels per cell type (``apoc_train.py``'s ``CellTypeTab``). This is the
+    inverse direction from the classic Cellpose :class:`ChannelConfigPanel`
+    (one dropdown per channel, picking a single cell type), and stores to its
+    own, separate config block - ``cellpose_sam.channel_selection:
+    {cell_type: [channel_idx, ...]}`` - uniform across samples, like the
+    existing ``cellpose_sam.size_filter``. Cellpose-SAM no longer shares
+    channel configuration with the classic v3 path.
+    """
+
+    def __init__(self, metadata_loader, cell_type_combo, get_cell_types,
+                 log_callback=None, title="Channel Selection"):
+        super().__init__(title)
+        self.metadata_loader = metadata_loader
+        self._cell_type_combo = cell_type_combo
+        self._get_cell_types = get_cell_types
+        self.log = log_callback or print
+        self._checkboxes = []
+        self._detect_channels()
+        self._init_ui()
+        cell_type_combo.currentTextChanged.connect(lambda _t: self._load_for_current_cell_type())
+
+    # ── channel count + label hints (read-only reference to classic Cellpose config) ──
+    def _detect_channels(self):
+        from behav3d.core.metadata import (
+            detect_organoid_types_from_metadata,
+            detect_immune_cell_types_from_metadata,
+            detect_other_cell_types_from_metadata,
+            has_dead_channel,
+        )
+        metadata = self.metadata_loader.metadata
+        if metadata is None:
+            self._n_channels = 0
+            return
+        n = (len(detect_organoid_types_from_metadata(metadata))
+             + len(detect_immune_cell_types_from_metadata(metadata))
+             + len(detect_other_cell_types_from_metadata(metadata)))
+        if has_dead_channel(metadata):
+            n += 1
+        classic_cfg = _cfg_get(self.metadata_loader.behav3d_parameters, "cellpose", {}) or {}
+        manual_n = classic_cfg.get("manual_n_channels")
+        self._n_channels = manual_n if manual_n is not None else n
+
+    # ── UI ──────────────────────────────────────────────────────────────
+    def _init_ui(self):
+        layout = QVBoxLayout()
+        self.setLayout(layout)
+
+        lbl_hint = QLabel(
+            "Select which raw channels feed Cellpose-SAM for the cell type "
+            "chosen above. Multiple channels are stacked as separate planes "
+            "(up to 3)."
+        )
+        lbl_hint.setWordWrap(True)
+        lbl_hint.setStyleSheet("color: #999; font-size: 10px; font-style: italic;")
+        layout.addWidget(lbl_hint)
+
+        self.checkbox_container = QWidget()
+        self.checkbox_layout = QVBoxLayout()
+        self.checkbox_layout.setContentsMargins(0, 0, 0, 0)
+        self.checkbox_container.setLayout(self.checkbox_layout)
+        layout.addWidget(self.checkbox_container)
+
+        self._build_checkboxes()
+
+    def _build_checkboxes(self):
+        while self.checkbox_layout.count():
+            item = self.checkbox_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._checkboxes = []
+
+        if self._n_channels == 0:
+            self.checkbox_layout.addWidget(
+                QLabel('<span style="color: orange;">No channels detected. Load metadata first.</span>')
+            )
+            return
+
+        self._ensure_migrated()
+
+        for i in range(self._n_channels):
+            cb = QCheckBox(f"Channel {i}")
+            cb.toggled.connect(lambda _checked: self._sync_current_cell_type_to_memory())
+            self.checkbox_layout.addWidget(cb)
+            self._checkboxes.append(cb)
+
+        self._load_for_current_cell_type()
+
+    # ── config: cellpose_sam.channel_selection ────────────────────────────
+    def _current_cell_type(self):
+        ct = self._cell_type_combo.currentText()
+        return ct if ct and ct != "(load metadata)" else None
+
+    def _ensure_migrated(self):
+        """Seed a default for any cell type that has no channel_selection
+        entry yet, from classic Cellpose's single-channel assignment (if
+        any) - so a working config exists immediately for users who already
+        configured channel labels there, without visiting every cell type."""
+        from behav3d.preprocessing.segmentation.cellpose_prediction import (
+            _label_to_channel_from_stored_map,
+        )
+        cfg = self.metadata_loader.behav3d_parameters.setdefault("cellpose_sam", {})
+        selection = cfg.setdefault("channel_selection", {})
+        classic_cfg = _cfg_get(self.metadata_loader.behav3d_parameters, "cellpose", {}) or {}
+        label_to_channel = _label_to_channel_from_stored_map(classic_cfg.get("channel_labels", {}))
+        for ct in self._get_cell_types():
+            if ct not in selection:
+                ch = label_to_channel.get(ct)
+                selection[ct] = [ch] if ch is not None else []
+
+    def _load_for_current_cell_type(self):
+        cell_type = self._current_cell_type()
+        if cell_type is None or not self._checkboxes:
+            return
+        selected = set(self.channels_for(cell_type))
+        for i, cb in enumerate(self._checkboxes):
+            cb.setChecked(i in selected)
+
+    def channels_for(self, cell_type) -> list:
+        """Return the persisted channel indices for *cell_type*."""
+        cfg = _cfg_get(self.metadata_loader.behav3d_parameters, "cellpose_sam", {}) or {}
+        return [int(c) for c in ((cfg.get("channel_selection") or {}).get(cell_type) or [])]
+
+    def _sync_current_cell_type_to_memory(self):
+        cell_type = self._current_cell_type()
+        if cell_type is None:
+            return
+        cfg = self.metadata_loader.behav3d_parameters.setdefault("cellpose_sam", {})
+        selection = cfg.setdefault("channel_selection", {})
+        selection[cell_type] = [i for i, cb in enumerate(self._checkboxes) if cb.isChecked()]
+
+    # ── refresh ──────────────────────────────────────────────────────────
+    def refresh(self):
+        """Re-detect channel count/hints and rebuild - e.g. when metadata
+        changes or classic Cellpose's channel config is edited elsewhere."""
+        self._detect_channels()
+        self._build_checkboxes()
+
+
+class CellposeSAMWidget(QWidget):
+    """Napari widget for Cellpose-SAM (cellpose v4) zero-shot segmentation.
+
+    Mirrors the official Cellpose GUI's segmentation settings. Unlike the
+    :class:`CellposeWidget` v3 page there is no model to load or train, so this
+    page instead surfaces the sidecar environment status (cellpose v4 cannot
+    share an interpreter with the pinned v3 - see
+    :mod:`behav3d.preprocessing.segmentation.cpsam_env`).
+
+    Channel selection is its own, Cellpose-SAM-specific config
+    (``cellpose_sam.channel_selection``) via an embedded
+    :class:`SAMChannelSelector` - a per-cell-type checkbox picker, separate
+    from classic Cellpose's per-channel ``ChannelConfigPanel``.
+    """
+
+    def __init__(self, viewer, metadata_loader, log_callback=None,
+                 tab_progress_row=None):
+        super().__init__()
+        self.viewer = viewer
+        self.metadata_loader = metadata_loader
+        self.log = log_callback or print
+        self.tab_progress_row = tab_progress_row
+        self._bg = BackgroundOperation(self)
+        # Cached preview state, keyed by cell type: the unfiltered labels of one
+        # ZYX volume plus its per-label voxel counts. Keeping these lets the
+        # size sliders re-filter instantly instead of re-running inference on
+        # every move. A preview run can cover several cell types at once (when
+        # "Run all cell types in one batch" is checked), all for the same
+        # sample/timepoint - recorded in _preview_key.
+        self._preview_labels = {}
+        self._preview_sizes = {}
+        self._preview_key = None
+        self._detect_cell_types()
+        self._init_ui()
+
+    # \u2500\u2500 cell-type detection (mirrors CellposeWidget) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    def _detect_cell_types(self):
+        from behav3d.core.metadata import (
+            detect_organoid_types_from_metadata,
+            detect_immune_cell_types_from_metadata,
+            detect_other_cell_types_from_metadata,
+            is_combined_multicolor_celltype,
+        )
+        metadata = self.metadata_loader.metadata
+        if metadata is None:
+            self.organoid_types = []
+            self.immune_types = []
+            self.other_types = []
+            self.all_cell_types = []
+            return
+        self.organoid_types = [ct for ct in detect_organoid_types_from_metadata(metadata)
+                               if not is_combined_multicolor_celltype(ct)]
+        self.immune_types = [ct for ct in detect_immune_cell_types_from_metadata(metadata)
+                             if not is_combined_multicolor_celltype(ct)]
+        self.other_types = [ct for ct in detect_other_cell_types_from_metadata(metadata)
+                            if not is_combined_multicolor_celltype(ct)]
+        self.all_cell_types = self.organoid_types + self.immune_types + self.other_types
+
+    def _cfg(self):
+        return _cfg_get(self.metadata_loader.behav3d_parameters, "cellpose_sam", {}) or {}
+
+    def _sample_names(self):
+        if self.metadata_loader.metadata is None:
+            return []
+        return list(self.metadata_loader.metadata["sample_name"].unique())
+
+    # \u2500\u2500 UI \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    def _init_ui(self):
+        from behav3d.preprocessing.segmentation.cellpose_sam_prediction import CPSAM_MODELS
+
+        cfg = self._cfg()
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.setLayout(layout)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        content = QWidget()
+        content_layout = QVBoxLayout()
+        content_layout.setContentsMargins(4, 4, 4, 4)
+        content_layout.setSpacing(4)
+        content.setLayout(content_layout)
+        scroll.setWidget(content)
+        layout.addWidget(scroll)
+
+        # A single shared px/um unit toggle covers every size- or radius-like
+        # field below (Section 4's diameter/sharpen/smooth/tile-norm/flow3D
+        # smooth, and Section 5's min/max size filter). Persistence/backend
+        # calls always read the native pixel/voxel value via get_native(),
+        # regardless of what unit is currently displayed.
+        self._unit_mgr = UnitGroupManager(self.metadata_loader.metadata, default_physical=True)
+
+        # --- Section 1: Environment -----------------------------------
+        env_group = QGroupBox("1. Cellpose-SAM Environment")
+        env_layout = QVBoxLayout()
+        env_group.setLayout(env_layout)
+
+        self.lbl_env_status = QLabel("Checking...")
+        self.lbl_env_status.setWordWrap(True)
+        env_layout.addWidget(self.lbl_env_status)
+
+        env_row = QHBoxLayout()
+        self.btn_setup_env = QPushButton("Set up Cellpose-SAM environment")
+        self.btn_setup_env.clicked.connect(self._on_setup_env)
+        env_row.addWidget(self.btn_setup_env)
+        env_row.addWidget(HelpButton(
+            "Set Up Cellpose-SAM Environment",
+            "Creates a small side ('sidecar') environment containing cellpose "
+            "version 4.\n\n"
+            "Cellpose-SAM needs cellpose>=4, which cannot coexist in the same "
+            "Python environment as the cellpose 3 this app otherwise uses (your "
+            "existing fine-tuned Cellpose models need version 3). This sidecar "
+            "reuses this environment's PyTorch install, so it only adds a few "
+            "MB -- your existing cellpose 3 install and trained models are left "
+            "completely untouched.\n\n"
+            "You only need to do this once per computer."
+        ))
+        env_layout.addLayout(env_row)
+        content_layout.addWidget(env_group)
+
+        # --- Section 2: What to segment ---------------------------------
+        what_group = QGroupBox("2. What to Segment")
+        what_layout = QVBoxLayout()
+        what_group.setLayout(what_layout)
+
+        ct_row = QHBoxLayout()
+        ct_row.addWidget(QLabel("Cell type:"))
+        self.cell_type_combo = QComboBox()
+        self.cell_type_combo.addItems(self.all_cell_types or ["(load metadata)"])
+        ct_row.addWidget(self.cell_type_combo)
+        self.cell_type_combo.setToolTip(
+            "Cell type to segment; determines the output filename and channel used."
+        )
+        ct_row.addStretch()
+        what_layout.addLayout(ct_row)
+
+        self.channel_panel = SAMChannelSelector(
+            self.metadata_loader, self.cell_type_combo,
+            get_cell_types=lambda: self.all_cell_types,
+            log_callback=self.log, title="Channel Selection",
+        )
+        what_layout.addWidget(self.channel_panel)
+
+        self.check_all_cell_types = QCheckBox("Run all cell types in one batch")
+        self.check_all_cell_types.setToolTip(
+            "Segment every detected cell type instead of only the one selected above."
+        )
+        all_ct_row = QHBoxLayout()
+        all_ct_row.addWidget(self.check_all_cell_types)
+        all_ct_row.addStretch()
+        self.check_all_cell_types.setChecked(bool(cfg.get("all_cell_types", False)))
+        self.check_all_cell_types.toggled.connect(
+            lambda on: self.cell_type_combo.setEnabled(not on)
+        )
+        self.cell_type_combo.setEnabled(not self.check_all_cell_types.isChecked())
+        what_layout.addLayout(all_ct_row)
+
+        # Timepoint range - same pattern as the Cellpose v3 page.
+        tp_check_row = QHBoxLayout()
+        self.check_process_all = QCheckBox("Process all timepoints")
+        self.check_process_all.setChecked(bool(cfg.get("use_all_timepoints", True)))
+        self.check_process_all.setToolTip(
+            "Uncheck to restrict the run to the timepoint range below."
+        )
+        tp_check_row.addWidget(self.check_process_all)
+        tp_check_row.addStretch()
+        what_layout.addLayout(tp_check_row)
+
+        tp_range_row = QHBoxLayout()
+        tp_range_row.addWidget(QLabel("From:"))
+        self.spin_t_start = QSpinBox()
+        self.spin_t_start.setRange(0, 9999)
+        self.spin_t_start.setValue(int(cfg.get("tp_start", 0)))
+        self.spin_t_start.setMaximumWidth(70)
+        tp_range_row.addWidget(self.spin_t_start)
+        tp_range_row.addWidget(QLabel("To:"))
+        self.spin_t_end = QSpinBox()
+        self.spin_t_end.setRange(0, 9999)
+        self.spin_t_end.setValue(int(cfg.get("tp_end", 0)))
+        self.spin_t_end.setMaximumWidth(70)
+        tp_range_row.addWidget(self.spin_t_end)
+        tp_range_row.addWidget(HelpButton(
+            "Timepoint Range",
+            "0-indexed, inclusive range of timepoints to process when "
+            "'Process all timepoints' is unchecked.\n\n"
+            "Timepoints outside this range keep whatever they already "
+            "contain -- running a sub-range never clears other timepoints."
+        ))
+        tp_range_row.addStretch()
+        what_layout.addLayout(tp_range_row)
+
+        self.check_process_all.toggled.connect(lambda on: (
+            self.spin_t_start.setEnabled(not on),
+            self.spin_t_end.setEnabled(not on),
+        ))
+        self.spin_t_start.setEnabled(not self.check_process_all.isChecked())
+        self.spin_t_end.setEnabled(not self.check_process_all.isChecked())
+        content_layout.addWidget(what_group)
+
+        # --- Section 3: Device ------------------------------------------
+        dev_group = QGroupBox("3. Device")
+        dev_layout = QVBoxLayout()
+        dev_group.setLayout(dev_layout)
+
+        gpu_row = QHBoxLayout()
+        gpu_row.addWidget(QLabel("GPU Device:"))
+        self.combo_gpu_device = QComboBox()
+        # Reuses ConvPaint's torch/CUDA enumeration. APOC's equivalent is
+        # OpenCL/pyclesperanto and does not apply to cellpose.
+        from behav3d.preprocessing.segmentation.convpaint_train import _detect_torch_devices
+        for label, value in _detect_torch_devices():
+            self.combo_gpu_device.addItem(label, value)
+        saved_device = str(cfg.get("device", "auto"))
+        idx = self.combo_gpu_device.findData(saved_device)
+        if idx >= 0:
+            self.combo_gpu_device.setCurrentIndex(idx)
+        gpu_row.addWidget(self.combo_gpu_device)
+        self.combo_gpu_device.setToolTip(
+            "CUDA device to run on (ignored if 'Force CPU-only' below is checked)."
+        )
+        dev_layout.addLayout(gpu_row)
+
+        self.btn_force_cpu = QCheckBox("Force CPU-only processing")
+        self.btn_force_cpu.setToolTip(
+            "Hide all GPUs from Cellpose-SAM. Slower, but useful if the GPU is busy."
+        )
+        force_cpu_row = QHBoxLayout()
+        force_cpu_row.addWidget(self.btn_force_cpu)
+        force_cpu_row.addStretch()
+        self.btn_force_cpu.setChecked(bool(cfg.get("force_cpu", False)))
+        self.btn_force_cpu.toggled.connect(
+            lambda on: self.combo_gpu_device.setEnabled(not on)
+        )
+        self.combo_gpu_device.setEnabled(not self.btn_force_cpu.isChecked())
+        dev_layout.addLayout(force_cpu_row)
+        content_layout.addWidget(dev_group)
+
+        # --- Section 4: Segmentation settings ---------------------------
+        set_group = QGroupBox("4. Segmentation Settings")
+        set_outer = QVBoxLayout()
+        set_group.setLayout(set_outer)
+
+        set_form_widget = QWidget()
+        set_form = QFormLayout()
+        set_form.setContentsMargins(0, 0, 0, 0)
+        set_form_widget.setLayout(set_form)
+        set_outer.addWidget(set_form_widget)
+
+        set_form.addRow("Units:", self._unit_mgr.header_row(
+            label="", show_help=False
+        ))
+
+        self.combo_model = QComboBox()
+        self.combo_model.addItems(list(CPSAM_MODELS))
+        saved_model = str(cfg.get("model_name", "cpsam"))
+        if saved_model in CPSAM_MODELS:
+            self.combo_model.setCurrentText(saved_model)
+        set_form.addRow("Model:", make_help_row(
+            self.combo_model,
+            "Cellpose-SAM Model",
+            "'cpsam' is the original Cellpose-SAM model (April 2025).\n"
+            "'cpsam_v2' is a newer version (June 2026).\n\n"
+            "Both are zero-shot -- no training or annotation required for "
+            "either; you can freely switch between them."
+        ))
+
+        self.spin_diameter = QDoubleSpinBox()
+        self.spin_diameter.setRange(0.0, 100000.0)
+        self.spin_diameter.setDecimals(2)
+        set_form.addRow("Diameter (0=auto):", make_help_row(
+            self.spin_diameter,
+            "Diameter",
+            "0 = automatic. Cellpose-SAM was trained on object diameters "
+            "7.5-120 px (mean 30 px) and is robust to size, so leave at 0 "
+            "unless your objects are far outside that range.\n\n"
+            "Shown in the unit selected above (um by default; converted "
+            "using this sample's pixel size)."
+        ))
+
+        self.spin_flow_threshold = QDoubleSpinBox()
+        self.spin_flow_threshold.setRange(0.0, 3.0)
+        self.spin_flow_threshold.setSingleStep(0.1)
+        self.spin_flow_threshold.setValue(float(cfg.get("flow_threshold", 0.4)))
+        self.lbl_flow_threshold = QLabel("Flow threshold:")
+        set_form.addRow(self.lbl_flow_threshold, make_help_row(
+            self.spin_flow_threshold,
+            "Flow Threshold",
+            "Maximum allowed flow error for a mask to be kept.\n\n"
+            "Raise it to detect more (possibly poorly-shaped) objects; lower "
+            "it to keep only cleanly-shaped ones.\n\n"
+            "Ignored entirely by cellpose when 3D segmentation is on, which "
+            "is why it is greyed out in that mode."
+        ))
+
+        self.spin_cellprob = QDoubleSpinBox()
+        self.spin_cellprob.setRange(-6.0, 6.0)
+        self.spin_cellprob.setSingleStep(0.5)
+        self.spin_cellprob.setValue(float(cfg.get("cellprob_threshold", 0.0)))
+        set_form.addRow("Cell prob threshold:", make_help_row(
+            self.spin_cellprob,
+            "Cell Probability Threshold",
+            "Pixels with predicted probability above this threshold are used "
+            "to build masks.\n\n"
+            "Lower it to detect more/larger objects; raise it (range -6 to 6) "
+            "to drop dim/uncertain detections."
+        ))
+
+        self.check_do_3d = QCheckBox("3D segmentation (do_3D)")
+        do_3d_row = QHBoxLayout()
+        do_3d_row.addWidget(self.check_do_3d)
+        do_3d_row.addWidget(HelpButton(
+            "3D Segmentation (do_3D)",
+            "On: cellpose averages flows over YX/ZY/XZ slices and runs "
+            "dynamics in 3D. This is the more accurate mode but is slower "
+            "(roughly 10-15x, measured on this dataset).\n\n"
+            "Off: each Z slice is segmented in 2D and stitched across slices "
+            "by IoU (see 'Stitch threshold' below) -- much faster, and useful "
+            "when the ZY/XZ views are unusable (e.g. very anisotropic data)."
+        ))
+        do_3d_row.addStretch()
+        self.check_do_3d.setChecked(bool(cfg.get("do_3D", True)))
+        self.check_do_3d.toggled.connect(self._on_do_3d_toggled)
+        set_form.addRow(do_3d_row)
+
+        self.spin_stitch = QDoubleSpinBox()
+        self.spin_stitch.setRange(0.0, 1.0)
+        self.spin_stitch.setSingleStep(0.05)
+        self.spin_stitch.setValue(float(cfg.get("stitch_threshold", 0.0)))
+        self.lbl_stitch = QLabel("Stitch threshold:")
+        set_form.addRow(self.lbl_stitch, make_help_row(
+            self.spin_stitch,
+            "Stitch Threshold",
+            "IoU (overlap) needed between a mask on one Z slice and the next "
+            "for them to be joined into one 3D object.\n\n"
+            "Only used when 3D segmentation (above) is off."
+        ))
+
+        self.spin_batch_size = QSpinBox()
+        self.spin_batch_size.setRange(1, 128)
+        self.spin_batch_size.setValue(int(cfg.get("batch_size", 8)))
+        set_form.addRow("Batch size:", make_help_row(
+            self.spin_batch_size,
+            "Batch Size",
+            "Number of 256x256 patches processed together per GPU pass.\n\n"
+            "Reduce this first if you hit a CUDA out-of-memory error; it is "
+            "the main lever for memory use."
+        ))
+
+        self.check_drop_2d = QCheckBox("Remove flat (single-slice) segments")
+        drop_2d_row = QHBoxLayout()
+        drop_2d_row.addWidget(self.check_drop_2d)
+        drop_2d_row.addWidget(HelpButton(
+            "Remove Flat (Single-Slice) Segments",
+            "Cellpose leaves flat fragments on the first/last Z slice -- "
+            "measured at ~100-350 voxels versus ~2400-4000 for real objects "
+            "on this dataset, and most common in 2D+stitch mode. This drops "
+            "any object occupying a single Z, Y or X slice.\n\n"
+            "Turn off if your objects genuinely occupy only one slice."
+        ))
+        drop_2d_row.addStretch()
+        self.check_drop_2d.setChecked(bool(cfg.get("drop_2d_segments", True)))
+        set_form.addRow(drop_2d_row)
+
+        # Advanced settings: nested inside this same section, collapsed and
+        # scrollable so the long list of normalization/filter knobs doesn't
+        # dominate the page until someone actually wants them.
+        from behav3d.preprocessing.segmentation.cellpose_sam_prediction import (
+            power_safe_settings,
+        )
+        self._power_safe_preset = power_safe_settings()
+
+        adv_section = CollapsibleSection("Advanced (normalization, filters)", expanded=False)
+        adv_scroll = QScrollArea()
+        adv_scroll.setWidgetResizable(True)
+        adv_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        adv_scroll.setMaximumHeight(280)
+        adv_content = QWidget()
+        adv_form = QFormLayout()
+        adv_content.setLayout(adv_form)
+        adv_scroll.setWidget(adv_content)
+        adv_section.addWidget(adv_scroll)
+
+        self.spin_norm_low = QDoubleSpinBox()
+        self.spin_norm_low.setRange(0.0, 100.0)
+        self.spin_norm_low.setValue(float(cfg.get("norm_percentile_low", 1.0)))
+        self.spin_norm_high = QDoubleSpinBox()
+        self.spin_norm_high.setRange(0.0, 100.0)
+        self.spin_norm_high.setValue(float(cfg.get("norm_percentile_high", 99.0)))
+        norm_row = QHBoxLayout()
+        norm_row.addWidget(QLabel("low:"))
+        norm_row.addWidget(self.spin_norm_low)
+        norm_row.addWidget(QLabel("high:"))
+        norm_row.addWidget(self.spin_norm_high)
+        norm_tooltip = "Intensity percentiles rescaled to 0/1 before segmentation."
+        self.spin_norm_low.setToolTip(norm_tooltip)
+        self.spin_norm_high.setToolTip(norm_tooltip)
+        adv_form.addRow("Norm percentiles:", norm_row)
+
+        self.check_norm3d = QCheckBox("Normalize across the whole Z stack (norm3D)")
+        norm3d_row = QHBoxLayout()
+        norm3d_row.addWidget(self.check_norm3d)
+        norm3d_row.addWidget(HelpButton(
+            "Normalize Across Whole Z Stack (norm3D)",
+            "On: intensity normalization is computed once for the entire 3D "
+            "stack.\n\n"
+            "Off: each Z slice is normalized independently -- useful if "
+            "brightness drifts a lot between slices."
+        ))
+        norm3d_row.addStretch()
+        self.check_norm3d.setChecked(bool(cfg.get("norm3D", True)))
+        adv_form.addRow(norm3d_row)
+
+        self.spin_niter = QSpinBox()
+        self.spin_niter.setRange(0, 10000)
+        self.spin_niter.setValue(int(cfg.get("niter", 0)))
+        adv_form.addRow("niter dynamics:", make_help_row(
+            self.spin_niter,
+            "niter Dynamics",
+            "Number of iterations used to run the flow dynamics.\n\n"
+            "0 = automatic, proportional to the diameter. Long, thin objects "
+            "may need a higher value, e.g. ~2000."
+        ))
+
+        self.spin_flow3d_smooth = QDoubleSpinBox()
+        self.spin_flow3d_smooth.setRange(0.0, 100000.0)
+        self.spin_flow3d_smooth.setSingleStep(0.5)
+        adv_form.addRow("flow3D smooth:", make_help_row(
+            self.spin_flow3d_smooth,
+            "flow3D Smooth",
+            "Standard deviation of a Gaussian filter applied to the 3D flows "
+            "before computing dynamics. Increasing it can remove ring "
+            "artifacts. 0 disables smoothing.\n\n"
+            "Shown in the unit selected above."
+        ))
+
+        self.spin_sharpen = QDoubleSpinBox()
+        self.spin_sharpen.setRange(0.0, 100000.0)
+        adv_form.addRow("Sharpen radius:", make_help_row(
+            self.spin_sharpen,
+            "Sharpen Radius",
+            "Applies a high-pass sharpening filter with this radius before "
+            "segmentation. Recommended around 1/4-1/8 of the expected object "
+            "diameter; 0 disables it.\n\n"
+            "Useful for dim, blurry images. Shown in the unit selected above."
+        ))
+
+        self.spin_smooth = QDoubleSpinBox()
+        self.spin_smooth.setRange(0.0, 100000.0)
+        adv_form.addRow("Smooth radius:", make_help_row(
+            self.spin_smooth,
+            "Smooth Radius",
+            "Applies a low-pass smoothing filter with this radius before "
+            "segmentation. Useful for noisy images; 0 disables it.\n\n"
+            "Shown in the unit selected above."
+        ))
+
+        self.spin_tile_norm = QDoubleSpinBox()
+        self.spin_tile_norm.setRange(0.0, 1000000.0)
+        adv_form.addRow("Tile norm blocksize:", make_help_row(
+            self.spin_tile_norm,
+            "Tile Norm Blocksize",
+            "Computes normalization in tiles of this size across the image, "
+            "rather than once for the whole frame. Brightens dark areas in "
+            "unevenly-illuminated images. 0 disables tiled normalization.\n\n"
+            "Shown in the unit selected above."
+        ))
+
+        self.spin_tile_norm_smooth = QDoubleSpinBox()
+        self.spin_tile_norm_smooth.setRange(0.0, 100.0)
+        self.spin_tile_norm_smooth.setValue(float(cfg.get("tile_norm_smooth3D", 0.0)))
+        adv_form.addRow("Tile norm smooth3D:", make_help_row(
+            self.spin_tile_norm_smooth,
+            "Tile Norm Smooth3D",
+            "Smoothing factor applied across Z when tile-based normalization "
+            "(above) is enabled. Only relevant when 'Tile norm blocksize' is "
+            "greater than 0."
+        ))
+
+        self.spin_max_size_fraction = QDoubleSpinBox()
+        self.spin_max_size_fraction.setRange(0.0, 1.0)
+        self.spin_max_size_fraction.setSingleStep(0.05)
+        self.spin_max_size_fraction.setValue(float(cfg.get("max_size_fraction", 1.0)))
+        adv_form.addRow("Max size fraction:", make_help_row(
+            self.spin_max_size_fraction,
+            "Max Size Fraction",
+            "Cellpose deletes masks larger than this fraction of the image "
+            "area.\n\n"
+            "Cellpose's own default is 0.4, which silently removes large "
+            "organoids; BEHAV3D defaults this to 1.0 (keep everything) and "
+            "relies on the size filter below instead."
+        ))
+
+        self.spin_n_threads = QSpinBox()
+        self.spin_n_threads.setRange(0, 256)
+        self.spin_n_threads.setValue(int(cfg.get("n_threads", 0)))
+        adv_form.addRow("CPU threads (0=all):", make_help_row(
+            self.spin_n_threads,
+            "CPU Threads",
+            "Cap on CPU threads used for mask post-processing and compression. "
+            "0 = use every logical core.\n\n"
+            "A full Cellpose-SAM run saturates the GPU and every CPU core at "
+            "once, which on some laptops draws more power than the machine's "
+            "power delivery can sustain, causing an abrupt shutdown mid-run. "
+            f"If that happens, try capping this around "
+            f"{self._power_safe_preset['n_threads']} threads."
+        ))
+
+        self.spin_cooldown = QDoubleSpinBox()
+        self.spin_cooldown.setRange(0.0, 120.0)
+        self.spin_cooldown.setSingleStep(1.0)
+        self.spin_cooldown.setValue(float(cfg.get("cooldown_s", 0.0)))
+        adv_form.addRow("Cooldown between frames (s):", make_help_row(
+            self.spin_cooldown,
+            "Cooldown Between Frames",
+            "Idle time inserted after each timepoint, letting the voltage "
+            "regulators and battery recover between GPU bursts. 0 = no pause.\n\n"
+            "Combine with a lower batch size and a capped CPU-thread count if "
+            "the machine powers off part-way through a run; "
+            f"{self._power_safe_preset['cooldown_s']:g}s is a reasonable "
+            "starting point."
+        ))
+
+        set_outer.addWidget(adv_section)
+        content_layout.addWidget(set_group)
+
+        # --- Section 5: Size filter + preview ---------------------------
+        filt_group = QGroupBox("5. Size Filter (preview before batch)")
+        filt_layout = QVBoxLayout()
+        filt_group.setLayout(filt_layout)
+
+        prev_row = QHBoxLayout()
+        prev_row.addWidget(QLabel("Sample:"))
+        self.combo_preview_sample = QComboBox()
+        self.combo_preview_sample.addItems(self._sample_names() or ["(load metadata)"])
+        saved_preview_sample = str(cfg.get("preview_sample", "") or "")
+        if saved_preview_sample:
+            idx = self.combo_preview_sample.findText(saved_preview_sample)
+            if idx >= 0:
+                self.combo_preview_sample.setCurrentIndex(idx)
+        prev_row.addWidget(self.combo_preview_sample)
+        prev_row.addWidget(QLabel("t:"))
+        self.spin_preview_t = QSpinBox()
+        self.spin_preview_t.setRange(0, 9999)
+        self.spin_preview_t.setValue(int(cfg.get("preview_timepoint", 0)))
+        self.spin_preview_t.setMaximumWidth(70)
+        prev_row.addWidget(self.spin_preview_t)
+        prev_row.addWidget(HelpButton(
+            "Preview Sample / Timepoint",
+            "The single sample and timepoint that 'Preview segmentation' "
+            "below runs on. Pick one that's representative of your data so "
+            "the size histogram reflects real object/artifact sizes."
+        ))
+        filt_layout.addLayout(prev_row)
+
+        lbl_units = QLabel(
+            "Units follow the toggle in Section 4 (Segmentation Settings) above."
+        )
+        lbl_units.setWordWrap(True)
+        lbl_units.setStyleSheet("color: #999; font-size: 10px; font-style: italic;")
+        filt_layout.addWidget(lbl_units)
+
+        size_form = QFormLayout()
+        self.spin_size_min = QSpinBox()
+        self.spin_size_min.setRange(0, 2_000_000_000)
+        self.spin_size_min.setSingleStep(10)
+        self.spin_size_min.setToolTip(
+            "Minimum object volume to keep; smaller objects are removed. 0 = no bound."
+        )
+        size_form.addRow("Min size:", self.spin_size_min)
+
+        self.spin_size_max = QSpinBox()
+        self.spin_size_max.setRange(0, 2_000_000_000)
+        self.spin_size_max.setSingleStep(100)
+        self.spin_size_max.setToolTip(
+            "Maximum object volume to keep; larger objects are removed. 0 = no bound."
+        )
+        size_form.addRow("Max size:", self.spin_size_max)
+        filt_layout.addLayout(size_form)
+
+        self.lbl_filter_stats = QLabel("Run a preview to see object sizes.")
+        self.lbl_filter_stats.setWordWrap(True)
+        self.lbl_filter_stats.setStyleSheet("color: #999; font-size: 10px; font-style: italic;")
+        filt_layout.addWidget(self.lbl_filter_stats)
+
+        preview_row = QHBoxLayout()
+        self.btn_preview = QPushButton("👁 Preview segmentation")
+        self.btn_preview.setToolTip(
+            "Segments only the sample/timepoint above, with no size "
+            "filtering, and shows the result as a napari Labels layer.\n\n"
+            "The Min/Max size fields above then re-filter this cached "
+            "result instantly — no Cellpose-SAM re-run needed while you tune "
+            "the thresholds."
+        )
+        self.btn_preview.setStyleSheet(
+            "QPushButton{color:#1565C0;border:1px solid #90CAF9;"
+            "border-radius:3px;padding:4px;}"
+            "QPushButton:hover{background:#E3F2FD;}"
+            "QPushButton:disabled{color:#aaa;border-color:#ddd;}"
+        )
+        self.btn_preview.clicked.connect(self._on_preview)
+        preview_row.addWidget(self.btn_preview, stretch=1)
+        filt_layout.addLayout(preview_row)
+        content_layout.addWidget(filt_group)
+
+        # --- Run ---------------------------------------------------------
+        run_row = QHBoxLayout()
+        self.btn_run = QPushButton("▶  Run Cellpose-SAM")
+        self.btn_run.setToolTip(
+            "Runs Cellpose-SAM for every sample in the loaded metadata, using "
+            "all the settings configured in Sections 1-5 above (they are "
+            "saved automatically when you click Run).\n\n"
+            "Runs in the background so the rest of the GUI stays usable; "
+            "progress is shown in the log below and the shared progress bar."
+        )
+        self.btn_run.setStyleSheet(
+            "QPushButton { background: #28a745; color: white; border-radius: 4px; "
+            "padding: 6px; font-weight: bold; font-size: 12px; }"
+            "QPushButton:hover { background: #218838; }"
+        )
+        self.btn_run.clicked.connect(lambda: self.run_batch_cellpose_sam(interactive=True, block=False))
+        run_row.addWidget(self.btn_run, stretch=1)
+
+        # +🛒 queue button
+        self.btn_queue_cellpose_sam = QPushButton("+🛒")
+        self.btn_queue_cellpose_sam.setFixedSize(36, 28)
+        self.btn_queue_cellpose_sam.setToolTip("Add Cellpose-SAM Segmentation to Processing Queue")
+        self.btn_queue_cellpose_sam.setStyleSheet(
+            "QPushButton { background: #1a1a2e; color: #ffc107; border: 1px solid #ffc107; "
+            "border-radius: 4px; font-size: 11px; font-weight: bold; }"
+            "QPushButton:hover { background: #ffc107; color: #1a1a2e; }"
+        )
+        self.btn_queue_cellpose_sam.setVisible(False)  # shown after metadata loaded
+        run_row.addWidget(self.btn_queue_cellpose_sam)
+        content_layout.addLayout(run_row)
+        content_layout.addStretch()
+
+        # Register the size/radius fields with the shared unit toggle. This
+        # must happen after every widget above is created but before the
+        # per-cell-type reload below (which uses set_native/get_native).
+        self._unit_mgr.register(self.spin_diameter, "distance", float(cfg.get("diameter", 0.0)))
+        self._unit_mgr.register(self.spin_flow3d_smooth, "distance", float(cfg.get("flow3D_smooth", 0.0)))
+        self._unit_mgr.register(self.spin_sharpen, "distance", float(cfg.get("sharpen_radius", 0.0)))
+        self._unit_mgr.register(self.spin_smooth, "distance", float(cfg.get("smooth_radius", 0.0)))
+        self._unit_mgr.register(self.spin_tile_norm, "distance", float(cfg.get("tile_norm_blocksize", 0.0)))
+        self._unit_mgr.register(self.spin_size_min, "volume", 0)
+        self._unit_mgr.register(self.spin_size_max, "volume", 0)
+        self.spin_size_min.valueChanged.connect(self._update_preview_filter)
+        self.spin_size_max.valueChanged.connect(self._update_preview_filter)
+
+        self._on_do_3d_toggled(self.check_do_3d.isChecked())
+        self._load_size_filter_for_cell_type()
+        self.cell_type_combo.currentTextChanged.connect(
+            lambda _t: self._load_size_filter_for_cell_type()
+        )
+        self._refresh_env_status()
+        self.channel_panel.refresh()
+
+    # -- environment --------------------------------------------------
+    def _refresh_env_status(self, refresh=False):
+        from behav3d.preprocessing.segmentation.cpsam_env import cpsam_env_status
+
+        status = cpsam_env_status(self.metadata_loader.behav3d_parameters, refresh=refresh)
+        if status["available"]:
+            gpus = ", ".join(status.get("gpus") or []) or "no CUDA GPU"
+            self.lbl_env_status.setText(
+                f"\u2705 Ready \u2014 cellpose {status['cellpose_version']}, "
+                f"torch {status.get('torch_version')} ({gpus})"
+            )
+            self.lbl_env_status.setStyleSheet("color: #7ec699;")
+            self.btn_setup_env.setEnabled(False)
+            self.btn_run.setEnabled(True)
+            self.btn_preview.setEnabled(True)
+        else:
+            self.lbl_env_status.setText(f"\u26a0\ufe0f {status['error']}")
+            self.lbl_env_status.setStyleSheet("color: #e0b070;")
+            self.btn_setup_env.setEnabled(True)
+            self.btn_run.setEnabled(False)
+            self.btn_preview.setEnabled(False)
+        return status
+
+    def _on_setup_env(self):
+        from behav3d.preprocessing.segmentation.cpsam_env import create_cpsam_env
+
+        if self._bg.is_running():
+            self.log("\u26a0\ufe0f An operation is already in progress.")
+            return
+
+        self.log("Setting up the Cellpose-SAM environment (this may take a minute)\u2026")
+
+        def _do_setup(progress_cb=None):
+            return create_cpsam_env(progress_cb=lambda m: self.log(f"  {m}"))
+
+        self._bg.run(
+            fn=_do_setup,
+            desc="Setting up Cellpose-SAM\u2026",
+            progress_row=self.tab_progress_row,
+            buttons=[self.btn_setup_env],
+            viewer=self.viewer,
+            on_done=lambda _r: (self.log("\u2705 Cellpose-SAM environment ready."),
+                                self._refresh_env_status(refresh=True)),
+            on_failed=lambda e: (self.log(f"\u274c Setup failed: {e}"),
+                                 self._refresh_env_status(refresh=True)),
+        )
+
+    # \u2500\u2500 small UI reactions \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    def _on_do_3d_toggled(self, checked):
+        # cellpose ignores flow_threshold entirely when do_3D=True, so showing an
+        # editable value there would be misleading.
+        self.spin_flow_threshold.setEnabled(not checked)
+        self.lbl_flow_threshold.setText(
+            "Flow threshold (ignored in 3D):" if checked else "Flow threshold:"
+        )
+        self.spin_stitch.setEnabled(not checked)
+        self.lbl_stitch.setEnabled(not checked)
+
+    def _current_cell_type(self):
+        return self.cell_type_combo.currentText()
+
+    def _load_size_filter_for_cell_type(self):
+        cfg = self._cfg()
+        entry = (cfg.get("size_filter") or {}).get(self._current_cell_type(), {})
+        # set_native() blocks signals internally while refreshing the display,
+        # so switching cell type does not trigger a redundant re-filter here;
+        # _update_preview_filter() is called explicitly below instead.
+        self._unit_mgr.set_native(self.spin_size_min, int(entry.get("size_min", 0) or 0))
+        self._unit_mgr.set_native(self.spin_size_max, int(entry.get("size_max", 0) or 0))
+        self._update_preview_filter()
+
+    # \u2500\u2500 parameter collection \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    def _collect_sam_params(self):
+        # Diameter/sharpen/smooth/tile-norm/flow3D-smooth are registered with
+        # the shared unit toggle, so get_native() is used instead of .value()
+        # to always return the canonical pixel value the backend expects,
+        # regardless of whether px or um is currently displayed.
+        diameter = self._unit_mgr.get_native(self.spin_diameter)
+        return {
+            "diameter": diameter if diameter > 0 else None,
+            "flow_threshold": float(self.spin_flow_threshold.value()),
+            "cellprob_threshold": float(self.spin_cellprob.value()),
+            "niter": int(self.spin_niter.value()),
+            "do_3D": bool(self.check_do_3d.isChecked()),
+            "stitch_threshold": float(self.spin_stitch.value()),
+            "flow3D_smooth": self._unit_mgr.get_native(self.spin_flow3d_smooth),
+            "batch_size": int(self.spin_batch_size.value()),
+            "max_size_fraction": float(self.spin_max_size_fraction.value()),
+            "norm_percentile_low": float(self.spin_norm_low.value()),
+            "norm_percentile_high": float(self.spin_norm_high.value()),
+            "norm3D": bool(self.check_norm3d.isChecked()),
+            "sharpen_radius": self._unit_mgr.get_native(self.spin_sharpen),
+            "smooth_radius": self._unit_mgr.get_native(self.spin_smooth),
+            "tile_norm_blocksize": self._unit_mgr.get_native(self.spin_tile_norm),
+            "tile_norm_smooth3D": float(self.spin_tile_norm_smooth.value()),
+            "drop_2d_segments": bool(self.check_drop_2d.isChecked()),
+        }
+
+    def _selected_device(self):
+        if self.btn_force_cpu.isChecked():
+            return "cpu"
+        return str(self.combo_gpu_device.currentData() or "auto")
+
+    def _persist_params(self):
+        cfg = self.metadata_loader.behav3d_parameters.setdefault("cellpose_sam", {})
+        cfg.update(self._collect_sam_params())
+        cfg["diameter"] = self._unit_mgr.get_native(self.spin_diameter)  # store 0 rather than None
+        cfg["model_name"] = self.combo_model.currentText()
+        cfg["device"] = str(self.combo_gpu_device.currentData() or "auto")
+        cfg["force_cpu"] = bool(self.btn_force_cpu.isChecked())
+        cfg["all_cell_types"] = bool(self.check_all_cell_types.isChecked())
+        cfg["use_all_timepoints"] = bool(self.check_process_all.isChecked())
+        cfg["tp_start"] = int(self.spin_t_start.value())
+        cfg["tp_end"] = int(self.spin_t_end.value())
+        cfg["preview_sample"] = self.combo_preview_sample.currentText()
+        cfg["preview_timepoint"] = int(self.spin_preview_t.value())
+        cfg["n_threads"] = int(self.spin_n_threads.value())
+        cfg["cooldown_s"] = float(self.spin_cooldown.value())
+
+        # Size filter is per cell type; get_native() returns the canonical
+        # voxel count regardless of whether px/um3 is currently displayed.
+        size_filter = cfg.setdefault("size_filter", {})
+        size_filter[self._current_cell_type()] = {
+            "size_min": int(self._unit_mgr.get_native(self.spin_size_min)),
+            "size_max": int(self._unit_mgr.get_native(self.spin_size_max)),
+        }
+
+        if hasattr(self.metadata_loader, "behav3d_parameters_path"):
+            yaml.safe_dump(
+                self.metadata_loader.behav3d_parameters,
+                self.metadata_loader.behav3d_parameters_path.open("w"),
+                sort_keys=False,
+            )
+
+    # \u2500\u2500 preview \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    def _on_preview(self):
+        from behav3d.preprocessing.segmentation.cellpose_sam_prediction import preview_cellpose_sam
+        from behav3d.io.images import load_image
+
+        if self.metadata_loader.metadata is None:
+            self.log("\u26a0\ufe0f Cannot preview: no metadata loaded.")
+            return
+        if self._bg.is_running():
+            self.log("\u26a0\ufe0f An operation is already in progress.")
+            return
+
+        sample_name = self.combo_preview_sample.currentText()
+        if not sample_name or sample_name == "(load metadata)":
+            self.log("\u26a0\ufe0f Select a sample first.")
+            return
+
+        timepoint = int(self.spin_preview_t.value())
+
+        if self.check_all_cell_types.isChecked():
+            cell_types = list(self.all_cell_types)
+        else:
+            cell_types = [self._current_cell_type()]
+        cell_types = [ct for ct in cell_types if ct and ct != "(load metadata)"]
+        if not cell_types:
+            self.log("\u26a0\ufe0f Select a cell type first.")
+            return
+
+        self._persist_params()
+        params = self._collect_sam_params()
+        device = self._selected_device()
+        force_cpu = bool(self.btn_force_cpu.isChecked())
+        model_name = self.combo_model.currentText()
+        output_dir = self.metadata_loader.output_dir
+        metadata = self.metadata_loader.metadata
+        behav3d_parameters = self.metadata_loader.behav3d_parameters
+        log_bridge = ThreadSafeLogger(self.log)
+
+        def _do_preview(progress_cb=None):
+            results = {}
+            n_ct = len(cell_types)
+            for i, ct in enumerate(cell_types):
+                if progress_cb is not None:
+                    try:
+                        progress_cb(i, n_ct, f"Cellpose-SAM preview: {ct}")
+                    except Exception:
+                        pass
+                results[ct] = preview_cellpose_sam(
+                    output_dir=output_dir,
+                    metadata=metadata,
+                    sample_name=sample_name,
+                    cell_type=ct,
+                    timepoint=timepoint,
+                    model_name=model_name,
+                    device=device,
+                    force_cpu=force_cpu,
+                    sam_params=params,
+                    log_callback=log_bridge,
+                    config=behav3d_parameters,
+                )
+            if progress_cb is not None:
+                try:
+                    progress_cb(n_ct, n_ct, "Cellpose-SAM preview done")
+                except Exception:
+                    pass
+            return results
+
+        def _on_done(results):
+            from behav3d.preprocessing.segmentation.size_filter import compute_label_sizes
+
+            # Every layer this preview adds is a plain (Z, Y, X) volume for a
+            # single timepoint, so with nothing else in the viewer there is no
+            # time slider left to imply "every timepoint got segmented".
+            self.viewer.layers.clear()
+            self._preview_labels = {}
+            self._preview_sizes = {}
+            self._preview_key = (sample_name, timepoint, tuple(cell_types))
+
+            raw_zarr = Path(output_dir) / "images" / str(sample_name) / f"{sample_name}.zarr"
+            # Single eager read of this one timepoint's full (C, Z, Y, X)
+            # frame. Preview only ever needs one timepoint \u2014 already bounded,
+            # not the "whole dataset in RAM" scenario dask laziness helps
+            # with \u2014 so slicing per channel from a dask-backed array here
+            # just meant napari re-triggered a separate disk read + auto-
+            # contrast compute for every channel layer, which was much
+            # slower than reading the frame once and slicing it in memory.
+            frame = np.asarray(load_image(raw_zarr)[timepoint])  # (C, Z, Y, X)
+
+            # Show every channel of the raw frame for context, not just the
+            # subset fed to the model for a given cell type \u2014 the log line
+            # from preview_cellpose_sam() already states which channels were
+            # actually used for each cell type's inference.
+            channel_colors = ["gray", "cyan", "yellow", "red", "green", "magenta", "blue"]
+            for ch_idx in range(frame.shape[0]):
+                self.viewer.add_image(
+                    frame[ch_idx],
+                    name=f"{sample_name} t{timepoint} \u00b7 ch{ch_idx}",
+                    colormap=channel_colors[ch_idx % len(channel_colors)],
+                    blending="additive",
+                )
+
+            for ct, labels in results.items():
+                self._preview_labels[ct] = labels
+                _lbls, sizes = compute_label_sizes(labels)
+                self._preview_sizes[ct] = sizes
+                if sizes.size:
+                    self.log(
+                        f"Preview ({ct}): {sizes.size} objects, volume "
+                        f"min={sizes.min()} median={int(np.median(sizes))} max={sizes.max()} voxels."
+                    )
+                else:
+                    self.log(f"Preview ({ct}): no objects found.")
+                self._show_preview_labels_layer(ct, labels)
+
+            self._update_preview_filter()
+
+        self._bg.run(
+            fn=_do_preview,
+            desc=f"Cellpose-SAM preview \u2014 {sample_name} t={timepoint}\u2026",
+            progress_row=self.tab_progress_row,
+            buttons=[self.btn_preview],
+            viewer=self.viewer,
+            on_done=_on_done,
+            on_failed=lambda e: self.log(f"\u274c Preview failed: {e}"),
+        )
+
+    def _show_preview_labels_layer(self, cell_type, data):
+        if self._preview_key is None:
+            return
+        sample_name, timepoint, _cell_types = self._preview_key
+        name = f"{sample_name} t{timepoint} \u00b7 {cell_type} \u00b7 preview"
+        try:
+            if name in self.viewer.layers:
+                self.viewer.layers[name].data = data
+            else:
+                self.viewer.add_labels(data, name=name, opacity=0.7)
+        except Exception as exc:  # pragma: no cover - viewer state dependent
+            self.log(f"\u26a0\ufe0f Could not show preview layer: {exc}")
+
+    def _update_preview_filter(self):
+        """Re-filter the currently-selected cell type's cached preview in
+        place. No inference re-run. Other previewed cell types' layers are
+        left as-is - the size filter is a per-cell-type setting."""
+        cell_type = self._current_cell_type()
+        labels = self._preview_labels.get(cell_type)
+        sizes = self._preview_sizes.get(cell_type)
+        if labels is None or sizes is None:
+            return
+        from behav3d.preprocessing.segmentation.size_filter import filter_labels_by_size
+
+        # get_native() always returns voxels regardless of the displayed
+        # unit, matching how self._preview_sizes (from compute_label_sizes)
+        # is measured, so filtering is correct whichever unit is on screen.
+        size_min = int(self._unit_mgr.get_native(self.spin_size_min)) or None
+        size_max = int(self._unit_mgr.get_native(self.spin_size_max)) or None
+        total = int(sizes.size)
+
+        keep = np.ones(total, dtype=bool)
+        if size_min:
+            keep &= sizes >= size_min
+        if size_max:
+            keep &= sizes <= size_max
+        n_keep = int(keep.sum())
+
+        if total:
+            self.lbl_filter_stats.setText(
+                f"{cell_type}: {total} objects \u2192 {n_keep} kept ({total - n_keep} removed). "
+                f"Volumes: min={sizes.min()} median={int(np.median(sizes))} max={sizes.max()} voxels."
+            )
+        else:
+            self.lbl_filter_stats.setText(f"{cell_type}: no objects in the preview.")
+
+        filtered = filter_labels_by_size(labels, size_min=size_min, size_max=size_max)
+        self._show_preview_labels_layer(cell_type, filtered)
+
+    # \u2500\u2500 queue contract \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    def validate_for_queue(self):
+        """Return (ok, error_msg)."""
+        status = cpsam_env_status_safe(self.metadata_loader.behav3d_parameters)
+        if not status["available"]:
+            return False, f"Cellpose-SAM environment not ready: {status['error']}"
+        if not self.check_all_cell_types.isChecked():
+            ct = self.cell_type_combo.currentText()
+            if not ct or ct == "(load metadata)":
+                return False, "No cell type selected."
+            cell_types_to_check = [ct]
+        elif not self.all_cell_types:
+            return False, "No cell types detected in metadata."
+        else:
+            cell_types_to_check = list(self.all_cell_types)
+        for ct in cell_types_to_check:
+            if not self.channel_panel.channels_for(ct):
+                return False, (
+                    f"No channels selected for '{ct}'. Configure it in the "
+                    "Channel Selection panel above."
+                )
+        return True, ""
+
+    def get_queue_params(self):
+        """Return the params dict for a queue step."""
+        return {
+            "cell_type": self.cell_type_combo.currentText(),
+            "all_cell_types": bool(self.check_all_cell_types.isChecked()),
+            "model_name": self.combo_model.currentText(),
+            "device": str(self.combo_gpu_device.currentData() or "auto"),
+            "force_cpu": bool(self.btn_force_cpu.isChecked()),
+            "n_threads": int(self.spin_n_threads.value()) or None,
+            "cooldown_s": float(self.spin_cooldown.value()),
+        }
+
+    def _on_metadata_updated(self, _metadata=None):
+        self._detect_cell_types()
+        current = self.cell_type_combo.currentText()
+        self.cell_type_combo.clear()
+        self.cell_type_combo.addItems(self.all_cell_types or ["(load metadata)"])
+        idx = self.cell_type_combo.findText(current)
+        if idx >= 0:
+            self.cell_type_combo.setCurrentIndex(idx)
+
+        current_sample = self.combo_preview_sample.currentText()
+        self.combo_preview_sample.clear()
+        self.combo_preview_sample.addItems(self._sample_names() or ["(load metadata)"])
+        idx = self.combo_preview_sample.findText(current_sample)
+        if idx >= 0:
+            self.combo_preview_sample.setCurrentIndex(idx)
+
+        # This page is built before metadata is loaded (napari constructs
+        # every tab up front), so the unit toggle's resolution check runs
+        # against metadata=None at __init__ time and locks itself as invalid.
+        # Re-check it now that real metadata may be available.
+        self._unit_mgr.refresh(self.metadata_loader.metadata)
+
+        self.channel_panel.refresh()
+        self._load_size_filter_for_cell_type()
+        self._refresh_env_status()
+        self.btn_queue_cellpose_sam.setVisible(True)
+
+    # \u2500\u2500 run \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    def run_batch_cellpose_sam(self, interactive=True, skip_existing=False,
+                               cell_type_override=None, block=True,
+                               extra_callbacks=None):
+        """Run Cellpose-SAM for the selected cell type (or all of them).
+
+        ``block=True`` (queue) runs synchronously; ``block=False`` (GUI) runs in
+        a background worker. ``extra_callbacks`` is the queue's chaining hook.
+        """
+        from behav3d.preprocessing.segmentation.cellpose_sam_prediction import (
+            run_cellpose_sam_and_sync_metadata,
+        )
+
+        if self.metadata_loader.metadata is None:
+            self.log("\u26a0\ufe0f Cannot run Cellpose-SAM: No metadata loaded.")
+            fire_extra_callback(extra_callbacks, "on_failed", "no metadata loaded")
+            return
+        if not block and self._bg.is_running():
+            self.log("\u26a0\ufe0f A Cellpose-SAM run is already in progress.")
+            fire_extra_callback(extra_callbacks, "on_failed", "already running")
+            return
+
+        ok, err = self.validate_for_queue()
+        if not ok:
+            self.log(f"\u26a0\ufe0f {err}")
+            fire_extra_callback(extra_callbacks, "on_failed", err)
+            return
+
+        if cell_type_override:
+            cell_types = [cell_type_override]
+        elif self.check_all_cell_types.isChecked():
+            cell_types = list(self.all_cell_types)
+        else:
+            cell_types = [self.cell_type_combo.currentText()]
+
+        self._persist_params()
+
+        if interactive:
+            from behav3d.napari._overwrite_prompt import prompt_overwrite_batch
+            md = self.metadata_loader.metadata
+            out_dir = Path(self.metadata_loader.output_dir)
+            existing = []
+            for ct in cell_types:
+                for sn in md["sample_name"].unique():
+                    if (out_dir / "images" / sn / f"{sn}_{ct}_segments.zarr").exists():
+                        existing.append(f"{ct} segments for {sn}")
+            if not existing:
+                existing = ["existing Cellpose-SAM results"]
+            choice = prompt_overwrite_batch(self, "Existing Segmentation Results", existing)
+            if choice == "cancel":
+                self.log("Cellpose-SAM segmentation cancelled.")
+                fire_extra_callback(extra_callbacks, "on_failed", "cancelled")
+                return
+            overwrite = (choice == "overwrite")
+        else:
+            overwrite = not skip_existing
+
+        if self.check_process_all.isChecked():
+            timepoint_range = None
+        else:
+            t_start = self.spin_t_start.value()
+            t_end = self.spin_t_end.value()
+            if t_start > t_end:
+                self.log("Error: Start timepoint must be <= End timepoint.")
+                fire_extra_callback(extra_callbacks, "on_failed", "bad timepoint range")
+                return
+            timepoint_range = (t_start, t_end)
+
+        # Read every Qt widget here, on the caller thread; the worker closure
+        # below runs off-thread and must not touch the GUI.
+        params = self._collect_sam_params()
+        model_name = self.combo_model.currentText()
+        device = self._selected_device()
+        force_cpu = bool(self.btn_force_cpu.isChecked())
+        size_filters = (self._cfg().get("size_filter") or {})
+        n_threads = int(self.spin_n_threads.value()) or None
+        cooldown_s = float(self.spin_cooldown.value())
+
+        self.log(f"Starting Cellpose-SAM ({model_name}) for: {', '.join(cell_types)}\u2026")
+        log_bridge = ThreadSafeLogger(self.log)
+
+        def _do_run(progress_cb=None):
+            # Each run_cellpose_sam_and_sync_metadata() call reports its own
+            # 0..total_ticks range for just that cell type, which would reset
+            # the bar back to 0% every time the next cell type starts. Scale
+            # each cell type's fraction into its 1/n_ct slice of a single
+            # combined 0..1000 bar so multi-cell-type batches show one
+            # continuously advancing progress bar instead of N resets.
+            n_ct = len(cell_types)
+
+            def _make_scaled_cb(ct_index):
+                def _scaled(current, total, label):
+                    if progress_cb is None:
+                        return
+                    try:
+                        frac = (ct_index + (current / total if total > 0 else 0.0)) / n_ct
+                        progress_cb(int(frac * 1000), 1000, label)
+                    except Exception:
+                        pass
+                return _scaled
+
+            results = []
+            for i, ct in enumerate(cell_types):
+                results.append(run_cellpose_sam_and_sync_metadata(
+                    output_dir=self.metadata_loader.output_dir,
+                    metadata_loader=self.metadata_loader,
+                    label_name=ct,
+                    model_name=model_name,
+                    timepoint_range=timepoint_range,
+                    device=device,
+                    force_cpu=force_cpu,
+                    sam_params=params,
+                    size_filter=size_filters.get(ct),
+                    resume=True,
+                    n_threads=n_threads,
+                    cooldown_s=cooldown_s,
+                    overwrite_existing=overwrite,
+                    skip_existing=skip_existing,
+                    progress_cb=_make_scaled_cb(i),
+                    log_callback=log_bridge,
+                ))
+            if progress_cb is not None:
+                try:
+                    progress_cb(1000, 1000, "Cellpose-SAM done")
+                except Exception:
+                    pass
+            merged = {"processed": [], "skipped": []}
+            for _md, summary in results:
+                merged["processed"].extend(summary["processed"])
+                merged["skipped"].extend(summary["skipped"])
+            return results[-1][0], merged
+
+        def _report_summary(summary):
+            n_proc = len(summary["processed"])
+            n_skip = len(summary["skipped"])
+            if n_skip:
+                self.log(f"Cellpose-SAM finished: {n_proc} processed, {n_skip} skipped.")
+            else:
+                self.log(f"Cellpose-SAM finished: {n_proc} processed.")
+            self.log("Metadata updated.")
+
+        if block:
+            try:
+                result = _do_run(progress_cb=None)
+                _report_summary(result[1])
+                fire_extra_callback(extra_callbacks, "on_done", result)
+            except Exception as e:
+                traceback.print_exc()
+                self.log(f"\u274c Cellpose-SAM error: {e}")
+                fire_extra_callback(extra_callbacks, "on_failed", str(e))
+                if not interactive:
+                    raise
+            return
+
+        def _on_done(result):
+            _report_summary(result[1])
+            fire_extra_callback(extra_callbacks, "on_done", result)
+
+        def _on_failed(err: str):
+            self.log(f"\u274c Cellpose-SAM error: {err}")
+            fire_extra_callback(extra_callbacks, "on_failed", err)
+
+        self._bg.run(
+            fn=_do_run,
+            desc=f"Cellpose-SAM \u2014 {', '.join(cell_types)}\u2026",
+            progress_row=self.tab_progress_row,
+            buttons=[self.btn_run],
+            viewer=self.viewer,
+            on_done=_on_done,
+            on_failed=_on_failed,
+        )
+
+
+def cpsam_env_status_safe(config):
+    """``cpsam_env_status`` that never raises, for use in validation paths."""
+    try:
+        from behav3d.preprocessing.segmentation.cpsam_env import cpsam_env_status
+        return cpsam_env_status(config)
+    except Exception as exc:  # pragma: no cover - defensive
+        return {
+            "available": False,
+            "python": None,
+            "cellpose_version": None,
+            "error": str(exc) or exc.__class__.__name__,
+        }
 
 
 class ImportWidget(QWidget):

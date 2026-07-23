@@ -7,7 +7,8 @@ Symptom-first quick reference. Find your **method** below, then your **problem**
 | Your situation | Use |
 |---|---|
 | Already segmented elsewhere (Imaris, Ilastik, script, …) | **Import segmentation** |
-| Roundish, well-separated cells and a pretrained model fits | **Cellpose** |
+| Strong GPU / HPC, accuracy is the priority, no time to label | **Cellpose-SAM** (zero-shot) |
+| Roundish, well-separated cells and a pretrained v3 model fits | **Cellpose** |
 | GPU with working OpenCL, can paint a few labels | **APOC** |
 | Subtle texture / weak boundaries, PyTorch device available | **ConvPaint** |
 | No GPU available | **Pixel Classifier** (CPU) |
@@ -128,6 +129,22 @@ Cellpose exposes almost no GUI parameters — tuning means picking the right mod
 | Two touching cells fused into one label | Fine-tune the model on touching-cell examples, or manually split labels after tracking |
 | Cells split into multiple labels | Fix pixel sizes (Z anisotropy) in your metadata |
 | Inference very slow | Confirm the GPU is being used; test on a small timepoint range first |
+
+---
+
+## Cellpose-SAM
+
+Zero-shot — no model to load or train. Tuning means the two thresholds, do_3D vs 2D+stitch, and the size filter. Full page: [Cellpose-SAM](cellpose_sam).
+
+| Symptom | Fix |
+|---|---|
+| First run fails / "environment not ready" | Click **Set up Cellpose-SAM environment** once (Section 1) before running |
+| CUDA out-of-memory | **Lower Batch size** first (Section 4) |
+| Touching cells fused into one label | Raise **Cell prob threshold** slightly, or split manually after tracking (Cellpose has no watershed splitting) |
+| Many small / flat fragments | Keep **Remove flat segments** on; set a **Min size** in Section 5 (preview first) |
+| Large organoids silently vanish | Check **Max size fraction** = 1.0 (BEHAV3D default), not Cellpose's 0.4 |
+| Cells over-split in Z | Fix pixel sizes in metadata (they set anisotropy); turn **norm3D** on |
+| Machine powers off mid-run (laptop) | Cap **CPU threads** and add **Cooldown**; the run resumes automatically |
 
 ---
 

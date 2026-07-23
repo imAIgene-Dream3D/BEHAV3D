@@ -238,6 +238,7 @@ def test_dump_cards_json(tmp_path=None):
 # --------------------------------------------------------------------------
 def test_app_tool_call_parsing_and_prompt():
     import app
+    assert app.CONTROL_CONTRACT_VERSION == CONTROL_CONTRACT_VERSION
     txt = ('try 2 channels.\n<TOOLCALL>{"name":"set_ui_value",'
            '"arguments":{"control_id":"segmentation.cellpose.number_of_channels",'
            '"value":2}}</TOOLCALL>')
@@ -250,6 +251,79 @@ def test_app_tool_call_parsing_and_prompt():
         [{"title": "btrack", "text": "good for crowded cells"}], [])
     assert "BEHAV3D" in sp and "good for crowded cells" in sp
     assert "at most the actions needed for this one user turn" in sp
+
+
+def test_backend_hides_bulk_metadata_tool_after_forms_exist():
+    import app
+    tools = [
+        {"name": "set_ui_value"},
+        {"name": "bulk_fill_metadata"},
+        {"name": "fill_metadata_builder"},
+    ]
+    fresh = app.tools_for_context(tools, {"metadata": {"loaded": False}})
+    assert {tool["name"] for tool in fresh} == {
+        "set_ui_value", "bulk_fill_metadata", "fill_metadata_builder",
+    }
+    existing = app.tools_for_context(tools, {
+        "metadata": {"loaded": True, "record_source": "metadata_builder_draft"},
+        "metadata_builder": {"open": True},
+        "ui_state": {"controls": [{"id": "metadata.samples.0.pixel_distance_xy"}]},
+    })
+    assert {tool["name"] for tool in existing} == {
+        "set_ui_value", "fill_metadata_builder",
+    }
+    description = (
+        "I have three movies with two immune cell types and collagen, four channels, "
+        "1.15 um pixel size and 4 um z spacing. Help me set up the analysis."
+    )
+    assert app.should_force_bulk_metadata(
+        {"metadata": {"loaded": False}}, description, fresh,
+    )
+    assert not app.should_force_bulk_metadata(
+        {"metadata": {"loaded": True}}, description, existing,
+    )
+    assert not app.should_force_bulk_metadata(
+        {"metadata": {"loaded": False}}, "What is metadata?", fresh,
+    )
+    forced_choice, forced_extra = app.model_tool_policy(True, True)
+    assert forced_choice is None
+    assert forced_extra == {"thinking": {"type": "disabled"}}
+    assert app.model_tool_policy(False, True) == ("auto", None)
+    assert app.model_tool_policy(False, False) == (None, None)
+    sanitized = app.sanitize_bulk_metadata_arguments({"samples": [{
+        "sample_name": "Movie_1", "dimension_order": "TCZYX",
+        "pixel_distance_xy": 1.15, "pixel_distance_z": 4,
+        "time_interval": 15, "time_unit": "s",
+        "cell_types": {"T cells": {}},
+    }]}, "I have three movies sampled every 15, but I do not know the unit")
+    assert sanitized == {"samples": [{
+        "pixel_distance_xy": 1.15, "pixel_distance_z": 4, "time_interval": 15,
+    }]}
+    recovered = app.recover_single_control_action(
+        [],
+        {"ui_state": {"controls": [{
+            "id": "tracking.tcell.btrack.maximum_search_radius",
+            "label": "Maximum search radius", "value": 100,
+            "visible": True, "enabled": True,
+        }]}},
+        "Please adjust the maximum search radius.",
+        "Would you like me to set the maximum search radius to **18 um**?",
+    )
+    assert recovered == [{
+        "name": "set_ui_value",
+        "arguments": {
+            "control_id": "tracking.tcell.btrack.maximum_search_radius", "value": 18,
+        },
+    }]
+    ambiguous = app.recover_single_control_action(
+        [],
+        {"ui_state": {"controls": [
+            {"id": "one", "value": 1, "visible": True, "enabled": True},
+            {"id": "two", "value": 2, "visible": True, "enabled": True},
+        ]}},
+        "Please adjust these.", "Set both to 3.",
+    )
+    assert ambiguous == []
 
 
 def test_tool_call_parsing_tolerates_malformed_markers():
@@ -415,6 +489,31 @@ def test_prompt_treats_metadata_builder_draft_as_current():
     assert "draft changes still need to be saved" in sp
 
 
+def test_prompt_encodes_pi_feedback_scenarios():
+    import app
+    sp = app.build_system_prompt(
+        {"current_step": "tracking", "metadata": {
+            "loaded": True,
+            "records": [{"sample_name": "Movie1", "time_interval": 15,
+                         "time_unit": "s"}],
+        }, "ui_state": {"controls": []}},
+        [], [])
+    assert "call bulk_fill_metadata directly" in sp
+    assert "Calling only open_builder" in sp
+    assert "Never infer a dimension order" in sp
+    assert "never rebuild the form from values mentioned earlier" in sp
+    assert "explicit request to fill, set, update, fix, or adjust" in sp
+    assert "raise Mask threshold and Seed threshold" in sp
+    assert "With plain Mask + EDT/Watershed, raise EDT" in sp
+    assert "With Peak EDT/Watershed, lower EDT" in sp
+    assert "do not infer motion from a label" in sp
+    assert "60 um/min at 15 seconds per frame is 15 um/frame" in sp
+    assert "Do not provide a numeric example speed" in sp
+    assert "merely because its inherited thresholds contain defaults" in sp
+    assert "Never call that combination contradictory" in sp
+    assert "Do not call a chosen minimum reasonable" in sp
+
+
 class _FakeSpin:
     def __init__(self, value, minimum=0, maximum=9999):
         self._value = value
@@ -487,6 +586,8 @@ class _FakeTrackingPanel:
         self.bt_max_search_radius = _FakeSpin(radius, 1, 9999)
         self.bt_use_visual_features = _FakeCheck(False)
         self.bt_use_optimize = _FakeCheck(False)
+        self.bt_dist_thresh = _FakeSpin(40.0)
+        self.bt_time_thresh = _FakeSpin(5)
         self.bt_hyp_checks = {"P_FP": _FakeCheck(True), "P_branch": _FakeCheck(False)}
         self.persisted = 0
 
@@ -497,6 +598,7 @@ def test_live_control_registry_targets_actual_cell_type_only():
     from types import SimpleNamespace
     tcell = _FakeTrackingPanel("tcell", 100)
     organoid = _FakeTrackingPanel("organoid1", 200)
+    organoid.bt_use_optimize.setChecked(True)
     tracking = SimpleNamespace(
         panels={"tcell": tcell, "organoid1": organoid},
         cell_tabs=_FakeTabs(tcell),
@@ -508,6 +610,12 @@ def test_live_control_registry_targets_actual_cell_type_only():
     assert "tracking.organoid1.btrack.maximum_search_radius" in ids
     assert "tracking.tcell.lap.merging_distance" in ids
     assert "tracking.tcell.trackpy.adaptive_step" in ids
+    by_id = {item["id"]: item for item in controls}
+    assert by_id["tracking.tcell.btrack.use_global_optimization"]["visible"] is True
+    assert "tracking.tcell.btrack.distance_threshold" not in by_id
+    assert "tracking.tcell.btrack.hypotheses" not in by_id
+    assert by_id["tracking.organoid1.btrack.distance_threshold"]["visible"] is True
+    assert by_id["tracking.organoid1.btrack.hypotheses"]["visible"] is True
     assert active_cell_type(main, "tracking") == "tcell"
     assert apply_set_ui_value(main, "tracking.tcell.btrack.maximum_search_radius", 125)
     assert tcell.bt_max_search_radius.value() == 125
@@ -659,6 +767,12 @@ def test_live_registry_covers_filtering_and_hmm_controls():
     assert "filtering.tcell.minimum_initial_size.enabled" in controls
     assert "filtering.tcell.dead_at_first_timepoint.enabled" in controls
     assert "filtering.tcell.time_unit" in controls
+    assert controls["filtering.tcell.maximum_length.enabled"]["label"].endswith(
+        "Trim retained tracks to a common length"
+    )
+    assert controls["filtering.tcell.maximum_length.timepoints"]["label"].endswith(
+        "Common output track length"
+    )
     states = "analysis.state_classification.tcell.number_of_states"
     assert states in controls and controls[states]["value"] == 4
     assert controls[states]["visible"] is True
@@ -677,6 +791,9 @@ def test_edt_recommendations_use_per_sample_xy_resolution():
     assert result["rows"][1]["edt_candidates_px"] == [2, 2.5, 3]
     text = format_edt_recommendations(result, "tcell")
     assert "Well_A1" in text and "global starting value" in text
+    assert "higher EDT values generally split touching objects more" in text
+    assert "On Peak EDT/Watershed, the direction is reversed" in text
+    assert "Lower EDT values split touching objects more aggressively" not in text
 
     organoid = calculate_edt_recommendations(
         [{"sample_name": "Org", "pixel_distance_xy": 0.5,
@@ -718,6 +835,48 @@ def test_segmentation_registry_exposes_exact_edt_control():
     assert control_id in controls and controls[control_id]["visible"] is True
     assert apply_set_ui_value(main, control_id, 5.0)
     assert edt.value() == 5.0
+
+
+def test_segmentation_registry_exposes_probability_thresholds_and_strategy():
+    from types import SimpleNamespace
+    persisted = []
+    strategy = _FakeCombo([
+        "APOC Probability Map + Watershed",
+        "APOC Mask + EDT/Watershed Resegmentation",
+    ])
+    tab = SimpleNamespace(
+        _per_tab_strategy_combo=strategy,
+        prob_mask_threshold_spin=_FakeSpin(0.4, 0.0, 1.0),
+        prob_seed_threshold_spin=_FakeSpin(0.7, 0.0, 1.0),
+        edt_threshold_spin=None,
+    )
+    training = SimpleNamespace(tabs={"Tcell_cmtrm": tab}, strategy_combo=None)
+    apoc = SimpleNamespace(
+        spin_examples=_FakeSpin(3), _training_widget=training,
+        _collect_apoc_tab_config=lambda: {"ok": True},
+        _save_apoc_params_to_yaml=lambda **kwargs: persisted.append(kwargs),
+    )
+    segmentation = SimpleNamespace(
+        method_combo=_FakeCombo([
+            "APOC (GPU)", "ConvPaint", "Pixel Classifier (Random Forest)",
+            "Cellpose", "Import segmentation",
+        ], 0),
+        apoc_page=apoc,
+        convpaint_page=SimpleNamespace(spin_examples=_FakeSpin(3)),
+        pixel_classifier_page=SimpleNamespace(spin_examples=_FakeSpin(3)),
+        cellpose_page=SimpleNamespace(),
+    )
+    main = SimpleNamespace(segmentation_tab=segmentation)
+    controls = {item["id"]: item for item in control_registry(main)}
+    base = "segmentation.apoc.Tcell_cmtrm"
+    assert controls[f"{base}.mask_threshold"]["strategy"] == strategy.currentText()
+    assert controls[f"{base}.seed_threshold"]["value"] == 0.7
+    assert f"{base}.edt_threshold" not in controls
+    assert apply_set_ui_value(main, f"{base}.mask_threshold", 0.45)
+    assert apply_set_ui_value(main, f"{base}.seed_threshold", 0.75)
+    assert tab.prob_mask_threshold_spin.value() == 0.45
+    assert tab.prob_seed_threshold_spin.value() == 0.75
+    assert len(persisted) == 2
 
 
 def test_active_segmentation_cell_type_uses_method_subtab():
@@ -807,7 +966,7 @@ def test_feedback_guidance_fixtures():
 
     fixture = Path(__file__).parent / "fixtures" / "assistant_feedback_transcripts.json"
     cases = json.loads(fixture.read_text(encoding="utf-8"))
-    assert KNOWLEDGE_VERSION == "2026.07.14.2"
+    assert KNOWLEDGE_VERSION == "2026.07.22.1"
     for case in cases:
         cards = select_guidance_cards(
             {"current_step": case["step"]}, case["user"], case.get("intent"))
@@ -824,7 +983,7 @@ def test_assistant_has_no_hidden_model_continuation():
     assert "def _auto_continue" not in source
     assert "_dispatch_proactive" not in source
     assert "Checking your setup" not in source
-    assert CONTROL_CONTRACT_VERSION == "2.0"
+    assert CONTROL_CONTRACT_VERSION == "2.5"
 
 
 # --------------------------------------------------------------------------

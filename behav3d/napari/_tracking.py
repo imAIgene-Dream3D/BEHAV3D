@@ -597,10 +597,14 @@ class CellTypeTrackingPanel(QWidget):
         self.combo_method = QComboBox()
         self.combo_method.addItems([
             "LAP (laptrack)", "TrackPy", "Propagation",
+            "Reporter Propagation",
             "btrack (Bayesian)", "Import tracking",
         ])
         saved_method = tcfg.get("method", def_method)
-        idx_map = {"lap": 0, "trackpy": 1, "propagation": 2, "btrack": 3, "import": 4}
+        idx_map = {
+            "lap": 0, "trackpy": 1, "propagation": 2, "reporter_propagation": 3,
+            "btrack": 4, "import": 5,
+        }
         self.combo_method.setCurrentIndex(idx_map.get(saved_method, 0))
         method_layout.addWidget(QLabel("Method:"))
         method_layout.addWidget(self.combo_method)
@@ -615,6 +619,15 @@ class CellTypeTrackingPanel(QWidget):
             "Propagation — no tunable parameters; identifies objects by "
             "spatial overlap/propagation instead of frame-to-frame "
             "linking cost.\n\n"
+            "Reporter Propagation — for near-static objects whose "
+            "segmentation is unreliable/intermittent over time (flickers "
+            "on and off): pools every segment detected at every timepoint, "
+            "groups together any that spatially overlap each other "
+            "(regardless of how far apart in time), and for each group uses "
+            "the single LARGEST detected instance as that object's mask — "
+            "stamped onto every timepoint of the video unchanged. No frame-"
+            "to-frame linking or gap parameter needed, since grouping is "
+            "purely spatial.\n\n"
             "btrack (Bayesian) — Kalman-filter based tracker with an "
             "optional global hypothesis optimizer for resolving merges, "
             "splits and false positives.\n\n"
@@ -845,7 +858,56 @@ class CellTypeTrackingPanel(QWidget):
 
         self.param_stack.addWidget(prop_page)
 
-        # Page 3 — btrack (Bayesian tracking)
+        # Page 3 — Reporter Propagation params
+        rp_cfg = tcfg.get("reporter_propagation", {})
+        rp_page = QWidget()
+        rp_form = QFormLayout(rp_page)
+        rp_form.setContentsMargins(6, 4, 6, 4)
+        rp_form.setSpacing(3)
+        rp_form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+
+        rp_info = QLabel(
+            "For near-static objects with unreliable/intermittent "
+            "segmentation. Groups segments that spatially overlap each "
+            "other across the whole video, then uses the single largest "
+            "instance per group as that object's mask for every timepoint."
+        )
+        rp_info.setWordWrap(True)
+        rp_info.setStyleSheet("color: #888; font-size: 10px; padding: 2px 0 6px 0;")
+        rp_form.addRow(rp_info)
+
+        self.rp_min_overlap_fraction = QDoubleSpinBox()
+        self.rp_min_overlap_fraction.setRange(0.0, 1.0)
+        self.rp_min_overlap_fraction.setSingleStep(0.05)
+        self.rp_min_overlap_fraction.setDecimals(2)
+        self.rp_min_overlap_fraction.setValue(float(rp_cfg.get("min_overlap_fraction", 0.1)))
+        self.rp_min_overlap_fraction.setMaximumWidth(90)
+        rp_form.addRow("Min overlap fraction:", make_help_row(
+            self.rp_min_overlap_fraction,
+            "Min Overlap Fraction",
+            "Minimum spatial overlap (as a fraction of the smaller "
+            "segment's area/volume) required for two segments — from any "
+            "two timepoints, however far apart — to be grouped as the same "
+            "object.\n\n"
+            "0 = any shared pixel counts. Raise this if unrelated nearby "
+            "objects are being incorrectly merged together."
+        ))
+
+        self.rp_segment_size_min = QSpinBox()
+        self.rp_segment_size_min.setRange(1, 999999)
+        self.rp_segment_size_min.setValue(int(rp_cfg.get("segment_size_min", 100)))
+        self.rp_segment_size_min.setMaximumWidth(90)
+        rp_form.addRow("Min segment size:", make_help_row(
+            self.rp_segment_size_min,
+            "Min Segment Size",
+            "Minimum segment size in voxels. Segments smaller than this "
+            "are ignored entirely (treated as noise), both as candidates "
+            "for the 'largest instance' and when grouping."
+        ))
+
+        self.param_stack.addWidget(rp_page)
+
+        # Page 4 — btrack (Bayesian tracking)
         bt_cfg = tcfg.get("btrack", {})
         btrack_page = QWidget()
         btrack_lay = QVBoxLayout(btrack_page)
@@ -1127,7 +1189,7 @@ class CellTypeTrackingPanel(QWidget):
         btrack_lay.addStretch()
         self.param_stack.addWidget(btrack_page)
 
-        # Page 4 — Import tracking
+        # Page 5 — Import tracking
         import_page = _ImportTrackingPage(
             cell_type=self.cell_type,
             category=self.category,
@@ -1178,7 +1240,7 @@ class CellTypeTrackingPanel(QWidget):
     # Persistence
     # ------------------------------------------------------------------
     def _get_method_key(self):
-        return ["lap", "trackpy", "propagation", "btrack", "import"][
+        return ["lap", "trackpy", "propagation", "reporter_propagation", "btrack", "import"][
             self.combo_method.currentIndex()
         ]
 
@@ -1225,6 +1287,10 @@ class CellTypeTrackingPanel(QWidget):
             "propagation": {
                 # Notice: no tunable params currently exposed
             },
+            "reporter_propagation": {
+                "min_overlap_fraction": float(self.rp_min_overlap_fraction.value()),
+                "segment_size_min": int(self.rp_segment_size_min.value()),
+            },
             "btrack": {
                 "config_preset": self._bt_get_config_preset(),
                 "config_path": self.bt_config_path.text().strip(),
@@ -1259,9 +1325,12 @@ class CellTypeTrackingPanel(QWidget):
             if ct in parent_tab.panels:
                 panel = parent_tab.panels[ct]
                 # Apply settings
-                idx_map = {"lap": 0, "trackpy": 1, "propagation": 2, "btrack": 3}
+                idx_map = {
+                    "lap": 0, "trackpy": 1, "propagation": 2, "reporter_propagation": 3,
+                    "btrack": 4,
+                }
                 panel.combo_method.setCurrentIndex(idx_map.get(settings["method"], 0))
-                
+
                 # LAP
                 panel._lap_unit_mgr.set_native(panel.lap_track_cost, settings["lap"]["track_cost_px"])
                 panel._lap_unit_mgr.set_native(panel.lap_gap_cost, settings["lap"]["gap_close_cost_px"])
@@ -1274,7 +1343,12 @@ class CellTypeTrackingPanel(QWidget):
                 panel.tp_memory.setValue(settings["trackpy"]["memory_frames"])
                 panel.tp_adaptive_stop.setValue(settings["trackpy"]["adaptive_stop"])
                 panel.tp_adaptive_step.setValue(settings["trackpy"]["adaptive_step"])
-                
+
+                # Reporter Propagation
+                rp = settings.get("reporter_propagation", {})
+                panel.rp_min_overlap_fraction.setValue(rp.get("min_overlap_fraction", 0.1))
+                panel.rp_segment_size_min.setValue(rp.get("segment_size_min", 100))
+
                 # btrack
                 bt = settings.get("btrack", {})
                 preset = bt.get("config_preset", "cell")
@@ -1343,6 +1417,10 @@ class CellTypeTrackingPanel(QWidget):
                 "memory": int(self.tp_memory.value()),
                 "adaptive_stop": float(self.tp_adaptive_stop.value()),
                 "adaptive_step": float(self.tp_adaptive_step.value()),
+            },
+            "reporter_propagation": {
+                "min_overlap_fraction": float(self.rp_min_overlap_fraction.value()),
+                "segment_size_min": int(self.rp_segment_size_min.value()),
             },
             "btrack": {
                 "config_preset": self._bt_get_config_preset(),
@@ -1446,6 +1524,17 @@ class CellTypeTrackingPanel(QWidget):
                 dist_thresh=int(bt["dist_thresh"]) if use_opt else None,
                 time_thresh=int(bt["time_thresh"]) if use_opt else None,
                 log_callback=ThreadSafeLogger(self.log),
+                progress_cb=progress_cb,
+            )
+
+        elif method == "reporter_propagation":
+            from behav3d.preprocessing.tracking.reporter_propagation_tracking import run_reporter_propagation_tracking
+            rp = params["reporter_propagation"]
+            new_md = run_reporter_propagation_tracking(
+                metadata=metadata, output_dir=out_dir, cell_type=cell_type,
+                overwrite=overwrite,
+                min_overlap_fraction=float(rp["min_overlap_fraction"]),
+                segment_size_min=int(rp["segment_size_min"]),
                 progress_cb=progress_cb,
             )
 
