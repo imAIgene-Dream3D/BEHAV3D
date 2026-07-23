@@ -1223,9 +1223,9 @@ class CellTypeTrackingPanel(QWidget):
         self.btn_run.clicked.connect(self._on_run_clicked)
         layout.addWidget(self.btn_run)
 
-        # Disable run button for coming-soon methods (only Import at index 4)
+        # Disable run button for coming-soon methods (only Import at index 5)
         def _on_method_idx_changed(idx):
-            is_coming_soon = idx >= 4
+            is_coming_soon = idx >= 5
             self.btn_run.setEnabled(not is_coming_soon)
             if is_coming_soon:
                 self.btn_run.setToolTip("This tracking method is not yet available.")
