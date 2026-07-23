@@ -316,7 +316,7 @@ def _make_chk_help_row(chk: QCheckBox, title: str, desc: str) -> QHBoxLayout:
 
 # ── Default selections (used when no prior config exists) ───────────────────
 _DEFAULT_TIMEPOINT_FEATURES = {"speed", "sphericity", "elongation", "extent", "solidity"}
-_DEFAULT_WINDOW_FEATURES    = {"net_displacement", "straightness"}
+_DEFAULT_WINDOW_FEATURES    = {"net_displacement"}
 _DEFAULT_LOG_SCALE_FEATURES = {"speed"}
 
 _TECHNICAL_OBS_COLS = {

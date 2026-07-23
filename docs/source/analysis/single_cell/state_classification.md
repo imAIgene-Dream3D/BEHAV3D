@@ -1,6 +1,6 @@
 # 🔬 State Classification
 
-The first inner sub-tab of **Analysis → 🧬 Single Cell**. It assigns every cell, at every timepoint, to a recurring **behavioural state** — a characteristic "mode" of movement, intensity, morphology and contact (for example *slow & in contact* vs *fast & free*). States are discovered with a **Hidden Markov Model (HMM)**, which models behaviour as a sequence that tends to stay in one state for a while before switching, rather than treating each timepoint independently.
+The first inner sub-tab of **Analysis → 🧬 Single Cell**. It assigns every cell, at every timepoint, to a recurring **behavioural state**, built in two stages. First, a **Hidden Markov Model (HMM)** clusters the continuous, dynamic features you choose — by default movement and morphology — into a handful of **intrinsic states** (an HMM models behaviour as a sequence, rather than treating each timepoint independently). Second, any **binary features** you also select (for example a contact flag or a `dead` flag) are layered on top — not fit by the HMM itself — to subdivide each intrinsic state into a **full behavioural cluster** (for example *slow-moving & in contact* vs *slow-moving & not in contact*). See *Feature Selection* and *Binary Group Selection* below for how each half is configured.
 
 The analysis runs on the **cell type chosen in the dropdown at the top of the Single Cell sub-tab** (immune / other only) and reads that cell type's per-track features table from [Feature Extraction](../feature_extraction).
 
@@ -15,22 +15,22 @@ The analysis runs on the **cell type chosen in the dropdown at the top of the Si
 At the very top is a checkbox: **Apply existing behavioral state classification**.
 
 - **Unchecked (default)** — *train* a fresh model on the current cell type. This is the **Step 1 — State Clustering** workflow described below.
-- **Checked** — *apply* a previously saved model to this dataset instead of fitting a new one. A small panel appears where you **Browse…** to a saved HMM deployment artifact (a `.pkl` file) and click **▶ Apply saved HMM artifact**. Use this to classify a new experiment with exactly the same state definitions you established earlier, so results are comparable across datasets.
+- **Checked** — *apply* a previously saved workflow to this dataset instead of fitting a new one. A small panel appears where you **Browse…** to a saved HMM deployment artifact (a `.pkl` file) and click **▶ Apply saved HMM artifact**. Use this to classify a new experiment with exactly the same state definitions you established earlier, so results are comparable across datasets.
 
 The rest of this page describes training a new model.
 
 ## Step 1 — State Clustering
 
-This is where you choose what the model "sees" and how many states to fit. The controls are grouped into collapsible sections.
+This is where you choose what features the model "sees" and how many states to fit. The controls are grouped into collapsible sections.
 
 ### Feature Selection
 
 This section is populated **from the actual feature columns** found in the selected cell type's features CSV, so you only ever see features you really computed.
 
-- **Timepoint features** — checkboxes for the per-timepoint measurements from Feature Extraction, grouped by family (movement, intensity, morphology, contact, death, …). Tick the ones that define the behaviour you care about. If no features appear, run [Feature Extraction](../feature_extraction) for this cell type first.
-- **Window features** — features computed over a short rolling window rather than a single frame:
+- **Timepoint features** — checkboxes for the per-timepoint measurements from Feature Extraction, grouped by family (movement, intensity, morphology, contact, death, …). Tick the ones that define the behaviour you care about. If no features appear, run [Feature Extraction](../feature_extraction) for this cell type first. **By default**, when present in the features table, **speed**, **elongation**, **sphericity**, **extent** and **solidity** are pre-ticked as a sensible starting set covering both movement and morphology.
+- **Window features** — features computed over a short, trailing, rolling window rather than a single frame (e.g. displacement, straightness):
   - **Window size** (default `5`, range 1–500) — how many timepoints each window spans. Keep it around 5 for motility behaviour; **set it to 1 when the events you care about happen at a single timepoint** (e.g. calcium-intensity peaks), so a window doesn't smear them out. The HMM still assigns a state *per timepoint* regardless of this setting — that is what a hidden Markov model does; the window only controls how the window-based features are aggregated.
-  - **net_displacement**, **straightness**, **mean_square_displacement** — tick the window-based motility summaries you want added. These are computed here, from the per-timepoint feature table — they are **not** columns in the Feature Extraction CSV.
+  - **net_displacement**, **straightness**, **mean_square_displacement** — tick the window-based motility summaries you want added. These are computed here, from the per-timepoint feature table — they are **not** columns in the Feature Extraction CSV. **net_displacement** is ticked by default; the other two are off by default.
 
 ```{tip}
 Start small and biological. A handful of well-chosen features (e.g. speed, a contact column, and one window feature such as straightness) usually gives cleaner, more interpretable states than throwing in every available column.
@@ -42,10 +42,10 @@ Optional clean-up applied to the chosen features before fitting:
 
 | Control | Default | Meaning | When to use |
 |---|---|---|---|
-| **Log scaling** (per-feature checkboxes) | none | Optionally apply `log1p` to the ticked features before the model standardises all continuous features. | Use **selectively** for strongly right-skewed non-negative measurements, not blanket across all features. Use **📊 Preview feature distributions** to see which features are skewed first. |
-| **Smooth window** | 5 | Rolling-average smoothing applied to features (1 = no smoothing). Usually matched to the Window size. | Damps single-frame segmentation errors (e.g. a cell that looks elongated for one frame through under-segmentation). Since no sticky HMM is used by default, this smoothing does that job. |
-| **Low percentile cap** | 0.00 | Clip values below this quantile (0 = off). | Tame extreme low outliers. |
-| **High percentile cap** | 1.00 | Clip values above this quantile (1 = off). | Off by default — in practice percentile clipping tended to hurt the HMM more than it helped. Reach for it only when tracking errors produce large outliers; inspect the distribution first. |
+| **Log scaling** (per-feature checkboxes) | speed | Optionally apply `log1p` to the ticked features before the model standardises all continuous features. | Use **selectively** for strongly right-skewed non-negative measurements, not blanket across all features. Use **📊 Preview feature distributions** to see which features are skewed first. |
+| **Smooth window** | 5 | Rolling-average smoothing applied to features (1 = no smoothing). Usually matched to the Window size. | Damps for example single-frame segmentation errors (e.g. a cell that looks elongated for one frame through merging of segmentation masks). This lowers the influence of these changes somewhat and keeps state changes more gradual |
+| **Low percentile cap** | 0.00 | Clip values below this quantile (0 = off). | Off by default - Tame extreme low outliers. |
+| **High percentile cap** | 1.00 | Clip values above this quantile (1 = off). | Off by default — Tame extreme high outliers |
 
 ```{tip}
 **Log scaling — `speed` is the classic case.** Speed is heavily zero-inflated (most tracked objects barely move most of the time) with a few high-speed excursions. Left untransformed, that skew lets the rare large values dominate any distance-based clustering and drown out the common near-zero values. Log-transforming compresses the long tail and gives the low-speed majority proportionally more influence. Check the histogram (📊 button) before deciding — don't apply it to features that aren't skewed.
@@ -53,7 +53,7 @@ Optional clean-up applied to the chosen features before fitting:
 
 ### Binary Group Selection
 
-Checkboxes for the **categorical / true-false** columns in the features table (for example a `dead` flag, an `*_contact` column, or an active-killing flag). These are deliberately **kept out of the HMM fit** — clustering on binary columns tends to create artificial states — and instead **subdivide** each behavioural state afterwards. A state such as *slow-moving* can be split into *slow-moving & in contact* vs *slow-moving & not in contact*. This is what later produces the **full behavioural clusters** (see Step 2).
+Contains checkboxes for the binary (**categorical / true-false**) flags that are assigned to cells at each timepoint in the features table (for example a `dead` flag, an `*_contact` column, or an active-killing flag). These are deliberately **kept out of the HMM fit** — clustering on binary columns tends to create artificial states — and instead **subdivide** each behavioural state afterwards. A state such as *slow-moving* can be split into *slow-moving & in contact* vs *slow-moving & not in contact*. This is what later produces the **full behavioural clusters** (see Step 2).
 
 ### Number of states
 
@@ -81,7 +81,7 @@ If your states flicker rapidly along a track (a cell flips state every frame), e
 
 ### How the states are computed
 
-After the chosen per-timepoint and window features are assembled, smoothed and standardised, they are modelled with a **Gaussian Hidden Markov Model**. An HMM treats each track as a sequence that occupies one of `n_states` hidden behavioural states at every timepoint, where each state has its own multivariate-Gaussian feature distribution (shape set by *Covariance type*) and a transition matrix gives the probability of switching between states. Because transitions are penalised, the model naturally produces **temporally coherent** state assignments — a cell tends to stay in a behaviour for a while rather than flickering — which is exactly what makes it suited to behaviour over time rather than clustering each frame independently. The fitted model then assigns every timepoint its most likely state (Viterbi decoding).
+After the chosen per-timepoint and window features are assembled, smoothed and standardised, they are modelled with a Gaussian Hidden Markov Model. A single model is fitted across all tracks: each of the hidden behavioural states has its own multivariate-Gaussian feature distribution (shape set by Covariance type), and a learned transition matrix gives the probability of moving between states at each step. States are then assigned by Viterbi decoding, which rather than judging each timepoint on its own, finds the one state sequence that best explains the whole track — this is what makes the model suited to behaviour over time.
 
 The **window features** summarise motion over each rolling window of length $w$. With $\mathbf{p}(t)$ the position and $\mathbf{s}(i)=\mathbf{p}(i)-\mathbf{p}(i-1)$ the steps inside the window:
 
@@ -98,31 +98,41 @@ $$
 
 **▶ Run State Classification** fits the model in the background (a progress bar and **Log** show what is happening; the rest of the GUI stays responsive). The **👁** button next to it becomes available once a model exists and lets you re-open the classified result. The fitted, classified data is written under the cell type's `behavioral_states` folder in the output directory.
 
+Alongside the classified data, the run also saves the **full trained workflow** — features, processing, binary groups and the fitted HMM itself — as a single deployment artifact:
+
+```text
+<output_dir>/analysis/<cell_type>/behavioral_states/processing/hmm_behavioral_classification/hmm_state_deployment_<cell_type>.pkl
+```
+
+This is the `.pkl` file you point **Apply existing behavioral state classification** (see *Two ways to run* above) at to classify new datasets with exactly the same, already-defined states — no need to retrain or re-choose features.
+
 ```{note}
 You can run State Classification interactively with the button, or add it to the [Processing Queue](../../plugin_essentials/processing_queue) with the **+🛒** button next to it (the queue exposes it as **🔬 State Clustering**, with separate **Train** / **Apply State Classifier** queue steps for the apply-existing workflow).
 ```
 
 ## Step 2 — Rename Clusters
 
-Freshly fitted states are numbered, not named. This step lets you give them meaningful biological labels. The buttons enable themselves once the matching clusters exist in the model.
+Freshly fitted states are numbered, not named. This step lets you give them meaningful biological labels and merge clusters if you think they are biologically similar. You can additionally order the clusters by dragging them and give them unique colors, which are used in the following reports and backprojection. 
+
+The buttons enable themselves once the matching clusters exist in the model.
 
 | Button | Renames | Available when |
 |---|---|---|
-| **✏ Rename Primary Dynamic State Clusters** | The raw HMM states (the *intrinsic* behavioural states). | A model has been fitted. |
-| **✏ Rename Full Behavioral Clusters (Binary Groups)** | The states **after** they were subdivided by the binary groups you selected in Step 1. | Available after the intrinsic states are renamed (the full clusters are created when intrinsic states are combined with the binary groups). |
+| **✏ Rename Primary Dynamic State Clusters** | The raw HMM states (the *intrinsic* behavioural states based on continuous, dynamic features). | A model has been fitted. |
+| **✏ Rename Full Behavioral Clusters (Binary Groups)** | The states **after** they were subdivided by the binary groups you selected in Step 1. | A model has been fitted (will be updated with the names of the **Primary Dynamic State Clusters** if they are renamed |
 
 Each button opens a dialog listing the current clusters with editable names; the new names are saved back into the classified data so all downstream reports and backprojection use them. **Giving two clusters the same name merges them** — a handy way to collapse states that mean the same thing biologically (for example merging several motion states into one *scanner*). A status line above the buttons tells you how many intrinsic and full clusters were found.
 
 ```{important}
-Rename the **primary dynamic states first**. The full behavioural clusters are built from the intrinsic states, so the "Full Behavioral Clusters" button only becomes meaningful once the intrinsic states exist (and ideally have been named).
+Rename the **primary dynamic states first**. The full behavioural clusters are built from the intrinsic states, so the "Full Behavioral Clusters" button only becomes meaningful once the intrinsic states exist (and ideally have been named). 
 ```
 
 ## Step 3 — Reports
 
 Two report buttons summarise the classification across your samples. Each has a **👁** button to reopen its PDF.
 
-- **▶ State Composition Report** — what fraction of time each state occupies, broken down by sample and (optionally) by metadata groupings. The **Group composition plots by** list below it lets you pick one or more metadata columns to split the composition by (Ctrl/Cmd-click for several).
-- **▶ State Transition Report** — how often cells switch between states (the transition structure of the behaviour).
+- **▶ State Composition Report** — what fraction of time each state occupies, broken down by sample and (optionally) by metadata groupings. The **Group composition plots by** list below it lets you pick one or more metadata columns to group the composition by, which combines samples with these same conditions (Ctrl/Cmd-click for several).
+- **▶ State Transition Report** — Which behavioral states cells transition into from each state, and how frequently these transitions occur.
 
 Reports are saved as PDFs and can be reopened at any time with their **👁** button or from the shared **Results** panel.
 
@@ -141,8 +151,8 @@ The **Live Napari Layer Backprojection** panel overlays coloured state labels on
 | Control | Default | Meaning |
 |---|---|---|
 | **Sample** | — All samples — | Which sample to overlay. **— All samples —** uses the first available sample. |
-| **Color by** | full_behavioral_cluster | Which state label to colour by: `full_behavioral_cluster` (states subdivided by binary groups) or `intrinsic_behavioral_cluster` (the raw HMM states). |
-| **Opacity** | 80 % | Opacity of the coloured overlay (10–100 %). |
+| **Color by** | full_behavioral_cluster | Which state label to colour by: `full_behavioral_cluster` (states subdivided by binary groups, renamed by the user), `intrinsic_behavioral_cluster` (the (renamed) HMM states) or `raw_hmm_state` (the original unnamed HMM states)|
+| **Opacity** | 80 % | Opacity of the coloured overlay (10–100 %), can be later changed using default napari functionality. |
 
 Click **▶ Show State Backprojection in Napari** to load the overlay — this produces a napari layer only and writes nothing to disk.
 
@@ -178,7 +188,14 @@ The HMM fit diagnostics, including the state-feature heatmap used to interpret e
 <output_dir>/analysis/<cell_type>/behavioral_states/processing/hmm_behavioral_classification/quality_control/raw/behavioral_clustering_diagnostics.pdf
 ```
 
-State Classification uses an **HMM on per-timepoint and rolling-window features**. The separate **Track Classification** tab contains whole-trajectory clustering, including the legacy DTW workflow; the two analyses answer different questions and should not be described interchangeably.
+**The full trained workflow** (features, processing settings, binary groups and the fitted HMM) is saved as a single deployment artifact at:
+
+```text
+<output_dir>/analysis/<cell_type>/behavioral_states/processing/hmm_behavioral_classification/hmm_state_deployment_<cell_type>.pkl
+```
+
+This is the file to **Browse…** to when applying an existing classification to new data (see *Two ways to run* above).
+
 
 The two reports are each saved as a PDF (the composition report also writes a CSV of the underlying curves).
 

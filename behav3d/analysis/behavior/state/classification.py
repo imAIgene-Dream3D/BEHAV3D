@@ -804,6 +804,17 @@ def _compute_optional_window_feature_frame(
     return df_window, effective_window
 
 
+def _merge_optional_window_features(df_base, df_window, *, join_cols):
+    """Merge computed window features onto df_base, letting them win over any
+    same-named raw column already present (e.g. mean_square_displacement is both
+    a raw per-timepoint CSV column and a supported window feature name)."""
+    join_cols = list(join_cols)
+    overlap_cols = [c for c in df_window.columns if c not in join_cols and c in df_base.columns]
+    if overlap_cols:
+        df_base = df_base.drop(columns=overlap_cols)
+    return df_base.merge(df_window, on=join_cols, how="left", validate="one_to_one")
+
+
 def _compute_hmm_sequence_lengths(df, *, id_cols=("sample_name", "TrackID")):
     if df is None or len(df) == 0:
         return []
@@ -860,11 +871,8 @@ def _prepare_hmm_apply_adata_from_df_positions(
             window_size=int(windowing.get("window_feature_window_size", windowing.get("feature_smoothing_window", 1))),
             verbose=verbose,
         )
-        df_base = df_base.merge(
-            df_window,
-            on=["sample_name", "TrackID", "position_t"],
-            how="left",
-            validate="one_to_one",
+        df_base = _merge_optional_window_features(
+            df_base, df_window, join_cols=["sample_name", "TrackID", "position_t"]
         )
 
     # Mirrors the training-path fix in run_hmm_state_clustering: rows skipped via start_offset
@@ -1531,12 +1539,7 @@ def run_hmm_state_clustering(
             window_size=window_features_window,
             verbose=verbose,
         )
-        df_base = df_base.merge(
-            df_window,
-            on=sort_cols,
-            how="left",
-            validate="one_to_one",
-        )
+        df_base = _merge_optional_window_features(df_base, df_window, join_cols=sort_cols)
     # Timepoints skipped via start_offset (e.g. the first timepoint of each track, whose raw
     # motion features are a fabricated 0.0 from the upstream np.diff(prepend=...) construction,
     # not a real measurement) must have zero influence on smoothing, quantile-cap bounds, or
