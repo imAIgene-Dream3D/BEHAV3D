@@ -58,6 +58,33 @@ flowchart TD
 
 Click **▶ Run Track Clustering** to run it (in the background, with a progress bar and **Log**). Next to it: **+🛒** queues the step for a batch run, and **👁** opens the result once it exists.
 
+For the default **categorical DTW** workflow, treat **`N clusters`** as a practical starting guess rather than a number the software can determine for you biologically. Start around the default `6`, inspect the resulting exemplar overview, then decide whether the clustering needs to be split further or collapsed.
+
+- **Increase `N clusters`** when one trajectory cluster still contains clearly different trajectories in the overview PDF, for example one cluster mixing tracks that linger, scan, and then disengage with tracks that go straight into sustained contact.
+- **Decrease `N clusters` or merge afterwards** when clusters have very few examples, or when two clusters look so similar in the overview exemplars that you would describe them with the same biological name.
+- **Prefer slight over-splitting to under-splitting.** It is usually safer to split a bit too much, then merge similar clusters in Step 2 by giving them the same final name.
+
+```{tip}
+A good cluster count for categorical DTW is one where each cluster looks like a recognisable trajectory archetype when you inspect the exemplars, not just a mathematically distinct branch in the hierarchy.
+```
+
+### How to judge whether `N clusters` is sensible
+
+For the default categorical workflow, the main evidence is the **exemplar overview PDF** saved as:
+
+```text
+<output_dir>/analysis/<cell_type>/behavorial_trajectories/example_tracks/example_tracks_overview.pdf
+```
+
+By default, this overview shows **10 representative tracks per cluster**, which is why it is the first thing to inspect after clustering. Use it to ask:
+
+1. **Does each cluster show one main movement pattern?** If a single cluster contains several visually distinct trajectory stories, raise `N clusters`.
+2. **Do different clusters really look different from one another?** If two clusters look nearly interchangeable across their exemplars, they may not deserve separate final names.
+3. **Are some clusters too small to feel robust?** Very tiny clusters can still be real, but they deserve extra skepticism and often end up merged unless they show a very distinct pattern.
+4. **Would you describe the cluster with a single biological label?** If not, the clustering may still be too coarse.
+
+The **diagnostics PDF** is still useful, but for this specific decision it is secondary to the visual evidence in the exemplar overview. The detailed cluster-count guidance on this page applies to the default **categorical DTW** workflow; the legacy **Original feature-based BEHAV3D DTW** method uses different diagnostics and is not the focus here.
+
 ### ⚙ Advanced Configuration (DTW)
 
 Collapsed by default; the defaults are sensible for most data.
@@ -102,6 +129,10 @@ Freshly computed clusters are numbered. **✏ Rename Track Clusters** opens a di
 
 Colors default to a **hash-stable** palette — a cluster keeps the same color across reruns and even when only a subset of clusters is plotted — unless you assign one manually here, in which case your choice is remembered instead.
 
+Treat renaming as the **curation step** that follows the overview PDF. First inspect the representative trajectories, then decide which clusters deserve distinct names and which ones are just oversplit versions of the same movement archetype.
+
+The goal here is **interpretable trajectory classes**, not preserving every split made by the clustering algorithm. If two clusters would end up with the same biological description, it is usually better to give them the same final name and merge them than to keep two labels that nobody can explain consistently.
+
 ```{tip}
 Clicking **Apply cluster names** automatically regenerates the **diagnostics** and **track-class-proportion** plots (Step 4) with the new names, order and colors — no separate "regenerate" step needed for those two. The **Condition Comparison Report** and **contact-analysis** plots depend on which condition/contact column you pick, so re-run those from their own buttons after a rename.
 ```
@@ -135,10 +166,12 @@ Both have **+🛒** (queue) and **👁** (view) buttons.
 | **Backprojection PDFs** | off | Also render per-exemplar backprojection figures to PDF. |
 | **Backprojection MP4** | off | Also render exemplar backprojection movies. |
 
-- **▶ Create Exemplar PDFs** — produces a PDF of representative tracks per cluster (optionally with state bars and backprojection figures/movies).
+- **▶ Create Exemplar PDFs** — produces a PDF of representative tracks per cluster (optionally with state bars and backprojection figures/movies). The most important cluster-count QC file here is the overview PDF `example_tracks_overview.pdf`, which by default shows **10 exemplars per cluster**.
 - **▶ Create Diagnostics** — produces clustering-quality diagnostic plots (UMAP/correlation, heatmap, matrixplot, cluster-occurrence ranking).
 
 Each has a **👁** button to reopen its PDF.
+
+For deciding whether **`N clusters`** was sensible, inspect the **overview PDF first** and use the diagnostics PDF second. The overview tells you whether the model has split tracks into visually meaningful trajectory types; the diagnostics help support that interpretation, but they are not the primary evidence for this particular choice.
 
 ### Track-Class Proportions
 
@@ -237,7 +270,8 @@ You will find there, depending on which steps you ran:
 - The **track-cluster data** as an `.h5ad` file (one trajectory per row, with its cluster label).
 - A **track-cluster table** (`BEHAV3D_<cell_type>_track_clusters.csv`) once the classifier is applied.
 - The trained **classifier** (`classifier_<cell_type>.pkl`).
-- **Exemplar** PDFs (`exemplar_tracks*.pdf`) and **diagnostics** PDFs (`diagnostics*.pdf`).
+- The **exemplar overview PDF** at `example_tracks/example_tracks_overview.pdf`, which is the main visual QC output for deciding whether `N clusters` split the trajectories sensibly.
+- Additional **exemplar** PDFs under `example_tracks/` and **diagnostics** PDFs under the trajectory-clustering output folders.
 - **Track-class proportion plots** under `behavior_proportions/`: `track_class_proportions_by_sample_<class>.pdf`/`.csv`, plus `track_class_proportions_by_group_<class>.csv` when grouping is used.
 - **Condition comparison reports** under `behavior_comparisons/`: `condition_comparison_<condition>.pdf`/`.csv`.
 - **Contact-based grouping analysis** under `contact_analysis/<contact_col>/`: `contact_analysis.pdf` plus a sibling `csv/` folder with the underlying tables.
@@ -252,7 +286,8 @@ The folder name on disk is `behavorial_trajectories`. The easiest way to reopen 
 ## Tips & best practices
 
 - **Run State Classification first** (for the categorical method). The default clustering compares behavioural-state sequences, so it needs the per-timepoint states to exist for the cell type.
-- **Start with fewer clusters.** Begin around the default *N clusters* and increase only if distinct trajectory types are being merged. Clusters can always be **merged afterwards** during renaming (give two clusters the same name), so err on the side of a few too many rather than too few.
+- **Use the overview-PDF decision loop.** A good practical workflow is: fit clusters → inspect `example_tracks_overview.pdf` → rename and merge similar clusters → only then rerun with higher or lower *N clusters* if the split still looks too coarse or too fragmented.
+- **Slight over-splitting is safer.** If you are unsure, it is usually better to split a bit too much and merge later during renaming than to force several distinct trajectory patterns into one cluster from the start.
 - **Leave Linkage on `average`.** `complete` gives comparable results and is worth trying; **`single` rarely works well** for these distances. Agglomerative clustering is preferred over k-means here, with the caveat that the resulting UMAP embedding can look poor even when the clusters themselves are sensible.
 - **Use Variable-length mode for uneven tracks.** If your tracks differ a lot in length and resampling distorts them, switch *Trajectory size* to its minimum (Variable-length) so DTW compares native lengths.
 - **Save the distance matrix only when you need it.** It grows with the square of the number of tracks and is rarely needed for routine analysis.

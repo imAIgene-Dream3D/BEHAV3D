@@ -59,6 +59,17 @@ Contains checkboxes for the binary (**categorical / true-false**) flags that are
 
 **n_states** (default `4`, range 2–50) — the number of behavioural states the HMM fits. The value is used directly.
 
+Treat this as a **practical starting guess**, not as a biological truth discovered automatically by the software. In most analyses, begin with a small, interpretable number such as `4`, inspect the resulting states, then decide whether you need more or fewer.
+
+- **Start small and readable.** A small number of states is easier to interpret biologically and easier to rename consistently.
+- **Increase `n_states`** when a single state still contains clearly different morphodynamic behaviours in the QC plots or in backprojection, for example one cluster mixing *static* and *actively moving* cells.
+- **Decrease `n_states` or merge afterwards** when several states differ only weakly in the diagnostics, have very similar feature distributions, or look the same once painted back onto the images.
+- **Prefer slight over-splitting to under-splitting.** It is usually safer to fit a few more states than you think you need, then merge them during renaming by giving them the same final name.
+
+```{tip}
+Choosing `n_states` is part of the interpretation workflow, not a one-off setup decision. A good fixed state count is one where each intrinsic state tells a distinct morphodynamic story that you can defend in both the QC plots and the backprojected images.
+```
+
 ### ⚙ Advanced Configuration
 
 Collapsed by default. Most users never need to touch these — sensible defaults are pre-filled.
@@ -110,22 +121,73 @@ This is the `.pkl` file you point **Apply existing behavioral state classificati
 You can run State Classification interactively with the button, or add it to the [Processing Queue](../../plugin_essentials/processing_queue) with the **+🛒** button next to it (the queue exposes it as **🔬 State Clustering**, with separate **Train** / **Apply State Classifier** queue steps for the apply-existing workflow).
 ```
 
+### How to interpret the QC outputs
+
+After a run, do not jump straight to the reports. First inspect the quality-control outputs saved next to the model:
+
+- **`behavioral_clustering_diagnostics.pdf`** — use this to compare the intrinsic HMM states at a glance. Look for which features separate one state from another, whether any states are rare, and whether the learned transition behaviour looks biologically sensible.
+- **`behavioral_clustering_feature_distributions.pdf`** — use this to inspect the raw feature distributions feature-by-feature, both overall and split by intrinsic state. This is especially useful for deciding whether two candidate states truly differ on the measurements you care about.
+
+In practice, ask four questions for each intrinsic state:
+
+1. **Does it differ on the important features?** A state is easier to justify when the features that motivated the clustering — often speed, shape, straightness, displacement, or death-related measurements — are visibly shifted relative to the others.
+2. **Is the difference consistent rather than accidental?** Small numerical differences are not enough if the distributions overlap heavily and the state means tell essentially the same story.
+3. **Does it occupy a real behavioural niche?** Very tiny or unstable states can still be real, but they deserve extra skepticism.
+4. **Can you recognise it visually later in backprojection?** If not, it may be better treated as a variant of another state rather than as its own named behaviour.
+
+Practical reasons to **combine** intrinsic states later in Step 2 include:
+
+- similar feature distributions across the measurements you care about,
+- very similar state-mean profiles,
+- no clear visual difference in backprojection,
+- or no distinct biological story you would actually describe separately in a figure legend or results section.
+
 ## Step 2 — Rename Clusters
 
-Freshly fitted states are numbered, not named. This step lets you give them meaningful biological labels and merge clusters if you think they are biologically similar. You can additionally order the clusters by dragging them and give them unique colors, which are used in the following reports and backprojection. 
+Freshly fitted states are numbered, not named. This step lets you give them meaningful biological labels and merge clusters if you think they are biologically similar. You can additionally order the clusters by dragging them and give them unique colors, which are used in the following reports and backprojection.
 
 The buttons enable themselves once the matching clusters exist in the model.
 
 | Button | Renames | Available when |
 |---|---|---|
 | **✏ Rename Primary Dynamic State Clusters** | The raw HMM states (the *intrinsic* behavioural states based on continuous, dynamic features). | A model has been fitted. |
-| **✏ Rename Full Behavioral Clusters (Binary Groups)** | The states **after** they were subdivided by the binary groups you selected in Step 1. | A model has been fitted (will be updated with the names of the **Primary Dynamic State Clusters** if they are renamed |
+| **✏ Rename Full Behavioral Clusters (Binary Groups)** | The states **after** they were subdivided by the binary groups you selected in Step 1. | A model has been fitted (and becomes easier to interpret once the **Primary Dynamic State Clusters** have been renamed). |
 
 Each button opens a dialog listing the current clusters with editable names; the new names are saved back into the classified data so all downstream reports and backprojection use them. **Giving two clusters the same name merges them** — a handy way to collapse states that mean the same thing biologically (for example merging several motion states into one *scanner*). A status line above the buttons tells you how many intrinsic and full clusters were found.
 
 ```{important}
 Rename the **primary dynamic states first**. The full behavioural clusters are built from the intrinsic states, so the "Full Behavioral Clusters" button only becomes meaningful once the intrinsic states exist (and ideally have been named). 
 ```
+
+### Rename intrinsic states first
+
+Start by naming the **intrinsic** HMM states as broad morphodynamic behaviours. These names should come from the continuous-feature differences you saw in the diagnostics and feature-distribution PDFs, then be checked again in backprojection. Typical examples might be *static*, *scanning*, *plastic*, *migratory*, or *rounded*, but only use names that the actual data support.
+
+The goal here is **biological interpretability**, not preserving every statistically separable HMM component. If two intrinsic states both look like versions of the same behaviour, it is usually better to give them the same final name than to keep two labels that no one can explain clearly.
+
+```{tip}
+If you are unsure whether two intrinsic states deserve different names, try writing the sentence you would use in a paper or figure legend. If both states would be described the same way, that is a good sign they should probably be merged.
+```
+
+### Then review the full behavioral clusters
+
+After the intrinsic states are named, move to the **full behavioural clusters**, which combine each intrinsic state with the binary flags you selected in Step 1. Treat these as candidate subtypes, not as automatically meaningful classes.
+
+For each intrinsic-state × binary-group combination, ask:
+
+- Does the binary split reflect a real behavioural subtype visible in the images?
+- Does it change the biological interpretation enough to deserve a distinct name?
+- Or is it only context, noise, or spillover from neighbouring signal?
+
+Some combinations should keep distinct names, for example when *scanning + organoid_contact* genuinely looks different from *scanning + no contact*. Others should collapse back to the same final name, for example when two full clusters differ by a binary flag but still look like the same underlying behaviour in practice.
+
+### Binary precedence is a manual naming rule
+
+When several binary labels coexist, decide on an explicit **naming hierarchy** yourself. BEHAV3D does not automatically enforce one priority order during renaming; this is a curation choice you make based on the biology and the images.
+
+For example, if a cell is both **dead** and **organoid_contacting**, and the backprojection still clearly looks like a dead cell, then `dead` is usually the more important label and the final class should simply be named *dead*. But if a class called something like *dead + organoid_contacting* does **not** visually look dead — for example it may only be picking up death-related signal from a dying organoid it is touching — then it should be renamed according to the visually supported interpretation instead.
+
+In other words: use the binary flags as clues, but let the **combination of QC plots and backprojection** decide the final name.
 
 ## Step 3 — Reports
 
@@ -142,7 +204,7 @@ Run a report only after you are happy with the classification (and ideally after
 
 ## Step 4 — Backprojection
 
-The final step paints the behavioural states **back onto the raw images**, so you can verify frame by frame that the computed labels match what the cells are actually doing. It is built directly into this sub-tab and works on the cell type selected at the top of Single Cell.
+The final step paints the behavioural states **back onto the raw images**, so you can verify frame by frame that the computed labels match what the cells are actually doing. It is built directly into this sub-tab and works on the cell type selected at the top of Single Cell. In practice, this is the **final validation step** of the whole curation workflow: use it to confirm that the names you assigned in Step 2 correspond to what the cells really look like.
 
 ### Live overlay in napari
 
@@ -169,7 +231,14 @@ Open the collapsible **⚙ Export Options** to render the same overlay to file.
 Click **▶ Export State Backprojection** to run the export in the background; the **Log** reports progress and where the files were written (under `analysis/<cell_type>/behavioral_states/backprojection/`).
 
 ```{tip}
-Use Backprojection as a sanity check: scrub through time and the colours should change when the cells visibly change behaviour. If they don't, revisit the features or the number of states above. Rename your clusters (Step 2) before exporting so legends are publication-ready.
+Use Backprojection as the final arbitration step:
+
+- scrub through time and check that colour changes coincide with visible behavioural changes,
+- inspect questionable **full behavioural clusters one by one**,
+- verify that clusters you intend to merge really do look equivalent,
+- and use it to decide whether a binary combination is a genuine subtype or just an artefact of neighbouring signal or thresholding.
+
+If the PDFs suggest a difference but the backprojection does not, revisit the naming or merge decision before treating the classes as biologically distinct. Rename your clusters (Step 2) before exporting so legends are publication-ready.
 ```
 
 ## Outputs
@@ -182,11 +251,19 @@ Use Backprojection as a sanity check: scrub through time and the colours should 
 
 It is stored as an `.h5ad` data file that holds, for every cell at every timepoint, its assigned **intrinsic state** and its **full behavioural cluster** — using your chosen names after renaming. This is the file the Reports and the **Step 4 — Backprojection** step read.
 
-The HMM fit diagnostics, including the state-feature heatmap used to interpret each state, are saved at:
+The HMM fit diagnostics used for state curation are saved under:
 
 ```text
-<output_dir>/analysis/<cell_type>/behavioral_states/processing/hmm_behavioral_classification/quality_control/raw/behavioral_clustering_diagnostics.pdf
+<output_dir>/analysis/<cell_type>/behavioral_states/processing/hmm_behavioral_classification/
 ```
+
+The most important files there are:
+
+- **`behavioral_clustering_diagnostics.pdf`** — the main intrinsic-state QC report, including the feature-based comparisons used to interpret states.
+- **`behavioral_clustering_feature_distributions.pdf`** — raw feature distributions overall and per intrinsic state; useful when deciding whether states truly differ or should be combined.
+- **`behavioral_clustering_hmm_state_means.csv`** — per-state mean values for the kept continuous features.
+- **`behavioral_clustering_hmm_state_counts.csv`** — how many classified timepoints fell into each intrinsic state.
+- **`behavioral_clustering_hmm_transition_matrix.csv`** — the learned transition probabilities between states.
 
 **The full trained workflow** (features, processing settings, binary groups and the fitted HMM) is saved as a single deployment artifact at:
 
@@ -195,7 +272,6 @@ The HMM fit diagnostics, including the state-feature heatmap used to interpret e
 ```
 
 This is the file to **Browse…** to when applying an existing classification to new data (see *Two ways to run* above).
-
 
 The two reports are each saved as a PDF (the composition report also writes a CSV of the underlying curves).
 
@@ -219,8 +295,10 @@ Reopen either report at any time with its **👁** button or from the shared **R
 ## Tips & best practices
 
 - **Choose features deliberately.** The states are only as meaningful as the features you feed in. Begin with a small, interpretable set and expand only if states are blurry.
+- **Treat curation as iterative.** A typical workflow is: fit states → inspect diagnostics and feature distributions → rename intrinsic states → review full binary-group states → backproject questionable classes → rename or merge again if needed.
 - **Use a fixed seed for reproducibility.** Leave **Random seed** at its default (or note the value you used) so re-runs and collaborators get the same states.
 - **Save and reuse a model across experiments.** Once you have a state definition you trust, apply it to new datasets via **Apply existing behavioral state classification** so states stay comparable.
+- **Let images overrule labels.** If a state name sounds convincing from the PDFs but does not hold up in backprojection, trust the image-level evidence and rename or merge the cluster.
 - **Pair with Backprojection.** After classifying, use **Step 4 — Backprojection** above to paint the states back onto the raw images and sanity-check that they correspond to real behaviour.
 
 ## See also
