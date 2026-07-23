@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 
-CONTROL_CONTRACT_VERSION = "2.5"
+CONTROL_CONTRACT_VERSION = "2.6"
 
 
 def _safe(fn: Callable, default=None):
@@ -156,6 +156,40 @@ def _checkset_binding(control_id, label, checks, **kwargs):
     return item
 
 
+def _selection_binding(control_id, label, widget, **kwargs):
+    """Bind a multi-selection list widget using its researcher-facing labels."""
+    def choices():
+        return [
+            str(widget.item(index).text())
+            for index in range(widget.count())
+        ]
+
+    def get():
+        return [str(item.text()) for item in widget.selectedItems()]
+
+    def set_(value):
+        if not isinstance(value, (list, tuple, set)):
+            return False
+        selected = {str(item) for item in value}
+        available = set(choices())
+        if not selected.issubset(available):
+            return False
+        for index in range(widget.count()):
+            item = widget.item(index)
+            item.setSelected(str(item.text()) in selected)
+        return True
+
+    item = _binding(control_id, label, widget, getter=get, setter=set_, **kwargs)
+    item["choices"] = choices()
+    return item
+
+
+def _display_unit(manager, kind: str, pixel_unit: str) -> str:
+    if manager is not None and bool(getattr(manager, "physical", False)):
+        return "um3" if kind == "volume" else "um"
+    return pixel_unit
+
+
 def _metadata_bindings(main_widget) -> list[dict]:
     dp = getattr(main_widget, "data_prep_tab", None)
     if dp is None:
@@ -281,10 +315,23 @@ def _segmentation_bindings(main_widget) -> list[dict]:
                 strategy=strategy, cell_type=str(cell_type),
                 visible=current_index == 0, persist=persist_apoc,
             ))
+        distance_unit = _display_unit(
+            getattr(tab, "_unit_mgr", None), "distance", "pixels"
+        )
+        volume_unit = _display_unit(
+            getattr(tab, "_unit_mgr", None), "volume", "voxels"
+        )
         for suffix, label, attr, unit in (
             ("mask_threshold", "mask threshold", "prob_mask_threshold_spin", None),
             ("seed_threshold", "seed threshold", "prob_seed_threshold_spin", None),
-            ("edt_threshold", "EDT threshold", "edt_threshold_spin", "pixels"),
+            ("edt_threshold", "EDT threshold", "edt_threshold_spin", distance_unit),
+            ("minimum_size", "minimum object size", "segment_size_min_spin", volume_unit),
+            ("opening", "morphological opening", "opening_nr_pixels_spin", "pixels"),
+            ("fill_holes", "fill enclosed holes", "fill_holes_cb", None),
+            ("peak_minimum_distance", "peak minimum distance",
+             "peak_min_distance_spin", distance_unit),
+            ("peak_minimum_ratio", "peak minimum ratio",
+             "peak_min_ratio_spin", None),
         ):
             widget = getattr(tab, attr, None)
             if widget is None:
@@ -316,10 +363,23 @@ def _segmentation_bindings(main_widget) -> list[dict]:
                 strategy=strategy, cell_type=str(cell_type),
                 visible=current_index == 1, persist=persist_convpaint,
             ))
+        distance_unit = _display_unit(
+            getattr(tab, "_unit_mgr", None), "distance", "pixels"
+        )
+        volume_unit = _display_unit(
+            getattr(tab, "_unit_mgr", None), "volume", "voxels"
+        )
         for suffix, label, attr, unit in (
             ("mask_threshold", "mask threshold", "prob_mask_threshold_spin", None),
             ("seed_threshold", "seed threshold", "prob_seed_threshold_spin", None),
-            ("edt_threshold", "EDT threshold", "edt_threshold_spin", "pixels"),
+            ("edt_threshold", "EDT threshold", "edt_threshold_spin", distance_unit),
+            ("minimum_size", "minimum object size", "segment_size_min_spin", volume_unit),
+            ("opening", "morphological opening", "opening_nr_pixels_spin", "pixels"),
+            ("fill_holes", "fill enclosed holes", "fill_holes_cb", None),
+            ("peak_minimum_distance", "peak minimum distance",
+             "peak_min_distance_spin", distance_unit),
+            ("peak_minimum_ratio", "peak minimum ratio",
+             "peak_min_ratio_spin", None),
         ):
             widget = getattr(tab, attr, None)
             if widget is None:
@@ -331,6 +391,29 @@ def _segmentation_bindings(main_widget) -> list[dict]:
                 strategy=strategy, cell_type=str(cell_type),
                 visible=current_index == 1, persist=persist_convpaint,
             ))
+
+    if conv_training is not None:
+        persist_global_convpaint = getattr(conv_training, "_persist_all_params", None)
+        for suffix, label, attr in (
+            ("feature_model", "feature extraction model", "fe_combo"),
+            ("channel_mode", "channel mode", "channel_mode_combo"),
+            ("normalization", "normalization mode", "normalize_combo"),
+            ("downsample", "image downsample", "downsample_spin"),
+            ("smoothing", "segmentation smoothing", "smooth_spin"),
+            ("iterations", "classifier iterations", "iterations_spin"),
+            ("depth", "classifier tree depth", "depth_spin"),
+            ("tile_image", "tile large images", "tile_image_cb"),
+            ("use_dask", "parallelize tiled prediction with Dask", "use_dask_cb"),
+        ):
+            widget = getattr(conv_training, attr, None)
+            if widget is not None:
+                out.append(_binding(
+                    f"segmentation.convpaint.{suffix}",
+                    f"ConvPaint: {label}", widget,
+                    step="segmentation", method="ConvPaint",
+                    visible=current_index == 1,
+                    persist=persist_global_convpaint,
+                ))
 
     random_forest = getattr(seg, "pixel_classifier_page", None)
     for cell_type, widgets in (getattr(random_forest, "param_widgets", {}) or {}).items():
@@ -353,6 +436,96 @@ def _segmentation_bindings(main_widget) -> list[dict]:
                             step="segmentation", method="Cellpose",
                             visible=current_index == 3,
                             persist=getattr(cellpose, "_persist_channel_config", None)))
+
+    sam = getattr(seg, "cellpose_sam_page", None)
+    if sam is not None:
+        sam_method = "Cellpose-SAM (zero-shot)"
+        sam_visible = current_index == 4
+        persist_sam = getattr(sam, "_persist_params", None)
+        cell_type_combo = getattr(sam, "cell_type_combo", None)
+        process_all_check = getattr(sam, "check_process_all", None)
+        all_cell_types_check = getattr(sam, "check_all_cell_types", None)
+        do_3d_check = getattr(sam, "check_do_3d", None)
+        force_cpu_check = getattr(sam, "btn_force_cpu", None)
+        cell_type = (
+            _safe(cell_type_combo.currentText, "")
+            if cell_type_combo is not None else ""
+        ) or None
+        process_all = bool(
+            _safe(process_all_check.isChecked, True)
+            if process_all_check is not None else True
+        )
+        all_cell_types = bool(
+            _safe(all_cell_types_check.isChecked, False)
+            if all_cell_types_check is not None else False
+        )
+        do_3d = bool(
+            _safe(do_3d_check.isChecked, True)
+            if do_3d_check is not None else True
+        )
+        force_cpu = bool(
+            _safe(force_cpu_check.isChecked, False)
+            if force_cpu_check is not None else False
+        )
+        distance_unit = _display_unit(
+            getattr(sam, "_unit_mgr", None), "distance", "pixels"
+        )
+        volume_unit = _display_unit(
+            getattr(sam, "_unit_mgr", None), "volume", "voxels"
+        )
+        sam_specs = [
+            ("cell_type", "Cell type to segment", "cell_type_combo", None, not all_cell_types),
+            ("all_cell_types", "Run all cell types in one batch",
+             "check_all_cell_types", None, True),
+            ("process_all_timepoints", "Process all timepoints",
+             "check_process_all", None, True),
+            ("from_timepoint", "From timepoint", "spin_t_start",
+             "timepoints", not process_all),
+            ("to_timepoint", "To timepoint", "spin_t_end",
+             "timepoints", not process_all),
+            ("gpu_device", "GPU device", "combo_gpu_device", None, not force_cpu),
+            ("force_cpu", "Force CPU-only processing", "btn_force_cpu", None, True),
+            ("model", "Model", "combo_model", None, True),
+            ("diameter", "Expected object diameter", "spin_diameter",
+             distance_unit, True),
+            ("flow_threshold", "Flow threshold", "spin_flow_threshold", None, not do_3d),
+            ("cell_probability_threshold", "Cell probability threshold",
+             "spin_cellprob", None, True),
+            ("three_dimensional", "Use 3D segmentation", "check_do_3d", None, True),
+            ("stitch_threshold", "2D slice stitch threshold",
+             "spin_stitch", None, not do_3d),
+            ("batch_size", "GPU batch size", "spin_batch_size", None, True),
+            ("remove_flat_segments", "Remove flat single-slice segments",
+             "check_drop_2d", None, True),
+            ("preview_sample", "Preview sample", "combo_preview_sample", None, True),
+            ("preview_timepoint", "Preview timepoint", "spin_preview_t",
+             "timepoints", True),
+            ("minimum_size", "Minimum object size", "spin_size_min",
+             volume_unit, True),
+            ("maximum_size", "Maximum object size", "spin_size_max",
+             volume_unit, True),
+        ]
+        for suffix, label, attr, unit, relevant in sam_specs:
+            widget = getattr(sam, attr, None)
+            if widget is not None:
+                out.append(_binding(
+                    f"segmentation.cellpose_sam.{suffix}",
+                    f"Cellpose-SAM: {label}", widget,
+                    step="segmentation", unit=unit, method=sam_method,
+                    cell_type=str(cell_type) if cell_type else None,
+                    visible=sam_visible and relevant,
+                    persist=persist_sam,
+                ))
+        channel_panel = getattr(sam, "channel_panel", None)
+        checkboxes = getattr(channel_panel, "_checkboxes", []) or []
+        if checkboxes and cell_type and not all_cell_types:
+            out.append(_checkset_binding(
+                f"segmentation.cellpose_sam.{cell_type}.channels",
+                f"{cell_type}: Cellpose-SAM input channels",
+                {f"Channel {index}": check for index, check in enumerate(checkboxes)},
+                step="segmentation", method=sam_method, cell_type=str(cell_type),
+                visible=sam_visible, persist=persist_sam,
+            ))
     return out
 
 
@@ -360,26 +533,43 @@ def _tracking_bindings(main_widget) -> list[dict]:
     tab = getattr(main_widget, "tracking_tab", None)
     panels = getattr(tab, "panels", {}) or {} if tab is not None else {}
     out = []
+    all_organoids = getattr(tab, "_all_organoids_panel", None) if tab is not None else None
+    together = getattr(all_organoids, "check_all_together", None)
+    if together is not None:
+        out.append(_binding(
+            "tracking.organoids.track_all_together",
+            "Track all organoid types together", together,
+            step="tracking", method="Propagation",
+            cell_type="all organoid types",
+        ))
+
     specs = [
         ("method", "Tracking method", "combo_method", None, None),
-        ("lap.frame_link_distance", "LAP frame-to-frame linking distance", "lap_track_cost", "px", "LAP"),
-        ("lap.gap_closing_distance", "LAP gap-closing distance", "lap_gap_cost", "px", "LAP"),
+        ("lap.frame_link_distance", "LAP frame-to-frame linking distance", "lap_track_cost", "distance", "LAP"),
+        ("lap.gap_closing_distance", "LAP gap-closing distance", "lap_gap_cost", "distance", "LAP"),
         ("lap.maximum_gap", "LAP maximum gap", "lap_gap_frames", "frames", "LAP"),
-        ("lap.merging_distance", "LAP merging distance", "lap_merge_cost", "px", "LAP"),
-        ("lap.splitting_distance", "LAP splitting distance", "lap_split_cost", "px", "LAP"),
-        ("trackpy.search_range", "TrackPy search range", "tp_search_range", "px", "TrackPy"),
+        ("lap.merging_distance", "LAP merging distance", "lap_merge_cost", "distance", "LAP"),
+        ("lap.splitting_distance", "LAP splitting distance", "lap_split_cost", "distance", "LAP"),
+        ("trackpy.search_range", "TrackPy search range", "tp_search_range", "distance", "TrackPy"),
         ("trackpy.memory", "TrackPy memory", "tp_memory", "frames", "TrackPy"),
-        ("trackpy.adaptive_stop", "TrackPy adaptive stop", "tp_adaptive_stop", "px", "TrackPy"),
+        ("trackpy.adaptive_stop", "TrackPy adaptive stop", "tp_adaptive_stop", "distance", "TrackPy"),
         ("trackpy.adaptive_step", "TrackPy adaptive step", "tp_adaptive_step", None, "TrackPy"),
+        ("propagation.track_all_organoids", "Track all organoid types together",
+         "check_all_together_prop", None, "Propagation"),
+        ("reporter_propagation.minimum_overlap", "Reporter Propagation minimum overlap",
+         "rp_min_overlap_fraction", None, "Reporter Propagation"),
+        ("reporter_propagation.minimum_segment_size",
+         "Reporter Propagation minimum segment size",
+         "rp_segment_size_min", "voxels", "Reporter Propagation"),
         ("btrack.config_preset", "btrack configuration preset", "bt_config_preset", None, "btrack"),
         ("btrack.config_path", "btrack custom configuration", "bt_config_path", None, "btrack"),
-        ("btrack.maximum_search_radius", "btrack maximum search radius", "bt_max_search_radius", "um", "btrack"),
+        ("btrack.maximum_search_radius", "btrack maximum search radius", "bt_max_search_radius", "distance", "btrack"),
         ("btrack.update_method", "btrack update method", "bt_update_method", None, "btrack"),
         ("btrack.step_size", "btrack step size", "bt_step_size", "frames", "btrack"),
         ("btrack.use_visual_features", "Use visual features", "bt_use_visual_features", None, "btrack"),
         ("btrack.workers", "btrack workers", "bt_n_workers", None, "btrack"),
         ("btrack.use_global_optimization", "Enable global track optimization", "bt_use_optimize", None, "btrack"),
-        ("btrack.distance_threshold", "btrack optimizer distance threshold", "bt_dist_thresh", "um", "btrack"),
+        ("btrack.distance_threshold", "btrack optimizer distance threshold", "bt_dist_thresh", "distance", "btrack"),
         ("btrack.time_threshold", "btrack optimizer time threshold", "bt_time_thresh", "frames", "btrack"),
     ]
     for cell_type, panel in panels.items():
@@ -400,8 +590,19 @@ def _tracking_bindings(main_widget) -> list[dict]:
                 visible = method_index == 0
             elif method == "TrackPy":
                 visible = method_index == 1
-            elif method == "btrack":
+            elif method == "Propagation":
+                visible = method_index == 2
+            elif method == "Reporter Propagation":
                 visible = method_index == 3
+            elif method == "btrack":
+                visible = method_index == 4
+            if unit == "distance":
+                manager = {
+                    "LAP": getattr(panel, "_lap_unit_mgr", None),
+                    "TrackPy": getattr(panel, "_tp_unit_mgr", None),
+                    "btrack": getattr(panel, "_bt_unit_mgr", None),
+                }.get(method)
+                unit = _display_unit(manager, "distance", "pixels")
             out.append(_binding(f"tracking.{cell_type}.{suffix}",
                                 f"{cell_type}: {label}", widget, step="tracking",
                                 unit=unit, method=method, cell_type=str(cell_type),
@@ -412,7 +613,7 @@ def _tracking_bindings(main_widget) -> list[dict]:
                 f"tracking.{cell_type}.btrack.hypotheses",
                 f"{cell_type}: btrack optimization hypotheses", checks,
                 step="tracking", method="btrack", cell_type=str(cell_type),
-                visible=method_index == 3,
+                visible=method_index == 4,
                 persist=getattr(panel, "_persist", None),
             ))
     return out
@@ -436,10 +637,68 @@ def _feature_bindings(main_widget) -> list[dict]:
         ]:
             widget = getattr(panel, attr, None)
             if widget is not None:
+                display_unit = unit
+                if suffix == "contact_distance":
+                    display_unit = _display_unit(
+                        getattr(panel, "_contact_unit_mgr", None),
+                        "distance", "pixels",
+                    )
                 out.append(_binding(f"features.{cell_type}.{suffix}",
                                     f"{cell_type}: {label}", widget,
-                                    step="feature_extraction", unit=unit,
+                                    step="feature_extraction", unit=display_unit,
                                     cell_type=str(cell_type), persist=getattr(panel, "_persist", None)))
+
+    active = getattr(tab, "active_killing_panel", None) if tab is not None else None
+    expanded = bool(_safe(
+        getattr(tab, "_ak_toggle_btn", None).isChecked, False
+    )) if getattr(tab, "_ak_toggle_btn", None) is not None else False
+    if active is not None:
+        immune_combo = getattr(active, "immune_combo", None)
+        absolute_check = getattr(active, "check_abs_threshold", None)
+        immune = (
+            _safe(immune_combo.currentText, "")
+            if immune_combo is not None else ""
+        ) or None
+        absolute = bool(
+            _safe(absolute_check.isChecked, False)
+            if absolute_check is not None else False
+        )
+        specs = [
+            ("immune_type", "Effector cell type", "immune_combo", None, True),
+            ("observation_window", "Observation window",
+             "spin_obs_window", "timepoints", True),
+            ("death_signal", "Death or reporter signal",
+             "death_signal_combo", None, True),
+            ("use_absolute_threshold", "Use an absolute signal-increase threshold",
+             "check_abs_threshold", None, True),
+            ("threshold_multiplier", "Signal-increase multiplier",
+             "spin_threshold_mult", None, not absolute),
+            ("absolute_threshold", "Absolute signal-increase threshold",
+             "spin_abs_threshold", None, absolute),
+            ("minimum_contact_duration", "Minimum contact duration",
+             "spin_min_contact", "timepoints", True),
+            ("top_killers_to_display", "Top killers to display",
+             "spin_top_n", None, True),
+        ]
+        for suffix, label, attr, unit, relevant in specs:
+            widget = getattr(active, attr, None)
+            if widget is not None:
+                out.append(_binding(
+                    f"features.active_killing.{suffix}",
+                    f"Active Killing: {label}", widget,
+                    step="feature_extraction", unit=unit,
+                    method="Active Killing", cell_type=immune,
+                    visible=expanded and relevant,
+                ))
+        target_list = getattr(active, "target_list", None)
+        if target_list is not None:
+            out.append(_selection_binding(
+                "features.active_killing.target_types",
+                "Active Killing: Target cell type",
+                target_list, step="feature_extraction",
+                method="Active Killing", cell_type=immune,
+                visible=expanded,
+            ))
     return out
 
 
@@ -454,6 +713,8 @@ def _filter_bindings(main_widget) -> list[dict]:
         ("minimum_length.timepoints", "Minimum track length", "spin_min_length", "timepoints"),
         ("maximum_length.enabled", "Trim retained tracks to a common length", "en_max_length", None),
         ("maximum_length.timepoints", "Common output track length", "spin_max_length", "timepoints"),
+        ("maximum_length.split_long_tracks", "Split long tracks into full-length chunks",
+         "check_split_long_tracks", None),
         ("minimum_initial_size.enabled", "Filter by initial size", "check_filter_min_size", None),
         ("minimum_initial_size.pixels", "Minimum initial size", "spin_min_size_t1", "pixels"),
         ("dead_at_first_timepoint.enabled", "Filter dead cells at first timepoint", "check_filter_dead_t0", None),
@@ -474,12 +735,28 @@ def _analysis_bindings(main_widget) -> list[dict]:
     analysis = getattr(main_widget, "analysis_tab", None)
     single = getattr(analysis, "single_cell_tab", None) if analysis is not None else None
     state = getattr(single, "state_tab", None) if single is not None else None
-    if state is None:
+    track = getattr(single, "track_tab", None) if single is not None else None
+    if state is None and track is None:
         return []
     cell_type = _safe(single.cell_type_combo.currentText, "") or None
     out = []
+    outer_tabs = getattr(analysis, "inner_tabs", None)
+    single_selected = (
+        _safe(outer_tabs.currentWidget, single) is single
+        if outer_tabs is not None and hasattr(outer_tabs, "currentWidget")
+        else True
+    )
+    focused = single_selected
+    stack = getattr(single, "_stack", None)
+    if stack is not None:
+        focused = focused and bool(_safe(stack.currentIndex, 1) == 1)
+    inner_index = _safe(
+        getattr(single, "inner_tabs", None).currentIndex, 0
+    ) if getattr(single, "inner_tabs", None) is not None else 0
+    state_visible = focused and inner_index == 0
+    track_visible = focused and inner_index == 1
     persist = ((lambda ct=cell_type: state._persist_state_cfg(ct))
-               if cell_type else None)
+               if state is not None and cell_type else None)
     mode_combo = getattr(state, "combo_hmm_n_states_mode", None)
     sticky_check = getattr(state, "chk_hmm_sticky", None)
     mode = _safe(mode_combo.currentText, "fixed") if mode_combo is not None else "fixed"
@@ -505,23 +782,24 @@ def _analysis_bindings(main_widget) -> list[dict]:
         ("random_seed", "Random seed", "spin_seed", None, None),
     ]
     for suffix, label, attr, unit, visible in specs:
-        widget = getattr(state, attr, None)
+        widget = getattr(state, attr, None) if state is not None else None
         if widget is not None:
+            relevant = state_visible if visible is None else state_visible and visible
             out.append(_binding(f"analysis.state_classification.{cell_type or 'selected'}.{suffix}",
                                 f"{cell_type or 'Selected cell type'}: {label}", widget,
                                 step="analysis", method="HMM", cell_type=cell_type,
-                                unit=unit, visible=visible, persist=persist))
+                                unit=unit, visible=relevant, persist=persist))
     window_checks = {
-        "net_displacement": getattr(state, "chk_net_disp", None),
-        "straightness": getattr(state, "chk_straight", None),
-        "mean_square_displacement": getattr(state, "chk_msd", None),
+        "net_displacement": getattr(state, "chk_net_disp", None) if state is not None else None,
+        "straightness": getattr(state, "chk_straight", None) if state is not None else None,
+        "mean_square_displacement": getattr(state, "chk_msd", None) if state is not None else None,
     }
     window_checks = {key: widget for key, widget in window_checks.items()
                      if widget is not None}
     for suffix, label, checks in [
-        ("timepoint_features", "Timepoint features", getattr(state, "_timepoint_checkboxes", {})),
-        ("log_scaled_features", "Log-scaled features", getattr(state, "_logscale_checkboxes", {})),
-        ("binary_feature_groups", "Binary feature groups", getattr(state, "_bingrp_checkboxes", {})),
+        ("timepoint_features", "Timepoint features", getattr(state, "_timepoint_checkboxes", {}) if state is not None else {}),
+        ("log_scaled_features", "Log-scaled features", getattr(state, "_logscale_checkboxes", {}) if state is not None else {}),
+        ("binary_feature_groups", "Binary feature groups", getattr(state, "_bingrp_checkboxes", {}) if state is not None else {}),
         ("window_features", "Additional window features", window_checks),
     ]:
         if checks:
@@ -529,8 +807,47 @@ def _analysis_bindings(main_widget) -> list[dict]:
                 f"analysis.state_classification.{cell_type or 'selected'}.{suffix}",
                 f"{cell_type or 'Selected cell type'}: {label}", checks,
                 step="analysis", method="HMM", cell_type=cell_type,
-                persist=persist,
+                visible=state_visible, persist=persist,
             ))
+
+    if track is not None:
+        persist_track = (
+            (lambda ct=cell_type: track._persist_track_cfg(ct))
+            if cell_type else None
+        )
+        original = bool(_safe(
+            getattr(track, "chk_use_original", None).isChecked, False
+        )) if getattr(track, "chk_use_original", None) is not None else False
+        for suffix, label, attr, unit, relevant in [
+            ("trajectory_size", "Trajectory size", "spin_traj_size", "timepoints", True),
+            ("number_of_clusters", "Number of trajectory clusters",
+             "spin_n_clusters", None, True),
+            ("linkage", "Agglomerative linkage", "combo_linkage", None, not original),
+            ("trim_direction", "Track trim direction", "combo_trim", None, not original),
+            ("divide_long_tracks", "Divide long tracks into full windows",
+             "chk_split_long_tracks", None, not original),
+            ("parallel_computation", "Use parallel computation",
+             "chk_parallel", None, not original),
+            ("save_distance_matrix", "Save distance matrix CSV",
+             "chk_save_dist", None, not original),
+            ("use_original_behav3d", "Use original feature-based BEHAV3D mode",
+             "chk_use_original", None, True),
+            ("umap_neighbors", "UMAP neighbours",
+             "spin_umap_neighbors", None, original),
+            ("umap_minimum_distance", "UMAP minimum distance",
+             "spin_umap_min_dist", None, original),
+            ("random_seed", "Random seed", "spin_seed", None, not original),
+        ]:
+            widget = getattr(track, attr, None)
+            if widget is not None:
+                out.append(_binding(
+                    f"analysis.state_trajectory.{cell_type or 'selected'}.{suffix}",
+                    f"{cell_type or 'Selected cell type'}: {label}", widget,
+                    step="analysis", method="State Trajectory",
+                    cell_type=cell_type, unit=unit,
+                    visible=track_visible and relevant,
+                    persist=persist_track,
+                ))
     return out
 
 
@@ -555,6 +872,13 @@ def find_control(main_widget, control_id: str) -> dict | None:
 
 
 def active_cell_type(main_widget, step: str) -> str | None:
+    if step == "feature_extraction":
+        tab = getattr(main_widget, "feature_extraction_tab", None)
+        toggle = getattr(tab, "_ak_toggle_btn", None) if tab is not None else None
+        if toggle is not None and bool(_safe(toggle.isChecked, False)):
+            active = getattr(tab, "active_killing_panel", None)
+            combo = getattr(active, "immune_combo", None) if active is not None else None
+            return _safe(combo.currentText) if combo is not None else None
     tab_attr = {
         "tracking": "tracking_tab",
         "feature_extraction": "feature_extraction_tab",
@@ -584,6 +908,13 @@ def active_cell_type(main_widget, step: str) -> str | None:
             available = list((getattr(random_forest, "param_widgets", {}) or {}).keys())
             if len(available) == 1:
                 return str(available[0])
+        if method_index == 4:
+            sam = getattr(segmentation, "cellpose_sam_page", None)
+            all_types = getattr(sam, "check_all_cell_types", None) if sam is not None else None
+            if all_types is not None and bool(_safe(all_types.isChecked, False)):
+                return "all cell types"
+            combo = getattr(sam, "cell_type_combo", None) if sam is not None else None
+            return _safe(combo.currentText) if combo is not None else None
         return None
     if step == "analysis":
         analysis = getattr(main_widget, "analysis_tab", None)

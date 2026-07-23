@@ -343,6 +343,316 @@
     "description": "BEHAV3D parameter 'cellpose.per_sample_channel_labels' (type dict, default {})."
   },
   {
+    "key": "cellpose_sam.model_name",
+    "title": "model_name",
+    "step": "segmentation",
+    "category": null,
+    "type": "str",
+    "default": "cpsam",
+    "choices": null,
+    "description": "Cellpose-SAM zero-shot model. cpsam and cpsam_v2 require no training and may be compared directly."
+  },
+  {
+    "key": "cellpose_sam.python_path",
+    "title": "python_path",
+    "step": "segmentation",
+    "category": null,
+    "type": "str",
+    "default": "",
+    "choices": null,
+    "description": "BEHAV3D parameter 'cellpose_sam.python_path' (type str, default '')."
+  },
+  {
+    "key": "cellpose_sam.device",
+    "title": "device",
+    "step": "segmentation",
+    "category": null,
+    "type": "str",
+    "default": "auto",
+    "choices": null,
+    "description": "BEHAV3D parameter 'cellpose_sam.device' (type str, default 'auto')."
+  },
+  {
+    "key": "cellpose_sam.force_cpu",
+    "title": "force_cpu",
+    "step": "segmentation",
+    "category": null,
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'cellpose_sam.force_cpu' (type bool, default False)."
+  },
+  {
+    "key": "cellpose_sam.all_cell_types",
+    "title": "all_cell_types",
+    "step": "segmentation",
+    "category": null,
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "Run each detected cell type in one Cellpose-SAM batch; every type still uses its own selected input channel(s) and output."
+  },
+  {
+    "key": "cellpose_sam.use_all_timepoints",
+    "title": "use_all_timepoints",
+    "step": "segmentation",
+    "category": null,
+    "type": "bool",
+    "default": true,
+    "choices": null,
+    "description": "Process every timepoint. Disable to restrict to a [tp_start, tp_end] range."
+  },
+  {
+    "key": "cellpose_sam.tp_start",
+    "title": "tp_start",
+    "step": "segmentation",
+    "category": null,
+    "type": "int",
+    "default": 0,
+    "choices": null,
+    "description": "BEHAV3D parameter 'cellpose_sam.tp_start' (type int, default 0)."
+  },
+  {
+    "key": "cellpose_sam.tp_end",
+    "title": "tp_end",
+    "step": "segmentation",
+    "category": null,
+    "type": "int",
+    "default": 0,
+    "choices": null,
+    "description": "BEHAV3D parameter 'cellpose_sam.tp_end' (type int, default 0)."
+  },
+  {
+    "key": "cellpose_sam.preview_sample",
+    "title": "preview_sample",
+    "step": "segmentation",
+    "category": null,
+    "type": "str",
+    "default": "",
+    "choices": null,
+    "description": "BEHAV3D parameter 'cellpose_sam.preview_sample' (type str, default '')."
+  },
+  {
+    "key": "cellpose_sam.preview_timepoint",
+    "title": "preview_timepoint",
+    "step": "segmentation",
+    "category": null,
+    "type": "int",
+    "default": 0,
+    "choices": null,
+    "description": "BEHAV3D parameter 'cellpose_sam.preview_timepoint' (type int, default 0)."
+  },
+  {
+    "key": "cellpose_sam.diameter",
+    "title": "diameter",
+    "step": "segmentation",
+    "category": null,
+    "type": "float",
+    "default": 0.0,
+    "choices": null,
+    "description": "Expected Cellpose-SAM object diameter. Leave at 0 for automatic sizing unless objects are well outside the model's roughly 7.5-120 pixel training range."
+  },
+  {
+    "key": "cellpose_sam.flow_threshold",
+    "title": "flow_threshold",
+    "step": "segmentation",
+    "category": null,
+    "type": "float",
+    "default": 0.4,
+    "choices": null,
+    "description": "Maximum Cellpose-SAM flow error. Default 0.4; raise it to keep more imperfect shapes or lower it for stricter shapes. Ignored in 3D mode."
+  },
+  {
+    "key": "cellpose_sam.cellprob_threshold",
+    "title": "cellprob_threshold",
+    "step": "segmentation",
+    "category": null,
+    "type": "float",
+    "default": 0.0,
+    "choices": null,
+    "description": "Cellpose-SAM cell probability threshold. Lower it to detect more or larger objects; raise it to reject dim or uncertain detections."
+  },
+  {
+    "key": "cellpose_sam.niter",
+    "title": "niter",
+    "step": "segmentation",
+    "category": null,
+    "type": "int",
+    "default": 0,
+    "choices": null,
+    "description": "BEHAV3D parameter 'cellpose_sam.niter' (type int, default 0)."
+  },
+  {
+    "key": "cellpose_sam.do_3D",
+    "title": "do_3D",
+    "step": "segmentation",
+    "category": null,
+    "type": "bool",
+    "default": true,
+    "choices": null,
+    "description": "Use full 3D Cellpose-SAM segmentation for accuracy. Disable for speed or highly anisotropic Z data, then tune slice stitching."
+  },
+  {
+    "key": "cellpose_sam.stitch_threshold",
+    "title": "stitch_threshold",
+    "step": "segmentation",
+    "category": null,
+    "type": "float",
+    "default": 0.0,
+    "choices": null,
+    "description": "IoU threshold for stitching 2D masks across Z. Used only when Cellpose-SAM 3D segmentation is disabled."
+  },
+  {
+    "key": "cellpose_sam.flow3D_smooth",
+    "title": "flow3D_smooth",
+    "step": "segmentation",
+    "category": null,
+    "type": "float",
+    "default": 0.0,
+    "choices": null,
+    "description": "BEHAV3D parameter 'cellpose_sam.flow3D_smooth' (type float, default 0.0)."
+  },
+  {
+    "key": "cellpose_sam.batch_size",
+    "title": "batch_size",
+    "step": "segmentation",
+    "category": null,
+    "type": "int",
+    "default": 8,
+    "choices": null,
+    "description": "Cellpose-SAM GPU patch batch size. Reduce this first after a CUDA out-of-memory error; it affects throughput and memory, not segmentation quality."
+  },
+  {
+    "key": "cellpose_sam.min_size",
+    "title": "min_size",
+    "step": "segmentation",
+    "category": null,
+    "type": "int",
+    "default": 1,
+    "choices": null,
+    "description": "BEHAV3D parameter 'cellpose_sam.min_size' (type int, default 1)."
+  },
+  {
+    "key": "cellpose_sam.max_size_fraction",
+    "title": "max_size_fraction",
+    "step": "segmentation",
+    "category": null,
+    "type": "float",
+    "default": 1.0,
+    "choices": null,
+    "description": "BEHAV3D parameter 'cellpose_sam.max_size_fraction' (type float, default 1.0)."
+  },
+  {
+    "key": "cellpose_sam.norm_percentile_low",
+    "title": "norm_percentile_low",
+    "step": "segmentation",
+    "category": null,
+    "type": "float",
+    "default": 1.0,
+    "choices": null,
+    "description": "BEHAV3D parameter 'cellpose_sam.norm_percentile_low' (type float, default 1.0)."
+  },
+  {
+    "key": "cellpose_sam.norm_percentile_high",
+    "title": "norm_percentile_high",
+    "step": "segmentation",
+    "category": null,
+    "type": "float",
+    "default": 99.0,
+    "choices": null,
+    "description": "BEHAV3D parameter 'cellpose_sam.norm_percentile_high' (type float, default 99.0)."
+  },
+  {
+    "key": "cellpose_sam.norm3D",
+    "title": "norm3D",
+    "step": "segmentation",
+    "category": null,
+    "type": "bool",
+    "default": true,
+    "choices": null,
+    "description": "BEHAV3D parameter 'cellpose_sam.norm3D' (type bool, default True)."
+  },
+  {
+    "key": "cellpose_sam.sharpen_radius",
+    "title": "sharpen_radius",
+    "step": "segmentation",
+    "category": null,
+    "type": "float",
+    "default": 0.0,
+    "choices": null,
+    "description": "BEHAV3D parameter 'cellpose_sam.sharpen_radius' (type float, default 0.0)."
+  },
+  {
+    "key": "cellpose_sam.smooth_radius",
+    "title": "smooth_radius",
+    "step": "segmentation",
+    "category": null,
+    "type": "float",
+    "default": 0.0,
+    "choices": null,
+    "description": "BEHAV3D parameter 'cellpose_sam.smooth_radius' (type float, default 0.0)."
+  },
+  {
+    "key": "cellpose_sam.tile_norm_blocksize",
+    "title": "tile_norm_blocksize",
+    "step": "segmentation",
+    "category": null,
+    "type": "float",
+    "default": 0.0,
+    "choices": null,
+    "description": "BEHAV3D parameter 'cellpose_sam.tile_norm_blocksize' (type float, default 0.0)."
+  },
+  {
+    "key": "cellpose_sam.tile_norm_smooth3D",
+    "title": "tile_norm_smooth3D",
+    "step": "segmentation",
+    "category": null,
+    "type": "float",
+    "default": 0.0,
+    "choices": null,
+    "description": "BEHAV3D parameter 'cellpose_sam.tile_norm_smooth3D' (type float, default 0.0)."
+  },
+  {
+    "key": "cellpose_sam.invert",
+    "title": "invert",
+    "step": "segmentation",
+    "category": null,
+    "type": "bool",
+    "default": false,
+    "choices": null,
+    "description": "BEHAV3D parameter 'cellpose_sam.invert' (type bool, default False)."
+  },
+  {
+    "key": "cellpose_sam.drop_2d_segments",
+    "title": "drop_2d_segments",
+    "step": "segmentation",
+    "category": null,
+    "type": "bool",
+    "default": true,
+    "choices": null,
+    "description": "Remove flat single-slice fragments after Cellpose-SAM. Keep enabled unless real objects genuinely occupy one slice."
+  },
+  {
+    "key": "cellpose_sam.size_filter",
+    "title": "size_filter",
+    "step": "segmentation",
+    "category": null,
+    "type": "dict",
+    "default": {},
+    "choices": null,
+    "description": "BEHAV3D parameter 'cellpose_sam.size_filter' (type dict, default {})."
+  },
+  {
+    "key": "cellpose_sam.channel_selection",
+    "title": "channel_selection",
+    "step": "segmentation",
+    "category": null,
+    "type": "dict",
+    "default": {},
+    "choices": null,
+    "description": "BEHAV3D parameter 'cellpose_sam.channel_selection' (type dict, default {})."
+  },
+  {
     "key": "tracking.track_organoids_together",
     "title": "track_organoids_together",
     "step": "tracking",
@@ -364,9 +674,10 @@
       "lap",
       "btrack",
       "propagation",
+      "reporter_propagation",
       "propagation_all_organoids"
     ],
-    "description": "Tracking algorithm: 'trackpy' (linking by proximity), 'lap' (linear assignment with gap-closing), 'btrack' (Bayesian, best for crowded/dividing cells), or 'propagation' (label propagation for organoids)."
+    "description": "Tracking algorithm. Use btrack routinely for motile cells, propagation for slow overlapping non-dividing objects, and reporter propagation for static objects with intermittent fluorescence. LAP and TrackPy are alternatives without an identified routine advantage."
   },
   {
     "key": "tracking.all_organoids.overwrite",
@@ -390,9 +701,10 @@
       "lap",
       "btrack",
       "propagation",
+      "reporter_propagation",
       "propagation_all_organoids"
     ],
-    "description": "Tracking algorithm: 'trackpy' (linking by proximity), 'lap' (linear assignment with gap-closing), 'btrack' (Bayesian, best for crowded/dividing cells), or 'propagation' (label propagation for organoids)."
+    "description": "Tracking algorithm. Use btrack routinely for motile cells, propagation for slow overlapping non-dividing objects, and reporter propagation for static objects with intermittent fluorescence. LAP and TrackPy are alternatives without an identified routine advantage."
   },
   {
     "key": "tracking.immune.overwrite",
@@ -558,7 +870,7 @@
     "type": "int",
     "default": 100,
     "choices": null,
-    "description": "btrack optimiser batch/step size; larger trades memory for speed."
+    "description": "btrack processing chunk size. Leave it unchanged unless tracking runs out of memory; lower it to reduce RAM at the cost of more stitching overhead."
   },
   {
     "key": "tracking.immune.btrack.n_workers",
@@ -627,9 +939,10 @@
       "lap",
       "btrack",
       "propagation",
+      "reporter_propagation",
       "propagation_all_organoids"
     ],
-    "description": "Tracking algorithm: 'trackpy' (linking by proximity), 'lap' (linear assignment with gap-closing), 'btrack' (Bayesian, best for crowded/dividing cells), or 'propagation' (label propagation for organoids)."
+    "description": "Tracking algorithm. Use btrack routinely for motile cells, propagation for slow overlapping non-dividing objects, and reporter propagation for static objects with intermittent fluorescence. LAP and TrackPy are alternatives without an identified routine advantage."
   },
   {
     "key": "tracking.other.overwrite",
@@ -795,7 +1108,7 @@
     "type": "int",
     "default": 100,
     "choices": null,
-    "description": "btrack optimiser batch/step size; larger trades memory for speed."
+    "description": "btrack processing chunk size. Leave it unchanged unless tracking runs out of memory; lower it to reduce RAM at the cost of more stitching overhead."
   },
   {
     "key": "tracking.other.btrack.n_workers",
@@ -864,9 +1177,10 @@
       "lap",
       "btrack",
       "propagation",
+      "reporter_propagation",
       "propagation_all_organoids"
     ],
-    "description": "Tracking algorithm: 'trackpy' (linking by proximity), 'lap' (linear assignment with gap-closing), 'btrack' (Bayesian, best for crowded/dividing cells), or 'propagation' (label propagation for organoids)."
+    "description": "Tracking algorithm. Use btrack routinely for motile cells, propagation for slow overlapping non-dividing objects, and reporter propagation for static objects with intermittent fluorescence. LAP and TrackPy are alternatives without an identified routine advantage."
   },
   {
     "key": "tracking.organoid.overwrite",
@@ -1032,7 +1346,7 @@
     "type": "int",
     "default": 100,
     "choices": null,
-    "description": "btrack optimiser batch/step size; larger trades memory for speed."
+    "description": "btrack processing chunk size. Leave it unchanged unless tracking runs out of memory; lower it to reduce RAM at the cost of more stitching overhead."
   },
   {
     "key": "tracking.organoid.btrack.n_workers",
@@ -1175,7 +1489,7 @@
     "type": "int",
     "default": 0,
     "choices": null,
-    "description": "Distance (pixels) within which two cells count as in contact. 0 = touching only."
+    "description": "Distance within which two cells count as interacting. 0 requires strict mask touching; larger values count proximity. Changing it requires feature extraction to be run again."
   },
   {
     "key": "features.immune.n_workers",
@@ -1219,7 +1533,7 @@
     "type": "int",
     "default": 0,
     "choices": null,
-    "description": "Distance (pixels) within which two cells count as in contact. 0 = touching only."
+    "description": "Distance within which two cells count as interacting. 0 requires strict mask touching; larger values count proximity. Changing it requires feature extraction to be run again."
   },
   {
     "key": "features.organoid.n_workers",
@@ -1263,7 +1577,7 @@
     "type": "int",
     "default": 0,
     "choices": null,
-    "description": "Distance (pixels) within which two cells count as in contact. 0 = touching only."
+    "description": "Distance within which two cells count as interacting. 0 requires strict mask touching; larger values count proximity. Changing it requires feature extraction to be run again."
   },
   {
     "key": "features.other.n_workers",
@@ -1313,7 +1627,7 @@
     "type": "int",
     "default": 0,
     "choices": null,
-    "description": "Discard tracks shorter than this many frames."
+    "description": "Optionally discard tracks shorter than this many timepoints. State analysis supports unequal lengths, but removing short tracks can reduce noise and computation."
   },
   {
     "key": "track_filtering.immune.min_track_length_enabled",
@@ -1333,7 +1647,7 @@
     "type": "int",
     "default": 999999,
     "choices": null,
-    "description": "Discard tracks longer than this many frames."
+    "description": "Trim retained tracks to this common length for analyses that require uniform trajectory windows."
   },
   {
     "key": "track_filtering.immune.max_track_length_enabled",
@@ -1383,7 +1697,7 @@
     "type": "int",
     "default": 50,
     "choices": null,
-    "description": "Discard tracks shorter than this many frames."
+    "description": "Optionally discard tracks shorter than this many timepoints. State analysis supports unequal lengths, but removing short tracks can reduce noise and computation."
   },
   {
     "key": "track_filtering.organoid.max_track_length_enabled",
@@ -1403,7 +1717,7 @@
     "type": "int",
     "default": 999999,
     "choices": null,
-    "description": "Discard tracks longer than this many frames."
+    "description": "Trim retained tracks to this common length for analyses that require uniform trajectory windows."
   },
   {
     "key": "track_filtering.other.exp_duration",
@@ -1433,7 +1747,7 @@
     "type": "int",
     "default": 0,
     "choices": null,
-    "description": "Discard tracks shorter than this many frames."
+    "description": "Optionally discard tracks shorter than this many timepoints. State analysis supports unequal lengths, but removing short tracks can reduce noise and computation."
   },
   {
     "key": "track_filtering.other.min_track_length_enabled",
@@ -1453,7 +1767,7 @@
     "type": "int",
     "default": 999999,
     "choices": null,
-    "description": "Discard tracks longer than this many frames."
+    "description": "Trim retained tracks to this common length for analyses that require uniform trajectory windows."
   },
   {
     "key": "track_filtering.other.max_track_length_enabled",
@@ -1533,7 +1847,7 @@
     "type": "int",
     "default": 1,
     "choices": null,
-    "description": "Discard tracks shorter than this many frames."
+    "description": "Optionally discard tracks shorter than this many timepoints. State analysis supports unequal lengths, but removing short tracks can reduce noise and computation."
   },
   {
     "key": "analysis.immune.max_track_length_enabled",
@@ -1553,7 +1867,7 @@
     "type": "int",
     "default": 999999,
     "choices": null,
-    "description": "Discard tracks longer than this many frames."
+    "description": "Trim retained tracks to this common length for analyses that require uniform trajectory windows."
   },
   {
     "key": "analysis.immune.feature_dtw_napari_backprojection_workers",
@@ -1713,7 +2027,7 @@
     "type": "int",
     "default": 1,
     "choices": null,
-    "description": "Discard tracks shorter than this many frames."
+    "description": "Optionally discard tracks shorter than this many timepoints. State analysis supports unequal lengths, but removing short tracks can reduce noise and computation."
   },
   {
     "key": "analysis.organoid.max_track_length_enabled",
@@ -1733,7 +2047,7 @@
     "type": "int",
     "default": 999999,
     "choices": null,
-    "description": "Discard tracks longer than this many frames."
+    "description": "Trim retained tracks to this common length for analyses that require uniform trajectory windows."
   },
   {
     "key": "analysis.organoid.feature_dtw_napari_backprojection_workers",
@@ -1893,7 +2207,7 @@
     "type": "int",
     "default": 1,
     "choices": null,
-    "description": "Discard tracks shorter than this many frames."
+    "description": "Optionally discard tracks shorter than this many timepoints. State analysis supports unequal lengths, but removing short tracks can reduce noise and computation."
   },
   {
     "key": "analysis.other.max_track_length_enabled",
@@ -1913,7 +2227,7 @@
     "type": "int",
     "default": 999999,
     "choices": null,
-    "description": "Discard tracks longer than this many frames."
+    "description": "Trim retained tracks to this common length for analyses that require uniform trajectory windows."
   },
   {
     "key": "analysis.other.feature_dtw_napari_backprojection_workers",
@@ -2118,7 +2432,7 @@
     "type": "int",
     "default": 5,
     "choices": null,
-    "description": "Frames over which a death-signal increase is assessed for active killing."
+    "description": "Timepoints counted forward from contact in which a death-signal increase is assessed. Choose it from the expected biological delay and imaging cadence."
   },
   {
     "key": "active_killing.death_signal_column",
@@ -2131,7 +2445,7 @@
       "percentage_dead_mask",
       "mean_dead_dye"
     ],
-    "description": "Feature column used as the death/viability signal."
+    "description": "Death or reporter signal. Dead-mask pixel count with an absolute threshold is the general default; percentage assumes comparable target sizes, and mean intensity suits diffuse reporters."
   },
   {
     "key": "active_killing.killing_threshold_multiplier",
@@ -2141,7 +2455,7 @@
     "type": "float",
     "default": 1.5,
     "choices": null,
-    "description": "Multiplier over baseline death signal that flags an active-killing event."
+    "description": "Relative increase over the target's own baseline. Reserve it for a single target line or heterogeneous within-well baselines; it can bias comparisons across target lines."
   },
   {
     "key": "active_killing.min_contact_duration",
@@ -2151,7 +2465,7 @@
     "type": "int",
     "default": 1,
     "choices": null,
-    "description": "Minimum frames of immune\u2013target contact required to call active killing."
+    "description": "Minimum effector-target contact timepoints required for active killing. Choose it from biological plausibility and acquisition cadence."
   },
   {
     "key": "active_killing.use_absolute_threshold",
@@ -2171,7 +2485,7 @@
     "type": "none",
     "default": null,
     "choices": null,
-    "description": "BEHAV3D parameter 'active_killing.absolute_killing_threshold' (type none, default None)."
+    "description": "Fixed signal increase used for active killing. Calibrate a dead-pixel threshold from cell diameter and XY pixel size, then validate visually."
   },
   {
     "key": "active_killing.save_results",
@@ -2221,7 +2535,7 @@
     "type": "str",
     "default": "fixed",
     "choices": null,
-    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.hmm_n_states_mode' (type str, default 'fixed')."
+    "description": "Use a fixed HMM state count for routine analysis; automatic selection has not performed well."
   },
   {
     "key": "behavioral_state_classification.defaults.hmm_n_states",
@@ -2331,7 +2645,7 @@
     "type": "int",
     "default": 5,
     "choices": null,
-    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.hmm_feature_smoothing_window' (type int, default 5)."
+    "description": "Feature smoothing window. Usually match the rolling feature window; use 1 for true single-frame events."
   },
   {
     "key": "behavioral_state_classification.defaults.hmm_smoothing_min_periods",
@@ -2351,7 +2665,7 @@
     "type": "int",
     "default": 1,
     "choices": null,
-    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.hmm_start_offset' (type int, default 1)."
+    "description": "Initial timepoints skipped before HMM assignment. Keep at 1 because first-frame speed is undefined."
   },
   {
     "key": "behavioral_state_classification.defaults.hmm_start_offset_fill_mode",
@@ -2406,7 +2720,7 @@
       "net_displacement"
     ],
     "choices": null,
-    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.hmm_log_scale_features' (type list, default ['speed', 'net_displacement'])."
+    "description": "Features selectively log-transformed after inspecting a strongly right-skewed non-negative distribution; do not apply blanket log scaling."
   },
   {
     "key": "behavioral_state_classification.defaults.feature_quantile_capping_low_percentile",
@@ -2416,7 +2730,7 @@
     "type": "str",
     "default": "",
     "choices": null,
-    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.feature_quantile_capping_low_percentile' (type str, default '')."
+    "description": "Optional lower percentile clipping. Not recommended routinely because clipping has degraded HMM results."
   },
   {
     "key": "behavioral_state_classification.defaults.feature_quantile_capping_high_percentile",
@@ -2426,7 +2740,7 @@
     "type": "str",
     "default": "",
     "choices": null,
-    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.feature_quantile_capping_high_percentile' (type str, default '')."
+    "description": "Optional upper percentile clipping. Not recommended routinely because clipping has degraded HMM results."
   },
   {
     "key": "behavioral_state_classification.defaults.apply_hmm_deployment_artifact_path",
@@ -2467,7 +2781,7 @@
       "is_active_killing"
     ],
     "choices": null,
-    "description": "BEHAV3D parameter 'behavioral_state_classification.defaults.binary_features_to_group' (type list, default ['any_immune_cell_contact', 'any_organoid_contact', 'dead', 'is_active_killing'])."
+    "description": "Binary event features applied after HMM fitting to split motion states; they are not inputs to the HMM."
   },
   {
     "key": "behavioral_state_classification.defaults.random_state",
@@ -2487,7 +2801,7 @@
     "type": "int",
     "default": 100,
     "choices": null,
-    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.behavioral_trajectory_size' (type int, default 100)."
+    "description": "Trajectory window size for clustering; it cannot exceed the track trim length set in Filtering."
   },
   {
     "key": "behavioral_track_classification.defaults.n_clusters",
@@ -2527,7 +2841,7 @@
     "type": "str",
     "default": "last",
     "choices": null,
-    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.trajectory_trim_mode' (type str, default 'last')."
+    "description": "Whether trajectory clustering keeps the first or last requested timepoints. This duplicates optional trimming in Filtering."
   },
   {
     "key": "behavioral_track_classification.defaults.linkage",
@@ -2537,7 +2851,7 @@
     "type": "str",
     "default": "average",
     "choices": null,
-    "description": "BEHAV3D parameter 'behavioral_track_classification.defaults.linkage' (type str, default 'average')."
+    "description": "Agglomerative linkage for trajectory clustering. Average is the default, Complete is a reasonable comparison, and Single performs poorly."
   },
   {
     "key": "behavioral_track_classification.defaults.missing_policy",
