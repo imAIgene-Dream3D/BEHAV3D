@@ -2,13 +2,7 @@
 
 Propagation tracking is **not** a centroid-distance method. For each consecutive pair of frames `t → t+1` it propagates the labels of frame `t` into frame `t+1` segmentation mask (watershed-based overlap tracking). 
 
-## When to use it
-
-- The objects move **slowly relative to their size** — the same physical object substantially overlaps itself from one frame to the next.
-- Cells almost never disappear or reappear.
-- You want maximally stable IDs across time.
-
-This is the default — and recommended — method for **organoids** in BEHAV3D EXPLORER.
+Because linking is by spatial overlap, the method relies on each object substantially overlapping itself between consecutive frames (a 2-pixel dilation absorbs small drifts). Per the reference workflow it is the default and recommended method for **organoids** (see [Tracking overview](index)).
 
 ## Parameters
 
@@ -60,7 +54,7 @@ There are no parameters to change. Tuning Propagation means **improving the segm
 **Two organoids that briefly touch end up sharing a track ID**
 
 - Cause: when two distinct foreground regions merge in one frame, the watershed assigns the merged blob to one parent ID and that ID propagates from then on.
-- Fix: re-segment with stricter splitting (lower EDT threshold, peak-EDT strategy in APOC) so the two organoids stay separated in the binary mask.
+- Fix: re-segment with stricter splitting (lower EDT threshold) so the two organoids stay separated in the binary mask.
 
 **You used `all_organoids` but needed fully separate tracking logic**
 

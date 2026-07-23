@@ -51,15 +51,7 @@ Select your target(s) **first**. The interaction-cell list only becomes meaningf
 
 Quantifies the death progression of the selected target population(s) over time, using the sticky `dead` flag and the dead-mask signal computed during Feature Extraction.
 
-The headline curve is the **percentage of dead targets at each timepoint**, and the death-signal traces are **baseline-normalised** (shifted so each starts at 0) so an already-dead baseline doesn't skew the trend:
-
-$$
-\%\text{dead}(t) = 100 \times \frac{\#\{\text{targets flagged dead at } t\}}{\#\{\text{tracked targets}\}}
-\qquad
-\Delta D(t) = D(t) - D(t_0)
-$$
-
-where $D$ is the dead-mask signal (`percentage_dead_mask` or `nr_dead_mask_pixels`) and $t_0$ is the track's first timepoint.
+The headline curve is the **percentage of dead targets at each timepoint** — the number of targets flagged dead at that timepoint, out of the targets tracked at the first timepoint. The death-signal traces (`percentage_dead_mask` or `nr_dead_mask_pixels`) are **baseline-normalised** — shifted so each starts at 0 at the track's first timepoint — so an already-dead baseline doesn't skew the trend.
 
 | Button | What it does | Enabled when |
 |---|---|---|
@@ -107,27 +99,39 @@ Relates target–effector contacts to target death and effector engagement. Unli
 | Button | What it does | Enabled when |
 |---|---|---|
 | **▶ Run Interaction Analysis (per target)** | For each selected target, analyses its interactions with each selected effector. | ≥ 1 target **and** ≥ 1 effector selected. |
-| **▶ Run Combined Interaction Comparison (≥2 targets)** | Compares interaction behaviour across targets. | ≥ 2 targets **and** ≥ 1 effector selected. |
+| **▶ Run Interaction Overview** | Produces the cumulative-contacts violin, the cumulative-to-death curves, and the active-killing dashboard across the selected target(s). Works with one or more targets. | ≥ 1 target **and** ≥ 1 effector selected. |
 
 ```{note}
 When **no dead channel** is configured, Interaction Analysis still runs, but the following are skipped automatically:
 
 - Alive-vs-dead comparison panels (overall and per-sample)
 - Fate-based statistics (how many targets survive vs die, and their contact counts)
-- Cumulative-to-death curves (Combined run)
-- The active-killing dashboard (Combined run)
+- Cumulative-to-death curves (Interaction Overview)
+- The active-killing dashboard (Interaction Overview)
 ```
 
-### Advanced settings (Interaction Analysis)
+### Interaction settings (two collapsible panels)
 
-A collapsible section with two controls that apply to the **Combined Interaction Comparison**:
+Interaction Analysis has **two** collapsible settings panels — one per run — and their controls affect **different plots**. Both are collapsed by default and are saved to `behav3d_parameters.yml` when you run the corresponding step.
 
-| Control | Default | Meaning | When to change |
+**Per-target settings** — apply to **▶ Run Interaction Analysis (per target)**:
+
+| Control | Default | What it does |
+|---|---|---|
+| **Group overall plots by immune line condition** | off | Splits the two per-target overall plots by the interacting immune cell's line condition (`im_{type}_line_condition`): the cumulative-contact curve draws one line per condition and the alive-vs-dead bar plot colours bars by condition. Only affects the per-target overall plots. |
+
+**Interaction Overview settings** — apply to **▶ Run Interaction Overview** (the violin of cumulative contacts per organoid, the cumulative-to-death curves, and the active-killing dashboard):
+
+| Control | Default | Applies to | What it does |
 |---|---|---|---|
-| **Time window before TOD** | 60 min | Look-back window before each target's **Time of Death** used to attribute interactions to that death. | Shorten it if you only want contacts immediately preceding death; lengthen it for slower killing kinetics. |
-| **Combined group by** | By target (organoid) type | Whether combined plots are grouped **by target type** or **by treatment** (the effector / immune cell condition). | Switch to *By treatment* when your comparison of interest is across experimental conditions rather than across target types. |
+| **Before-death window** | 60 min | the **cumulative-to-death curve only** | Look-back window, in minutes before each target's Time of Death. Requires death classification. |
+| **Temporal Range** — *All timepoints* / *Custom time range* → Start T – End T | All timepoints | the **cumulative-interactions-per-organoid** and **active-killing** plots | Restricts those plots to a timepoint window. *Custom time range* enables the Start T / End T spinboxes (0-indexed timepoints; defaults 0 and 100). |
+| **Annotate by immune line condition** | off | the violin and the active-killing dashboard | Adds the immune line condition as a hue / line-style annotation within the chosen *Group by* grouping, instead of pooling all conditions. Does not affect the cumulative-to-death curve. |
+| **Group by** | By target (organoid) type | violin, cumulative-to-death curve, active-killing dashboard | Sets the x-axis grouping. *By target (organoid) type* keeps each organoid type as its own group; *By treatment (immune cell)* pools all organoid types and groups by the interacting immune cell type instead. |
 
-These two settings are saved to `behav3d_parameters.yml` when you run the combined comparison, so they persist between sessions.
+```{note}
+The **Before-death window** and the **Temporal Range** are two separate controls for two separate sets of plots: the window only sets how far back before each death the **cumulative-to-death** curve looks, whereas the Temporal Range restricts the timepoints used by the **cumulative-interactions-per-organoid** and **active-killing** plots.
+```
 
 ### Interaction outputs
 
@@ -176,7 +180,11 @@ The analysis produces three views:
 - **Per-movie summary** — the chosen over-time curve collapsed to one dot per movie using the summary stat.
 
 ```{note}
-**mean vs. AUC for the per-movie summary.** `mean` is the plain average of the per-timepoint values; **AUC** is the area under the per-timepoint curve normalized by the time span (a trapezoidal integral ÷ duration), which keeps it on the same 0–100 scale but weights *sustained* engagement over brief spikes. Both the per-timepoint trace and a per-movie summary are usually worth reporting together.
+The **Per-movie summary stat** collapses each movie's over-time curve to a single dot per movie:
+- **mean** — average of the per-timepoint values.
+- **median** — the middle per-timepoint value.
+- **max** — the highest per-timepoint value reached.
+- **AUC** — the area under the curve normalized by its duration (a time-weighted average, on the same scale as the curve).
 ```
 
 Buttons mirror the other steps: **▶ Run Invasiveness Analysis**, **+🛒** to queue, and **👁** to reopen the result PDF.
@@ -187,7 +195,7 @@ Written under `<output_dir>/analysis/<immune_type>/invasiveness_analysis/`:
 
 | File | Contents |
 |---|---|
-| `BEHAV3D_<immune_type>_invasiveness_analysis.pdf` | All the figures: the **fraction-invasive-over-time** curve, the **mean/median surface-contact-% over time** curve, the **per-movie summary** (one dot per movie, using the chosen stat), and — if organoid targets with death data are selected — **fate violins** comparing contact-% / invasive-cell counts on organoids that died vs. survived. |
+| `invasiveness_analysis_<immune_type>.pdf` | All the figures: the **fraction-invasive-over-time** curve, the **mean/median surface-contact-% over time** curve, the **per-movie summary** (one dot per movie, using the chosen stat), and — if organoid targets with death data are selected — **fate violins** comparing contact-% / invasive-cell counts on organoids that died vs. survived. |
 | `invasiveness_fraction_over_time_<immune_type>.csv` | The per-timepoint fraction of invasive cells (the boolean-≥50 % curve), per sample / target. |
 | `invasiveness_perc_over_time_<immune_type>.csv` | The per-timepoint mean/median surface-contact percentage. |
 | `invasiveness_per_movie_summary_<immune_type>.csv` | One row per movie: the over-time curve collapsed with the chosen summary stat. |

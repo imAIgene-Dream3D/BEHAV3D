@@ -67,9 +67,9 @@ When at least one `*_tracked.zarr` layer is present, the **Manual Edition** grou
 If you have unsaved manual edits and try to switch to another tab, BEHAV3D EXPLORER pops a "Save / Discard / Cancel" dialog. Don't ignore the dialog or you'll lose work.
 ```
 
-## When to use it
+## What to inspect after each step
 
-| After this step… | …open Visualization to check |
+| After this step… | …what the tab lets you check |
 |---|---|
 | Data Preparation (zarr conversion) | Did the raw zarr open correctly? Are the channels in the right order? |
 | Segmentation | Are masks tight to the cell boundaries? Any background bleed? Any cells split into pieces? |

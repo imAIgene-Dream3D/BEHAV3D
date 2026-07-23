@@ -73,7 +73,7 @@ Each sub-tab exposes the following spinboxes:
 | Control | Default | Range | Units | Meaning |
 |---|---|---|---|---|
 | **Contact Threshold** | 0.0 | 0.0 – 500.0 | µm | Maximum distance between two cells to be counted as "in contact" (used for distance-based contact columns and `touching_*`). Pixel contact is fixed at one-voxel-diagonal (≈ 1.73 px). Visible only when Contact is checked. |
-| **Dead mask % threshold** | 0.1 | 0.0 – 100.0 | fraction (0–1) | Minimum fraction of the cell's voxels that must overlap the dead mask before the cell is flagged as dead. The value is compared **directly** to `percentage_dead_mask` (a 0–1 fraction), so `0.1` means ≈ 10 % of the mask. Set to **0** to skip dead classification entirely. |
+| **Dead mask % threshold** | 10 % (stored as 0.1) | 0 – 100 % | percent shown, fraction stored | Minimum share of the cell's voxels that must overlap the dead mask before the cell is flagged as dead. The spinbox is shown as a **percentage** (default 10 %), but the value is saved to `behav3d_parameters.yml` and compared as a **0–1 fraction** — 10 % is stored and compared as `0.1`, directly against `percentage_dead_mask` (itself a 0–1 fraction). Set to **0** to skip dead classification entirely. |
 | **Preview sample** | first sample | dropdown | — | Sample used by the dead-threshold preview button. |
 | **Workers** | balanced default | 1 – (CPU cores − 1) | cores | Parallel workers for image-based computations (morphology / intensity / contact / dead mask). |
 
@@ -129,25 +129,35 @@ If yes (and contact lasted long enough), the whole observed contact duration is 
 
 #### The killing rule (how it is computed)
 
-For each sample, the **background death rate** is the mean, over all target (organoid) tracks, of the death-signal change per timepoint:
+Each touched organoid is judged **only against its own death signal**, anchored at the timepoint the contact **started** ($t_c$) — there is no background death rate and no averaging across organoids or across the sample. Let $W$ be the observation window and $D$ the chosen death-signal column. For one touched organoid:
 
 $$
-r_{\text{bg}} = \operatorname{mean}_{\text{tracks}} \frac{D_{\text{final}} - D_{\text{initial}}}{\text{track duration}}
-$$
-
-where $D$ is the chosen death-signal column. At a contact timepoint $t$, the **observed increase** over the observation window $W$ on the touched organoid is $\Delta D = D(t+W) - D(t)$, and the **expected** background increase is $r_{\text{bg}} \cdot W$. The timepoint is flagged as active killing when the observed increase beats the threshold:
-
-$$
-\Delta D > \theta
+D_{\text{start}} = D(t_c)
 \qquad
+D_{\text{end}} = D(t_c + W)
+\qquad
+\Delta D = D_{\text{end}} - D_{\text{start}}
+$$
+
+If the track ends before $t_c + W$, $D_{\text{end}}$ is read at the organoid's last available timepoint. The increase $\Delta D$ is compared to a threshold $\theta$ set by the mode:
+
+$$
 \theta =
 \begin{cases}
-\theta_{\text{abs}} & \text{absolute-threshold mode} \\
-r_{\text{bg}} \cdot W \cdot m & \text{multiplier mode (multiplier } m\text{)}
+\theta_{\text{abs}} & \text{(absolute mode)} \\[4pt]
+D_{\text{start}} \times (m - 1) & \text{(multiplier mode)}
 \end{cases}
 $$
 
-and the contact has lasted at least the **minimum contact duration**. The reported `killing_efficiency` is how far the observed increase exceeds background, $\ \Delta D / (r_{\text{bg}} \cdot W)$.
+Multiplier mode is therefore equivalent to requiring $D_{\text{end}} \ge D_{\text{start}} \times m$ — the signal must grow to at least $m\times$ its value at contact start. A baseline of exactly $D_{\text{start}} = 0$ is replaced by $0.1$ so the threshold isn't trivially zero. The organoid is flagged as killed when
+
+$$
+\Delta D > \theta
+\qquad\text{with}\qquad
+\text{killing\_efficiency} = \frac{\Delta D}{\theta}
+$$
+
+Every touched organoid is scored this way, and the one with the **highest** `killing_efficiency` is reported as the event's target (`targeted_track_id`, set only when it is actually flagged as killed). That single per-event verdict is then written onto **every** timepoint of the observed contact, and the event is only counted once the contact has lasted at least the **minimum contact duration**.
 
 ### Parameters
 
@@ -258,9 +268,10 @@ $$
 $$
 
 $$
-\text{cumulative\_displacement}(t) = \sum_{i \le t} \lVert \mathbf{s}(i) \rVert
-\qquad
-\text{displacement\_from\_origin}(t) = \lVert \mathbf{p}(t) - \mathbf{p}(0) \rVert
+\begin{aligned}
+\text{cumulative\_displacement}(t) &= \sum_{i \le t} \lVert \mathbf{s}(i) \rVert \\[4pt]
+\text{displacement\_from\_origin}(t) &= \lVert \mathbf{p}(t) - \mathbf{p}(0) \rVert
+\end{aligned}
 $$
 
 The **mean square displacement** at timepoint $t$ averages the squared distance from the current position to *every* position up to and including $t$:
@@ -325,11 +336,11 @@ When Morphology is **unchecked**, only the cheap `nr_pixels` and `volume` column
 Let $V$ be the object's physical volume and $A$ its surface area. **Surface area** is measured directly from the voxelised mask by counting the exposed faces (each internal face between a foreground and a background voxel), weighted by the physical area of that face — not a smoothed mesh. **Sphericity** compares the object's surface area to that of a sphere of equal volume:
 
 $$
-\Psi = \frac{\pi^{1/3}\,(6V)^{2/3}}{A}
-\qquad
-\text{surface\_to\_volume\_ratio} = \frac{A}{V}
-\qquad
-\text{equivalent\_diameter} = \left(\frac{6V}{\pi}\right)^{1/3}
+\begin{aligned}
+\Psi &= \frac{\pi^{1/3}\,(6V)^{2/3}}{A} \\[4pt]
+\text{surface\_to\_volume\_ratio} &= \frac{A}{V} \\[4pt]
+\text{equivalent\_diameter} &= \left(\frac{6V}{\pi}\right)^{1/3}
+\end{aligned}
 $$
 
 $\Psi = 1$ for a perfect sphere and decreases as the object becomes more irregular or elongated.
@@ -337,13 +348,10 @@ $\Psi = 1$ for a perfect sphere and decreases as the object becomes more irregul
 The three **principal axes** ($a \ge b \ge c$ = `axis1` ≥ `axis2` ≥ `axis3`) come from a principal-component analysis of the mask's voxel coordinates in physical units. The shape descriptors are then:
 
 $$
-\text{elongation} = \frac{a}{b}
-\qquad
-\text{oblateness} = 1 - \frac{c}{a}
-\qquad
-\text{prolateness} = 1 - \frac{b}{a}
-\qquad
-\text{extent} = \frac{V}{a\,b\,c}
+\begin{aligned}
+\text{elongation} &= \frac{a}{b} & \qquad \text{oblateness} &= 1 - \frac{c}{a} \\[4pt]
+\text{prolateness} &= 1 - \frac{b}{a} & \qquad \text{extent} &= \frac{V}{a\,b\,c}
+\end{aligned}
 $$
 
 **Solidity** ($V / V_{\text{convex}}$) measures how much of the object's convex hull it actually fills — low solidity flags protrusions or concavities.
@@ -380,8 +388,10 @@ When checked (and Contact is also on), for each organoid type `{org}`:
 This is a **surface-contact fraction**, not a strict "immune voxels inside organoid volume" check — it measures how much of the immune cell's boundary is wrapped by organoid tissue:
 
 $$
-\text{invasiveness\_perc} = 100 \times \frac{\#\{\text{immune surface voxels within Contact Threshold of the organoid}\}}{\#\{\text{immune surface voxels}\}}
-\qquad
+\text{invasiveness\_perc} = 100 \times \frac{\#\{\text{immune surface voxels contacting the organoid}\}}{\#\{\text{immune surface voxels}\}}
+$$
+
+$$
 \text{invasive} = \big(\text{invasiveness\_perc} \ge 50\%\big)
 $$
 
@@ -401,7 +411,9 @@ where "surface voxels" are the immune cell's boundary shell (within ~2 µm of it
 
 $$
 \text{percentage\_dead\_mask} = \frac{\#\{\text{cell voxels overlapping the dead mask}\}}{\#\{\text{cell voxels}\}}
-\qquad
+$$
+
+$$
 \text{nr\_dead\_mask\_pixels} = \text{nr\_pixels} \times \text{percentage\_dead\_mask}
 $$
 

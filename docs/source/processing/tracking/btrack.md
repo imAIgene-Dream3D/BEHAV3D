@@ -1,16 +1,15 @@
 # 🧠 btrack (Bayesian)
 
-[btrack](https://github.com/quantumjot/btrack) is a Bayesian multi-object tracker with a Kalman-filter motion model and an optional global hypothesis optimiser. It is the right tool when you want:
+[btrack](https://btrack.readthedocs.io/) is a Bayesian multi-object tracker. Its
+**motion model** is *"used to make forward predictions about the location of objects
+using historical information and estimates of the error in the measurements"*, and
+its **hypothesis model** is *"used by the global optimizer to build the final set of
+tracks"* ([btrack documentation](https://btrack.readthedocs.io/en/stable/user_guide/configuration.html)).
 
-- A motion model — Kalman-filter predictions from position and velocity.
-- Explicit modelling of **track initialization / termination / branching / cell death / merging** via global hypotheses.
-- Better accuracy than greedy linkers at the cost of more parameters to tune.
-
-## When to use it
-
-- Immune cells or other fast-moving cells.
-- Datasets with cell divisions (branching) or programmed cell death (`P_dead`).
-- Any motile cell type where you want a motion model and finer control over linking, gap-closing, division and death.
+In BEHAV3D EXPLORER, btrack runs on a cell type's per-timepoint segmentation in two
+phases: the Kalman-filter tracker (always) and the global hypothesis optimiser
+(optional). Per the reference workflow it is the tracker used in routine practice
+for immune / motile cells (see [Tracking overview](index)).
 
 ## Two-step workflow
 
@@ -38,9 +37,21 @@ Tune Step 1 first and **validate visually** before turning on Step 2.
 | Parameter | Default | Effect |
 |---|---|---|
 | **Enable global track optimization** | OFF | Master switch for Step 2. |
-| **Hypotheses** | `P_FP, P_init, P_term, P_link` | Which hypotheses the optimizer considers. `P_FP` is always required (and the checkbox is disabled in the UI). Additional opt-in hypotheses: `P_branch` (track branching — cell division), `P_dead` (cell death), `P_merge` (track merging). |
-| **Distance threshold** (`dist_thresh`) | 60 | Maximum distance (in your data's spatial units) between the **end of one tracklet and the start of another** for the optimizer to even consider linking them. If two fragments of the same real cell drift further apart than this while segmentation missed a few frames, they will not be reconnected — no matter how good the rest of the evidence looks. |
-| **Time threshold** (`time_thresh`) | 3 | Maximum number of frames a track can be **"missing"** before the optimizer will still consider re-linking it to a later tracklet. If a cell disappears for longer than this (out of focus, signal drops), the two fragments are treated as unrelated tracks rather than one interrupted track. |
+| **Hypotheses** | `P_FP, P_init, P_term, P_link` | Which hypotheses the optimizer considers (definitions below). `P_FP` is always required (the checkbox is disabled in the UI). `P_branch`, `P_dead` and `P_merge` are opt-in. |
+| **Distance threshold** (`dist_thresh`) | 60 | BEHAV3D's help text: *"Maximum distance for generating link/branch hypotheses in the optimizer"* (in the unit selected by the µm/px toggle). btrack's own documentation does not define this field in detail. |
+| **Time threshold** (`time_thresh`) | 3 | BEHAV3D's help text: *"Maximum frame gap for generating link hypotheses in the optimizer."* btrack's own documentation does not define this field in detail. |
+
+**Hypothesis definitions** (quoted from the [btrack documentation](https://btrack.readthedocs.io/en/stable/user_guide/configuration.html)):
+
+| Hypothesis | btrack definition |
+|---|---|
+| `P_FP` | "Hypothesis that a tracklet is a false positive detection." |
+| `P_init` | "Hypothesis that a tracklet starts at the beginning of the movie or edge of the FOV." |
+| `P_term` | "Hypothesis that a tracklet ends at the end of the movie or edge of the FOV." |
+| `P_link` | "Hypothesis that two tracklets should be linked together." |
+| `P_branch` | "Hypothesis that a tracklet can split onto two daughter tracklets." |
+| `P_dead` | "Hypothesis that a tracklet terminates without leaving the FOV." |
+| `P_merge` | "Hypothesis that two tracklets merge into one tracklet." |
 
 ```{tip}
 **Recommended workflow**: tune Step 1 only → preview → fix segmentation issues that surface → tune Step 1 again → only *then* enable Step 2 for refinement. Step 2 makes Step 1's mistakes much harder to diagnose, so debug Step 1 first.
@@ -79,9 +90,8 @@ After inspecting the result in the Visualization tab, identify the failure mode 
 - Cause: `Max search radius` is smaller than the fastest cell's single-frame displacement.
 - Fix: **raise `Max search radius`** until the fragmentation goes away.
 
-*Track IDs swap between neighbouring cells*
-- Cause: motion alone is not enough to disambiguate two crossing trajectories.
-- Fix: **enable `Use visual features`** so the Kalman filter also uses per-channel intensity statistics (mean and standard deviation) as a cue. Make sure `raw_image_path` is present in the metadata.
+*Adding an intensity cue*
+- **`Use visual features`** computes each cell's per-channel intensity mean and standard deviation and feeds them to the Kalman filter alongside the centroids. Requires `raw_image_path` in the metadata.
 
 *Step 1 is very slow / runs out of memory*
 - Cause: large cell counts per frame combined with EXACT update.
@@ -126,7 +136,7 @@ CSV columns: `TrackID, SegmentID, position_t, position_x/y/z, pixel_position_x/y
 
 - **Start with the `Cell` preset.** It is the bundled default and the one the lab tunes against. Switch to `Particle` only for genuinely small objects (bacteria, organelles).
 - **Use `EXACT` update unless tracking is too slow.** EXACT is the safer default; switch to `APPROXIMATE` once your cells-per-frame counts exceed a few hundred and runtime becomes a problem.
-- **`Use visual features` helps disambiguate identity swaps** when two cells cross paths and pure motion cues aren't enough. The metadata must provide `raw_image_path` for this to work.
+- **`Use visual features`** feeds each cell's per-channel intensity mean and standard deviation to the Kalman filter alongside the centroids. Requires `raw_image_path` in the metadata.
 - **Enable Step 2 only after Step 1 looks correct.** A poor Step 1 + Step 2 = mysterious failures that are very hard to diagnose. Build confidence in Step 1 first.
 - **`P_branch` is the right hypothesis for cell division.** Without it, mitosis events will be tracked as two unrelated tracks starting where the parent ended.
 - **Workers are capped at one less than your CPU core count.** btrack itself is serial; the workers parallelise per-timepoint feature extraction and zarr writing, not the tracker.

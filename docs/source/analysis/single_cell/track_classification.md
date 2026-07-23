@@ -34,11 +34,11 @@ flowchart TD
     H --> J[UMAP cluster CSVs + PDFs<br/>Steps 2–5 need categorical .h5ad]
 ```
 
-| Method | Use it when | Requires first | Full Steps 2–5 in the plugin? |
+| Method | What it does | Requires first | Full Steps 2–5 in the plugin? |
 |---|---|---|---|
-| **Categorical DTW** (default) | Normal analysis; you want interpretable trajectory types defined by behavioural *story* | [State Classification](state_classification.md) for this cell type | ✅ Yes |
-| **Original feature-based BEHAV3D DTW** (legacy) | Reproducing classic BEHAV3D results, or clustering on raw movement/contact dynamics before states exist | [Filtering](../filtering.md) (filtered track-features CSV) | ⚠ No — clustering only; rename/classify/plots/backprojection need the categorical `.h5ad` |
-| **Apply pretrained classifier** | Assigning the *same* clusters to a new, comparable dataset | A saved classifier `.pkl` + matching states `.h5ad` | Skips Steps 1–3 |
+| **Categorical DTW** (default) | Compares each track's sequence of behavioural-state labels | [State Classification](state_classification.md) for this cell type | ✅ Yes |
+| **Original feature-based BEHAV3D DTW** (legacy) | Clusters on raw movement/contact feature trajectories; reproduces the original BEHAV3D paper's track clustering | [Filtering](../filtering.md) (filtered track-features CSV) | ⚠ No — clustering only; rename/classify/plots/backprojection need the categorical `.h5ad` |
+| **Apply pretrained classifier** | Assigns a saved set of clusters to a new dataset | A saved classifier `.pkl` + matching states `.h5ad` | Skips Steps 1–3 |
 
 ```{note}
 **Applying a saved classifier instead of clustering.** The checkbox **Apply pretrained trajectory classifier** at the very top hides Steps 1–3 and shows a panel where you **Browse…** to a saved classifier (`.pkl`) and its matching state data (`.h5ad`; auto-filled if State Classification output exists for the cell type), then click **▶ Apply Pretrained Classifier**. Use this to reproduce the same trajectory clusters on a new dataset.

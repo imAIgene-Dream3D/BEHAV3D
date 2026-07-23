@@ -54,8 +54,8 @@ Per-sample fields:
   differ (name, image path, etc.).
 - **Save** the metadata CSV, then click **Load Metadata** to make the latest
   version active.
-- **Convert to Zarr** for fast access (e.g. CZI → Zarr): a worker count around 7
-  is a reasonable default; expect roughly 7–10 minutes per image.
+- **Convert to Zarr** for fast access (e.g. CZI → Zarr): set the worker count to
+  what your machine can comfortably handle.
 
 ## Visualization
 
@@ -156,8 +156,7 @@ Shared random-forest / instance settings:
 
 - Process **all time points**; set workers to what your machine can handle;
   overwrite existing results if re-running.
-- A full time series can take on the order of ~1.5 hours per image — run long jobs
-  overnight, plugged in.
+- A full time series can be slow — run long jobs overnight, plugged in.
 - Trained classifiers are saved in the `pixel_classification` subfolder and can be
   reused across experiments by copying that folder.
 
@@ -165,10 +164,10 @@ Shared random-forest / instance settings:
 
 - **Organoids — propagation:** select the organoid layer; the method auto-sets to
   propagation. It copies segmentation frame-to-frame, so there's nothing to tune.
-  It's the slower of the two (~5–10 min/sample).
+  It is the slower of the two methods.
 - **T cells — btrack:** select btrack, enable **global track optimization**, and
-  set workers around 4 on most laptops (keeps the machine usable). Typical
-  ~1–2 min/sample. Useful starting parameters:
+  set workers around 4 on most laptops (keeps the machine usable). Useful
+  starting parameters:
   - **Max search radius:** ~100 px (how far ahead to look for the next-frame
     candidate along the predicted trajectory).
   - **Distance threshold:** ~60 px (used to link tracklets during global
@@ -191,9 +190,8 @@ Shared random-forest / instance settings:
     so a few dead cells are a small volume fraction.
   - **T cells:** ~10 % (0.1). A binary is-dead flag is stored alongside the actual
     intensity and percentage, so you can re-tune later.
-- **Run Batch Extraction** covers all cell types in one pass (~5–10 min/sample).
-  Output lands in `track_data/` as per-track, per-time-point feature tables; files
-  can reach ~1 GB on dense data.
+- **Run Batch Extraction** covers all cell types in one pass. Output lands in
+  `track_data/` as per-track, per-time-point feature tables.
 
 **Active killing** — run *after* feature extraction (it relies on extracted
 features). It links organoid death to contacting T cells: for a T cell touching an
@@ -307,8 +305,8 @@ first, then merge and run feature extraction and analysis jointly.
 | Segmentation | Max depth / n_trees | 5 / 100 |
 | Segmentation | Foreground / seed threshold | 0.50 / 0.80 |
 | Segmentation | Min size (trained) | ~500–1000 px (organoids) |
-| Tracking | Organoid method | propagation (~5–10 min/sample) |
-| Tracking | T-cell method | btrack (~1–2 min/sample) |
+| Tracking | Organoid method | propagation |
+| Tracking | T-cell method | btrack |
 | Tracking | Global track optimization | Enabled |
 | Tracking | Workers | ~4 |
 | Tracking | Max search radius / distance threshold | ~100 px / ~60 px |
@@ -323,4 +321,4 @@ first, then merge and run feature extraction and analysis jointly.
 | Single-cell | Smoothing window | ~5 time points |
 | Data prep | Dim order | `TCZYX` |
 | Data prep | Time interval | ~120 s (use your real value) |
-| Data prep | Zarr conversion workers | ~7 |
+| Data prep | Zarr conversion workers | what your machine can handle |

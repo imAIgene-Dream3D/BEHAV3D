@@ -4,15 +4,15 @@ The Processing Queue is the collapsible panel at the bottom of the BEHAV3D EXPLO
 
 ![Processing Queue](../_static/screenshots/processing_queue.png)
 
-## Why it exists
+## What it does
 
-Running each step manually from its tab is fine for testing and checking. But once you've decided what to segment, track, feature-extract and filter across the whole experiment, the queue:
+The queue:
 
-- Bundles every step you need into one list.
+- Bundles every step you add into one list.
 - Snapshots the **parameters at add-time**, so changes you make in a tab after queueing don't affect the queued step.
-- Resolves **dependencies automatically**, if you queue *Filter* without having queued *Feature Extract*, it prompts to add it.
+- Resolves **dependencies automatically** — if you queue *Filter* without having queued *Feature Extract*, it prompts to add it.
 - Sorts steps by their canonical pipeline order before running.
-- Reports progress and elapsed time per step, and surfaces errors clearly.
+- Reports progress and elapsed time per step, and surfaces errors.
 
 ## Step types
 
