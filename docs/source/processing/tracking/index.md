@@ -50,7 +50,7 @@ sample before committing to a batch run.
 ## Generic workflow per sub-tab
 
 1. **Method dropdown** — pick the method.
-2. **Method-specific parameter panel** appears below (Propagation has no tunable parameters, btrack has a two-step layout, Import has a per-sample status table).
+2. **Method-specific parameter panel** appears below (Propagation has no tunable parameters, btrack has a two-part layout — Kalman-filter tracking + global optimisation, Import has a per-sample status table).
 3. **Apply to all *Category* / Apply to all** — two buttons that propagate the current sub-tab's settings to other sub-tabs (same category, or all cell types).
 4. **Run *Cell type* Tracking** — the green button at the bottom of the sub-tab (e.g. *Run Tcell Tracking*). It runs the selected method for **every sample** in the metadata for this one cell type, immediately, and blocks the GUI until it finishes.
 

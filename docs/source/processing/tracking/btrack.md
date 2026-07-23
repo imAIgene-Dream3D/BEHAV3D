@@ -6,21 +6,24 @@ using historical information and estimates of the error in the measurements"*, a
 its **hypothesis model** is *"used by the global optimizer to build the final set of
 tracks"* ([btrack documentation](https://btrack.readthedocs.io/en/stable/user_guide/configuration.html)).
 
-In BEHAV3D EXPLORER, btrack runs on a cell type's per-timepoint segmentation in two
-phases: the Kalman-filter tracker (always) and the global hypothesis optimiser
-(optional). Per the reference workflow it is the tracker used in routine practice
-for immune / motile cells (see [Tracking overview](index)).
+In BEHAV3D EXPLORER, btrack has **two parts** that work together on a cell type's
+per-timepoint segmentation: the **Kalman-filter tracker** and the **global
+hypothesis optimiser**. In routine lab practice both are used on every run — the
+optimiser is enabled. Per the reference workflow, btrack is the tracker used for
+immune / motile cells (see [Tracking overview](index)).
 
-## Two-step workflow
+## The two parts
 
-btrack runs in two phases inside BEHAV3D EXPLORER:
+- **Kalman-filter tracking** — links detections between frames using the motion
+  model.
+- **Global hypothesis optimisation** — resolves track merges, splits, terminations
+  and false positives across the whole track set. It is switched on with the
+  **Enable global track optimization** checkbox, which **defaults off in the GUI**;
+  in lab practice it is enabled on every run.
 
-1. **Step 1 — Kalman filter tracking**. Always runs.
-2. **Step 2 — Global hypothesis optimizer**. Optional, off by default. Resolves track merges, splits and false positives over the whole track set.
+Both parts run together in the final tracking.
 
-Tune Step 1 first and **validate visually** before turning on Step 2.
-
-### Step 1 — Kalman Filter Tracking *(always runs)*
+### Kalman-filter tracking parameters
 
 | Parameter | Default | Range | Effect |
 |---|---|---|---|
@@ -32,12 +35,12 @@ Tune Step 1 first and **validate visually** before turning on Step 2.
 | **Use visual features** | OFF | checkbox | When enabled, raw image intensity statistics (**mean and standard deviation per channel**) of each cell are computed alongside the centroids and fed to the Kalman filter as an extra cue. Requires `raw_image_path` in the metadata. |
 | **Workers** | 1 | 1 to (CPU cores − 1) | CPU cores for parallel feature extraction and zarr writing during btrack. The tracker itself is serial. |
 
-### Step 2 — Global Hypothesis Optimizer *(opt-in)*
+### Global hypothesis optimisation parameters
 
 | Parameter | Default | Effect |
 |---|---|---|
-| **Enable global track optimization** | OFF | Master switch for Step 2. |
-| **Hypotheses** | `P_FP, P_init, P_term, P_link` | Which hypotheses the optimizer considers (definitions below). `P_FP` is always required (the checkbox is disabled in the UI). `P_branch`, `P_dead` and `P_merge` are opt-in. |
+| **Enable global track optimization** | OFF (GUI default; enabled in routine practice) | Switches on the global optimiser. |
+| **Hypotheses** | `P_FP, P_init, P_term, P_link` | Which hypotheses the optimizer considers (definitions below). `P_FP` is always required (the checkbox is disabled in the UI). `P_branch`, `P_dead` and `P_merge` are added as your biology requires. |
 | **Distance threshold** (`dist_thresh`) | 60 | BEHAV3D's help text: *"Maximum distance for generating link/branch hypotheses in the optimizer"* (in the unit selected by the µm/px toggle). btrack's own documentation does not define this field in detail. |
 | **Time threshold** (`time_thresh`) | 3 | BEHAV3D's help text: *"Maximum frame gap for generating link hypotheses in the optimizer."* btrack's own documentation does not define this field in detail. |
 
@@ -53,38 +56,28 @@ Tune Step 1 first and **validate visually** before turning on Step 2.
 | `P_dead` | "Hypothesis that a tracklet terminates without leaving the FOV." |
 | `P_merge` | "Hypothesis that two tracklets merge into one tracklet." |
 
-```{tip}
-**Recommended workflow**: tune Step 1 only → preview → fix segmentation issues that surface → tune Step 1 again → only *then* enable Step 2 for refinement. Step 2 makes Step 1's mistakes much harder to diagnose, so debug Step 1 first.
-```
-
 ## Step-by-step in the napari plugin
 
 1. **Open the Tracking tab** and pick the sub-tab for the cell type you want to track.
 2. From the **Method** dropdown, pick **btrack (Bayesian)**.
-3. **Configure Step 1 — Kalman Filter Tracking**:
+3. **Configure the Kalman-filter tracking parameters**:
    - **Config preset**: start with **Cell**. Switch to **Particle** only for very small objects (bacteria, organelles). `Custom JSON…` is for advanced users with their own motion model.
    - **Max search radius**: set to roughly the fastest cell's single-frame displacement in your data, in the same units as your metadata's `pixel_distance_xy`. Default 100 µm is generous; lower it for slower cells.
-   - **Update method**: leave at **EXACT** for now (more accurate). Switch to **APPROXIMATE** later only if Step 1 is too slow on your data (typically when cells-per-frame exceed a few hundred).
-   - **Step size**: default 100 frames is fine for most datasets. Lower it if Step 1 runs out of RAM on long movies.
-   - **Use visual features**: tick this if two cells of the same type cross paths and pure motion isn't enough to disambiguate them. Requires `raw_image_path` in your metadata.
-4. **Click *Run … Tracking*** (the green button at the bottom of the sub-tab, named after the cell type) with Step 2 still disabled, then **inspect the result** in the Visualization tab.
-5. **Iterate Step 1** until the tracks look correct under pure motion-based linking. See [Tuning the parameters](#tuning-the-parameters).
-6. **Only now consider enabling Step 2 (Global Hypothesis Optimizer)**:
-   - Tick **Enable global track optimization**.
-   - Tick the additional hypotheses you need (`P_branch` for cell division, `P_dead` for cell death, `P_merge` for genuine cell-cell fusion). `P_FP` is always on. Don't tick hypotheses you don't biologically expect — false positives are very disruptive.
+   - **Update method**: **EXACT** is more accurate; switch to **APPROXIMATE** if tracking is too slow (typically when cells-per-frame exceed a few hundred).
+   - **Step size**: default 100 frames is fine for most datasets. Lower it if tracking runs out of RAM on long movies.
+   - **Use visual features**: tick to add each cell's per-channel intensity mean and standard deviation as a linking cue. Requires `raw_image_path` in your metadata.
+4. **Tick *Enable global track optimization*** and configure the optimisation parameters:
+   - Tick the hypotheses your data needs (`P_branch` for cell division, `P_dead` for cell death, `P_merge` for genuine cell-cell fusion). `P_FP` is always on. Don't tick hypotheses you don't biologically expect — false positives are very disruptive.
    - **Distance threshold** and **Time threshold** govern the candidate links / branches the optimizer considers. Defaults (60 / 3) are conservative.
-7. **Re-run** and re-inspect. If Step 2 makes things worse, turn it back off and go back to step 5.
-8. When happy, queue the work with the tab-level **+🛒** button below the sub-tabs. The queued step is global — it runs every cell type's currently-configured method at run time, using your saved btrack settings (see [Processing Queue](../../plugin_essentials/processing_queue)).
-
-```{tip}
-**Always tune Step 1 first, in isolation.** A poor Step 1 + Step 2 produces failures that look like Step 2 problems but are really Step 1 problems. Once Step 1 is correct, Step 2 becomes a refinement step rather than a black box.
-```
+5. **Click *Run … Tracking*** (the green button at the bottom of the sub-tab, named after the cell type) and **inspect the result** in the Visualization tab.
+6. **Iterate.** Adjust the parameters of either part and re-run (see [Tuning the parameters](#tuning-the-parameters)).
+7. When happy, queue the work with the tab-level **+🛒** button below the sub-tabs. The queued step is global — it runs every cell type's currently-configured method at run time, using your saved btrack settings (see [Processing Queue](../../plugin_essentials/processing_queue)).
 
 ## Tuning the parameters
 
 After inspecting the result in the Visualization tab, identify the failure mode and tune accordingly.
 
-**Step 1 — Kalman Filter Tracking**
+**Kalman-filter tracking**
 
 *Tracks are fragmented*
 - Cause: `Max search radius` is smaller than the fastest cell's single-frame displacement.
@@ -93,7 +86,7 @@ After inspecting the result in the Visualization tab, identify the failure mode 
 *Adding an intensity cue*
 - **`Use visual features`** computes each cell's per-channel intensity mean and standard deviation and feeds them to the Kalman filter alongside the centroids. Requires `raw_image_path` in the metadata.
 
-*Step 1 is very slow / runs out of memory*
+*Tracking is very slow / runs out of memory*
 - Cause: large cell counts per frame combined with EXACT update.
 - Fix: switch **Update method** to **APPROXIMATE**, and/or lower **Step size** (e.g. 100 → 50) so each iteration uses less RAM.
 
@@ -101,27 +94,27 @@ After inspecting the result in the Visualization tab, identify the failure mode 
 - Cause: your cells are unusually small (organelles) or have very specific motion patterns.
 - Fix: try `Particle`, or build a custom JSON config — the bundled JSON files in the repo are a useful starting template.
 
-**Step 2 — Global Hypothesis Optimizer**
+**Global hypothesis optimisation**
 
 *Cell divisions are tracked as two unrelated tracks*
 - Cause: `P_branch` is not enabled.
 - Fix: **tick `P_branch`** in the hypothesis list. Confirm divisions are now tracked as parent → two daughters in the output.
 
 *Spurious branches / merges appear where there shouldn't be any*
-- Cause: too many opt-in hypotheses are enabled.
+- Cause: too many hypotheses are enabled.
 - Fix: **untick the hypotheses you didn't biologically expect**. The defaults (`P_FP, P_init, P_term, P_link`) are deliberately conservative.
 
-*Step 2 doesn't bridge gaps you expected it to*
+*The optimisation doesn't bridge gaps you expected it to*
 - Cause: `Time threshold` is too short, or `Distance threshold` is too small.
 - Fix: **raise both gradually**. Default `60 / 3` is conservative; doubling either is a reasonable next attempt.
 
-*Step 2 produces too many bridges across unrelated cells*
+*The optimisation produces too many bridges across unrelated cells*
 - Cause: `Time threshold` / `Distance threshold` are too generous.
 - Fix: **lower one of them**, usually `Time threshold` first.
 
 *The optimisation step is very slow*
 - Cause: a large hypothesis set combined with large `Time threshold` / `Distance threshold`.
-- Fix: tighten the thresholds, or run Step 1 alone first to confirm the issue isn't in the input tracks.
+- Fix: tighten the thresholds.
 
 ## Outputs
 
@@ -137,13 +130,12 @@ CSV columns: `TrackID, SegmentID, position_t, position_x/y/z, pixel_position_x/y
 - **Start with the `Cell` preset.** It is the bundled default and the one the lab tunes against. Switch to `Particle` only for genuinely small objects (bacteria, organelles).
 - **Use `EXACT` update unless tracking is too slow.** EXACT is the safer default; switch to `APPROXIMATE` once your cells-per-frame counts exceed a few hundred and runtime becomes a problem.
 - **`Use visual features`** feeds each cell's per-channel intensity mean and standard deviation to the Kalman filter alongside the centroids. Requires `raw_image_path` in the metadata.
-- **Enable Step 2 only after Step 1 looks correct.** A poor Step 1 + Step 2 = mysterious failures that are very hard to diagnose. Build confidence in Step 1 first.
 - **`P_branch` is the right hypothesis for cell division.** Without it, mitosis events will be tracked as two unrelated tracks starting where the parent ended.
 - **Workers are capped at one less than your CPU core count.** btrack itself is serial; the workers parallelise per-timepoint feature extraction and zarr writing, not the tracker.
 
 ## Things this page does **not** claim
 
-- Specific per-sample runtimes — depends on cells-per-frame, frames, and Step 2 hypothesis set.
+- Specific per-sample runtimes — depends on cells-per-frame, frames, and the optimisation's hypothesis set.
 
 ## See also
 
