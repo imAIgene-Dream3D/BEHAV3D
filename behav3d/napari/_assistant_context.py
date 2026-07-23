@@ -22,6 +22,10 @@ The returned dict shape:
           "columns": [...],
           "cell_types": {"immune": [...], "organoid": [...], "other": [...], "merged": [...]},
       },
+      "experiment_reference": {
+          "notes": [{"source": "README_BEHAV3D_Exp010.md", "text": "..."}],
+          "saved_configurations": [{"source": "...yml", "settings": {...}}],
+      },
       "queue": [{"type": "track", "label": "📍 Batch Tracking", "status": "pending", "params": {...}}],
       "parameters": {                      # only values that differ from defaults
           "tracking.immune.method": {"current": "btrack", "default": "trackpy"},
@@ -32,6 +36,7 @@ The returned dict shape:
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -63,6 +68,17 @@ def _safe(fn, default=None):
 _DIMENSION_ORDERS = {"TCZYX", "TZCYX", "ZCTYX", "ZTCYX", "CZTYX", "CTZYX"}
 _RAW_IMAGE_SUFFIXES = (".zarr", ".zarr.zip", ".czi", ".lif", ".liff",
                        ".tif", ".tiff", ".ims", ".h5")
+_EXPERIMENT_NOTE_PATTERNS = (
+    "README_BEHAV3D*.md",
+    "EXPERIMENT_CONTEXT*.md",
+    "BEHAV3D_CONTEXT*.md",
+)
+_EXPERIMENT_CONFIG_PATTERNS = (
+    "behav3d_parameters.yml",
+    "behav3d_parameters*.yml",
+    "behav3d_parameters*.yaml",
+)
+_EXPERIMENT_NOTE_CHAR_LIMIT = 16_000
 
 
 def _json_value(value):
@@ -86,6 +102,228 @@ def _json_value(value):
     if isinstance(value, (str, int, float, bool)):
         return value
     return str(value)
+
+
+def _reference_roots(output_dir: str, parameters: dict) -> list[Path]:
+    roots: list[Path] = []
+    candidates = [output_dir]
+    paths = parameters.get("paths") if isinstance(parameters, dict) else None
+    metadata_path = paths.get("metadata_csv") if isinstance(paths, dict) else None
+    if metadata_path:
+        candidates.append(str(Path(str(metadata_path)).expanduser().parent))
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = Path(str(candidate)).expanduser()
+        if path.is_dir() and path not in roots:
+            roots.append(path)
+    return roots
+
+
+def _compact_experiment_config(config: dict) -> dict:
+    """Keep interpretation-relevant settings without paths or large model features."""
+    if not isinstance(config, dict):
+        return {}
+    summary: dict[str, Any] = {}
+
+    pixel = config.get("pixel_classifier")
+    if isinstance(pixel, dict):
+        summary["segmentation"] = {
+            key: _json_value(pixel[key])
+            for key in (
+                "apoc_strategy", "convpaint_strategy", "examples_per_sample",
+                "use_all_timepoints", "tp_start", "tp_end",
+            )
+            if key in pixel
+        }
+
+    apoc = config.get("apoc")
+    if isinstance(apoc, dict):
+        suffixes = (
+            "prob_mask_threshold", "prob_seed_threshold", "edt_threshold",
+            "segment_size_min", "opening_nr_pixels", "fill_holes",
+            "max_depth", "num_ensembles",
+        )
+        by_cell_type: dict[str, dict] = {}
+        for key, value in apoc.items():
+            match = re.match(r"^apoc_(.+)_(%s)$" % "|".join(suffixes), str(key))
+            if match:
+                cell_type, setting = match.groups()
+                by_cell_type.setdefault(cell_type, {})[setting] = _json_value(value)
+        if by_cell_type:
+            summary.setdefault("segmentation", {})["apoc_by_cell_type"] = by_cell_type
+
+    tracking = config.get("tracking")
+    if isinstance(tracking, dict):
+        tracking_summary = {}
+        if "track_organoids_together" in tracking:
+            tracking_summary["track_organoids_together"] = _json_value(
+                tracking["track_organoids_together"]
+            )
+        for cell_type, settings in tracking.items():
+            if not isinstance(settings, dict) or "method" not in settings:
+                continue
+            item = {"method": _json_value(settings.get("method"))}
+            btrack = settings.get("btrack")
+            if isinstance(btrack, dict):
+                item["btrack"] = {
+                    key: _json_value(btrack[key])
+                    for key in (
+                        "max_search_radius", "use_visual_features", "use_optimize",
+                        "dist_thresh", "time_thresh", "step_size",
+                    )
+                    if key in btrack
+                }
+            tracking_summary[str(cell_type)] = item
+        if tracking_summary:
+            summary["tracking"] = tracking_summary
+
+    feature_summary = {}
+    features = config.get("features")
+    for cell_type, settings in (
+        features.items() if isinstance(features, dict) else ()
+    ):
+        if not isinstance(settings, dict):
+            continue
+        item = {
+            key: _json_value(settings[key])
+            for key in (
+                "features_choice", "contact_threshold",
+                "dead_mask_percentage_threshold",
+            )
+            if key in settings
+        }
+        if item:
+            feature_summary[str(cell_type)] = item
+    if feature_summary:
+        summary["features"] = feature_summary
+
+    filtering_summary = {}
+    filtering = config.get("track_filtering")
+    for cell_type, settings in (
+        filtering.items() if isinstance(filtering, dict) else ()
+    ):
+        if not isinstance(settings, dict):
+            continue
+        item = {
+            key: _json_value(settings[key])
+            for key in (
+                "exp_duration_enabled", "exp_duration", "min_length_enabled",
+                "min_track_length", "max_length_enabled", "max_track_length",
+                "split_long_tracks", "filter_min_size_t1", "min_size_t1",
+                "filter_t0_dead", "time_type",
+            )
+            if key in settings
+        }
+        if item:
+            filtering_summary[str(cell_type)] = item
+    if filtering_summary:
+        summary["filtering"] = filtering_summary
+
+    active_killing = config.get("active_killing")
+    if isinstance(active_killing, dict):
+        summary["active_killing"] = {
+            key: _json_value(active_killing[key])
+            for key in (
+                "observation_window", "death_signal_column",
+                "killing_threshold_multiplier", "use_absolute_threshold",
+                "absolute_killing_threshold", "min_contact_duration",
+            )
+            if key in active_killing
+        }
+    death_dynamics = config.get("death_dynamics")
+    if isinstance(death_dynamics, dict):
+        summary["death_dynamics"] = _json_value(death_dynamics)
+
+    module_specs = {
+        "behavioral_state_classification": (
+            "hmm_n_states_mode", "hmm_n_states",
+            "hmm_feature_smoothing_window", "hmm_start_offset",
+            "selected_features", "binary_features_to_group",
+        ),
+        "behavioral_track_classification": (
+            "behavioral_trajectory_size", "n_clusters",
+            "trajectory_trim_mode", "linkage",
+        ),
+    }
+    for module, keys in module_specs.items():
+        settings = config.get(module)
+        if not isinstance(settings, dict):
+            continue
+        defaults = settings.get("defaults", settings)
+        if isinstance(defaults, dict):
+            summary[module] = {
+                key: _json_value(defaults[key])
+                for key in keys if key in defaults
+            }
+    for module in ("state_classification", "track_classification"):
+        settings = config.get(module)
+        if isinstance(settings, dict):
+            summary[module] = {
+                "cell_types_present": [str(key) for key in settings],
+                "cell_types_with_nonempty_settings": [
+                    str(key) for key, value in settings.items() if value
+                ],
+            }
+    return summary
+
+
+def _experiment_reference_context(output_dir: str, parameters: dict) -> dict | None:
+    """Discover optional, dataset-specific notes and a compact saved configuration."""
+    roots = _reference_roots(output_dir, parameters)
+    if not roots:
+        return None
+
+    note_paths: list[Path] = []
+    config_paths: list[Path] = []
+    for root in roots:
+        for pattern in _EXPERIMENT_NOTE_PATTERNS:
+            note_paths.extend(sorted(root.glob(pattern)))
+        for pattern in _EXPERIMENT_CONFIG_PATTERNS:
+            config_paths.extend(sorted(root.glob(pattern)))
+    note_paths = list(dict.fromkeys(path for path in note_paths if path.is_file()))
+    config_paths = list(dict.fromkeys(path for path in config_paths if path.is_file()))
+
+    remaining = _EXPERIMENT_NOTE_CHAR_LIMIT
+    notes = []
+    for path in note_paths:
+        if remaining <= 0:
+            break
+        text = _safe(lambda p=path: p.read_text(encoding="utf-8"), "") or ""
+        excerpt = text[:remaining]
+        if excerpt:
+            notes.append({
+                "source": path.name,
+                "text": excerpt,
+                "truncated": len(excerpt) < len(text),
+            })
+            remaining -= len(excerpt)
+
+    saved_configs = []
+    for path in config_paths[:3]:
+        try:
+            import yaml
+            loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            continue
+        compact = _compact_experiment_config(loaded)
+        if compact:
+            saved_configs.append({"source": path.name, "settings": compact})
+
+    if not notes and not saved_configs:
+        return None
+    return {
+        "notes": notes,
+        "saved_configurations": saved_configs,
+        "provenance": (
+            "User-provided, dataset-specific reference files discovered beside "
+            "the selected output directory or metadata file."
+        ),
+        "configuration_caveat": (
+            "Saved settings describe configured intent and are not proof that a "
+            "module ran. Confirm execution from discovered result files."
+        ),
+    }
 
 
 def validate_metadata_records(records: list[dict]) -> list[dict]:
@@ -469,7 +707,73 @@ def _segmentation_state(main_widget) -> dict:
             "global_strategy": global_strategy or None,
             "cell_type_strategies": by_cell_type,
         }
+    sam = getattr(seg, "cellpose_sam_page", None)
+    if sam is not None:
+        all_types = bool(_widget_value(getattr(sam, "check_all_cell_types", None)))
+        selected_type = _widget_value(getattr(sam, "cell_type_combo", None))
+        state["cellpose_sam"] = {
+            "selected_cell_type": selected_type,
+            "run_all_cell_types": all_types,
+            "process_all_timepoints": _widget_value(
+                getattr(sam, "check_process_all", None)
+            ),
+            "use_3d": _widget_value(getattr(sam, "check_do_3d", None)),
+            "force_cpu": _widget_value(getattr(sam, "btn_force_cpu", None)),
+            "environment_status": _widget_value(
+                getattr(sam, "lbl_env_status", None)
+            ),
+        }
     return state
+
+
+def _feature_extraction_state(main_widget) -> dict:
+    tab = getattr(main_widget, "feature_extraction_tab", None)
+    toggle = getattr(tab, "_ak_toggle_btn", None) if tab is not None else None
+    expanded = bool(_widget_value(toggle)) if toggle is not None else False
+    active = getattr(tab, "active_killing_panel", None) if tab is not None else None
+    if active is None:
+        return {"active_killing_open": False}
+    targets = []
+    target_list = getattr(active, "target_list", None)
+    if target_list is not None:
+        targets = _safe(
+            lambda: [str(item.text()) for item in target_list.selectedItems()],
+            [],
+        ) or []
+    return {
+        "active_killing_open": expanded,
+        "active_killing": {
+            "effector_cell_type": _widget_value(getattr(active, "immune_combo", None)),
+            "target_cell_types": targets,
+        },
+    }
+
+
+def _analysis_state(main_widget) -> dict:
+    analysis = getattr(main_widget, "analysis_tab", None)
+    single = getattr(analysis, "single_cell_tab", None) if analysis is not None else None
+    if single is None:
+        return {}
+    outer_tabs = getattr(analysis, "inner_tabs", None)
+    outer_index = _safe(outer_tabs.currentIndex, 1) if outer_tabs is not None else 1
+    if outer_index != 1:
+        return {"view": "death_dynamics"}
+    stack = getattr(single, "_stack", None)
+    if stack is not None and _safe(stack.currentIndex, 0) == 0:
+        view = "single_cell_overview"
+    else:
+        inner_tabs = getattr(single, "inner_tabs", None)
+        inner_index = (
+            _safe(inner_tabs.currentIndex, 0)
+            if inner_tabs is not None else 0
+        )
+        view = "behavioral_state" if inner_index == 0 else "state_trajectory"
+    return {
+        "view": view,
+        "selected_cell_type": _widget_value(
+            getattr(single, "cell_type_combo", None)
+        ),
+    }
 
 
 def _required_params_at_default(
@@ -547,6 +851,11 @@ def build_context(main_widget) -> dict:
         "step_schema": [] if step == "visualization"
                        else (_safe(lambda: cards_for_step(step), []) or []),
     }
+    experiment_reference = _safe(
+        lambda: _experiment_reference_context(output_dir, params), None
+    )
+    if experiment_reference:
+        ctx["experiment_reference"] = experiment_reference
     # Keep an open/drafted builder visible even after a tab switch. This avoids
     # regressing to the stale saved DataFrame on the next assistant turn.
     if (step == "data_preparation" or builder_state.get("open")
@@ -554,6 +863,12 @@ def build_context(main_widget) -> dict:
         ctx["metadata_builder"] = builder_state
     if step == "segmentation":
         ctx["segmentation"] = _safe(lambda: _segmentation_state(main_widget), {})
+    if step == "feature_extraction":
+        ctx["feature_extraction"] = _safe(
+            lambda: _feature_extraction_state(main_widget), {}
+        )
+    if step == "analysis":
+        ctx["analysis"] = _safe(lambda: _analysis_state(main_widget), {})
 
     controls = _safe(lambda: control_registry(main_widget), []) or []
     ctx["ui_state"] = {
@@ -577,6 +892,8 @@ def context_summary_line(ctx: dict) -> str:
     nq = len(ctx.get("queue", []))
     step = ctx.get("current_tab_label") or ctx.get("current_step", "")
     details = [str(step), f"{n} sample(s)", out_ok, f"{nq} queued"]
+    if ctx.get("experiment_reference"):
+        details.append("experiment context")
     active = ctx.get("active_cell_type")
     if active:
         details.insert(1, str(active))

@@ -161,7 +161,10 @@ def _segmentation_case() -> dict:
 
 
 def _tracking_guide_case() -> dict:
-    choices = ["LAP (laptrack)", "TrackPy", "Propagation", "btrack (Bayesian)"]
+    choices = [
+        "LAP (laptrack)", "TrackPy", "Propagation",
+        "Reporter Propagation", "btrack (Bayesian)",
+    ]
     controls = [
         _control(
             f"tracking.{cell_type}.method", f"{cell_type}: Tracking method", method,
@@ -184,7 +187,10 @@ def _tracking_guide_case() -> dict:
 def _stationary_tracking_case() -> dict:
     controls = [_control(
         "tracking.collagen.method", "collagen: Tracking method", "LAP (laptrack)",
-        choices=["LAP (laptrack)", "TrackPy", "Propagation", "btrack (Bayesian)"],
+        choices=[
+            "LAP (laptrack)", "TrackPy", "Propagation",
+            "Reporter Propagation", "btrack (Bayesian)",
+        ],
         cell_type="collagen",
     )]
     return {
@@ -240,6 +246,248 @@ def _filtering_case() -> dict:
         "messages": [{"role": "user", "content": "Review filters"}],
         "context": _context("filtering", controls, active_cell_type="Tcell_HIV"),
         "check": _check_filtering,
+    }
+
+
+def _reporter_propagation_case() -> dict:
+    controls = [_control(
+        "tracking.calcium_reporter.method",
+        "calcium reporter: Tracking method",
+        "btrack (Bayesian)",
+        choices=[
+            "LAP (laptrack)", "TrackPy", "Propagation",
+            "Reporter Propagation", "btrack (Bayesian)",
+        ],
+        cell_type="calcium_reporter",
+    )]
+    return {
+        "name": "static_reporter_uses_reporter_propagation",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "These calcium reporter cells do not move or change shape, but their "
+                "fluorescence flickers and some frames cannot be segmented. Please set "
+                "the appropriate tracking method."
+            ),
+        }],
+        "context": _context(
+            "tracking", controls, active_cell_type="calcium_reporter"
+        ),
+        "check": _check_reporter_propagation,
+    }
+
+
+def _active_killing_case() -> dict:
+    controls = [
+        _control(
+            "features.active_killing.target_types",
+            "Active Killing: Target cell type",
+            ["organoid1", "organoid2"],
+            choices=["organoid1", "organoid2"],
+            method="Active Killing",
+            cell_type="tcell",
+        ),
+        _control(
+            "features.active_killing.observation_window",
+            "Active Killing: Observation window",
+            3,
+            unit="timepoints",
+            method="Active Killing",
+            cell_type="tcell",
+        ),
+        _control(
+            "features.active_killing.death_signal",
+            "Active Killing: Death or reporter signal",
+            "percentage_dead_mask",
+            choices=[
+                "percentage_dead_mask", "mean_dead_dye", "nr_dead_mask_pixels",
+            ],
+            method="Active Killing",
+            cell_type="tcell",
+        ),
+        _control(
+            "features.active_killing.use_absolute_threshold",
+            "Active Killing: Use an absolute signal-increase threshold",
+            False,
+            method="Active Killing",
+            cell_type="tcell",
+        ),
+    ]
+    metadata = {
+        "loaded": True,
+        "records": [{
+            "sample_name": "Movie1",
+            "pixel_distance_xy": 0.5,
+            "pixel_distance_z": 2.0,
+            "time_interval": 2,
+            "time_unit": "min",
+        }],
+        "validation": [],
+    }
+    return {
+        "name": "active_killing_uses_cadence",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "Configure active killing for tcell against organoid1 only. I expect "
+                "killing within 10 minutes and images are every 2 minutes. Use the "
+                "generally recommended death signal and threshold mode."
+            ),
+        }],
+        "context": _context(
+            "feature_extraction", controls, metadata=metadata,
+            active_cell_type="tcell",
+            feature_extraction={"active_killing_open": True},
+        ),
+        "check": _check_active_killing,
+    }
+
+
+def _hmm_single_frame_case() -> dict:
+    controls = [
+        _control(
+            "analysis.state_classification.tcell.window_size",
+            "tcell: Window size", 5, unit="timepoints", method="HMM",
+            cell_type="tcell",
+        ),
+        _control(
+            "analysis.state_classification.tcell.smooth_window",
+            "tcell: Feature smoothing window", 5, unit="timepoints",
+            method="HMM", cell_type="tcell",
+        ),
+        _control(
+            "analysis.state_classification.tcell.start_offset",
+            "tcell: Start offset", 1, unit="timepoints", method="HMM",
+            cell_type="tcell",
+        ),
+    ]
+    return {
+        "name": "hmm_single_frame_events",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "My calcium events are single-timepoint peaks. Please set the HMM "
+                "windows appropriately and leave the start offset at its recommendation."
+            ),
+        }],
+        "context": _context(
+            "analysis", controls, active_cell_type="tcell",
+            analysis={"view": "behavioral_state", "selected_cell_type": "tcell"},
+        ),
+        "check": _check_hmm_single_frame,
+    }
+
+
+def _trajectory_linkage_case() -> dict:
+    controls = [_control(
+        "analysis.state_trajectory.tcell.linkage",
+        "tcell: Agglomerative linkage",
+        "single",
+        choices=["average", "complete", "single"],
+        method="State Trajectory",
+        cell_type="tcell",
+    )]
+    return {
+        "name": "trajectory_uses_average_linkage",
+        "messages": [{
+            "role": "user",
+            "content": "Set the recommended linkage for State Trajectory clustering.",
+        }],
+        "context": _context(
+            "analysis", controls, active_cell_type="tcell",
+            analysis={"view": "state_trajectory", "selected_cell_type": "tcell"},
+        ),
+        "check": _check_trajectory_linkage,
+    }
+
+
+def _functional_experiment_context_case() -> dict:
+    reference = {
+        "notes": [{
+            "source": "README_BEHAV3D_FUNC_MUC1_Exp085.md",
+            "text": (
+                "Exp085 is an isogenic functional comparison. organoid1 is 27T_V2_KO "
+                "(MUC1 knockout) and organoid2 is 27T_V2_OE (MUC1 rescue). Both are "
+                "present in each well with the same T-cell product, so the primary "
+                "comparison is paired KO versus rescue within each well. NCAM+ has "
+                "3 wells and NCAM- has 5, so that axis is exploratory. Invasiveness "
+                "was not computed in this experiment."
+            ),
+        }],
+        "saved_configurations": [{
+            "source": "behav3d_parameters_FUNC_clean.yml",
+            "settings": {
+                "features": {
+                    "organoid1": {
+                        "features_choice": [
+                            "intensity", "morphology", "contact", "death",
+                        ],
+                    },
+                    "organoid2": {
+                        "features_choice": [
+                            "intensity", "morphology", "contact", "death",
+                        ],
+                    },
+                },
+            },
+        }],
+        "configuration_caveat": "Saved settings are not proof that a module ran.",
+    }
+    return {
+        "name": "functional_experiment_uses_paired_design",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "What is the cleanest comparison for the MUC1 question, and can I "
+                "interpret invasiveness from this experiment?"
+            ),
+        }],
+        "context": _context(
+            "analysis", [], experiment_reference=reference, results=[],
+        ),
+        "check": _check_functional_experiment_context,
+    }
+
+
+def _safety_profiling_context_case() -> dict:
+    reference = {
+        "notes": [{
+            "source": "README_BEHAV3D_SafetyProfiling_Exp010.md",
+            "text": (
+                "Exp010 is multi-organoid safety profiling. In combined wells, tumor "
+                "27T and healthy MDO share the same well with TEG cells. Active killing "
+                "is a contact-associated relative rise: percentage_dead_mask reaches "
+                "at least 1.5 times baseline within 5 frames (10 minutes), after at "
+                "least one frame of contact. There is one well per control and two "
+                "combined wells, so comparisons are descriptive/exploratory."
+            ),
+        }],
+        "saved_configurations": [{
+            "source": "behav3d_parameters_multiorganoid_clean.yml",
+            "settings": {
+                "features": {
+                    "TEG": {
+                        "features_choice": [
+                            "movement", "contact", "invasiveness", "death",
+                        ],
+                    },
+                },
+            },
+        }],
+    }
+    return {
+        "name": "safety_profiling_preserves_operational_definition",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "How should I frame the safety comparison, and what exactly does "
+                "active killing mean here?"
+            ),
+        }],
+        "context": _context(
+            "analysis", [], experiment_reference=reference, results=[],
+        ),
+        "check": _check_safety_profiling_context,
     }
 
 
@@ -383,6 +631,94 @@ def _check_filtering(result: dict) -> list[str]:
     return []
 
 
+def _changed_values(result: dict) -> dict:
+    return {
+        call.get("control_id"): call.get("value")
+        for call in _tool_calls(result, "set_ui_value")
+    }
+
+
+def _check_reporter_propagation(result: dict) -> list[str]:
+    changed = _changed_values(result)
+    value = changed.get("tracking.calcium_reporter.method")
+    if str(value).lower() != "reporter propagation":
+        return [f"tracking method was {value!r}, expected Reporter Propagation"]
+    return []
+
+
+def _check_active_killing(result: dict) -> list[str]:
+    changed = _changed_values(result)
+    expected = {
+        "features.active_killing.target_types": ["organoid1"],
+        "features.active_killing.observation_window": 5,
+        "features.active_killing.death_signal": "nr_dead_mask_pixels",
+        "features.active_killing.use_absolute_threshold": True,
+    }
+    errors = []
+    for control_id, value in expected.items():
+        if changed.get(control_id) != value:
+            errors.append(
+                f"{control_id} was {changed.get(control_id)!r}, expected {value!r}"
+            )
+    return errors
+
+
+def _check_hmm_single_frame(result: dict) -> list[str]:
+    changed = _changed_values(result)
+    errors = []
+    for suffix in ("window_size", "smooth_window"):
+        control_id = f"analysis.state_classification.tcell.{suffix}"
+        if changed.get(control_id) != 1:
+            errors.append(f"{control_id} was not set to 1")
+    if "analysis.state_classification.tcell.start_offset" in changed:
+        errors.append("needlessly rewrote the already-correct Start offset")
+    return errors
+
+
+def _check_trajectory_linkage(result: dict) -> list[str]:
+    changed = _changed_values(result)
+    value = changed.get("analysis.state_trajectory.tcell.linkage")
+    if str(value).lower() != "average":
+        return [f"trajectory linkage was {value!r}, expected average"]
+    return []
+
+
+def _check_functional_experiment_context(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    if not (
+        "within" in text and "well" in text
+        and ("paired" in text or "same well" in text)
+        and "ko" in text and ("rescue" in text or "oe" in text)
+    ):
+        errors.append("did not prioritize the paired within-well KO/rescue comparison")
+    if not any(phrase in text for phrase in (
+        "not computed", "not available", "wasn't computed", "was not run",
+        "would need", "need to enable",
+    )):
+        errors.append("did not state that invasiveness is unavailable")
+    if result["calls"]:
+        errors.append("attempted a UI action for an interpretation-only question")
+    return errors
+
+
+def _check_safety_profiling_context(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    if not all(token in text for token in ("27t", "mdo", "1.5")):
+        errors.append("lost the tumor/healthy identities or 1.5x definition")
+    if not (
+        ("5 frame" in text or "five frame" in text)
+        and ("10 minute" in text or "ten minute" in text)
+    ):
+        errors.append("lost the 5-frame / 10-minute observation window")
+    if not any(word in text for word in ("exploratory", "descriptive", "small")):
+        errors.append("omitted the small-sample interpretation caveat")
+    if result["calls"]:
+        errors.append("attempted a UI action for an interpretation-only question")
+    return errors
+
+
 SCENARIOS = [
     _metadata_setup_case,
     _pixel_fill_case,
@@ -391,6 +727,12 @@ SCENARIOS = [
     _stationary_tracking_case,
     _tracking_radius_case,
     _filtering_case,
+    _reporter_propagation_case,
+    _active_killing_case,
+    _hmm_single_frame_case,
+    _trajectory_linkage_case,
+    _functional_experiment_context_case,
+    _safety_profiling_context_case,
 ]
 
 

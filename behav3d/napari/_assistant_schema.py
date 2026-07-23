@@ -39,6 +39,7 @@ STEP_MAP = {
     "signal_unmixing": "preprocessing",
     "pixel_classifier": "segmentation",
     "cellpose": "segmentation",
+    "cellpose_sam": "segmentation",
     "tracking": "tracking",
     "tracking_visualization": "visualization",
     "features": "feature_extraction",
@@ -55,7 +56,10 @@ CELL_CATEGORIES = ("immune", "organoid", "other")
 # Known enumerated choices, keyed by the *leaf* parameter name.
 # ---------------------------------------------------------------------------
 CHOICES: dict[str, list] = {
-    "method": ["trackpy", "lap", "btrack", "propagation", "propagation_all_organoids"],
+    "method": [
+        "trackpy", "lap", "btrack", "propagation",
+        "reporter_propagation", "propagation_all_organoids",
+    ],
     "update_method": ["EXACT", "APPROXIMATE"],
     "config_preset": ["cell", "particle"],
     "mode": ["mean", "max", "median", "sum"],
@@ -89,9 +93,19 @@ _DESCRIPTIONS: dict[str, str] = {
     "number_of_channels": "Number of image channels passed to Cellpose.",
     "labels_mode": "'same_for_all' applies one channel→cell-type label map to every sample; 'per_sample' lets each sample differ.",
     "channel_labels": "Mapping of channel index → cell-type name (e.g. {0: 'organoid', 1: 'tcell'}).",
+    # Cellpose-SAM
+    "model_name": "Cellpose-SAM zero-shot model. cpsam and cpsam_v2 require no training and may be compared directly.",
+    "all_cell_types": "Run each detected cell type in one Cellpose-SAM batch; every type still uses its own selected input channel(s) and output.",
+    "diameter": "Expected Cellpose-SAM object diameter. Leave at 0 for automatic sizing unless objects are well outside the model's roughly 7.5-120 pixel training range.",
+    "flow_threshold": "Maximum Cellpose-SAM flow error. Default 0.4; raise it to keep more imperfect shapes or lower it for stricter shapes. Ignored in 3D mode.",
+    "cellprob_threshold": "Cellpose-SAM cell probability threshold. Lower it to detect more or larger objects; raise it to reject dim or uncertain detections.",
+    "do_3D": "Use full 3D Cellpose-SAM segmentation for accuracy. Disable for speed or highly anisotropic Z data, then tune slice stitching.",
+    "stitch_threshold": "IoU threshold for stitching 2D masks across Z. Used only when Cellpose-SAM 3D segmentation is disabled.",
+    "batch_size": "Cellpose-SAM GPU patch batch size. Reduce this first after a CUDA out-of-memory error; it affects throughput and memory, not segmentation quality.",
+    "drop_2d_segments": "Remove flat single-slice fragments after Cellpose-SAM. Keep enabled unless real objects genuinely occupy one slice.",
     # tracking — general
     "track_organoids_together": "Track all organoids as a single merged object rather than individually.",
-    "method": "Tracking algorithm: 'trackpy' (linking by proximity), 'lap' (linear assignment with gap-closing), 'btrack' (Bayesian, best for crowded/dividing cells), or 'propagation' (label propagation for organoids).",
+    "method": "Tracking algorithm. Use btrack routinely for motile cells, propagation for slow overlapping non-dividing objects, and reporter propagation for static objects with intermittent fluorescence. LAP and TrackPy are alternatives without an identified routine advantage.",
     "overwrite": "Re-run and overwrite existing outputs instead of skipping completed samples.",
     # tracking — trackpy
     "search_range_px": "Max distance (pixels) a cell may move between consecutive frames. Set just above the fastest expected displacement; too small drops links, too large makes spurious ones.",
@@ -110,7 +124,7 @@ _DESCRIPTIONS: dict[str, str] = {
     "use_visual_features": "Use image-derived intensity measurements alongside motion for btrack linking. This is separate from global track optimization.",
     "max_search_radius": "btrack maximum linking radius in physical distance units (normally micrometres after metadata scaling).",
     "update_method": "btrack hypothesis update: 'EXACT' (accurate, slower) or 'APPROXIMATE' (faster for large datasets).",
-    "step_size": "btrack optimiser batch/step size; larger trades memory for speed.",
+    "step_size": "btrack processing chunk size. Leave it unchanged unless tracking runs out of memory; lower it to reduce RAM at the cost of more stitching overhead.",
     "n_workers": "Parallel workers for this step.",
     "use_optimize": "Run btrack's global optimisation pass (better tracks, slower).",
     "hypotheses": "btrack hypotheses to evaluate (P_FP false-positive, P_init initialisation, P_term termination, P_link linking, P_branch division).",
@@ -118,23 +132,35 @@ _DESCRIPTIONS: dict[str, str] = {
     "time_thresh": "btrack time threshold (frames) for candidate links.",
     # features
     "features_choice": "Which feature groups to compute for this cell category: movement, intensity, contact, death, morphology.",
-    "contact_threshold": "Distance (pixels) within which two cells count as in contact. 0 = touching only.",
+    "contact_threshold": "Distance within which two cells count as interacting. 0 requires strict mask touching; larger values count proximity. Changing it requires feature extraction to be run again.",
     # filtering
     "exp_duration": "Total experiment duration (hours); used to convert frame counts to time.",
     "exp_duration_enabled": "Whether to apply the experiment-duration based filter.",
-    "min_track_length": "Discard tracks shorter than this many frames.",
+    "min_track_length": "Optionally discard tracks shorter than this many timepoints. State analysis supports unequal lengths, but removing short tracks can reduce noise and computation.",
     "min_track_length_enabled": "Whether the minimum-track-length filter is active.",
-    "max_track_length": "Discard tracks longer than this many frames.",
+    "max_track_length": "Trim retained tracks to this common length for analyses that require uniform trajectory windows.",
     "max_track_length_enabled": "Whether the maximum-track-length filter is active.",
     # analysis
     "umap_min_dist": "UMAP min_dist: lower packs clusters tighter, higher spreads points out (0–1).",
     "umap_n_neighbors": "UMAP neighbourhood size: low = local structure, high = global structure.",
     "nr_of_clusters": "Number of behavioural clusters to extract.",
+    "linkage": "Agglomerative linkage for trajectory clustering. Average is the default, Complete is a reasonable comparison, and Single performs poorly.",
+    "trajectory_trim_mode": "Whether trajectory clustering keeps the first or last requested timepoints. This duplicates optional trimming in Filtering.",
+    "behavioral_trajectory_size": "Trajectory window size for clustering; it cannot exceed the track trim length set in Filtering.",
     # active killing
-    "observation_window": "Frames over which a death-signal increase is assessed for active killing.",
-    "death_signal_column": "Feature column used as the death/viability signal.",
-    "killing_threshold_multiplier": "Multiplier over baseline death signal that flags an active-killing event.",
-    "min_contact_duration": "Minimum frames of immune–target contact required to call active killing.",
+    "observation_window": "Timepoints counted forward from contact in which a death-signal increase is assessed. Choose it from the expected biological delay and imaging cadence.",
+    "death_signal_column": "Death or reporter signal. Dead-mask pixel count with an absolute threshold is the general default; percentage assumes comparable target sizes, and mean intensity suits diffuse reporters.",
+    "killing_threshold_multiplier": "Relative increase over the target's own baseline. Reserve it for a single target line or heterogeneous within-well baselines; it can bias comparisons across target lines.",
+    "min_contact_duration": "Minimum effector-target contact timepoints required for active killing. Choose it from biological plausibility and acquisition cadence.",
+    "absolute_killing_threshold": "Fixed signal increase used for active killing. Calibrate a dead-pixel threshold from cell diameter and XY pixel size, then validate visually.",
+    # behavioral state classification
+    "hmm_n_states_mode": "Use a fixed HMM state count for routine analysis; automatic selection has not performed well.",
+    "hmm_feature_smoothing_window": "Feature smoothing window. Usually match the rolling feature window; use 1 for true single-frame events.",
+    "hmm_start_offset": "Initial timepoints skipped before HMM assignment. Keep at 1 because first-frame speed is undefined.",
+    "hmm_log_scale_features": "Features selectively log-transformed after inspecting a strongly right-skewed non-negative distribution; do not apply blanket log scaling.",
+    "feature_quantile_capping_low_percentile": "Optional lower percentile clipping. Not recommended routinely because clipping has degraded HMM results.",
+    "feature_quantile_capping_high_percentile": "Optional upper percentile clipping. Not recommended routinely because clipping has degraded HMM results.",
+    "binary_features_to_group": "Binary event features applied after HMM fitting to split motion states; they are not inputs to the HMM.",
     # death dynamics
     "dead_perc_threshold": "Fraction of dead-mask pixels above which a cell is considered dead.",
 }
