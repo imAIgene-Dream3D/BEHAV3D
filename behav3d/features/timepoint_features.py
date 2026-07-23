@@ -684,6 +684,7 @@ def run_feature_extraction(
                 ### Calculate image based features (per timepoint)
                 print(f"{get_current_time()} - Calculating single-timepoint image-based features...")
                 df_intensity_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_intensity.csv")
+                df_top_quantile_intensity_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_top_quantile_intensity.csv")
                 df_contacts_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_contact.csv")
                 df_dead_mask_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_dead_mask.csv")
                 df_morphology_outpath = Path(track_intermediate_outdir, f"{sample_name}_{cell_type}_morphology.csv")
@@ -704,6 +705,7 @@ def run_feature_extraction(
                         df_dead_mask_outpath=df_dead_mask_outpath,
                         df_morphology_outpath=df_morphology_outpath,
                         df_intensity_outpath=df_intensity_outpath,
+                        df_top_quantile_intensity_outpath=df_top_quantile_intensity_outpath,
                         df_contacts_outpath=df_contacts_outpath,
                         dead_channel=dead_channel,
                         contact_threshold=contact_threshold,
@@ -727,6 +729,11 @@ def run_feature_extraction(
                 if intensity_cols:
                     print(f"{get_current_time()} - Calculating fold change over baseline for intensity features...")
                     df_tracks = calculate_fold_change_over_baseline(df_tracks, intensity_cols)
+
+                top_quantile_cols = [c for c in df_tracks.columns if c.startswith("q75_mean_intensity_ch")]
+                if top_quantile_cols:
+                    print(f"{get_current_time()} - Calculating fold change over track minimum for top-quartile intensity features...")
+                    df_tracks = calculate_fold_change_over_track_min(df_tracks, top_quantile_cols)
 
             print(f"{get_current_time()} - Interpolating missing timepoints based on time interval")
             # As sometimes 1 or several timepoints are missing in a track, interpolate these missing rows
@@ -830,6 +837,7 @@ def calculate_image_based_track_features(
     df_dead_mask_outpath="",
     df_morphology_outpath="",
     df_intensity_outpath="",
+    df_top_quantile_intensity_outpath="",
     df_contacts_outpath="",
     # Overwrite/redo df_intensity_outpath and df_contacts_outpath
     dead_mask_percentage_threshold=None,
@@ -940,6 +948,21 @@ def calculate_image_based_track_features(
                 df_intensity.to_csv(df_intensity_outpath, sep=",", index=False)
         df_intensity = _normalize_merge_keys(df_intensity, keys=merge_keys)
         df_tracks = pd.merge(df_tracks, df_intensity, how="left", on=merge_keys)
+
+        print(f"{get_current_time()} - Calculating top-quartile (hot-pixel) intensities...")
+        if df_top_quantile_intensity_outpath.exists() and not overwrite:
+            print("Top-quartile intensity calculation .csv already exists. Loading in top-quartile intensity information...")
+            df_top_quantile_intensity = pd.read_csv(df_top_quantile_intensity_outpath)
+        else:
+            df_top_quantile_intensity = calculate_segment_top_quantile_intensity(
+                segments=segments_path,
+                intensity_image=raw_image_path,
+                n_workers=n_workers,
+            )
+            if df_top_quantile_intensity_outpath != "":
+                df_top_quantile_intensity.to_csv(df_top_quantile_intensity_outpath, sep=",", index=False)
+        df_top_quantile_intensity = _normalize_merge_keys(df_top_quantile_intensity, keys=merge_keys)
+        df_tracks = pd.merge(df_tracks, df_top_quantile_intensity, how="left", on=merge_keys)
     else:
         print(f"{get_current_time()} - Skipping intensity features as not requested in features_choice")
     
@@ -1919,7 +1942,7 @@ def calculate_segment_intensity(segments, intensity_image, calculation="mean", n
     df_intensity = pd.concat(results, ignore_index=True)
     if df_intensity.empty:
         return pd.DataFrame(columns=["TrackID", "position_t"])
-    
+
     # Define a dictionary mapping old column names to new column names using regex
     column_mapping = {}
     for i in range(df_intensity.shape[1]):
@@ -1929,6 +1952,61 @@ def calculate_segment_intensity(segments, intensity_image, calculation="mean", n
     column_mapping["label"]="TrackID"
     df_intensity=df_intensity.rename(columns=column_mapping)
     return(df_intensity)
+
+
+def _calculate_segment_top_quantile_intensity_single_timepoint(args):
+    t, segments_path, intensity_image_path, quantile = args
+    label_stack = np.asarray(load_image_timepoint(segments_path, t))
+    intensity_stack = np.asarray(load_image_timepoint(intensity_image_path, t)).transpose(1, 2, 3, 0)
+
+    labels = np.unique(label_stack)
+    labels = labels[labels != 0]
+    n_channels = intensity_stack.shape[-1]
+
+    rows = []
+    for label in labels:
+        mask = label_stack == label
+        row = {"label": int(label), "position_t": t}
+        for c in range(n_channels):
+            values = intensity_stack[..., c][mask]
+            if values.size == 0:
+                row[f"q75_mean_intensity_ch{c}"] = np.nan
+                continue
+            cutoff = np.percentile(values, quantile * 100)
+            top_values = values[values >= cutoff]
+            row[f"q75_mean_intensity_ch{c}"] = float(top_values.mean()) if top_values.size else np.nan
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(columns=["label", "position_t"])
+    return pd.DataFrame(rows)
+
+
+def calculate_segment_top_quantile_intensity(segments, intensity_image, quantile=0.75, n_workers=1):
+    """Per-segment, per-timepoint mean intensity of the pixels at/above the
+    given quantile of that segment's own pixel intensity distribution (e.g.
+    quantile=0.75 -> mean of the brightest 25% of pixels), for each channel.
+
+    Unlike ``calculate_segment_intensity``'s whole-segment mean, this tracks
+    a segment's brightest sub-region rather than being diluted by the rest
+    of the cell body - the "hot-pixel mean" feature.
+    """
+    assert 0.0 <= quantile < 1.0
+    timepoints = int(load_image(segments).shape[0])
+    args_list = [(t, segments, intensity_image, quantile) for t in range(timepoints)]
+    if n_workers > 1:
+        results = _run_parallel_with_fallback(_calculate_segment_top_quantile_intensity_single_timepoint, args_list, n_workers)
+    else:
+        results = [_calculate_segment_top_quantile_intensity_single_timepoint(args) for args in tqdm(args_list)]
+
+    if not results:
+        return pd.DataFrame(columns=["TrackID", "position_t"])
+    df_top_quantile = pd.concat(results, ignore_index=True)
+    if df_top_quantile.empty:
+        return pd.DataFrame(columns=["TrackID", "position_t"])
+    df_top_quantile = df_top_quantile.rename(columns={"label": "TrackID"})
+    return df_top_quantile
+
 
 def calculate_relative_increase(df, column, nr_timepoints_back, groupby="TrackID"):
     df = df.sort_values(by=[groupby, "position_t"]).copy()
@@ -1994,6 +2072,27 @@ def calculate_fold_change_over_baseline(df, intensity_cols, baseline_percentile=
         baseline = baseline.where(baseline > 0, np.nan)
         df[f"{col}_fold_change"] = df[col] / baseline
     return df
+
+
+def calculate_fold_change_over_track_min(df, intensity_cols, groupby=("sample_name", "TrackID")):
+    """Per-track fold change of each intensity column over that track's own
+    minimum value (the literal lowest value ever observed for that track,
+    not a percentile). Intended for hot-pixel-mean columns (e.g.
+    ``q75_mean_intensity_ch{N}``, the mean of a segment's brightest quartile
+    of pixels) where the caller specifically wants the strictest possible
+    baseline rather than the more noise-robust percentile baseline used by
+    ``calculate_fold_change_over_baseline``.
+    """
+    df = df.sort_values(list(groupby) + ["position_t"]).copy()
+    grouped = df.groupby(list(groupby), sort=False, observed=True)
+    for col in intensity_cols:
+        if col not in df.columns:
+            continue
+        baseline = grouped[col].transform("min")
+        baseline = baseline.where(baseline > 0, np.nan)
+        df[f"{col}_fold_change"] = df[col] / baseline
+    return df
+
 
 def _zero_dead_mask_under_segments(dead_mask_t, immune_arrays_t):
     """Return a copy of ``dead_mask_t`` with voxels set to 0 wherever any
