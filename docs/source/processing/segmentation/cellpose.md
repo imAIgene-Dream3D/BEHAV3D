@@ -6,12 +6,7 @@ Cellpose is the **classic deep-learning instance segmenter** (cellpose v3) in BE
 This page covers **classic Cellpose (v3)**, where you load a pretrained or retrained model file. If you want the newer zero-shot foundation model that needs **no model and no training**, see [Cellpose-SAM (zero-shot)](cellpose_sam) instead — it runs cellpose v4 in a separate sidecar environment.
 ```
 
-Pick classic Cellpose when:
-
-- The objects are **roughly round** with **clear boundaries**.
-- A pretrained model already exists for your sample type.
-- You do not want pixel-level labeling — Cellpose models are trained on full segmentation masks, not painted points, so you cannot fine-tune them from the napari plugin itself (see the [Cellpose Training Notebook](../../cellpose_training)).
-- You have a CUDA GPU. Cellpose works on CPU but is slow on 3-D volumes.
+Classic Cellpose loads a pretrained or retrained model file — the models are trained on full segmentation masks, not painted points, so they cannot be fine-tuned from the napari plugin itself (see the [Cellpose Training Notebook](../../cellpose_training)). For method choice across all six segmentation options, see the [segmentation overview](./index.md#how-to-pick-a-method).
 
 ![Cellpose tab](../../_static/screenshots/segmentation_tab_cellpose.png)
 

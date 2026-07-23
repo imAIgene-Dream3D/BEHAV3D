@@ -57,7 +57,7 @@ Checkboxes for the **categorical / true-false** columns in the features table (f
 
 ### Number of states
 
-**n_states** (default `4`, range 2–50) — how many behavioural states to fit. This is the single most important choice: too few merges distinct behaviours, too many fragments one behaviour across several states. By default the value is used directly (*fixed* mode); see Advanced Configuration for automatic selection.
+**n_states** (default `4`, range 2–50) — the number of behavioural states the HMM fits. The value is used directly.
 
 ### ⚙ Advanced Configuration
 
@@ -65,8 +65,6 @@ Collapsed by default. Most users never need to touch these — sensible defaults
 
 | Control | Default | Meaning |
 |---|---|---|
-| **State selection mode** | fixed | `fixed` uses your **n_states**; `auto` searches a range and picks the best number of states automatically. |
-| **k_min / k_max** | 2 / 8 | The range of state counts searched in `auto` mode (shown only when `auto` is selected). |
 | **Start offset** | 1 | Number of leading timepoints to skip per track before classifying, backfilling the skipped frames from the next timepoint's state. **Leave at 1; changing it is not recommended.** The first timepoint of a track has no speed by definition (there is no previous position), so without this offset every track would start in a "static" state. Window features also use an *expanding* rolling window (timepoints 1–2, then 1–3, …) until the full window is available. |
 | **Skipped frames** | backfill | What to do with those skipped frames: `backfill` assigns them the first classified state; `leave_unassigned` leaves them out. |
 | **Covariance type** | full | Shape of each state's feature distribution (`full`, `diag`, `spherical`, `tied`). `full` is the most flexible; `diag` is a lighter, more stable choice when you have many features or few cells. |
@@ -88,9 +86,10 @@ After the chosen per-timepoint and window features are assembled, smoothed and s
 The **window features** summarise motion over each rolling window of length $w$. With $\mathbf{p}(t)$ the position and $\mathbf{s}(i)=\mathbf{p}(i)-\mathbf{p}(i-1)$ the steps inside the window:
 
 $$
-\text{net\_displacement} = \lVert \mathbf{p}(t) - \mathbf{p}(t-w+1) \rVert
-\qquad
-\text{straightness} = \frac{\text{net\_displacement}}{\sum_i \lVert \mathbf{s}(i) \rVert}
+\begin{aligned}
+\text{net\_displacement} &= \lVert \mathbf{p}(t) - \mathbf{p}(t-w+1) \rVert \\[4pt]
+\text{straightness} &= \frac{\text{net\_displacement}}{\sum_i \lVert \mathbf{s}(i) \rVert}
+\end{aligned}
 $$
 
 **Straightness** ranges from 0 (a cell that wanders but ends where it started) to 1 (perfectly straight travel), and the window **mean_square_displacement** is the mean squared distance of each in-window position from the window's start — together these separate directed migration from local scanning.
@@ -204,7 +203,6 @@ Reopen either report at any time with its **👁** button or from the shared **R
 
 - **Choose features deliberately.** The states are only as meaningful as the features you feed in. Begin with a small, interpretable set and expand only if states are blurry.
 - **Use a fixed seed for reproducibility.** Leave **Random seed** at its default (or note the value you used) so re-runs and collaborators get the same states.
-- **Let `auto` mode suggest n_states when unsure.** If you have no prior expectation of how many behaviours exist, switch State selection mode to `auto` and inspect the result, then pin a `fixed` value for the final run.
 - **Save and reuse a model across experiments.** Once you have a state definition you trust, apply it to new datasets via **Apply existing behavioral state classification** so states stay comparable.
 - **Pair with Backprojection.** After classifying, use **Step 4 — Backprojection** above to paint the states back onto the raw images and sanity-check that they correspond to real behaviour.
 

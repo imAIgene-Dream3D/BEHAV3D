@@ -32,31 +32,20 @@ Special cases:
 
 Each cell type is tracked with one of the following methods, picked from the method dropdown in its sub-tab:
 
-| Method | Algorithm | Best for |
-|---|---|---|
-| **Propagation** | Watershed propagation of the previous timepoint's labels onto the current timepoint's mask (overlap-based, not centroid distance). | Slow, non-dividing, non-touching structures whose segments overlap themselves across frames — **organoids** (and, in practice, microglia). |
-| **btrack (Bayesian)** | Bayesian tracker with a Kalman-filter motion model, optionally followed by a global integer-programming hypothesis optimiser. | **Motile cells** — immune cells with fast motion, short disappearances, crossing trajectories, divisions or death. The default and only tracker in routine use for moving objects. |
-| **Import tracking** | Validates + re-chunks an externally-produced tracked zarr / TIFF into BEHAV3D EXPLORER's canonical layout. | Track data produced by Imaris or any external pipeline. |
+| Method | What it does |
+|---|---|
+| **Propagation** | Propagates the previous timepoint's labels onto the current timepoint's mask by spatial overlap (watershed-based, not centroid distance). No tunable parameters. |
+| **Reporter Propagation** | Pools all segments across the whole movie, groups spatially-overlapping ones regardless of time, and stamps each group's single largest detection onto every timepoint. For near-static objects whose segmentation flickers on and off. See [Reporter Propagation](reporter_propagation). |
+| **btrack (Bayesian)** | Bayesian tracker with a Kalman-filter motion model, optionally followed by a global hypothesis optimiser. See [btrack](btrack). |
+| **Import tracking** | Validates and re-chunks an externally-produced tracked zarr / TIFF into BEHAV3D EXPLORER's canonical layout. See [Import tracking](import). |
 
-```{tip}
-**Starting points that we generally recommend:**
-
-- **Propagation** for organoids — they are large, slow, and overlap themselves across consecutive frames.
-- **btrack** for immune / motile cells — in our hands it consistently gives the best results, handling fast motion, short disappearances, divisions, and cell death.
-
-These are starting points, not endpoints — every method needs to be checked visually on at least one sample before committing to a batch run.
+```{note}
+**Recommended practice** (from the reference workflow): **Propagation** for organoids
+— and, in practice, microglia — which are large, slow, and overlap themselves across
+consecutive frames; **btrack** for immune / motile cells, where it is the tracker in
+routine use. These are starting points — check every method visually on at least one
+sample before committing to a batch run.
 ```
-
-## How to choose
-
-Two questions usually settle the choice:
-
-1. **How much do the cells move between frames, relative to their size?**
-   - Almost no motion (organoids): **Propagation** works well because the previous-frame segment still overlaps itself in the current frame.
-   - Visible motion (immune cells, motile cancer cells): **btrack** — its Kalman-filter motion model links detections across frames by predicted position.
-2. **Do you need to recover short disappearances, or model divisions / death?**
-   - btrack's global hypothesis optimiser bridges short gaps and can model branching (division), death, and merging — see [btrack](btrack).
-   - Propagation has no built-in support for gaps or divisions; it relies purely on frame-to-frame overlap.
 
 ## Generic workflow per sub-tab
 
@@ -128,6 +117,7 @@ Full step-by-step instructions, all six tools, and tips: **[Manual editing of tr
 :maxdepth: 1
 
 propagation
+reporter_propagation
 btrack
 import
 manual_editing

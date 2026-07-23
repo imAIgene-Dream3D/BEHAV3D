@@ -1,11 +1,8 @@
 # ⚡ APOC (GPU)
 
-APOC ([Accelerated Pixel and Object Classifiers](https://github.com/haesleinhuepf/apoc)) is the **GPU pixel classifier** option in BEHAV3D EXPLORER. It computes image features on the GPU, then trains a Random Forest classifier on those features. Once trained, the classifier runs on the GPU to predict the class of every voxel in your image.
+APOC ([Accelerated Pixel and Object Classifiers](https://github.com/haesleinhuepf/apoc)) is the **GPU pixel classifier** option in BEHAV3D EXPLORER — a project where, in its own words, *"clesperanto meets scikit-learn to classify pixels, objects and edges in images."* It computes image features on an OpenCL GPU, trains a Random Forest classifier on those features, and runs that classifier on the GPU to predict the class of every voxel.
 
-Pick it when:
-- Your computer has a dedicated or integrated GPU.
-- You want fast training and batch processing.
-- Your objects have clear boundaries or intensity differences from the background. For subtler textures, see [ConvPaint](convpaint).
+APOC's own documentation does not give a formal reference for the feature and classifier parameters; the definitions on this page are the standard image-processing meanings of each filter plus the values BEHAV3D exposes. For method choice across all six segmentation options, see the [segmentation overview](./index.md#how-to-pick-a-method).
 
 ![APOC tab](../../_static/screenshots/segmentation_tab_apoc.png)
 
