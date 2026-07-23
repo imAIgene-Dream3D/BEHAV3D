@@ -721,8 +721,13 @@ def run_feature_extraction(
                     )
             else:
                 print(f"{get_current_time()} - Skipping image-based features as none requested in features_choice (morphology, intensity, contact, death)")
-                
-            
+
+            if "intensity" in features_choice:
+                intensity_cols = [c for c in df_tracks.columns if c.startswith("mean_intensity_ch")]
+                if intensity_cols:
+                    print(f"{get_current_time()} - Calculating fold change over baseline for intensity features...")
+                    df_tracks = calculate_fold_change_over_baseline(df_tracks, intensity_cols)
+
             print(f"{get_current_time()} - Interpolating missing timepoints based on time interval")
             # As sometimes 1 or several timepoints are missing in a track, interpolate these missing rows
             # Values are interpolated linearly, forward filled or left blank based on the column
@@ -1968,6 +1973,27 @@ def calculate_relative_increase(df, column, nr_timepoints_back, groupby="TrackID
 #         result.index = result.index.droplevel(0)
 
 #     return result
+
+def calculate_fold_change_over_baseline(df, intensity_cols, baseline_percentile=10, groupby=("sample_name", "TrackID")):
+    """Per-track fold change of each intensity column over that track's own baseline.
+
+    The baseline is a robust low percentile of the track's own intensity
+    history (not its minimum, so a single noisy low dip doesn't set an
+    artificially low denominator, and not its mean/std, which would collapse
+    for a constant, non-flickering track and amplify ordinary noise into a
+    false signal). Dividing by each track's own baseline level makes cells
+    with different absolute intensities comparable, while a constant track
+    stays at fold-change ~1 throughout.
+    """
+    df = df.sort_values(list(groupby) + ["position_t"]).copy()
+    grouped = df.groupby(list(groupby), sort=False, observed=True)
+    for col in intensity_cols:
+        if col not in df.columns:
+            continue
+        baseline = grouped[col].transform(lambda s: np.nanpercentile(s, baseline_percentile))
+        baseline = baseline.where(baseline > 0, np.nan)
+        df[f"{col}_fold_change"] = df[col] / baseline
+    return df
 
 def _zero_dead_mask_under_segments(dead_mask_t, immune_arrays_t):
     """Return a copy of ``dead_mask_t`` with voxels set to 0 wherever any

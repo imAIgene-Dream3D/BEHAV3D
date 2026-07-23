@@ -189,6 +189,59 @@ def compute_dtaidistance_onehot_distance_matrix(
     return _validate_distance_matrix(distances, len(encoded_sequences)), categories
 
 
+def compute_transition_profile_distance_matrix(sequences, *, use_bigrams=True, use_trigrams=False, verbose=True):
+    """Distance matrix based on which state transitions a track ever exhibits.
+
+    Unlike the one-hot DTW distance above (which aligns sequences timepoint by
+    timepoint and is dominated by how much time is spent in each state), this
+    represents each track as the *set* of state-to-state transitions (bigrams
+    and/or trigrams) it ever exhibits, then measures Jaccard distance between
+    those sets. Two tracks that both contain a brief A->B->A blip end up at
+    distance 0 from each other regardless of when the blip occurs or how long
+    the surrounding runs of A are, and both are pulled away from a track that
+    never transitions at all — the timepoint-alignment approach instead scores
+    a single-timepoint blip as nearly identical to "no event" and often fails
+    to separate them.
+    """
+    from behav3d.features.state_descriptive_features import rle_encode, ngram_counts_from_runs
+    from scipy.spatial.distance import pdist, squareform
+
+    profiles = []
+    vocab = set()
+    for seq in sequences:
+        runs = rle_encode([str(value) for value in seq])
+        observed = set()
+        if use_bigrams:
+            observed.update(ngram_counts_from_runs(runs, n=2, weight="count").keys())
+        if use_trigrams:
+            observed.update(ngram_counts_from_runs(runs, n=3, weight="count").keys())
+        profiles.append(observed)
+        vocab.update(observed)
+
+    n = len(sequences)
+    vocab = sorted(vocab, key=str)
+    if bool(verbose):
+        _winfo(
+            "trajectory-dtai",
+            "transition-profile distance matrix | "
+            f"tracks={n} | vocabulary_size={len(vocab)} | "
+            f"use_bigrams={use_bigrams} | use_trigrams={use_trigrams}",
+        )
+    if not vocab:
+        return np.zeros((n, n)), []
+
+    vocab_index = {g: i for i, g in enumerate(vocab)}
+    presence = np.zeros((n, len(vocab)), dtype=float)
+    for i, observed in enumerate(profiles):
+        for g in observed:
+            presence[i, vocab_index[g]] = 1.0
+
+    distances = squareform(pdist(presence, metric="jaccard"))
+    distances = np.where(np.isnan(distances), 0.0, distances)
+    np.fill_diagonal(distances, 0.0)
+    return _validate_distance_matrix(distances, n), vocab
+
+
 def _cluster_precomputed_distances(distances, *, n_clusters=6, linkage="average"):
     n_clusters = int(n_clusters)
     if n_clusters < 2:
@@ -216,7 +269,20 @@ def _cluster_precomputed_distances(distances, *, n_clusters=6, linkage="average"
 
 
 def _ensure_dtaidistance_umap(adata_tracks, distances, *, random_state=123, n_neighbors=15, min_dist=0.1):
-    if "X_umap" in adata_tracks.obsm:
+    """Compute (or reuse) the 2D UMAP embedding for a dtaidistance track adata.
+
+    The cached embedding is only reused when the requested UMAP parameters
+    match those it was computed with — otherwise a stale embedding from a
+    previous n_neighbors/min_dist would silently be returned even after the
+    user changed those controls.
+    """
+    requested_params = {
+        "n_neighbors": int(n_neighbors),
+        "min_dist": float(min_dist),
+        "random_state": int(random_state),
+    }
+    cached_params = adata_tracks.uns.get("_umap_params")
+    if "X_umap" in adata_tracks.obsm and cached_params == requested_params:
         return np.asarray(adata_tracks.obsm["X_umap"], dtype=float)
     if umap is None:
         raise ImportError("umap-learn is required to create DTAI UMAP quality-control plots.")
@@ -226,12 +292,13 @@ def _ensure_dtaidistance_umap(adata_tracks, distances, *, random_state=123, n_ne
     reducer = umap.UMAP(
         n_components=2,
         metric="precomputed",
-        n_neighbors=max(2, min(int(n_neighbors), n_obs - 1)),
-        min_dist=float(min_dist),
-        random_state=int(random_state),
+        n_neighbors=max(2, min(requested_params["n_neighbors"], n_obs - 1)),
+        min_dist=requested_params["min_dist"],
+        random_state=requested_params["random_state"],
     )
     embedding = reducer.fit_transform(np.asarray(distances, dtype=float))
     adata_tracks.obsm["X_umap"] = np.asarray(embedding, dtype=float)
+    adata_tracks.uns["_umap_params"] = requested_params
     return adata_tracks.obsm["X_umap"]
 
 def _relabel_by_cluster_size(raw_labels):
