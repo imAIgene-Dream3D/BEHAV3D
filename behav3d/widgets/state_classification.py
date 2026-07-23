@@ -305,7 +305,11 @@ def _show_intrinsic_hmm_backprojection(
         sample_name=sample_name,
         cell_type=cell_type,
     )
-    code_map = _build_code_map(adata.obs, state_col=INTRINSIC_STATE_COL)
+    code_map = _build_code_map(
+        adata.obs,
+        state_col=INTRINSIC_STATE_COL,
+        state_order=_get_classification_state_order(adata, INTRINSIC_STATE_COL),
+    )
     if track_features_csv_path is None or not Path(track_features_csv_path).exists():
         raise FileNotFoundError("Track-features CSV is required for intrinsic HMM backprojection.")
 
@@ -518,7 +522,11 @@ def _show_hmm_state_backprojection(
         sample_name=sample_name,
         cell_type=cell_type,
     )
-    code_map = _build_code_map(adata.obs, state_col=state_col)
+    code_map = _build_code_map(
+        adata.obs,
+        state_col=state_col,
+        state_order=_get_classification_state_order(adata, state_col),
+    )
     if track_features_csv_path is None or not Path(track_features_csv_path).exists():
         raise FileNotFoundError("Track-features CSV is required for HMM backprojection.")
 
@@ -2687,6 +2695,7 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
         if not isinstance(clustering_meta, dict):
             clustering_meta = {}
         full_state_colors = self._current_full_state_color_mapping(write=True)
+        full_state_order = _get_classification_state_order(adata_for_plots, FULL_STATE_COL)
         if adata_for_plots is not self.model_adata and FULL_STATE_COL in getattr(adata_for_plots, "obs", {}).columns:
             observed_labels = set(
                 pd.Series(adata_for_plots.obs[FULL_STATE_COL]).dropna().astype(str).unique().tolist()
@@ -2754,6 +2763,7 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
                     id_cols=("sample_name", "TrackID"),
                     time_col="position_t",
                     state_colors=full_state_colors,
+                    state_order=full_state_order,
                     verbose=verbose,
                 )
                 transition_dir = str(transition_out.get("output_dir", transitions_outdir))

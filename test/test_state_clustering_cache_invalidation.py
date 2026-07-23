@@ -1204,6 +1204,39 @@ def test_run_hmm_state_clustering_start_offset_backfills_initial_rows(tmp_path):
         assert labels.iloc[0] == labels.iloc[1]
 
 
+def test_run_hmm_state_clustering_backfill_handles_track_shorter_than_start_offset(tmp_path):
+    df_positions = _with_binary_contact_flag(_make_positions_df_variable_lengths([1, 6, 6, 6]))
+    output_dir = Path(tmp_path) / "hmm_start_offset_backfill_short_track"
+
+    with pytest.warns(RuntimeWarning, match="timepoints"):
+        cluster_out = state_classification.run_hmm_state_clustering(
+            features=["speed", "elongation"],
+            binary_features_to_group=["contact_flag"],
+            output_dir=output_dir,
+            cell_type="tcell",
+            n_states=2,
+            start_offset=1,
+            start_offset_fill_mode="backfill",
+            random_state=45,
+            df_positions=df_positions,
+            return_details=True,
+            verbose=False,
+        )
+
+    assert isinstance(cluster_out["hmm_deployment_artifact"], dict)
+    assert len(cluster_out["hmm_deployment_artifact"]["full_label_mapping"]) > 0
+
+    obs = cluster_out["model_adata"].obs
+    short_track = obs[obs["TrackID"].astype(int) == 0]
+    assert len(short_track) == 1
+    for col in (
+        state_classification.INTRINSIC_STATE_COL,
+        state_classification.FULL_STATE_COL,
+        "full_behavioral_cluster",
+    ):
+        assert pd.Series(short_track[col], dtype="string").isna().all()
+
+
 def test_hmm_deployment_apply_start_offset_leave_unassigned(tmp_path):
     df_positions = _with_binary_contact_flag(_make_positions_df_variable_lengths([1, 5, 5, 5]))
     train_output_dir = Path(tmp_path) / "hmm_start_offset_leave_unassigned_train"

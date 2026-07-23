@@ -665,6 +665,7 @@ def _rebuild_full_behavioral_cluster_from_intrinsic(
 
     _bcols = binary_cols_to_merge if binary_cols_to_merge is not None else []
     binary_cols = [str(c) for c in list(_bcols)]
+    missing_intrinsic_mask = pd.isna(adata.obs[intrinsic_col])
     adata.obs = _add_clean_binary_annotation_columns(adata.obs, binary_cols)
     adata.obs["behavioral_clusterid"] = adata.obs[intrinsic_col].astype(str)
     adata.obs["binary_group"] = _assign_binary_group_labels(
@@ -673,9 +674,10 @@ def _rebuild_full_behavioral_cluster_from_intrinsic(
         binary_group_constraints=binary_group_constraints,
         enforce_binary_group_constraints=bool(enforce_binary_group_constraints),
     ).astype("category")
-    adata.obs["full_behavioral_cluster"] = (
+    full_behavioral_cluster = (
         adata.obs["binary_group"].astype(str) + "_" + adata.obs["behavioral_clusterid"].astype(str)
-    ).astype("category")
+    ).where(~missing_intrinsic_mask, pd.NA)
+    adata.obs["full_behavioral_cluster"] = full_behavioral_cluster.astype("category")
     adata.obs["behavioral_clusterid"] = adata.obs["behavioral_clusterid"].astype("category")
     return adata
 

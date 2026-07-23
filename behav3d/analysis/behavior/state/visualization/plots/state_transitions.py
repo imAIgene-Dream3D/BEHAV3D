@@ -11,6 +11,7 @@ from io import BytesIO
 from pathlib import Path
 from matplotlib.backends.backend_pdf import PdfPages
 from behav3d.analysis.behavior.utils import _sanitize_filename_token
+from behav3d.analysis.behavior.state.utils import _apply_state_order
 
 # -----------------------------
 # Plot timepoint>timepoint state transition matrix
@@ -149,6 +150,7 @@ def compute_cluster_transition_matrix(
     plot: bool = False,
     ax: plt.Axes = None,
     only_transitions: bool = False,
+    state_order=None,
 ):
     """
     Compute a transition matrix between cluster states from tracked objects over time.
@@ -175,6 +177,9 @@ def compute_cluster_transition_matrix(
         by setting diagonal counts to 0 and re-normalizing across off-diagonal
         entries (so rows sum to 1 when there is at least one off-diagonal transition).
         Also makes the diagonal appear empty in the plot.
+    state_order : list of str, optional
+        Saved display order for the states (e.g. from `_get_classification_state_order`). States
+        not present in this list are appended afterwards. Defaults to alphabetical.
 
     Returns
     -------
@@ -200,8 +205,14 @@ def compute_cluster_transition_matrix(
         transitions["next_state"]
     )
 
-    # Ensure all states present on both axes
-    states = sorted(df[cluster_key].unique())
+    # Ensure all states present on both axes, in the saved display order (falling back to
+    # alphabetical for any state absent from `state_order`). Order matching is done via string
+    # keys (matching `_get_classification_state_order`'s stored labels) but the original
+    # `cluster_key` dtype (e.g. int cluster ids) is preserved for the reindex/tick labels below.
+    states_raw = sorted(df[cluster_key].unique())
+    ordered_labels = _apply_state_order([str(s) for s in states_raw], state_order)
+    label_to_raw = {str(s): s for s in states_raw}
+    states = [label_to_raw[label] for label in ordered_labels]
     transition_counts = transition_counts.reindex(
         index=states, columns=states, fill_value=0
     )
@@ -1066,6 +1077,7 @@ def save_state_transition_report(
     ngram_include_per_start_state=True,
     ngram_min_count=1,
     state_colors=None,
+    state_order=None,
     verbose=True,
 ):
     """Save transition matrix + all-pairs Sankey report for one state column."""
@@ -1093,6 +1105,7 @@ def save_state_transition_report(
         normalize=True,
         plot=False,
         only_transitions=False,
+        state_order=state_order,
     )
 
     matrix_counts_csv = matrix_data_dir / "transition_matrix_counts.csv"
@@ -1114,6 +1127,7 @@ def save_state_transition_report(
             normalize=True,
             plot=False,
             only_transitions=True,
+            state_order=state_order,
         )
         counts_no_self.to_csv(matrix_counts_no_self_csv)
         probs_no_self.to_csv(matrix_probs_no_self_csv)
@@ -1127,7 +1141,7 @@ def save_state_transition_report(
         .astype(str)
         .str.strip()
     )
-    states = sorted(states.unique().tolist(), key=_natural_sort_key)
+    states = _apply_state_order(sorted(states.unique().tolist(), key=_natural_sort_key), state_order)
 
     ngrams_all_csv = matrix_data_dir / "transition_ngrams_all.csv"
     ngrams_pooled_csv = matrix_data_dir / "transition_ngrams_pooled.csv"

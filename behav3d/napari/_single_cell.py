@@ -2180,7 +2180,10 @@ class StateClassificationSubTab(QWidget):
             from behav3d.analysis.behavior.state.visualization.plots.state_transitions import (
                 save_state_transition_report,
             )
-            from behav3d.analysis.behavior.state.utils import _get_classification_state_colors
+            from behav3d.analysis.behavior.state.utils import (
+                _get_classification_state_colors,
+                _get_classification_state_order,
+            )
             adata = ad.read_h5ad(str(full_path))
             transition_dir = _resolve_state_paths(out, ct).state_transitions_outdir
             transition_dir.mkdir(parents=True, exist_ok=True)
@@ -2190,6 +2193,7 @@ class StateClassificationSubTab(QWidget):
                 state_col=FULL_STATE_COL,
                 time_col="position_t",
                 state_colors=_get_classification_state_colors(adata, FULL_STATE_COL),
+                state_order=_get_classification_state_order(adata, FULL_STATE_COL),
                 verbose=True,
             )
 
@@ -3092,6 +3096,40 @@ class TrackClassificationSubTab(QWidget):
         contact_row.addWidget(self.btn_view_contact_analysis)
         g_contact.addLayout(contact_row)
 
+        g_contact.addWidget(QLabel("State-shift analysis (behavioral state before → after contact):"))
+        shift_form = QFormLayout()
+        shift_form.setSpacing(3)
+        self.combo_contact_shift_window_mode = QComboBox()
+        self.combo_contact_shift_window_mode.addItems(["Fixed", "Full"])
+        shift_form.addRow("Window mode:", make_help_row(
+            self.combo_contact_shift_window_mode, "Before/after window mode",
+            "'Fixed': compare a fixed number of timepoints immediately before the contact bout "
+            "starts vs. immediately after it ends. 'Full': compare everything before the bout to "
+            "everything after it, within the track's classified window."
+        ))
+        self.spin_contact_shift_window_length = QSpinBox()
+        self.spin_contact_shift_window_length.setRange(1, 100000)
+        self.spin_contact_shift_window_length.setValue(10)
+        self.spin_contact_shift_window_length.setMaximumWidth(100)
+        shift_form.addRow("Fixed window length:", make_help_row(
+            self.spin_contact_shift_window_length, "Fixed window length (timepoints)",
+            "Only used in 'Fixed' window mode: number of timepoints immediately before the bout "
+            "start / after the bout end to compare."
+        ))
+        self.combo_contact_shift_state_col = QComboBox()
+        self.combo_contact_shift_state_col.addItems(
+            ["full_behavioral_cluster", "intrinsic_behavioral_cluster", "raw_hmm_state"]
+        )
+        shift_form.addRow("State column:", self.combo_contact_shift_state_col)
+        g_contact.addLayout(shift_form)
+        shift_row = QHBoxLayout()
+        self.btn_contact_state_shift = QPushButton("▶ Run State-Shift Analysis")
+        _style_secondary(self.btn_contact_state_shift)
+        shift_row.addWidget(self.btn_contact_state_shift, stretch=1)
+        self.btn_view_contact_state_shift = _make_view_btn()
+        shift_row.addWidget(self.btn_view_contact_state_shift)
+        g_contact.addLayout(shift_row)
+
         self.grp_exemplar = QGroupBox("Exemplar Tracks")
         g_exemplar = QVBoxLayout(self.grp_exemplar)
         g_exemplar.setSpacing(4)
@@ -3299,6 +3337,8 @@ class TrackClassificationSubTab(QWidget):
         )
         self.btn_contact_analysis.clicked.connect(self._on_contact_analysis)
         self.btn_view_contact_analysis.clicked.connect(lambda: self._on_view("contact_analysis"))
+        self.btn_contact_state_shift.clicked.connect(self._on_contact_state_shift_analysis)
+        self.btn_view_contact_state_shift.clicked.connect(lambda: self._on_view("contact_state_shift"))
         self.btn_browse_pretrained_clf.clicked.connect(self._browse_pretrained_clf)
         self.btn_browse_pretrained_states.clicked.connect(self._browse_pretrained_states)
         self.btn_run_apply_pretrained.clicked.connect(self._on_apply_pretrained)
@@ -3886,6 +3926,11 @@ class TrackClassificationSubTab(QWidget):
         self.combo_contact_col.blockSignals(False)
         self.combo_contact_col.setEnabled(len(contact_cols) > 0)
         self.btn_contact_analysis.setEnabled(len(contact_cols) > 0 and self._track_adata is not None)
+        state_adata_path = self._state_adata_path(ct) if ct else None
+        has_states = bool(state_adata_path and state_adata_path.exists())
+        self.btn_contact_state_shift.setEnabled(
+            len(contact_cols) > 0 and self._track_adata is not None and has_states
+        )
 
     def _update_view_buttons(self):
         ct = self._cell_type()
@@ -3895,6 +3940,7 @@ class TrackClassificationSubTab(QWidget):
                 self.btn_view_apply_track, self.btn_view_exemplars,
                 self.btn_view_diagnostics, self.btn_view_track_proportions,
                 self.btn_view_track_condition_comparison, self.btn_view_contact_analysis,
+                self.btn_view_contact_state_shift,
             ):
                 btn.setEnabled(False)
             return
@@ -3935,6 +3981,13 @@ class TrackClassificationSubTab(QWidget):
                 contact_dir
                 and contact_dir.exists()
                 and any(contact_dir.glob("*/*.pdf"))
+            )
+        )
+        self.btn_view_contact_state_shift.setEnabled(
+            bool(
+                contact_dir
+                and contact_dir.exists()
+                and any(contact_dir.glob("*/contact_state_shift.pdf"))
             )
         )
 
@@ -4577,7 +4630,6 @@ class TrackClassificationSubTab(QWidget):
                     cluster_key="ClusterID",
                     tmin_key="position_t_min",
                     tmax_key="position_t_max",
-                    verbose=True,
                 )
                 results["statebar_pdfs"] = statebar_out
 
@@ -4899,6 +4951,79 @@ class TrackClassificationSubTab(QWidget):
             on_failed=lambda e: self._log(f"❌ Contact-vs-no-contact analysis failed: {e}"),
         )
 
+    def _on_contact_state_shift_analysis(self):
+        ct = self._cell_type()
+        if not ct:
+            return
+        if self._track_adata is None:
+            QMessageBox.warning(self, "No data", "Run track clustering first.")
+            return
+        if self._bg.is_running():
+            QMessageBox.warning(self, "Busy", "Another operation is running.")
+            return
+        contact_col = self.combo_contact_col.currentText()
+        if not contact_col:
+            QMessageBox.warning(self, "Missing selection", "Select a contact column to analyze.")
+            return
+        state_adata_path = self._state_adata_path(ct)
+        if not state_adata_path or not state_adata_path.exists():
+            QMessageBox.warning(
+                self, "No data",
+                "Behavioral states h5ad not found. Run State Classification first.",
+            )
+            return
+        csv_path = self._track_features_csv_path(ct)
+        if not csv_path or not csv_path.exists():
+            QMessageBox.warning(self, "No data", "Track-features CSV not found. Run feature extraction first.")
+            return
+        min_bout_length = int(self.spin_contact_min_bout.value())
+        window_mode = self.combo_contact_shift_window_mode.currentText().lower()
+        fixed_window_length = int(self.spin_contact_shift_window_length.value())
+        state_col_choice = self.combo_contact_shift_state_col.currentText()
+        out = self._out_dir()
+        track_adata = self._track_adata
+        self._log(f"▶ Running contact state-shift analysis for '{ct}'…")
+
+        def _run(**kw):
+            import pandas as pd
+            import anndata as _ad
+            from behav3d.analysis.behavior.state.classification import FULL_STATE_COL
+            from behav3d.analysis.behavior.track.utils import _resolve_dtaidistance_paths
+            from behav3d.analysis.behavior.track.visualization.plots.contact_state_shift_report import (
+                save_track_contact_state_shift_report,
+            )
+            state_col = FULL_STATE_COL if state_col_choice == "full_behavioral_cluster" else state_col_choice
+            full_adata = _ad.read_h5ad(str(state_adata_path))
+            df_timepoints = pd.read_csv(csv_path)
+            contact_dir = _resolve_dtaidistance_paths(str(out) if out else "", ct)["outfolder"]
+            return save_track_contact_state_shift_report(
+                track_adata,
+                df_timepoints,
+                full_adata,
+                contact_dir,
+                contact_col=contact_col,
+                min_bout_length=min_bout_length,
+                state_col=state_col,
+                window_mode=window_mode,
+                fixed_window_length=fixed_window_length,
+                verbose=True,
+            )
+
+        self._bg.run(
+            fn=_run,
+            desc=f"Contact state-shift analysis ({ct})…",
+            progress_row=self.progress_row,
+            buttons=[self.btn_contact_state_shift],
+            viewer=self.viewer,
+            inject_progress=False,
+            on_done=lambda r: (
+                self._log(f"✅ Contact state-shift analysis done for '{ct}'."),
+                self._update_view_buttons(),
+                self._notify_results(),
+            ),
+            on_failed=lambda e: self._log(f"❌ Contact state-shift analysis failed: {e}"),
+        )
+
     # ── Backprojection ───────────────────────────────────────────────────
 
     def _on_bp_layer_display_changed(self, event=None):
@@ -5140,6 +5265,12 @@ class TrackClassificationSubTab(QWidget):
                 (f"{f.parent.name}/{f.stem}", f)
                 for f in sorted(contact_dir.glob("*/*.pdf"))
             ]
+        elif kind == "contact_state_shift" and traj_dir:
+            contact_dir = traj_dir / "contact_analysis"
+            candidates = [
+                (f.parent.name, f)
+                for f in sorted(contact_dir.glob("*/contact_state_shift.pdf"))
+            ]
 
         existing = [(lbl, p) for lbl, p in candidates if p and p.exists()]
         if not existing:
@@ -5232,6 +5363,17 @@ class SingleCellTab(QWidget):
         self.status_lbl.setStyleSheet("color: #888; font-size: 11px;")
         hdr_lay.addWidget(self.status_lbl)
         outer.addLayout(hdr_lay)
+
+        # ── Data-consistency warning (h5ad vs. filtered CSV track IDs) ────
+        self.data_consistency_warning_label = QLabel("")
+        self.data_consistency_warning_label.setWordWrap(True)
+        self.data_consistency_warning_label.setStyleSheet(
+            "QLabel { background: #3d2200; color: #ffaa44; border-radius: 4px; "
+            "padding: 6px 8px; font-size: 11px; }"
+        )
+        self.data_consistency_warning_label.hide()
+        outer.addWidget(self.data_consistency_warning_label)
+        self._consistency_bg = BackgroundOperation(self)
 
         # ── Guided overview + isolated settings pages ────────────────────
         from behav3d.napari._guided import GuidedPanel, make_back_header
@@ -5364,6 +5506,7 @@ class SingleCellTab(QWidget):
             combo.blockSignals(False)
 
         self._propagate_metadata_update()
+        self._refresh_data_consistency_warning()
 
     def _propagate_metadata_update(self):
         self.state_tab.on_metadata_updated()
@@ -5379,6 +5522,100 @@ class SingleCellTab(QWidget):
             params.setdefault("single_cell", {})["selected_cell_type"] = text
             _save_behav3d_params(self.metadata_loader, self._out_dir)
         self._propagate_metadata_update()
+        self._refresh_data_consistency_warning()
 
     def _current_cell_type(self) -> str:
         return self.cell_type_combo.currentText()
+
+    # ── Data-consistency warning ─────────────────────────────────────────
+
+    def showEvent(self, event):
+        """Fires whenever this tab becomes visible (initial show and every tab
+        switch back to it) — the natural "entering Single-Cell Analysis" hook,
+        so the warning reflects any h5ad/CSV drift since it was last shown."""
+        super().showEvent(event)
+        self._refresh_data_consistency_warning()
+
+    def _refresh_data_consistency_warning(self):
+        """Cheap background check: do the filtered track-features CSV and the
+        track/behavioral-states h5ad(s) for the current cell type still describe
+        the same tracks?
+
+        Only reads the two ID columns from the CSV (not the full file) and the
+        ``.obs`` table from each h5ad in ``backed="r"`` mode (not the full
+        AnnData, so no X matrix is loaded) — this is far cheaper than the
+        full contact/no-contact analysis pipeline and safe to run on every tab
+        entry. Runs off the Qt thread so it never blocks tab switching; if a
+        previous check is still in flight, this call is skipped (a subsequent
+        trigger — e.g. the next tab visit — will pick it up).
+        """
+        ct = self._current_cell_type()
+        out = self._out_dir()
+        self.data_consistency_warning_label.hide()
+        if not ct or not out:
+            return
+
+        csv_path = self.track_tab._track_features_csv_path(ct)
+        if not csv_path or not csv_path.exists():
+            return
+        h5ad_sources = [
+            ("track classification h5ad", self.track_tab._track_adata_path(ct)),
+            ("behavioral states h5ad", self.track_tab._state_adata_path(ct)),
+        ]
+        h5ad_sources = [(label, p) for label, p in h5ad_sources if p and p.exists()]
+        if not h5ad_sources:
+            return
+
+        if self._consistency_bg.is_running():
+            return
+
+        groupby_cols = ["sample_name", "TrackID"]
+
+        def _key_set(df):
+            from behav3d.analysis.behavior.track.contact_grouping import _normalize_id_column
+            d = df[groupby_cols].copy()
+            for col in groupby_cols:
+                d[col] = _normalize_id_column(d[col])
+            return set(map(tuple, d.drop_duplicates().to_numpy()))
+
+        def _check():
+            import pandas as pd
+            import anndata as ad
+
+            csv_keys = _key_set(pd.read_csv(csv_path, usecols=groupby_cols))
+            mismatches = []
+            for label, path in h5ad_sources:
+                adata = ad.read_h5ad(str(path), backed="r")
+                try:
+                    h5ad_keys = _key_set(adata.obs[groupby_cols])
+                finally:
+                    if getattr(adata, "isbacked", False):
+                        adata.file.close()
+                missing = h5ad_keys - csv_keys
+                if missing:
+                    mismatches.append((label, len(missing)))
+            return mismatches
+
+        def _on_done(mismatches):
+            if not mismatches:
+                self.data_consistency_warning_label.hide()
+                return
+            details = "; ".join(f"{n} track(s) missing from {label}" for label, n in mismatches)
+            self.data_consistency_warning_label.setText(
+                f"⚠ Filtered track data no longer matches the behavioral-analysis h5ad output "
+                f"for cell type '{ct}' ({details}). Contact/no-contact plots will error — "
+                f"re-run Behavioral Analysis (Track / State Classification) to refresh the h5ad "
+                f"from the current filtered data."
+            )
+            self.data_consistency_warning_label.show()
+
+        def _on_failed(err):
+            print(f"[BEHAV3D] Data-consistency check failed: {err}")
+
+        self._consistency_bg.run(
+            fn=_check,
+            desc="Checking data consistency…",
+            inject_progress=False,
+            on_done=_on_done,
+            on_failed=_on_failed,
+        )

@@ -23,6 +23,7 @@ from behav3d.analysis.behavior.state.utils import (
     A4_LANDSCAPE,
     _apply_log1p_to_feature_matrix,
     _get_classification_state_colors,
+    _get_classification_state_order,
     _infer_binary_group_constraints,
     _invert_log_scaling_in_continuous_matrix,
     _mixed_label_sort_key,
@@ -708,6 +709,60 @@ def _warn_hmm_apply_row_drops(drop_summary):
         f"Kept rows={int(drop_summary.get('n_timepoints_kept', 0))}. "
         f"Affected tracks={int(drop_summary.get('n_tracks_with_dropped_timepoints', 0))}/"
         f"{int(drop_summary.get('n_tracks_input', 0))}. "
+        f"Preview: {preview_text}.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+
+def _summarize_hmm_short_tracks(
+    df_model,
+    *,
+    sample_col="sample_name",
+    track_col="TrackID",
+    scored_col="_start_offset_scored",
+    max_preview=5,
+):
+    key_cols = [str(sample_col), str(track_col)]
+    input_tracks = df_model[key_cols].drop_duplicates()
+    scored_rows = df_model.loc[pd.Series(df_model[scored_col], index=df_model.index).astype(bool)]
+    scored_tracks = scored_rows[key_cols].drop_duplicates()
+    scored_track_keys = set(map(tuple, scored_tracks.itertuples(index=False, name=None)))
+    all_track_keys = list(map(tuple, input_tracks.itertuples(index=False, name=None)))
+    short_track_keys = [k for k in all_track_keys if k not in scored_track_keys]
+
+    short_track_mask = pd.Series(
+        list(zip(df_model[sample_col], df_model[track_col])), index=df_model.index
+    ).isin(short_track_keys)
+
+    preview = [f"{sample}/{track}" for sample, track in short_track_keys[: int(max_preview)]]
+    omitted = max(0, len(short_track_keys) - len(preview))
+
+    return {
+        "n_tracks_input": int(len(all_track_keys)),
+        "n_tracks_too_short": int(len(short_track_keys)),
+        "n_timepoints_too_short": int(short_track_mask.sum()),
+        "short_track_preview": preview,
+        "short_track_preview_omitted": int(omitted),
+    }
+
+
+def _warn_hmm_short_tracks(short_track_summary, *, start_offset):
+    if int(short_track_summary.get("n_tracks_too_short", 0)) <= 0:
+        return
+
+    preview = list(short_track_summary.get("short_track_preview", []))
+    preview_text = ", ".join(preview) if len(preview) > 0 else "none"
+    omitted = int(short_track_summary.get("short_track_preview_omitted", 0))
+    if omitted > 0:
+        preview_text = f"{preview_text} (+{omitted} more)"
+
+    warnings.warn(
+        f"{int(short_track_summary.get('n_tracks_too_short', 0))}/"
+        f"{int(short_track_summary.get('n_tracks_input', 0))} tracks "
+        f"({int(short_track_summary.get('n_timepoints_too_short', 0))} timepoints) contain "
+        f"{int(start_offset)} or fewer timepoints and were never scored by the HMM. "
+        "These tracks will have no assigned behavioral state and are dropped from the state output. "
         f"Preview: {preview_text}.",
         RuntimeWarning,
         stacklevel=2,
@@ -1661,6 +1716,8 @@ def run_hmm_state_clustering(
     )
     df_model.loc[:, HMM_INTRINSIC_RAW_STATE_COL] = raw_states
     df_model.loc[:, INTRINSIC_STATE_COL] = raw_states.astype("string")
+    _short_track_summary = _summarize_hmm_short_tracks(df_model)
+    _warn_hmm_short_tracks(_short_track_summary, start_offset=start_offset)
     if start_offset_fill_mode == "backfill" and start_offset > 0:
         for _, group_idx in df_model.groupby(["sample_name", "TrackID"], sort=False, observed=False).groups.items():
             group = df_model.loc[list(group_idx)]
@@ -2007,6 +2064,7 @@ def _finalize_hmm_apply_outputs(
     adata_full.uns["preprocessing"] = dict(preprocessing_meta)
     adata_full.uns["classification"] = dict(classification_meta)
     report_state_colors = {}
+    report_state_order = []
     if full_output_col in report_adata.obs.columns:
         report_state_colors = _normalize_label_color_map(
             _obs_label_values(report_adata, full_output_col),
@@ -2014,6 +2072,10 @@ def _finalize_hmm_apply_outputs(
                 _extract_state_color_mapping(classification_meta.get("state_colors", {}), full_output_col)
                 or _extract_state_color_mapping(classification_meta.get("state_colors", {}), FULL_STATE_COL)
             ),
+        )
+        report_state_order = (
+            _get_classification_state_order(adata_full, full_output_col)
+            or _get_classification_state_order(adata_full, FULL_STATE_COL)
         )
 
     state_composition_report_pdf = None
@@ -2105,6 +2167,7 @@ def _finalize_hmm_apply_outputs(
                 sankey_min_count=int(state_transitions_min_count),
                 sankey_relative_count=float(state_transitions_relative_count),
                 state_colors=report_state_colors,
+                state_order=report_state_order,
                 verbose=verbose,
             )
             state_transition_report_dir = str(transition_out.get("output_dir", transitions_outdir))

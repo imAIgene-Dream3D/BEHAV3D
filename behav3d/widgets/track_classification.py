@@ -60,6 +60,9 @@ from behav3d.analysis.behavior.track.visualization.plots.reports import (
     save_track_condition_comparison_report,
     save_track_contact_group_analysis,
 )
+from behav3d.analysis.behavior.track.visualization.plots.contact_state_shift_report import (
+    save_track_contact_state_shift_report,
+)
 from behav3d.analysis.behavior.track.contact_grouping import list_available_contact_columns
 from behav3d.analysis.behavior.track.utils import (
     _build_identity_cluster_mapping_from_obs,
@@ -433,6 +436,28 @@ class TrackClassificationPanel:
         self.contact_analysis_spinner = widgets.HTML(value=spinning_loader)
         self.contact_analysis_spinner.layout.display = "none"
 
+        self.contact_shift_window_mode_dd = widgets.Dropdown(
+            options=["Fixed", "Full"], value="Fixed", description="Window mode:",
+            style={"description_width": "130px"}, layout=widgets.Layout(width="360px"),
+        )
+        self.contact_shift_window_length = widgets.IntText(
+            description="Fixed window length (timepoints):", value=10,
+            style={"description_width": "260px"}, layout=widgets.Layout(width="360px"),
+        )
+        self.contact_shift_state_col_dd = widgets.Dropdown(
+            options=["full_behavioral_cluster", "intrinsic_behavioral_cluster", "raw_hmm_state"],
+            value="full_behavioral_cluster", description="State column:",
+            style={"description_width": "130px"}, layout=widgets.Layout(width="360px"),
+        )
+        self.btn_contact_state_shift = widgets.Button(
+            description="Run contact state-shift analysis",
+            button_style="info",
+            layout=widgets.Layout(width="280px"),
+            disabled=True,
+        )
+        self.contact_state_shift_spinner = widgets.HTML(value=spinning_loader)
+        self.contact_state_shift_spinner.layout.display = "none"
+
         self.run_section = widgets.VBox(
             [
                 self.state_col_html,
@@ -525,6 +550,24 @@ class TrackClassificationPanel:
                 self.contact_group_cols_select,
             ],
         )
+        contact_state_shift_box = build_plot_box(
+            title="Contact state-shift analysis",
+            description=(
+                "Compares each track's behavioral-state composition before vs. after its first "
+                "sufficiently long contact bout (contact tracks; uses the same 'Min. contiguous "
+                "contact bout' setting above), against a timing-matched null before/after split "
+                "for no-contact tracks."
+            ),
+            run_row=widgets.HBox(
+                [self.btn_contact_state_shift, self.contact_state_shift_spinner],
+                layout=widgets.Layout(gap="8px"),
+            ),
+            settings=[
+                self.contact_shift_window_mode_dd,
+                self.contact_shift_window_length,
+                self.contact_shift_state_col_dd,
+            ],
+        )
         exemplar_box = build_plot_box(
             title="Exemplar tracks",
             description="Writes exemplar overview and per-cluster statebar PDFs.",
@@ -549,6 +592,7 @@ class TrackClassificationPanel:
                 track_proportions_box,
                 track_condition_comparison_box,
                 contact_group_box,
+                contact_state_shift_box,
                 exemplar_box,
                 self.out_plots,
             ],
@@ -803,6 +847,7 @@ class TrackClassificationPanel:
         self.btn_diagnostics.on_click(self._on_diagnostics_clicked)
         self.btn_track_proportions.on_click(self._on_track_proportions_clicked)
         self.btn_contact_analysis.on_click(self._on_contact_analysis_clicked)
+        self.btn_contact_state_shift.on_click(self._on_contact_state_shift_clicked)
         self.btn_exemplars.on_click(self._on_exemplars_clicked)
         self.make_overview_statebars.observe(self._on_exemplar_output_changed, names="value")
         self.make_backprojection_pdf.observe(self._on_exemplar_output_changed, names="value")
@@ -1267,6 +1312,9 @@ class TrackClassificationPanel:
                 self.contact_col_dd.value = contact_columns[0]
         self.contact_col_dd.disabled = len(contact_columns) == 0
         self.btn_contact_analysis.disabled = len(contact_columns) == 0 or not model_path.exists()
+        self.btn_contact_state_shift.disabled = (
+            len(contact_columns) == 0 or not model_path.exists() or not self._has_behavioral_states()
+        )
         if bool(self.use_original_behav3d.value):
             self.btn_diagnostics.disabled = not _feature_dtw_umap_csv_path(
                 self.output_dir,
@@ -2029,6 +2077,58 @@ class TrackClassificationPanel:
                 traceback.print_exc()
             finally:
                 self._set_busy(self.btn_contact_analysis, self.contact_analysis_spinner, busy=False)
+
+    def _on_contact_state_shift_clicked(self, _):
+        self._set_busy(self.btn_contact_state_shift, self.contact_state_shift_spinner, busy=True)
+        self.out_plots.clear_output()
+        with self.out_plots:
+            try:
+                if bool(self.use_original_behav3d.value):
+                    raise ValueError(
+                        "Contact state-shift analysis is only available for the one-hot dtaidistance method."
+                    )
+                contact_col = self.contact_col_dd.value
+                if not contact_col:
+                    raise ValueError("Select a contact column to analyze.")
+                min_bout_length = int(self.contact_min_bout_length.value)
+                if min_bout_length < 1:
+                    raise ValueError("Min. contiguous contact bout must be at least 1 timepoint.")
+                if not self._has_behavioral_states():
+                    raise FileNotFoundError(
+                        "Behavioral states h5ad not found. Run State Classification first."
+                    )
+
+                state_col_choice = self.contact_shift_state_col_dd.value
+                state_col = (
+                    FULL_STATE_COL if state_col_choice == "full_behavioral_cluster" else state_col_choice
+                )
+                adata_tracks = self._load_model_adata()
+                df_timepoints = pd.read_csv(self._original_track_features_path())
+                full_adata = ad.read_h5ad(str(self._state_adata_path()))
+                paths = _resolve_dtaidistance_paths(self.output_dir, self._current_cell_type())
+                result = save_track_contact_state_shift_report(
+                    adata_tracks,
+                    df_timepoints,
+                    full_adata,
+                    paths["outfolder"],
+                    contact_col=contact_col,
+                    min_bout_length=min_bout_length,
+                    state_col=state_col,
+                    window_mode=self.contact_shift_window_mode_dd.value.lower(),
+                    fixed_window_length=int(self.contact_shift_window_length.value),
+                    verbose=True,
+                )
+                self.plot_status_html.value = (
+                    "<b>Contact state-shift analysis ready:</b> plot and CSVs were written."
+                )
+                _winfo(
+                    "trajectory-dtai-widget",
+                    f"Created contact state-shift report: {result.get('pdf_path')}",
+                )
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self._set_busy(self.btn_contact_state_shift, self.contact_state_shift_spinner, busy=False)
 
     def _on_exemplars_clicked(self, _):
         self._set_busy(self.btn_exemplars, self.exemplar_spinner, busy=True)
