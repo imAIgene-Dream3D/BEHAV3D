@@ -955,7 +955,7 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
         self.reuse_prepared_dataset = widgets.Checkbox(value=False, indent=False)
         self.describe_window_feature_cbs = {}
         self.additional_window_feature_cbs = {
-            "net_displacement": widgets.Checkbox(description="net_displacement", value=False, indent=False),
+            "net_displacement": widgets.Checkbox(description="net_displacement", value=True, indent=False),
             "straightness": widgets.Checkbox(description="straightness", value=False, indent=False),
             "mean_square_displacement": widgets.Checkbox(
                 description="mean_square_displacement",
@@ -1061,7 +1061,7 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
         )
         self.hmm_feature_smoothing_window = widgets.IntText(
             description="Smooth window (timepoints)",
-            value=1,
+            value=5,
             style={"description_width": "initial"},
             layout=widgets.Layout(width="250px"),
         )
@@ -1637,7 +1637,11 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
     def _rebuild_log_scale_feature_controls(self):
         selected_features = self._selected_hmm_feature_columns()
         cfg = self._effective_panel_cfg()
-        saved_log = set(cfg.get("hmm_log_scale_features", [])) if isinstance(cfg, dict) else set()
+        saved_log_cfg = cfg.get("hmm_log_scale_features", None) if isinstance(cfg, dict) else None
+        if saved_log_cfg is None:
+            saved_log = {"speed"} if "speed" in selected_features else set()
+        else:
+            saved_log = set(saved_log_cfg)
         previous_log = {
             str(col)
             for col, cb in getattr(self, "_hmm_log_scale_checkboxes", {}).items()
@@ -1785,7 +1789,11 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
         self.feature_quantile_capping_high_percentile.value = str(
             cfg.get("feature_quantile_capping_high_percentile", self.feature_quantile_capping_high_percentile.value)
         )
-        saved_window_features = set(cfg.get("hmm_window_features", []))
+        saved_window_features_cfg = cfg.get("hmm_window_features", None)
+        if saved_window_features_cfg is None:
+            saved_window_features = {"net_displacement"}
+        else:
+            saved_window_features = set(saved_window_features_cfg)
         for feature_name, cb in self.additional_window_feature_cbs.items():
             cb.value = str(feature_name) in saved_window_features
         self._update_selected_features_box()

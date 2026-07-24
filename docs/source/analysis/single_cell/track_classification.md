@@ -1,6 +1,6 @@
 # 🛤️ Track Classification
 
-The second inner sub-tab of **Analysis → 🧬 Single Cell**. Where [State Classification](state_classification.md) labels behaviour **timepoint by timepoint**, Track Classification groups **whole trajectories** into clusters based on how their behaviour unfolds over time — so two cells that follow a similar behavioural "story" end up in the same trajectory cluster, even if they are never in the exact same state at the exact same frame.
+The second inner sub-tab of **Analysis → 🧬 Single Cell**. Where [State Classification](state_classification.md) labels behaviour **timepoint by timepoint**, Track Classification groups **whole trajectories** into clusters based on how their behaviour unfolds over time — so two cells that follow a similar behavioural "story" (e.g. *static*▶*scanning*▶*killing* ) end up in the same trajectory cluster, even if they are never in the exact same state at the exact same frame.
 
 It runs on the **cell type chosen in the dropdown** at the top of the Single Cell sub-tab (immune / other only). The default method compares the **sequence of behavioural states** along each track, so you normally run [State Classification](state_classification.md) for that cell type first.
 
@@ -14,8 +14,8 @@ It runs on the **cell type chosen in the dropdown** at the top of the Single Cel
 
 Trajectories are compared with **Dynamic Time Warping (DTW)**, which aligns two sequences even when they differ slightly in length or timing, then groups the most similar ones with hierarchical clustering. Two clustering engines are available:
 
-- **Categorical DTW (default)** — each track becomes its **sequence of behavioural-state labels** (the per-timepoint states from State Classification). DTW compares state *ordering*, then **hierarchical clustering** groups similar sequences. Because it compares *which states occur and in what order* rather than raw speed, it will not split, say, fast vs. slow scanners that follow the same behavioural story.
-- **Original feature-based BEHAV3D DTW** (legacy) — each track becomes a **multi-dimensional numeric trajectory** (displacement, speed, dead-dye, contacts). DTW runs on those scaled features, the distances are embedded with **UMAP**, and **K-means** cuts the clusters. This reproduces the classic BEHAV3D trajectory analysis.
+- **Categorical behavioral state DTW (default)** — each track becomes its **sequence of behavioural-state labels** (the per-timepoint states from [State Classification](state_classification.md)). DTW compares state *ordering*, then **hierarchical clustering** groups similar sequences. Because it compares *which states occur and in what order* that are defined in [State Classification](state_classification.md) rather than raw features, it is limited by the states defined by the user and will not split clusters based on differences raw feature values, such as **how** fast each trajectory is. 
+- **Original feature-based BEHAV3D DTW** (legacy) — each track becomes a **multi-dimensional numeric trajectory** (displacement, speed, dead-dye-intensity, contacts). DTW runs on those scaled features, the distances are embedded with **UMAP**, and **K-means** cuts the clusters. This reproduces the classic [BEHAV3D](https://www.nature.com/articles/s41587-022-01397-w) trajectory analysis.
 
 ## Choosing a clustering method
 
@@ -34,11 +34,11 @@ flowchart TD
     H --> J[UMAP cluster CSVs + PDFs<br/>Steps 2–5 need categorical .h5ad]
 ```
 
-| Method | Use it when | Requires first | Full Steps 2–5 in the plugin? |
+| Method | What it does | Requires first | Full Steps 2–5 in the plugin? |
 |---|---|---|---|
-| **Categorical DTW** (default) | Normal analysis; you want interpretable trajectory types defined by behavioural *story* | [State Classification](state_classification.md) for this cell type | ✅ Yes |
-| **Original feature-based BEHAV3D DTW** (legacy) | Reproducing classic BEHAV3D results, or clustering on raw movement/contact dynamics before states exist | [Filtering](../filtering.md) (filtered track-features CSV) | ⚠ No — clustering only; rename/classify/plots/backprojection need the categorical `.h5ad` |
-| **Apply pretrained classifier** | Assigning the *same* clusters to a new, comparable dataset | A saved classifier `.pkl` + matching states `.h5ad` | Skips Steps 1–3 |
+| **Categorical DTW** (default) | Compares each track's sequence of behavioural-state labels | [State Classification](state_classification.md) for this cell type | ✅ Yes |
+| **Original feature-based BEHAV3D DTW** (legacy) | Clusters on raw movement/contact feature trajectories; reproduces the original BEHAV3D paper's track clustering | [Filtering](../filtering.md) (filtered track-features CSV) | ⚠ No — clustering only; rename/classify/plots/backprojection need the categorical `.h5ad` |
+| **Apply pretrained classifier** | Assigns a saved set of clusters to a new dataset | A saved classifier `.pkl` + matching states `.h5ad` | Skips Steps 1–3 |
 
 ```{note}
 **Applying a saved classifier instead of clustering.** The checkbox **Apply pretrained trajectory classifier** at the very top hides Steps 1–3 and shows a panel where you **Browse…** to a saved classifier (`.pkl`) and its matching state data (`.h5ad`; auto-filled if State Classification output exists for the cell type), then click **▶ Apply Pretrained Classifier**. Use this to reproduce the same trajectory clusters on a new dataset.
@@ -52,11 +52,38 @@ flowchart TD
 
 | Control | Default | Meaning |
 |---|---|---|
-| **Trajectory size** | 100 | Number of timepoints each trajectory is resampled to before comparison. Set it to its minimum to switch to **Variable-length** mode (compare tracks at their native lengths). |
+| **Trajectory size** | 100 | Number of timepoints each trajectory is resampled to before comparison (Filters out tracks shorter than this length and cuts remaining tracks to this length). Set it to its minimum to switch to **Variable-length** mode (compare tracks at their native lengths). |
 | **N clusters** | 6 | How many trajectory clusters to cut the hierarchy into. |
 | **Random seed** | 123 | Fixes the random parts of clustering so re-runs with identical settings are reproducible. |
 
 Click **▶ Run Track Clustering** to run it (in the background, with a progress bar and **Log**). Next to it: **+🛒** queues the step for a batch run, and **👁** opens the result once it exists.
+
+For the default **categorical DTW** workflow, treat **`N clusters`** as a practical starting guess rather than a number the software can determine for you biologically. Start around the default `6`, inspect the resulting exemplar overview, then decide whether the clustering needs to be split further or collapsed.
+
+- **Increase `N clusters`** when one trajectory cluster still contains clearly different trajectories in the overview PDF, for example one cluster mixing tracks that linger, scan, and then disengage with tracks that go straight into sustained contact.
+- **Decrease `N clusters` or merge afterwards** when clusters have very few examples, or when two clusters look so similar in the overview exemplars that you would describe them with the same biological name.
+- **Prefer slight over-splitting to under-splitting.** It is usually safer to split a bit too much, then merge similar clusters in Step 2 by giving them the same final name.
+
+```{tip}
+A good cluster count for categorical DTW is one where each cluster looks like a recognisable trajectory archetype when you inspect the exemplars, not just a mathematically distinct branch in the hierarchy.
+```
+
+### How to judge whether `N clusters` is sensible
+
+For the default categorical workflow, the main evidence is the **exemplar overview PDF** saved as:
+
+```text
+<output_dir>/analysis/<cell_type>/behavorial_trajectories/example_tracks/example_tracks_overview.pdf
+```
+
+By default, this overview shows **10 representative tracks per cluster**, which is why it is the first thing to inspect after clustering. Use it to ask:
+
+1. **Does each cluster show one main movement pattern?** If a single cluster contains several visually distinct trajectory stories, raise `N clusters`.
+2. **Do different clusters really look different from one another?** If two clusters look nearly interchangeable across their exemplars, they may not deserve separate final names.
+3. **Are some clusters too small to feel robust?** Very tiny clusters can still be real, but they deserve extra skepticism and often end up merged unless they show a very distinct pattern.
+4. **Would you describe the cluster with a single biological label?** If not, the clustering may still be too coarse.
+
+The **diagnostics PDF** is still useful, but for this specific decision it is secondary to the visual evidence in the exemplar overview. The detailed cluster-count guidance on this page applies to the default **categorical DTW** workflow; the legacy **Original feature-based BEHAV3D DTW** method uses different diagnostics and is not the focus here.
 
 ### ⚙ Advanced Configuration (DTW)
 
@@ -70,9 +97,14 @@ Collapsed by default; the defaults are sensible for most data.
 | **Psi** | blank (off) | Psi-relaxation: lets DTW ignore a few timepoints at the start/end of each track (useful when tracks begin or end mid-behaviour). |
 | **Linkage** | average | Hierarchical-clustering linkage (`average`, `complete`, `single`). |
 | **Trim mode** | last | When a track is longer than *Trajectory size*, whether to trim from the `last` or `first` timepoints. |
+| **Divide long tracks** | off | Instead of trimming an over-length track to *Trajectory size*, split it into consecutive, non-overlapping, full-length windows. Each window keeps the same `TrackID` (so backprojection still works) but gets its own `trajectory_window_id`, so a single long track can contribute several independently clustered trajectories rather than one truncated one. Any leftover timepoints shorter than a full window are discarded, from the end *Trim mode* points at. |
 | **Missing policy** | Keep as category | How to treat missing timepoints: `Keep as category` treats "missing" as its own state, or `Drop missing timepoints`. |
 | **Parallel DTW computation** | on | Use multiple CPU cores for the (expensive) pairwise distance computation. |
 | **Save distance matrix CSV** | off | Also write the full pairwise DTW distance matrix to CSV (large for many tracks). |
+
+```{note}
+**Divide long tracks** only affects clustering/training. **Apply Classifier** (Step 3) always assigns exactly one cluster label per original track, even if the classifier it's using was trained on split windows.
+```
 
 ### Original feature-based BEHAV3D DTW
 
@@ -93,7 +125,17 @@ Original mode performs **clustering only**. The integrated Steps 2–5 (rename, 
 
 ## Step 2 — Rename Track Clusters
 
-Freshly computed clusters are numbered. **✏ Rename Track Clusters** opens a dialog where you give each trajectory cluster a meaningful name (e.g. *super-engager*, *engager*, *killer*, *seeder*, *static*); the names are written back into the cluster data so downstream plots and **Step 5 — Backprojection** use them. Giving two clusters the same name merges them. The button enables itself once clustering has produced data, and a status line reports how many trajectories were loaded. **👁** reopens the renamed result.
+Freshly computed clusters are numbered. **✏ Rename Track Clusters** opens a dialog where you can combine biologically similar clusters and give each trajectory cluster a meaningful name (e.g. *super-engager*, *engager*, *killer*, *scanner*, *static*). Additionally you can order these clusters by dragging them up or down and assign a color to each cluster; the names, order and colors are written back into the cluster data so downstream plots and **Step 5 — Backprojection** use them. Giving two clusters the same name merges them. The button enables itself once clustering has produced data, and a status line reports how many trajectories were loaded. **👁** reopens the renamed result.
+
+Colors default to a **hash-stable** palette — a cluster keeps the same color across reruns and even when only a subset of clusters is plotted — unless you assign one manually here, in which case your choice is remembered instead.
+
+Treat renaming as the **curation step** that follows the overview PDF. First inspect the representative trajectories, then decide which clusters deserve distinct names and which ones are just oversplit versions of the same movement archetype.
+
+The goal here is **interpretable trajectory classes**, not preserving every split made by the clustering algorithm. If two clusters would end up with the same biological description, it is usually better to give them the same final name and merge them than to keep two labels that nobody can explain consistently.
+
+```{tip}
+Clicking **Apply cluster names** automatically regenerates the **diagnostics** and **track-class-proportion** plots (Step 4) with the new names, order and colors — no separate "regenerate" step needed for those two. The **Condition Comparison Report** and **contact-analysis** plots depend on which condition/contact column you pick, so re-run those from their own buttons after a rename.
+```
 
 ## Step 3 — Classify Tracks
 
@@ -115,6 +157,8 @@ Both have **+🛒** (queue) and **👁** (view) buttons.
 
 ## Step 4 — Create Plots
 
+### Exemplars & diagnostics
+
 | Control | Default | Meaning |
 |---|---|---|
 | **Exemplars / cluster** | 10 | How many representative trajectories to show per cluster. |
@@ -122,10 +166,68 @@ Both have **+🛒** (queue) and **👁** (view) buttons.
 | **Backprojection PDFs** | off | Also render per-exemplar backprojection figures to PDF. |
 | **Backprojection MP4** | off | Also render exemplar backprojection movies. |
 
-- **▶ Create Exemplar PDFs** — produces a PDF of representative tracks per cluster (optionally with state bars and backprojection figures/movies).
-- **▶ Create Diagnostics** — produces clustering-quality diagnostic plots.
+- **▶ Create Exemplar PDFs** — produces a PDF of representative tracks per cluster (optionally with state bars and backprojection figures/movies). The most important cluster-count QC file here is the overview PDF `example_tracks_overview.pdf`, which by default shows **10 exemplars per cluster**.
+- **▶ Create Diagnostics** — produces clustering-quality diagnostic plots (UMAP/correlation, heatmap, matrixplot, cluster-occurrence ranking).
 
 Each has a **👁** button to reopen its PDF.
+
+For deciding whether **`N clusters`** was sensible, inspect the **overview PDF first** and use the diagnostics PDF second. The overview tells you whether the model has split tracks into visually meaningful trajectory types; the diagnostics help support that interpretation, but they are not the primary evidence for this particular choice.
+
+### Track-Class Proportions
+
+What fraction of tracks each trajectory cluster occupies, per sample — optionally grouped by experimental condition.
+
+| Control | Default | Meaning |
+|---|---|---|
+| **Group in X** | — none — | A metadata column whose levels become one axis of a 2D grid of proportion bars (one grid cell per combination). |
+| **Group in Y** | — none — | A second metadata column for the other grid axis. With one or two columns set you get a true 2D grid; with neither set you just get the plain per-sample bars. |
+| **Group per page** | none selected | Additional metadata column(s) (Ctrl/Cmd-click for several) whose combinations instead **paginate** the output — one full grid page per combination, rather than adding more grid axes. |
+
+Click **▶ Create Track Proportion Plots**. The output is one PDF with the per-sample bars plus (if grouping is set) the grouped grid pages; a companion CSV records, per group, both the mean proportion *and* the underlying track count (`n_tracks`) behind each bar, since the bar itself only shows the mean.
+
+```{tip}
+Three or more **Group per page** columns selected at once falls back to a flat, wrapped panel-per-combination layout rather than a true 2D grid — keep to at most two grouping axes (X + Y) if you want the proper grid.
+```
+
+### Condition Comparison Report
+
+Statistically compares trajectory-cluster proportions between the levels of one metadata column — e.g. does cluster composition differ between organoid lines?
+
+| Control | Default | Meaning |
+|---|---|---|
+| **Compare condition** | — | The metadata column whose levels are compared pairwise (Welch's t-test) for each cluster. |
+| **Group in X** | — none — | Splits the comparison into side-by-side columns from a second condition. |
+| **Group per page** | none selected | Additional column(s) that paginate rather than add another axis. |
+
+Click **▶ Condition Comparison Report**. Each cluster gets a signed bar showing the proportion difference between two condition levels, annotated with significance stars (`*`/`**`/`***`/`****`). When **Compare condition** has exactly two levels and a second grouping axis is also set, the report switches to a true 2D grid layout instead of one row per pairwise comparison.
+
+### Contact-Based Grouping
+
+Labels every classified track **contact** or **no_contact** with another cell type (using the `*_contact` columns from [Filtering](../filtering.md)), so you can ask whether a trajectory cluster occurs more in cells that touched, say, an organoid or macrophage.
+
+| Control | Default | Meaning |
+|---|---|---|
+| **Contact column** | first detected | Which per-timepoint contact column to use (auto-populated from columns ending in `_contact` / `_contact_on_distance`). |
+| **Min. contiguous contact bout (timepoints)** | 5 | A track is labelled **contact** if it has an unbroken run of at least this many consecutive contact timepoints within its classified time window; otherwise **no_contact**. Raise it to require sustained contact and ignore fleeting touches; lower it (e.g. to 1) to count any single contact timepoint. |
+| **Group in X** / **Group in Y** | — none — | Same 2D-grid grouping as the plots above, applied to the contact/no_contact composition grid. |
+| **Group per page** | none selected | Same pagination behaviour as above. |
+
+Click **▶ Run Contact-vs-No-Contact Analysis**. This produces one combined PDF with:
+- per-sample contact-rate bars,
+- a cluster × contact/no_contact composition grid,
+- a contact-vs-no_contact condition-comparison (always a binary, 2D-grid-eligible comparison),
+- two violin plots — **mean contact fraction** and **max contact-bout length** per cluster — the two continuous per-track features computed alongside the binary label.
+
+```{important}
+Only available for the **Categorical DTW** method (needs a fitted one-hot dtaidistance model). The legacy **Original BEHAV3D DTW** engine has no contact-grouping support.
+```
+
+Output:
+
+```text
+<output_dir>/analysis/<cell_type>/behavorial_trajectories/contact_analysis/<contact_col>/contact_analysis.pdf
+<output_dir>/analysis/<cell_type>/behavorial_trajectories/contact_analysis/<contact_col>/csv/
+```
 
 ## Step 5 — Backprojection
 
@@ -168,7 +270,11 @@ You will find there, depending on which steps you ran:
 - The **track-cluster data** as an `.h5ad` file (one trajectory per row, with its cluster label).
 - A **track-cluster table** (`BEHAV3D_<cell_type>_track_clusters.csv`) once the classifier is applied.
 - The trained **classifier** (`classifier_<cell_type>.pkl`).
-- **Exemplar** PDFs (`exemplar_tracks*.pdf`) and **diagnostics** PDFs (`diagnostics*.pdf`).
+- The **exemplar overview PDF** at `example_tracks/example_tracks_overview.pdf`, which is the main visual QC output for deciding whether `N clusters` split the trajectories sensibly.
+- Additional **exemplar** PDFs under `example_tracks/` and **diagnostics** PDFs under the trajectory-clustering output folders.
+- **Track-class proportion plots** under `behavior_proportions/`: `track_class_proportions_by_sample_<class>.pdf`/`.csv`, plus `track_class_proportions_by_group_<class>.csv` when grouping is used.
+- **Condition comparison reports** under `behavior_comparisons/`: `condition_comparison_<condition>.pdf`/`.csv`.
+- **Contact-based grouping analysis** under `contact_analysis/<contact_col>/`: `contact_analysis.pdf` plus a sibling `csv/` folder with the underlying tables.
 - Optionally the **DTW distance matrix** CSV (if you ticked *Save distance matrix CSV*).
 
 The **Original feature-based BEHAV3D DTW** engine instead writes its UMAP cluster tables (`BEHAV3D_<cell_type>_UMAP_clusters.csv`, `..._combined_track_features_clustered.csv`, `..._UMAP_cluster_percentages.csv`) and diagnostic PDFs under `analysis/<cell_type>/results/`.
@@ -180,11 +286,15 @@ The folder name on disk is `behavorial_trajectories`. The easiest way to reopen 
 ## Tips & best practices
 
 - **Run State Classification first** (for the categorical method). The default clustering compares behavioural-state sequences, so it needs the per-timepoint states to exist for the cell type.
-- **Start with fewer clusters.** Begin around the default *N clusters* and increase only if distinct trajectory types are being merged. Clusters can always be **merged afterwards** during renaming (give two clusters the same name), so err on the side of a few too many rather than too few.
+- **Use the overview-PDF decision loop.** A good practical workflow is: fit clusters → inspect `example_tracks_overview.pdf` → rename and merge similar clusters → only then rerun with higher or lower *N clusters* if the split still looks too coarse or too fragmented.
+- **Slight over-splitting is safer.** If you are unsure, it is usually better to split a bit too much and merge later during renaming than to force several distinct trajectory patterns into one cluster from the start.
 - **Leave Linkage on `average`.** `complete` gives comparable results and is worth trying; **`single` rarely works well** for these distances. Agglomerative clustering is preferred over k-means here, with the caveat that the resulting UMAP embedding can look poor even when the clusters themselves are sensible.
 - **Use Variable-length mode for uneven tracks.** If your tracks differ a lot in length and resampling distorts them, switch *Trajectory size* to its minimum (Variable-length) so DTW compares native lengths.
 - **Save the distance matrix only when you need it.** It grows with the square of the number of tracks and is rarely needed for routine analysis.
 - **Queue the heavy steps.** DTW clustering and classifier training are CPU-intensive — use the **+🛒** buttons to run them unattended behind your other pipeline steps.
+- **Turn on Divide long tracks when tracks run much longer than Trajectory size** and the part that would otherwise be discarded likely holds meaningfully different behaviour — you get more, shorter, independently classified trajectories instead of one truncated one.
+- **Tune Min. contiguous contact bout to your imaging's time resolution.** A few timepoints is usually enough to exclude noisy single-frame touches while still catching genuine sustained contact; lower it toward 1 only if you want any touch, however brief, to count.
+- **Cluster colors and order set during renaming persist automatically** into every later plot — proportions, condition comparisons, contact analysis, backprojection — so you don't need to reapply them per report.
 
 ## See also
 

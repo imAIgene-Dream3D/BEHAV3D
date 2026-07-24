@@ -62,7 +62,7 @@ Data preparation: building the metadata table, setting up the output folder, con
 :link: processing/index
 :link-type: doc
 
-Segmentation (6 methods, including zero-shot Cellpose-SAM) and Tracking (Propagation, btrack, Import) — the heavy computation that turns images into trackable cells.
+Segmentation (6 methods, including zero-shot Cellpose-SAM) and Tracking (Propagation, Reporter Propagation, btrack, Import) — the heavy computation that turns images into trackable cells.
 ::::
 
 ::::{grid-item-card} 📈 Analysis

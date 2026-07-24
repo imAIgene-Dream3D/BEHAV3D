@@ -22,7 +22,7 @@ from behav3d.napari._assistant_actions import (
 )
 from behav3d.napari._assistant_context import (
     summarize_metadata, _diff_from_defaults, validate_metadata_records,
-    _metadata_builder_state, build_context,
+    _metadata_builder_state, _experiment_reference_context, build_context,
 )
 from behav3d.napari._assistant_controls import (
     CONTROL_CONTRACT_VERSION, active_cell_type, control_registry,
@@ -489,6 +489,84 @@ def test_prompt_treats_metadata_builder_draft_as_current():
     assert "draft changes still need to be saved" in sp
 
 
+def test_experiment_reference_discovers_notes_and_compacts_configuration(tmp_path=None):
+    import tempfile
+    from pathlib import Path
+
+    root = Path(tmp_path or tempfile.mkdtemp())
+    (root / "README_BEHAV3D_Exp085.md").write_text(
+        "# Experiment\nWithin-well paired KO versus rescue comparison.",
+        encoding="utf-8",
+    )
+    (root / "behav3d_parameters_clean.yml").write_text(
+        "\n".join([
+            "paths:",
+            "  metadata_csv: /private/raw/metadata.csv",
+            "pixel_classifier:",
+            "  apoc_strategy: APOC Probability Map + Watershed",
+            "apoc:",
+            "  apoc_organoid1_prob_mask_threshold: 0.55",
+            "  apoc_organoid1_prob_seed_threshold: 1.0",
+            "  apoc_organoid1_feature_string: very-large-internal-value",
+            "tracking:",
+            "  organoid1:",
+            "    method: propagation",
+            "features:",
+            "  organoid1:",
+            "    features_choice: [intensity, contact, death]",
+            "    dead_mask_percentage_threshold: 2.0",
+            "track_filtering:",
+            "  organoid1:",
+            "    min_length_enabled: true",
+            "    min_track_length: 100",
+        ]),
+        encoding="utf-8",
+    )
+    reference = _experiment_reference_context(str(root), {})
+    assert reference["notes"][0]["source"] == "README_BEHAV3D_Exp085.md"
+    settings = reference["saved_configurations"][0]["settings"]
+    assert settings["tracking"]["organoid1"]["method"] == "propagation"
+    assert settings["segmentation"]["apoc_by_cell_type"]["organoid1"] == {
+        "prob_mask_threshold": 0.55,
+        "prob_seed_threshold": 1.0,
+    }
+    assert settings["features"]["organoid1"]["dead_mask_percentage_threshold"] == 2.0
+    serialized = str(reference)
+    assert "/private/raw" not in serialized
+    assert "very-large-internal-value" not in serialized
+    assert "not proof that a module ran" in reference["configuration_caveat"]
+
+
+def test_prompt_scopes_experiment_reference_and_requires_result_evidence():
+    import app
+    reference = {
+        "notes": [{
+            "source": "README_BEHAV3D_Exp010.md",
+            "text": "Safety profiling with tumor and healthy organoids.",
+        }],
+        "saved_configurations": [{
+            "source": "behav3d_parameters.yml",
+            "settings": {"features": {"TEG": {
+                "features_choice": ["invasiveness"],
+            }}},
+        }],
+    }
+    sp = app.build_system_prompt(
+        {
+            "current_step": "analysis",
+            "metadata": {"loaded": True, "records": []},
+            "experiment_reference": reference,
+            "results": [],
+        },
+        [], [],
+    )
+    assert "for this dataset only" in sp
+    assert "not proof that" in sp
+    assert "Claim an output is available only when" in sp
+    assert '"experiment_reference"' in sp
+    assert "Safety profiling with tumor and healthy organoids" in sp
+
+
 def test_prompt_encodes_pi_feedback_scenarios():
     import app
     sp = app.build_system_prompt(
@@ -503,13 +581,19 @@ def test_prompt_encodes_pi_feedback_scenarios():
     assert "Never infer a dimension order" in sp
     assert "never rebuild the form from values mentioned earlier" in sp
     assert "explicit request to fill, set, update, fix, or adjust" in sp
-    assert "raise Mask threshold and Seed threshold" in sp
+    assert "Seed threshold is the main splitting lever" in sp
+    assert "Mask threshold primarily defines the foreground contour" in sp
     assert "With plain Mask + EDT/Watershed, raise EDT" in sp
     assert "With Peak EDT/Watershed, lower EDT" in sp
     assert "do not infer motion from a label" in sp
+    assert "btrack is the routine default" in sp
+    assert "Reporter Propagation" in sp
     assert "60 um/min at 15 seconds per frame is 15 um/frame" in sp
     assert "Do not provide a numeric example speed" in sp
     assert "merely because its inherited thresholds contain defaults" in sp
+    assert "Filtering must be run even when all filters are disabled" in sp
+    assert "keep Start offset at 1" in sp
+    assert "Average linkage is the default" in sp
     assert "Never call that combination contradictory" in sp
     assert "Do not call a chosen minimum reasonable" in sp
 
@@ -562,6 +646,25 @@ class _FakeCombo:
     def isHidden(self): return False
 
 
+class _FakeListItem:
+    def __init__(self, text, selected=False):
+        self._text, self._selected = text, selected
+    def text(self): return self._text
+    def isSelected(self): return self._selected
+    def setSelected(self, selected): self._selected = bool(selected)
+
+
+class _FakeList:
+    def __init__(self, items, selected=()):
+        selected = set(selected)
+        self.items = [_FakeListItem(item, item in selected) for item in items]
+    def count(self): return len(self.items)
+    def item(self, index): return self.items[index]
+    def selectedItems(self): return [item for item in self.items if item.isSelected()]
+    def isEnabled(self): return True
+    def isHidden(self): return False
+
+
 class _FakeTabs:
     def __init__(self, panel): self.panel = panel
     def currentWidget(self): return self.panel
@@ -578,7 +681,10 @@ class _FakeWorkflowTabs:
 class _FakeTrackingPanel:
     def __init__(self, cell_type, radius):
         self.cell_type = cell_type
-        self.combo_method = _FakeCombo(["LAP", "TrackPy", "Propagation", "btrack"], 3)
+        self.combo_method = _FakeCombo(
+            ["LAP", "TrackPy", "Propagation", "Reporter Propagation", "btrack"],
+            4,
+        )
         self.lap_merge_cost = _FakeSpin(0)
         self.lap_split_cost = _FakeSpin(0)
         self.tp_adaptive_stop = _FakeSpin(10.0)
@@ -589,6 +695,7 @@ class _FakeTrackingPanel:
         self.bt_dist_thresh = _FakeSpin(40.0)
         self.bt_time_thresh = _FakeSpin(5)
         self.bt_hyp_checks = {"P_FP": _FakeCheck(True), "P_branch": _FakeCheck(False)}
+        self._bt_unit_mgr = type("_Unit", (), {"physical": True})()
         self.persisted = 0
 
     def _persist(self): self.persisted += 1
@@ -612,6 +719,7 @@ def test_live_control_registry_targets_actual_cell_type_only():
     assert "tracking.tcell.trackpy.adaptive_step" in ids
     by_id = {item["id"]: item for item in controls}
     assert by_id["tracking.tcell.btrack.use_global_optimization"]["visible"] is True
+    assert by_id["tracking.tcell.btrack.maximum_search_radius"]["unit"] == "um"
     assert "tracking.tcell.btrack.distance_threshold" not in by_id
     assert "tracking.tcell.btrack.hypotheses" not in by_id
     assert by_id["tracking.organoid1.btrack.distance_threshold"]["visible"] is True
@@ -621,6 +729,27 @@ def test_live_control_registry_targets_actual_cell_type_only():
     assert tcell.bt_max_search_radius.value() == 125
     assert organoid.bt_max_search_radius.value() == 200
     assert tcell.persisted == 1 and organoid.persisted == 0
+
+
+def test_tracking_registry_separates_reporter_propagation_from_btrack():
+    from types import SimpleNamespace
+    panel = _FakeTrackingPanel("reporter", 100)
+    panel.combo_method.setCurrentIndex(3)
+    panel.rp_min_overlap_fraction = _FakeSpin(0.1, 0.0, 1.0)
+    panel.rp_segment_size_min = _FakeSpin(100)
+    main = SimpleNamespace(
+        tracking_tab=SimpleNamespace(
+            panels={"reporter": panel},
+            cell_tabs=_FakeTabs(panel),
+        )
+    )
+    controls = {item["id"]: item for item in control_registry(main)}
+    assert controls[
+        "tracking.reporter.reporter_propagation.minimum_overlap"
+    ]["visible"] is True
+    assert controls[
+        "tracking.reporter.btrack.maximum_search_radius"
+    ]["visible"] is False
 
 
 def test_apoc_same_value_is_noop_and_method_specific():
@@ -647,6 +776,54 @@ def test_apoc_same_value_is_noop_and_method_specific():
     }], [], {}, controls=controls)
     assert len(actions) == 1 and actions[0].data.get("no_op") is True
     assert not actions[0].ok  # no confirmation card should be rendered
+
+
+def test_cellpose_sam_registry_exposes_live_core_controls():
+    from types import SimpleNamespace
+    persisted = []
+    channels = [_FakeCheck(True), _FakeCheck(False)]
+    sam = SimpleNamespace(
+        cell_type_combo=_FakeCombo(["tcell", "organoid1"]),
+        check_all_cell_types=_FakeCheck(False),
+        check_process_all=_FakeCheck(True),
+        combo_gpu_device=_FakeCombo(["Auto", "CUDA 0"]),
+        btn_force_cpu=_FakeCheck(False),
+        combo_model=_FakeCombo(["cpsam", "cpsam_v2"]),
+        spin_diameter=_FakeSpin(0.0, 0.0, 1000.0),
+        spin_flow_threshold=_FakeSpin(0.4, 0.0, 3.0),
+        spin_cellprob=_FakeSpin(0.0, -6.0, 6.0),
+        check_do_3d=_FakeCheck(True),
+        spin_stitch=_FakeSpin(0.0, 0.0, 1.0),
+        spin_batch_size=_FakeSpin(8, 1, 256),
+        check_drop_2d=_FakeCheck(True),
+        spin_size_min=_FakeSpin(0),
+        spin_size_max=_FakeSpin(0),
+        channel_panel=SimpleNamespace(_checkboxes=channels),
+        _unit_mgr=SimpleNamespace(physical=True),
+        _persist_params=lambda: persisted.append(True),
+    )
+    segmentation = SimpleNamespace(
+        method_combo=_FakeCombo([
+            "APOC (GPU)", "ConvPaint", "Pixel Classifier (Random Forest)",
+            "Cellpose", "Cellpose-SAM (zero-shot)", "Import segmentation",
+        ], 4),
+        apoc_page=SimpleNamespace(spin_examples=_FakeSpin(3)),
+        convpaint_page=SimpleNamespace(spin_examples=_FakeSpin(3)),
+        pixel_classifier_page=SimpleNamespace(spin_examples=_FakeSpin(3)),
+        cellpose_page=SimpleNamespace(),
+        cellpose_sam_page=sam,
+    )
+    main = SimpleNamespace(segmentation_tab=segmentation)
+    controls = {item["id"]: item for item in control_registry(main)}
+    assert controls["segmentation.cellpose_sam.diameter"]["unit"] == "um"
+    assert controls["segmentation.cellpose_sam.flow_threshold"]["visible"] is False
+    assert controls["segmentation.cellpose_sam.stitch_threshold"]["visible"] is False
+    channel_id = "segmentation.cellpose_sam.tcell.channels"
+    assert controls[channel_id]["choices"] == ["Channel 0", "Channel 1"]
+    assert active_cell_type(main, "segmentation") == "tcell"
+    assert apply_set_ui_value(main, "segmentation.cellpose_sam.batch_size", 4)
+    assert sam.spin_batch_size.value() == 4
+    assert persisted
 
 
 def test_metadata_records_are_complete_and_validated():
@@ -744,6 +921,7 @@ def test_live_registry_covers_filtering_and_hmm_controls():
         en_exp_duration=_FakeCheck(True), spin_exp_duration=_FakeSpin(350),
         en_min_length=_FakeCheck(True), spin_min_length=_FakeSpin(30),
         en_max_length=_FakeCheck(True), spin_max_length=_FakeSpin(30),
+        check_split_long_tracks=_FakeCheck(False),
         check_filter_min_size=_FakeCheck(False), spin_min_size_t1=_FakeSpin(1000),
         check_filter_dead_t0=_FakeCheck(False),
         combo_time_type=_FakeCombo(["frames", "hours"]),
@@ -773,9 +951,86 @@ def test_live_registry_covers_filtering_and_hmm_controls():
     assert controls["filtering.tcell.maximum_length.timepoints"]["label"].endswith(
         "Common output track length"
     )
+    assert "filtering.tcell.maximum_length.split_long_tracks" in controls
     states = "analysis.state_classification.tcell.number_of_states"
     assert states in controls and controls[states]["value"] == 4
     assert controls[states]["visible"] is True
+
+
+def test_active_killing_registry_targets_one_selected_type():
+    from types import SimpleNamespace
+    active = SimpleNamespace(
+        immune_combo=_FakeCombo(["tcell"]),
+        target_list=_FakeList(
+            ["organoid1", "organoid2"],
+            selected=["organoid1", "organoid2"],
+        ),
+        spin_obs_window=_FakeSpin(5),
+        death_signal_combo=_FakeCombo([
+            "percentage_dead_mask", "mean_dead_dye", "nr_dead_mask_pixels",
+        ]),
+        check_abs_threshold=_FakeCheck(False),
+        spin_threshold_mult=_FakeSpin(1.5),
+        spin_abs_threshold=_FakeSpin(25.0),
+        spin_min_contact=_FakeSpin(1),
+        spin_top_n=_FakeSpin(10),
+    )
+    main = SimpleNamespace(feature_extraction_tab=SimpleNamespace(
+        panels={},
+        active_killing_panel=active,
+        _ak_toggle_btn=_FakeCheck(True),
+    ))
+    controls = {item["id"]: item for item in control_registry(main)}
+    target_id = "features.active_killing.target_types"
+    assert controls[target_id]["visible"] is True
+    assert controls[target_id]["value"] == ["organoid1", "organoid2"]
+    assert apply_set_ui_value(main, target_id, ["organoid2"])
+    assert controls["features.active_killing.absolute_threshold"]["visible"] is False
+    assert active_cell_type(main, "feature_extraction") == "tcell"
+    assert [item.text() for item in active.target_list.selectedItems()] == ["organoid2"]
+
+
+def test_analysis_registry_exposes_only_active_trajectory_controls():
+    from types import SimpleNamespace
+    persisted = []
+    track = SimpleNamespace(
+        spin_traj_size=_FakeSpin(100),
+        spin_n_clusters=_FakeSpin(6),
+        combo_linkage=_FakeCombo(["average", "complete", "single"]),
+        combo_trim=_FakeCombo(["first", "last"], 1),
+        chk_split_long_tracks=_FakeCheck(False),
+        chk_parallel=_FakeCheck(True),
+        chk_save_dist=_FakeCheck(False),
+        chk_use_original=_FakeCheck(False),
+        spin_seed=_FakeSpin(12345),
+        _persist_track_cfg=lambda cell_type: persisted.append(cell_type),
+    )
+    state = SimpleNamespace(
+        spin_window_size=_FakeSpin(5),
+        combo_hmm_n_states_mode=_FakeCombo(["fixed", "auto"]),
+        chk_hmm_sticky=_FakeCheck(False),
+        _timepoint_checkboxes={},
+        _logscale_checkboxes={},
+        _bingrp_checkboxes={},
+    )
+    single = SimpleNamespace(
+        cell_type_combo=_FakeCombo(["tcell"]),
+        state_tab=state,
+        track_tab=track,
+        _stack=_FakeCombo(["overview", "settings"], 1),
+        inner_tabs=_FakeCombo(["Behavioral State", "State Trajectory"], 1),
+    )
+    main = SimpleNamespace(
+        analysis_tab=SimpleNamespace(single_cell_tab=single)
+    )
+    controls = {item["id"]: item for item in control_registry(main)}
+    trajectory = "analysis.state_trajectory.tcell.linkage"
+    hmm = "analysis.state_classification.tcell.window_size"
+    assert controls[trajectory]["visible"] is True
+    assert controls[hmm]["visible"] is False
+    assert apply_set_ui_value(main, trajectory, "complete")
+    assert track.combo_linkage.currentText() == "complete"
+    assert persisted == ["tcell"]
 
 
 def test_edt_recommendations_use_per_sample_xy_resolution():
@@ -966,7 +1221,7 @@ def test_feedback_guidance_fixtures():
 
     fixture = Path(__file__).parent / "fixtures" / "assistant_feedback_transcripts.json"
     cases = json.loads(fixture.read_text(encoding="utf-8"))
-    assert KNOWLEDGE_VERSION == "2026.07.22.1"
+    assert KNOWLEDGE_VERSION == "2026.07.23.2"
     for case in cases:
         cards = select_guidance_cards(
             {"current_step": case["step"]}, case["user"], case.get("intent"))
@@ -975,6 +1230,23 @@ def test_feedback_guidance_fixtures():
             assert required.lower() in text, (case["id"], required)
         for forbidden in case.get("forbidden", []):
             assert forbidden.lower() not in text, (case["id"], forbidden)
+    method_cards = select_guidance_cards(
+        {
+            "current_step": "segmentation",
+            "segmentation": {"method": "Cellpose-SAM (zero-shot)"},
+        },
+        "My objects are touching; how should I tune this method?",
+    )
+    method_ids = {card["id"] for card in method_cards}
+    assert "cellpose_sam" in method_ids and "apoc" not in method_ids
+    experiment_cards = select_guidance_cards(
+        {
+            "current_step": "analysis",
+            "experiment_reference": {"notes": [{"text": "paired design"}]},
+        },
+        "What should I compare?",
+    )
+    assert "experiment_design" in {card["id"] for card in experiment_cards}
 
 
 def test_assistant_has_no_hidden_model_continuation():
@@ -983,7 +1255,7 @@ def test_assistant_has_no_hidden_model_continuation():
     assert "def _auto_continue" not in source
     assert "_dispatch_proactive" not in source
     assert "Checking your setup" not in source
-    assert CONTROL_CONTRACT_VERSION == "2.5"
+    assert CONTROL_CONTRACT_VERSION == "2.6"
 
 
 # --------------------------------------------------------------------------

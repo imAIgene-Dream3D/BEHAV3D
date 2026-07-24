@@ -452,8 +452,12 @@ def _compute_relative_auc_table(
     return pd.DataFrame(rows)
 
 
-def _build_relative_plot_data_table(relative_by_sample, plot_view=None):
-    """Build long-form CSV table for all relative curves used in the report pages."""
+def _build_relative_plot_data_table(relative_by_sample, plot_view=None, label_col_name="sample_name"):
+    """Build long-form CSV table for all relative curves used in the report pages.
+
+    ``label_col_name`` lets this same builder be reused for the grouped report
+    rows (``relative_by_group``, keyed by group label rather than sample name).
+    """
     rows = []
     for sample_name, mat in relative_by_sample.items():
         if mat is None or len(mat) == 0:
@@ -464,7 +468,7 @@ def _build_relative_plot_data_table(relative_by_sample, plot_view=None):
             for t, v in zip(x.tolist(), y.tolist()):
                 rows.append(
                     {
-                        "sample_name": str(sample_name),
+                        label_col_name: str(sample_name),
                         "time": float(t),
                         "state_id": str(state_id),
                         "relative_proportion": float(v),
@@ -476,8 +480,12 @@ def _build_relative_plot_data_table(relative_by_sample, plot_view=None):
     return out
 
 
-def _build_overall_summary_plot_data_table(overall_by_sample, plot_view=None):
-    """Build long-form CSV table for pooled per-sample summary bars."""
+def _build_overall_summary_plot_data_table(overall_by_sample, plot_view=None, label_col_name="sample_name"):
+    """Build long-form CSV table for pooled per-sample summary bars.
+
+    ``label_col_name`` lets this same builder be reused for the grouped report
+    rows (``overall_by_group``, keyed by group label rather than sample name).
+    """
     rows = []
     for sample_name, ser in overall_by_sample.items():
         if ser is None or len(ser) == 0:
@@ -485,7 +493,7 @@ def _build_overall_summary_plot_data_table(overall_by_sample, plot_view=None):
         for state_id, value in ser.items():
             rows.append(
                 {
-                    "sample_name": str(sample_name),
+                    label_col_name: str(sample_name),
                     "time": np.nan,
                     "state_id": str(state_id),
                     "relative_proportion": float(value),
@@ -754,7 +762,16 @@ def save_state_condition_comparison_report(
     """
     obs = adata.obs
     effective_group_cols, _ = _resolve_effective_group_cols(group_cols, group_x, None)
-    valid_group_cols = [c for c in effective_group_cols if c in obs.columns]
+    # Grouping by the same column being compared is degenerate (every group would
+    # contain a single condition level) and, worse, would duplicate condition_col
+    # inside metadata_cols below, turning df[condition_col] into a 2-column
+    # DataFrame instead of a Series and breaking downstream .unique() calls.
+    if condition_col in effective_group_cols and bool(verbose):
+        print(
+            f"  Note: '{condition_col}' is both the comparison condition and a "
+            "requested group column — ignoring it as a group."
+        )
+    valid_group_cols = [c for c in effective_group_cols if c in obs.columns and c != condition_col]
     required = [state_col, sample_col, condition_col] + valid_group_cols
     missing = [c for c in required if c not in obs.columns]
     if len(missing) > 0:
@@ -769,6 +786,18 @@ def save_state_condition_comparison_report(
     if len(df) == 0:
         raise ValueError("No valid rows remain after filtering NaNs in required columns.")
 
+    # The unit compared below is (sample, condition_col level), not the sample alone.
+    # condition_col is usually constant within a sample (e.g. a per-well treatment),
+    # in which case this is a no-op relabeling - each sample still maps to exactly
+    # one unit. But for a merged cell-type group, condition_col can instead be a
+    # per-cell tag (e.g. origin_cell_type) that varies *within* a sample. Collapsing
+    # straight to one row per sample would arbitrarily keep whichever level happened
+    # to appear first and silently leave a single degenerate condition level with
+    # zero pairs left to compare (empty report). Using this composite unit lets a
+    # sample that contains multiple condition levels contribute one row per level.
+    unit_col = "__comparison_unit__"
+    df[unit_col] = df[sample_col] + " | " + df[condition_col]
+
     observed_states = sorted(df[state_col].unique().tolist(), key=_natural_sort_key)
     if state_order is None:
         resolved_state_order = _apply_state_order(
@@ -779,20 +808,20 @@ def save_state_condition_comparison_report(
         extras = [s for s in observed_states if str(s) not in resolved_state_order]
         resolved_state_order.extend(extras)
 
-    sample_order = df[sample_col].drop_duplicates().tolist()
+    unit_order = df[unit_col].drop_duplicates().tolist()
 
-    overall_by_sample = _compute_overall_relative_composition_by_sample(
+    overall_by_unit = _compute_overall_relative_composition_by_sample(
         df,
         state_col=state_col,
-        sample_col=sample_col,
+        sample_col=unit_col,
         state_order=resolved_state_order,
-        sample_order=sample_order,
+        sample_order=unit_order,
     )
-    per_sample_df = pd.DataFrame(overall_by_sample).T.reindex(columns=resolved_state_order, fill_value=0.0)
+    per_unit_df = pd.DataFrame(overall_by_unit).T.reindex(columns=resolved_state_order, fill_value=0.0)
 
-    metadata_cols = [sample_col, condition_col] + valid_group_cols
-    sample_metadata = (
-        df[metadata_cols].drop_duplicates(subset=[sample_col]).set_index(sample_col)
+    metadata_cols = [unit_col, condition_col] + valid_group_cols
+    unit_metadata = (
+        df[metadata_cols].drop_duplicates(subset=[unit_col]).set_index(unit_col)
     )
 
     if state_colors is None:
@@ -800,8 +829,8 @@ def save_state_condition_comparison_report(
     resolved_colors = _normalize_label_color_map(resolved_state_order, colors=state_colors, cmap_name="tab20")
 
     diff_stats_by_group = compute_condition_diff_stats_pairwise(
-        per_sample_df,
-        sample_metadata,
+        per_unit_df,
+        unit_metadata,
         class_order=resolved_state_order,
         condition_col=condition_col,
         group_cols=valid_group_cols,
@@ -1611,17 +1640,39 @@ def save_state_composition_report(
             pdf.savefig(fig_overall_h, dpi=dpi)
             plt.close(fig_overall_h)
 
-    merged_plot_data = pd.concat(
-        [
-            _build_relative_plot_data_table(relative_by_sample, plot_view="stacked_by_sample").assign(
-                plot_component="timecourse"
-            ),
-            _build_overall_summary_plot_data_table(overall_by_sample, plot_view="stacked_by_sample").assign(
-                plot_component="overall_summary"
-            ),
-        ],
-        ignore_index=True,
-    )
+    tables_to_concat = [
+        _build_relative_plot_data_table(relative_by_sample, plot_view="stacked_by_sample").assign(
+            plot_component="timecourse"
+        ),
+        _build_overall_summary_plot_data_table(overall_by_sample, plot_view="stacked_by_sample").assign(
+            plot_component="overall_summary"
+        ),
+    ]
+    # The PDF's grouped pages come from relative_by_group/overall_by_group, but
+    # the CSV previously only ever included the plain per-sample tables above -
+    # a group_cols selection changed what the PDF showed with no matching
+    # breakdown in the CSV at all. Add the same grouped data here, with each
+    # requested group column broken back out (via the group label each row was
+    # built from) so it can be filtered/pivoted directly.
+    if len(valid_group_cols) > 0:
+        group_label_lookup = (
+            df.assign(_group_label=_make_group_label(df, valid_group_cols).values)
+            .drop_duplicates(subset=["_group_label"])
+            .set_index("_group_label")[valid_group_cols]
+        )
+        group_timecourse = _build_relative_plot_data_table(
+            relative_by_group, plot_view="stacked_by_group", label_col_name="group_label"
+        ).assign(plot_component="group_timecourse")
+        group_overall = _build_overall_summary_plot_data_table(
+            overall_by_group, plot_view="stacked_by_group", label_col_name="group_label"
+        ).assign(plot_component="group_overall_summary")
+        for gtable in (group_timecourse, group_overall):
+            if len(gtable) > 0:
+                for col in valid_group_cols:
+                    gtable[col] = gtable["group_label"].map(group_label_lookup[col])
+        tables_to_concat.extend([group_timecourse, group_overall])
+
+    merged_plot_data = pd.concat(tables_to_concat, ignore_index=True)
     merged_plot_data.to_csv(merged_plot_csv_path, index=False)
 
     if verbose:

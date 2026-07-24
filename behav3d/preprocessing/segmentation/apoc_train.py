@@ -15,6 +15,12 @@ import shutil
 import contextlib
 from pathlib import Path
 
+# Defeat buggy PyOpenCL compiler caching that causes TypeErrors on some systems
+# (e.g. enqueue_knl_predict() argument-count mismatches from a stale cached kernel).
+# Must be set before pyclesperanto_prototype/apoc are imported. See apoc_segment.py.
+os.environ['PYOPENCL_NO_CACHE'] = '1'
+os.environ['PYOPENCL_COMPILER_OUTPUT'] = '0'
+
 import numpy as np
 import napari
 from qtpy.QtWidgets import (

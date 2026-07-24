@@ -2,15 +2,7 @@
 
 Cellpose-SAM is the **foundation-model instance segmenter** in BEHAV3D EXPLORER. Like classic [Cellpose](cellpose) it outputs cell-level instance labels directly from raw intensities (no pixel labeling, no watershed post-processing), but it is built on the newer **Cellpose-SAM** backbone ([cellpose v4](https://github.com/MouseLand/cellpose)) and is **zero-shot** — it segments a wide range of cell shapes with *no training and no annotation*.
 
-Pick it when:
-
-- You have a **good GPU (or HPC)**, clean high-resolution images, low channel bleed-through, and **accuracy is the priority**.
-- Your objects are dense with a good signal-to-noise ratio, and you'd rather not spend time painting labels or building ground truth.
-- You have a manageable number of movies/timepoints — this is the **most computationally expensive** method, and runtime is the limiting factor.
-
-```{note}
-**Cellpose-SAM vs. the other methods.** Cellpose-SAM is the most accurate but slowest option. For a normal workstation, many similar datasets, or lower-resolution live imaging with bleed-through, [APOC](apoc) (train once, reuse everywhere) is usually the more practical first choice; [ConvPaint](convpaint) is the fallback when APOC misses complex structures; classic [Cellpose](cellpose) (retrained) is for complex, heterogeneous data where you can invest in ground-truth masks. See the [segmentation overview](./index.md#how-to-pick-a-method) for the full comparison.
-```
+For method choice across all six segmentation options (including when Cellpose-SAM is the recommended choice versus APOC / ConvPaint / classic Cellpose), see the [segmentation overview](./index.md#how-to-pick-a-method).
 
 ```{important}
 Cellpose-SAM segments **one cell type per run** (the channel(s) for that cell type must be selected). T cells and organoids cannot be predicted in a single pass — either run the tool once per cell type, or tick **Run all cell types in one batch** to loop through every declared type automatically.

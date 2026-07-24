@@ -9,26 +9,149 @@
     "id": "segmentation_method_ladder",
     "step": "segmentation",
     "user": "Which segmentation method should I use?",
-    "required": ["start with apoc", "random forest", "custom-trained cellpose", "tiff or zarr"],
-    "forbidden": ["apoc is the random forest"]
+    "required": [
+      "cellpose-sam",
+      "normal-workstation default",
+      "try convpaint when apoc",
+      "retrained classic cellpose",
+      "random forest",
+      "tiff or zarr"
+    ]
   },
   {
-    "id": "btrack_units_and_features",
+    "id": "apoc_mode_and_thresholds",
+    "step": "segmentation",
+    "user": "My APOC probability-map cells are touching and not split. What should I tune?",
+    "required": [
+      "probability map + watershed is the default",
+      "seed threshold is the main splitting lever",
+      "mask threshold defines the foreground contour",
+      "annotate more background",
+      "excludes objects",
+      "never merges"
+    ]
+  },
+  {
+    "id": "convpaint_defaults",
+    "step": "segmentation",
+    "user": "Help me configure ConvPaint normalization, features, smoothing and Dask.",
+    "required": [
+      "vgg16",
+      "mode 2 normalizes the whole stack",
+      "mode 3 normalizes each image",
+      "smoothing around 1-3",
+      "dask only parallelizes tiled prediction"
+    ]
+  },
+  {
+    "id": "cellpose_sam_workflow",
+    "step": "segmentation",
+    "user": "How should I configure Cellpose-SAM?",
+    "required": [
+      "one-time sidecar environment",
+      "zero-shot",
+      "diameter at 0",
+      "flow threshold defaults to 0.4",
+      "3d is most accurate",
+      "reduce batch size first"
+    ]
+  },
+  {
+    "id": "tracking_method_choice",
     "step": "tracking",
-    "user": "Help with btrack visual features, branching, and search radius.",
-    "required": ["physical distances", "global optimization is a separate", "p_branch only"]
+    "user": "Help choose between propagation, reporter propagation and btrack.",
+    "required": [
+      "propagation for slow",
+      "reporter propagation for genuinely static",
+      "btrack is the routine default",
+      "no identified routine advantage",
+      "one-frame displacement",
+      "step size only after an out-of-memory error"
+    ]
+  },
+  {
+    "id": "feature_contact_semantics",
+    "step": "feature_extraction",
+    "user": "Should I calculate morphology, movement and use contact threshold 0?",
+    "required": [
+      "morphology is the most expensive",
+      "movement is fast",
+      "contact distance 0 means strict mask touching",
+      "requires feature extraction to be run again"
+    ]
+  },
+  {
+    "id": "active_killing_calibration",
+    "step": "feature_extraction",
+    "user": "How should I choose the active killing window and threshold?",
+    "required": [
+      "one target type per run",
+      "metadata time interval",
+      "dead-mask pixel count",
+      "absolute increase threshold",
+      "do not reuse 20-30 pixels blindly",
+      "minimum contact duration"
+    ]
+  },
+  {
+    "id": "filtering_required",
+    "step": "filtering",
+    "user": "Can I skip Filtering if I do not want to remove tracks?",
+    "required": [
+      "must be run even when every filter is disabled",
+      "creates the downstream csv",
+      "interpolates missing timepoints"
+    ]
   },
   {
     "id": "filtering_tradeoff",
     "step": "filtering",
     "user": "What minimum track length should I use?",
-    "required": ["track-length distribution", "exclude real short-lived behavior", "downstream"]
+    "required": [
+      "track-length distribution",
+      "state analysis supports unequal lengths",
+      "reduce noise and computation"
+    ]
   },
   {
-    "id": "hmm_not_dtw",
+    "id": "hmm_defaults",
     "step": "analysis",
-    "user": "Explain HMM windows, log scaling and where the heatmap is.",
-    "required": ["hmm", "legacy dtw", "window size", "smooth window", "standardized", "behavioral_clustering_diagnostics.pdf"]
+    "user": "Explain HMM windows, log scaling, states, start offset and the heatmap.",
+    "required": [
+      "window size 5",
+      "use 1",
+      "smooth window usually matches",
+      "fixed state selection",
+      "start offset at 1",
+      "binary groups are applied post hoc",
+      "behavioral_clustering_diagnostics.pdf"
+    ]
+  },
+  {
+    "id": "analysis_summaries",
+    "step": "analysis",
+    "user": "Explain interaction windows and the mean versus AUC invasiveness summaries.",
+    "required": [
+      "looks back before death",
+      "60 minutes as an example",
+      "per-timepoint trace",
+      "mean averages timepoints",
+      "auc integrates the trace"
+    ]
+  },
+  {
+    "id": "trajectory_defaults",
+    "step": "analysis",
+    "user": "Configure State Trajectory clustering linkage and trajectory size.",
+    "required": [
+      "cannot exceed the trim length",
+      "average linkage is the default",
+      "complete is a reasonable comparison",
+      "single linkage performs poorly",
+      "original behav3d feature-based mode is deprecated",
+      "contact-based comparison plots",
+      "exemplar track"
+    ]
   },
   {
     "id": "death_preview",
@@ -40,30 +163,25 @@
     "id": "metadata_based_edt",
     "step": "segmentation",
     "user": "Calcula el EDT segun la resolucion de mis imagenes.",
-    "required": ["10 um cell", "XY pixel size", "20%, 25%, and 30%", "cell widths"]
+    "required": ["10 um cell", "xy pixel size", "20%, 25%, and 30%", "cell widths"]
   },
   {
     "id": "interactive_track_counts",
     "step": "filtering",
     "user": "Si filtro a 200 timepoints, cuantos tracks quedan en position_t 0?",
-    "required": ["unique position_t", "requested position_t", "never estimate"]
-  },
-  {
-    "id": "merged_cells_threshold_direction",
-    "step": "segmentation",
-    "user": "The CMTMR T cells are touching and not split.",
-    "required": ["raise both mask and seed thresholds", "raise EDT for plain", "lower EDT for Peak"]
-  },
-  {
-    "id": "tracking_uses_motion_and_interval",
-    "step": "tracking",
-    "user": "Guide tracking for my T cells and collagen.",
-    "required": ["do not infer it from the cell-type label", "Use Propagation", "one-frame displacement", "15 seconds is 15 um/frame"]
+    "required": [
+      "unique timepoints per sample and track id",
+      "requested timepoint",
+      "never estimate"
+    ]
   },
   {
     "id": "equal_track_lengths_are_valid",
     "step": "filtering",
     "user": "Are minimum 30 and maximum 30 contradictory?",
-    "required": ["valid, not contradictory", "trims retained longer tracks", "same comparison window"]
+    "required": [
+      "equal minimum and maximum lengths are valid",
+      "maximum trims retained tracks"
+    ]
   }
 ]

@@ -304,7 +304,11 @@ def compute_condition_diff_stats_pairwise(
     class_order = [str(c) for c in list(class_order)]
     joined = per_sample_class_props.join(sample_metadata, how="inner")
 
-    valid_group_cols = [c for c in (group_cols or []) if c in joined.columns]
+    # Excluding condition_col here too (not just at the caller) guards against
+    # any other caller passing an overlapping group_cols/condition_col combo -
+    # joined[condition_col] would otherwise be ambiguous if condition_col were
+    # duplicated among the selected columns, since DataFrame.unique() doesn't exist.
+    valid_group_cols = [c for c in (group_cols or []) if c in joined.columns and c != condition_col]
     if valid_group_cols:
         group_labels = _make_group_label(joined, valid_group_cols).astype(str)
         groups = {label: joined[group_labels == label] for label in group_labels.unique().tolist()}

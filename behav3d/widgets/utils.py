@@ -479,7 +479,7 @@ behav3d_calculated_features = {
         "median_turning_angle", "fraction_reversed_movement",
     ],
     "intensity": [
-        "mean_intensity_*", "mean_dead_dye",
+        "mean_intensity_*", "mean_dead_dye", "q75_mean_intensity_*",
     ],
     "death": [
         "percentage_dead_mask", "nr_dead_mask_pixels", "increase_dead_mask", "dead",
