@@ -4348,6 +4348,7 @@ class CellposeSAMWidget(QWidget):
                 fire_extra_callback(extra_callbacks, "on_failed", "cancelled")
                 return
             overwrite = (choice == "overwrite")
+            skip_existing = (choice == "skip")
         else:
             overwrite = not skip_existing
 
