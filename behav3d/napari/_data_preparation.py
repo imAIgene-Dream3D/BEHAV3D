@@ -618,6 +618,22 @@ class DataPreparationTab(QWidget):
                 out.append(base)
         return out
 
+    @staticmethod
+    def _ensure_sample_prefix(name: str) -> str:
+        """Guarantee a sample name starts with ``S``.
+
+        Purely numeric sample names (e.g. ``"12"``) cause downstream problems
+        in the pipeline (they get parsed as integers when read back from CSV,
+        break path/column construction, etc.). Prepending ``S`` forces a
+        non-numeric name. An empty entry is left empty so required-field
+        validation still fires, and a name that already starts with ``S`` is
+        returned unchanged so repeated edits/saves never stack extra prefixes.
+        """
+        name = name.strip().strip('"').strip("'")
+        if not name or name.startswith("S"):
+            return name
+        return "S" + name
+
     def _create_sample_form(self, idx: int, org_names, imm_names, oth_names, include_dead) -> dict:
         grp = QGroupBox(f"Sample {idx + 1}")
         layout = QFormLayout(grp)
@@ -630,6 +646,15 @@ class DataPreparationTab(QWidget):
         # Basic fields
         fields["sample_name"] = QLineEdit()
         fields["sample_name"].setPlaceholderText("e.g. Sample001")
+        fields["sample_name"].setToolTip(
+            "Sample names are automatically prefixed with 'S' so they are never "
+            "purely numeric (numeric names break parts of the pipeline)."
+        )
+        # Apply the 'S' prefix as soon as the user leaves the field so the
+        # change is visible in the form, not only in the saved CSV.
+        fields["sample_name"].editingFinished.connect(
+            lambda w=fields["sample_name"]: w.setText(self._ensure_sample_prefix(w.text()))
+        )
         layout.addRow("Name*:", fields["sample_name"])
 
         fields["exp_nr"] = QSpinBox(); fields["exp_nr"].setMaximum(9999); fields["exp_nr"].setValue(1); fields["exp_nr"].setMaximumWidth(70)
@@ -1196,7 +1221,10 @@ class DataPreparationTab(QWidget):
             row: dict = {}
             for k, w in form["basic"].items():
                 if isinstance(w, QLineEdit):
-                    row[k] = w.text().strip().strip('"').strip("'")
+                    val = w.text().strip().strip('"').strip("'")
+                    if k == "sample_name":
+                        val = self._ensure_sample_prefix(val)
+                    row[k] = val
                 elif isinstance(w, QComboBox):
                     row[k] = w.currentText()
                 elif isinstance(w, QSpinBox):
