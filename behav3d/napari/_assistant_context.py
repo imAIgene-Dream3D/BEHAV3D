@@ -70,6 +70,7 @@ _RAW_IMAGE_SUFFIXES = (".zarr", ".zarr.zip", ".czi", ".lif", ".liff",
                        ".tif", ".tiff", ".ims", ".h5")
 _EXPERIMENT_NOTE_PATTERNS = (
     "README_BEHAV3D*.md",
+    "README_Calcium*.md",
     "EXPERIMENT_CONTEXT*.md",
     "BEHAV3D_CONTEXT*.md",
 )
@@ -128,21 +129,45 @@ def _compact_experiment_config(config: dict) -> dict:
 
     pixel = config.get("pixel_classifier")
     if isinstance(pixel, dict):
-        summary["segmentation"] = {
+        segmentation = {
             key: _json_value(pixel[key])
             for key in (
                 "apoc_strategy", "convpaint_strategy", "examples_per_sample",
-                "use_all_timepoints", "tp_start", "tp_end",
+                "sample_specific_classifier", "use_all_timepoints", "tp_start",
+                "tp_end", "convpaint_fe_alias", "convpaint_channel_mode",
+                "convpaint_normalize", "convpaint_image_downsample",
+                "convpaint_seg_smoothening", "convpaint_clf_iterations",
+                "convpaint_clf_depth", "convpaint_clf_learning_rate",
+                "convpaint_class_weights",
             )
             if key in pixel
         }
+        instance_suffixes = (
+            "prob_mask_threshold", "prob_seed_threshold", "edt_threshold",
+            "segment_size_min", "opening_nr_pixels", "fill_holes",
+        )
+        instance_by_cell_type: dict[str, dict] = {}
+        for key, value in pixel.items():
+            match = re.match(
+                r"^(.+)_(%s)$" % "|".join(instance_suffixes), str(key)
+            )
+            if match:
+                cell_type, setting = match.groups()
+                instance_by_cell_type.setdefault(cell_type, {})[setting] = (
+                    _json_value(value)
+                )
+        if instance_by_cell_type:
+            segmentation["saved_instance_by_cell_type"] = instance_by_cell_type
+        if segmentation:
+            summary["segmentation"] = segmentation
 
     apoc = config.get("apoc")
     if isinstance(apoc, dict):
         suffixes = (
             "prob_mask_threshold", "prob_seed_threshold", "edt_threshold",
             "segment_size_min", "opening_nr_pixels", "fill_holes",
-            "max_depth", "num_ensembles",
+            "max_depth", "num_ensembles", "channels", "feature_preset",
+            "consider_original", "grid_sigmas",
         )
         by_cell_type: dict[str, dict] = {}
         for key, value in apoc.items():
@@ -173,6 +198,13 @@ def _compact_experiment_config(config: dict) -> dict:
                         "dist_thresh", "time_thresh", "step_size",
                     )
                     if key in btrack
+                }
+            reporter = settings.get("reporter_propagation")
+            if isinstance(reporter, dict):
+                item["reporter_propagation"] = {
+                    key: _json_value(reporter[key])
+                    for key in ("min_overlap_fraction", "segment_size_min")
+                    if key in reporter
                 }
             tracking_summary[str(cell_type)] = item
         if tracking_summary:
@@ -221,6 +253,8 @@ def _compact_experiment_config(config: dict) -> dict:
         summary["filtering"] = filtering_summary
 
     active_killing = config.get("active_killing")
+    if not isinstance(active_killing, dict) and isinstance(filtering, dict):
+        active_killing = filtering.get("active_killing")
     if isinstance(active_killing, dict):
         summary["active_killing"] = {
             key: _json_value(active_killing[key])
@@ -259,12 +293,50 @@ def _compact_experiment_config(config: dict) -> dict:
     for module in ("state_classification", "track_classification"):
         settings = config.get(module)
         if isinstance(settings, dict):
-            summary[module] = {
+            keys = (
+                (
+                    "n_states", "selected_features", "binary_features_to_group",
+                    "additional_window_features", "window_features_window",
+                    "feature_smoothing_window", "start_offset", "covariance_type",
+                    "log_scale_features", "lower_quantile_cap",
+                    "upper_quantile_cap",
+                )
+                if module == "state_classification" else
+                (
+                    "behavioral_trajectory_size", "n_clusters", "linkage",
+                    "trajectory_trim_mode", "split_long_tracks", "use_original",
+                )
+            )
+            by_cell_type = {}
+            for cell_type, values in settings.items():
+                if not isinstance(values, dict):
+                    continue
+                compact = {
+                    key: _json_value(values[key])
+                    for key in keys if key in values
+                }
+                if compact:
+                    by_cell_type[str(cell_type)] = compact
+            item = {
                 "cell_types_present": [str(key) for key in settings],
                 "cell_types_with_nonempty_settings": [
                     str(key) for key, value in settings.items() if value
                 ],
             }
+            if by_cell_type:
+                item["by_cell_type"] = by_cell_type
+            summary[module] = item
+
+    groups = config.get("cell_type_groups")
+    if isinstance(groups, dict):
+        summary["cell_type_groups"] = _json_value(groups)
+    single_cell = config.get("single_cell")
+    if isinstance(single_cell, dict) and "selected_cell_type" in single_cell:
+        summary["single_cell"] = {
+            "selected_cell_type": _json_value(
+                single_cell["selected_cell_type"]
+            ),
+        }
     return summary
 
 
@@ -323,25 +395,81 @@ def _experiment_reference_context(output_dir: str, parameters: dict) -> dict | N
             "Saved settings describe configured intent and are not proof that a "
             "module ran. Confirm execution from discovered result files."
         ),
+        "source_policy": (
+            "Use live metadata for acquisition facts and populations, README notes "
+            "for study intent and operational definitions, YAML for saved settings, "
+            "and discovered result files for execution evidence. If sources disagree, "
+            "state the discrepancy and prefer live metadata until corrected."
+        ),
     }
 
 
 def validate_metadata_records(records: list[dict]) -> list[dict]:
     """Return factual metadata issues and review notes without biological guesses."""
     issues: list[dict] = []
+    field_labels = {
+        "sample_name": "sample name",
+        "exp_nr": "experiment number",
+        "well": "well",
+        "raw_image_path": "raw image path",
+        "pixel_distance_xy": "XY pixel size",
+        "pixel_distance_z": "Z pixel size",
+        "distance_unit": "distance unit",
+        "time_interval": "time interval",
+        "time_unit": "time unit",
+    }
 
     def add(row, field, severity, message):
         issues.append({"row": row, "field": field, "severity": severity,
                        "message": message})
 
-    required = ("sample_name", "raw_image_path", "pixel_distance_xy",
-                "pixel_distance_z", "time_interval")
+    required = (
+        "sample_name", "exp_nr", "well", "raw_image_path",
+        "pixel_distance_xy", "pixel_distance_z", "distance_unit",
+        "time_interval", "time_unit",
+    )
     for index, record in enumerate(records):
         sample = record.get("sample_name") or f"row {index + 1}"
         for field in required:
             value = record.get(field)
             if value is None or (isinstance(value, str) and not value.strip()):
-                add(index, field, "error", f"{sample}: {field.replace('_', ' ')} is missing.")
+                add(
+                    index, field, "error",
+                    f"{sample}: mandatory {field_labels[field]} is missing.",
+                )
+
+        # Draft builder records keep line and condition as separate nested
+        # fields. A line is mandatory for every configured population; condition
+        # is optional. Use the literal value "None" for a confirmed absent
+        # population so absence is explicit rather than indistinguishable from an
+        # unfinished row.
+        for cell_type, fields in (record.get("cell_types") or {}).items():
+            line = fields.get("line") if isinstance(fields, dict) else None
+            if line is None or (isinstance(line, str) and not line.strip()):
+                add(
+                    index, f"{cell_type}.line", "error",
+                    f"{sample}: mandatory {cell_type} line is missing.",
+                )
+
+        # Saved metadata combines the mandatory line and optional condition in
+        # one column. Validate every configured population column that is present.
+        for field, value in record.items():
+            if not str(field).endswith("_line_condition"):
+                continue
+            if value is None or (
+                isinstance(value, str)
+                and (not value.strip() or value.strip().lower() == "nan")
+            ):
+                label = str(field)
+                for prefix in ("or_", "im_", "ot_"):
+                    if label.startswith(prefix):
+                        label = label[len(prefix):]
+                        break
+                label = label[: -len("_line_condition")].replace("_", " ")
+                add(
+                    index, str(field), "error",
+                    f"{sample}: mandatory {label} line is missing.",
+                )
 
         raw = str(record.get("raw_image_path") or "").strip()
         if raw:
@@ -385,6 +513,31 @@ def validate_metadata_records(records: list[dict]) -> list[dict]:
             add(None, field, "review",
                 f"{field.replace('_', ' ').capitalize()} differs between samples; verify that this is intentional.")
     return issues
+
+
+_METADATA_FIELD_REQUIREMENTS = {
+    "mandatory": [
+        "Sample name",
+        "Experiment number",
+        "Well",
+        "Raw image path",
+        "XY pixel size",
+        "Z pixel size",
+        "Distance unit",
+        "Time interval",
+        "Time unit",
+        "Line for every configured cell or organoid type in every sample",
+    ],
+    "optional": [
+        "Condition for each cell or organoid type",
+        "Existing segmentation and tracking paths",
+        "Dead-mask path",
+    ],
+    "absence_value": (
+        'Use "None" as the line only after the researcher confirms that a '
+        "configured population is absent from that sample."
+    ),
+}
 
 
 def summarize_metadata(metadata) -> dict:
@@ -439,6 +592,7 @@ def summarize_metadata(metadata) -> dict:
         "cell_types": cell_types,
         "records": records,
         "validation": validate_metadata_records(records),
+        "field_requirements": _METADATA_FIELD_REQUIREMENTS,
     }
 
 
@@ -586,6 +740,23 @@ def _metadata_builder_state(dp) -> dict:
                 record["cell_types"] = cell_types
             draft_records.append(record)
 
+        loaded_metadata = getattr(dp, "metadata", None)
+        explicit_dirty = getattr(dp, "_metadata_builder_dirty", None)
+        if explicit_dirty is None:
+            save_required = bool(draft_records)
+        else:
+            save_required = bool(
+                draft_records
+                and (loaded_metadata is None or bool(explicit_dirty))
+            )
+        draft_validation = (
+            validate_metadata_records(draft_records) if draft_records else []
+        )
+        output_dir = str(_widget_value(getattr(dp, "output_dir_edit", None)) or "").strip()
+        csv_path = str(_widget_value(getattr(dp, "csv_path_edit", None)) or "").strip()
+        save_errors = [
+            item for item in draft_validation if item.get("severity") == "error"
+        ]
         return {
             "open": bool(getattr(dp, "builder_grp", None) and dp.builder_grp.isChecked()),
             "n_samples": _safe(lambda: dp.n_samples_spin.value(), 1),
@@ -603,12 +774,102 @@ def _metadata_builder_state(dp) -> dict:
             # These values are the live form draft and can be newer than
             # dp.metadata while an existing CSV is being edited.
             "draft_records": draft_records,
-            "draft_validation": validate_metadata_records(draft_records) if draft_records else [],
-            "record_source": "metadata_builder_draft" if draft_records else None,
-            "save_required": bool(draft_records),
+            "draft_validation": draft_validation,
+            "field_requirements": _METADATA_FIELD_REQUIREMENTS,
+            "record_source": (
+                "metadata_builder_draft" if save_required
+                else ("loaded_metadata_copy" if draft_records else None)
+            ),
+            "save_required": save_required,
+            "actions": {
+                "save_available": bool(
+                    save_required and output_dir and not save_errors
+                ),
+                "save_also_loads": True,
+                "load_available": bool(
+                    csv_path.lower().endswith(".csv")
+                    and Path(csv_path).expanduser().exists()
+                ),
+            },
         }
     except Exception:
         return {"open": False}
+
+
+def _image_dimensions_state(dp) -> list[dict]:
+    """Read image shape/channel counts already loaded into the dimension table."""
+    import ast
+
+    table = getattr(dp, "dim_table", None) if dp is not None else None
+    if table is None:
+        return []
+    rows = []
+    for index in range(_safe(table.rowCount, 0) or 0):
+        sample_item = _safe(lambda i=index: table.item(i, 0))
+        shape_item = _safe(lambda i=index: table.item(i, 1))
+        order_widget = _safe(lambda i=index: table.cellWidget(i, 2))
+        sample = _safe(sample_item.text, "") if sample_item is not None else ""
+        shape_text = _safe(shape_item.text, "") if shape_item is not None else ""
+        order = _widget_value(order_widget)
+        item = {
+            "sample_name": str(sample),
+            "shape": str(shape_text),
+            "dimension_order": str(order or ""),
+        }
+        try:
+            shape = list(ast.literal_eval(str(shape_text)))
+            if len(shape) == len(str(order or "")):
+                axes = str(order)
+                if "C" in axes:
+                    item["channel_count"] = int(shape[axes.index("C")])
+                if "T" in axes:
+                    item["timepoint_count"] = int(shape[axes.index("T")])
+        except (TypeError, ValueError, SyntaxError):
+            pass
+        rows.append(item)
+    return rows
+
+
+def _current_log_state(main_widget, step: str) -> dict | None:
+    """Return a short tail of the current workflow log without sending full logs."""
+    tab_attr = {
+        "data_preparation": "data_prep_tab",
+        "visualization": "visualization_tab",
+        "segmentation": "segmentation_tab",
+        "tracking": "tracking_tab",
+        "feature_extraction": "feature_extraction_tab",
+        "filtering": "filtering_tab",
+        "analysis": "analysis_tab",
+    }.get(step)
+    tab = getattr(main_widget, tab_attr, None) if tab_attr else None
+    if tab is None:
+        return None
+    widget = next(
+        (
+            getattr(tab, attr, None)
+            for attr in ("log_box", "log", "log_edit")
+            if getattr(tab, attr, None) is not None
+            and hasattr(getattr(tab, attr, None), "toPlainText")
+        ),
+        None,
+    )
+    if widget is None:
+        return None
+    text = _safe(widget.toPlainText, "") or ""
+    lines = [line.strip() for line in str(text).splitlines() if line.strip()][-20:]
+    if not lines:
+        return None
+    error_markers = ("error", "failed", "exception", "traceback", "❌")
+    errors = [
+        line for line in lines
+        if any(marker in line.lower() for marker in error_markers)
+    ]
+    return {
+        "source": step,
+        "recent_lines": lines,
+        "errors": errors,
+        "has_explicit_error": bool(errors),
+    }
 
 
 def _step_readiness(main_widget, ctx: dict) -> dict:
@@ -697,16 +958,68 @@ def _segmentation_state(main_widget) -> dict:
             _safe(lambda c=global_combo: c.currentText(), "") if global_combo is not None else ""
         )
         by_cell_type = {}
+        training_state = {}
         for cell_type, tab in (getattr(training, "tabs", {}) or {}).items():
             per_tab = getattr(tab, "_per_tab_strategy_combo", None)
             by_cell_type[str(cell_type)] = (
                 _safe(lambda c=per_tab: c.currentText(), "")
                 if per_tab is not None else global_strategy
             )
+            checks = getattr(tab, "channel_checkboxes", []) or []
+            selected_features = []
+            for (feature, sigma), check in (
+                getattr(tab, "_feat_sigma_checks", {}) or {}
+            ).items():
+                if bool(_safe(check.isChecked, False)):
+                    selected_features.append({
+                        "filter": {
+                            "gaussian_blur": "Gaussian blur",
+                            "difference_of_gaussian": "Difference of Gaussians",
+                            "laplace_box_of_gaussian_blur": "Laplacian of Gaussian",
+                            "sobel_of_gaussian_blur": "Sobel edge",
+                        }.get(str(feature), str(feature)),
+                        "sigma_px": _json_value(sigma),
+                    })
+            classifier_path = _safe(
+                getattr(tab, "_get_clf_path", lambda: None), None
+            )
+            training_state[str(cell_type)] = {
+                "available_input_channels": [
+                    str(_safe(check.text, "")) for check in checks
+                ],
+                "selected_input_channels": [
+                    str(_safe(check.text, "")) for check in checks
+                    if bool(_safe(check.isChecked, False))
+                ],
+                "channel_controls_ready": bool(checks),
+                "feature_preset": _widget_value(
+                    getattr(tab, "feature_combo", None)
+                ),
+                "custom_feature_tuning_open": _widget_value(
+                    getattr(tab, "tune_group", None)
+                ),
+                "custom_feature_scales_px": _widget_value(
+                    getattr(tab, "sigma_input", None)
+                ),
+                "selected_feature_filters": selected_features,
+                "include_original_intensity": _widget_value(
+                    getattr(tab, "consider_original_cb", None)
+                ),
+                "trained_classifier_found": bool(
+                    classifier_path and Path(classifier_path).is_file()
+                ),
+            }
         state[token] = {
             "global_strategy": global_strategy or None,
             "cell_type_strategies": by_cell_type,
         }
+        if token == "apoc":
+            state[token].update({
+                "training_data_loaded": bool(
+                    getattr(page, "_is_session_active", False)
+                ),
+                "cell_types": training_state,
+            })
     sam = getattr(seg, "cellpose_sam_page", None)
     if sam is not None:
         all_types = bool(_widget_value(getattr(sam, "check_all_cell_types", None)))
@@ -724,6 +1037,67 @@ def _segmentation_state(main_widget) -> dict:
             ),
         }
     return state
+
+
+def _interface_capabilities(controls: list[dict]) -> dict:
+    """Describe capability ownership without implying that hidden controls exist."""
+    control_ids = {
+        str(control.get("id") or "")
+        for control in controls
+        if control.get("id")
+    }
+    return {
+        "metadata_builder": {
+            "owns": [
+                "processing population names",
+                "per-sample line and condition",
+                "dead-channel index",
+                "image and acquisition metadata",
+            ],
+            "does_not_own": [
+                "raw-channel-to-cell-type mapping",
+                "segmentation-method input channels",
+            ],
+        },
+        "segmentation": {
+            "channel_selection_is_method_specific": True,
+            "apoc": {
+                "custom_feature_scales_supported": True,
+                "custom_feature_filters_supported": True,
+                "custom_feature_scales_currently_exposed": any(
+                    control_id.startswith("segmentation.apoc.")
+                    and control_id.endswith(".feature_scales")
+                    for control_id in control_ids
+                ),
+                "custom_feature_filters_currently_exposed": any(
+                    control_id.startswith("segmentation.apoc.")
+                    and control_id.endswith(".feature_filters")
+                    for control_id in control_ids
+                ),
+                "feature_filters": [
+                    "Gaussian blur",
+                    "Difference of Gaussians",
+                    "Laplacian of Gaussian",
+                    "Sobel-of-Gaussian",
+                ],
+                "feature_scale_unit": "pixels",
+                "mask_edt_direction": "higher generally splits more",
+                "peak_edt_direction": "lower generally splits more",
+            },
+        },
+        "feature_extraction": {
+            "contact_distance_zero": "strict mask touching",
+            "positive_contact_distance": "allowed physical separation",
+        },
+        "tracking": {
+            "btrack_step_1": "Kalman filter tracking",
+            "btrack_step_2": "Global Hypothesis Optimizer",
+            "step_2_requires_step_1_review": True,
+            "step_2_default_hypotheses": [
+                "P_FP", "P_init", "P_term", "P_link",
+            ],
+        },
+    }
 
 
 def _feature_extraction_state(main_widget) -> dict:
@@ -816,15 +1190,21 @@ def build_context(main_widget) -> dict:
     queue = serialize_queue(queue_panel) if queue_panel is not None else []
 
     metadata_summary = summarize_metadata(metadata)
+    image_dimensions = _safe(lambda: _image_dimensions_state(dp), []) or []
+    if image_dimensions:
+        metadata_summary["image_dimensions"] = image_dimensions
     builder_state = _safe(lambda: _metadata_builder_state(dp), {"open": False}) or {
         "open": False
     }
     draft_records = builder_state.get("draft_records") or []
-    if draft_records:
+    if draft_records and builder_state.get("save_required"):
         # Questions about current form entries must use the draft. Otherwise an
         # older loaded DataFrame can make the assistant repeat a completed change.
         metadata_summary["records"] = draft_records
         metadata_summary["validation"] = builder_state.get("draft_validation", [])
+        metadata_summary["field_requirements"] = builder_state.get(
+            "field_requirements", _METADATA_FIELD_REQUIREMENTS
+        )
         metadata_summary["n_samples"] = len(draft_records)
         metadata_summary["sample_names"] = [
             str(record.get("sample_name")) for record in draft_records
@@ -869,12 +1249,16 @@ def build_context(main_widget) -> dict:
         )
     if step == "analysis":
         ctx["analysis"] = _safe(lambda: _analysis_state(main_widget), {})
+    current_log = _safe(lambda: _current_log_state(main_widget, step), None)
+    if current_log:
+        ctx["current_log"] = current_log
 
     controls = _safe(lambda: control_registry(main_widget), []) or []
     ctx["ui_state"] = {
         "contract_version": CONTROL_CONTRACT_VERSION,
         "controls": controls,
     }
+    ctx["interface_capabilities"] = _interface_capabilities(controls)
 
     # Guided-flow enrichments.
     ctx["step_readiness"] = _safe(lambda: _step_readiness(main_widget, ctx), {})

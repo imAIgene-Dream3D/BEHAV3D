@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 
-KNOWLEDGE_VERSION = "2026.07.23.2"
+KNOWLEDGE_VERSION = "2026.07.24.23"
 
 
 GUIDANCE_CARDS = {
@@ -15,12 +15,29 @@ GUIDANCE_CARDS = {
         "metadata exists, open the Metadata Builder and populate all known values immediately; omit "
         "unknown fields and ask only for the one ambiguity that matters next. If asked to correct a "
         "shared acquisition value, propose that correction for every sample. When asked what "
-        "analysis to run, first ask the research question; do not infer it from metadata alone."
+        "analysis to run, first ask the research question; do not infer it from metadata alone. "
+        "An open builder containing an unchanged copy of loaded metadata does not need to be saved "
+        "again. After an external Zarr conversion or external metadata-path edit, use Load Metadata "
+        "to propagate the new paths. The in-app Zarr converter reloads all tabs automatically. "
+        "The Metadata Builder does not map raw channel indices to cell types. Channel-input or "
+        "channel-label controls belong to the selected segmentation method. For swapped-channel "
+        "replicates, generic processing population slots with the true identity recorded in each "
+        "sample's Line field are a valid metadata structure; confirm that this slot-based workflow "
+        "matches the intended downstream processing before editing it. Organoid lines are not "
+        "necessarily separate processing types: ask whether they coexist in "
+        "one movie and need separate segmentation/tracking, or should share one organoid type with "
+        "line identity recorded per sample. Well and each configured population's line are mandatory; "
+        "condition is optional. When no physical wells exist, propose one shared identifier such as "
+        "'1'. Use line 'None' only after absence of that population is confirmed."
     ),
     "experiment_design": (
         "Use the loaded experiment reference only for the current dataset. Preserve explicit "
         "population identities, assay purpose, operational definitions, scope exclusions, and "
-        "caveats. When two populations share a well and the reference identifies a paired design, "
+        "caveats. Apply this source hierarchy: live metadata is authoritative for acquisition facts "
+        "and configured populations; the experiment README describes study intent and operational "
+        "definitions; YAML describes saved configuration; discovered output files prove execution. "
+        "When sources disagree, name the discrepancy and use live metadata unless the researcher "
+        "confirms a correction. When two populations share a well and the reference identifies a paired design, "
         "prioritize the within-well comparison because dose, timing, and imaging conditions are "
         "shared. Distinguish an isogenic functional comparison from tumor-versus-healthy safety "
         "profiling; they answer different questions. Call small, unequal, or unreplicated condition "
@@ -32,23 +49,75 @@ GUIDANCE_CARDS = {
         "trajectory clustering, or another readout is available, require a corresponding discovered "
         "result; otherwise say it was configured or described but no result was found."
     ),
+    "reference_examples": (
+        "Historical experiment profiles are provenance-labeled examples, never defaults. Mention "
+        "the source profile, compare its image spacing, cadence, object scale, motion, signal quality, "
+        "and method with the current experiment, and never edit a live control from an example alone. "
+        "Older YAMLs may use legacy labels or units. IVM HIV example: CSV 1.15 um XY, 4 um Z, 15 s; "
+        "ConvPaint Probability + Watershed; historical btrack maximum radii 12/10, optimizer distance "
+        "26, time 6/4 frames; fixed 15-frame tracks and a three-state motility HMM. Its README says "
+        "one sample was 10 s, conflicting with the CSV, so use live metadata. CD4/CD8-13T example: "
+        "1.01 um XY, 1.05 um Z, 2 min; APOC Mask + EDT; organoid propagation; matched T-cell btrack "
+        "100 maximum radius, 60 optimizer distance, 3 frames; Active Killing 7 frames, relative 2x "
+        "rise, minimum 3 contact frames. Its YAML contains multiple segmentation snapshots, so those "
+        "post-processing values are not a final preset. Multi-organoid safety example: 1.77 um "
+        "isotropic, 2 min; paired 27T-versus-MDO targets with TEG effectors; organoid propagation; "
+        "README Active Killing definition 5 frames, relative 1.5x rise, one contact frame; configured "
+        "does not mean executed. Calcium reporter example: 0.33 um XY, 2 um Z, 5 s, 32 frames; external "
+        "Cellpose-SAM import; Reporter Propagation for near-static intermittent detections; historical "
+        "100-voxel noise and 10% overlap values; a five-state HMM on one reporter-intensity fold-change "
+        "feature with smoothing 1 and a full 32-frame trajectory. Use it to explain intensity-driven "
+        "behavior, not as a motility template. For any spatial btrack value, calculate or measure "
+        "per-frame displacement; for optimizer values, ask for the largest spatial and missing-frame "
+        "gap; for segmentation thresholds, use the current resolution and preview."
+    ),
     "segmentation": (
-        "Choose the segmentation method from the data and available compute. Cellpose-SAM is the "
-        "accuracy-first zero-shot choice for clean, high-resolution, low-bleed-through images when "
+        "Choose the segmentation method from the image signal, resolution, and available compute; "
+        "the method currently shown in the dropdown may only be the UI default. Signal bleed-through "
+        "is not metadata and only the researcher can confirm it, so ask whether each target is isolated "
+        "in a clean channel before comparing or recommending any method. When that information is "
+        "missing, ask the channel-cleanliness question and stop rather than calling the selected method "
+        "a good default. Cellpose-SAM is the accuracy-first "
+        "zero-shot choice only for confirmed clean, high-resolution, low-bleed-through inputs when "
         "a strong GPU or HPC is available and the number of movies/timepoints is manageable. APOC "
-        "is the normal-workstation default for lower-resolution live imaging, bleed-through, or "
-        "many similar experiments; its training can be reused. Try ConvPaint when APOC misses "
-        "complex structures. Retrained classic Cellpose is the longest setup and is reserved for "
-        "complex heterogeneous data where accuracy justifies creating ground-truth masks. The CPU "
-        "Random Forest pixel classifier remains a fallback when a suitable GPU is unavailable. "
-        "Import accepts existing TIFF or zarr segmentations. Discuss only controls for the selected "
-        "method and exact cell type. For EDT advice, calculate the expected XY diameter from each "
+        "is the normal-workstation default for lower-resolution live imaging, bleed-through, or many "
+        "similar experiments; its training can be reused. Try ConvPaint when APOC misses complex "
+        "structures. Retrained classic Cellpose is the longest setup and is reserved for complex "
+        "heterogeneous data where accuracy justifies creating ground-truth masks. The CPU Random "
+        "Forest pixel classifier remains a fallback when a suitable GPU is unavailable. Import accepts "
+        "existing TIFF or zarr segmentations. Image shape can provide the channel count but cannot say "
+        "what biological signal is visible in each channel; ask for a channel-by-channel map and never "
+        "infer signal identities or absence of bleed-through from filenames. Fluorophore names such as "
+        "GFP/RFP are not needed, so do not ask for them or use them in examples. Discuss only controls for the "
+        "selected method and exact cell type. For EDT advice, calculate the expected XY diameter from each "
         "sample's XY pixel size, using a 10 um cell by default and 20%, 25%, and 30% of its pixel "
         "diameter as transparent preview starting points. For organoids, first ask how many cell "
-        "widths span the diameter."
+        "widths span the diameter. For a single-cell Minimum size starting point, ask for the "
+        "estimated cell diameter, approximate a full spherical volume, and start at 50% of that "
+        "volume so incomplete or dim segmentations are not immediately discarded. Convert to voxels "
+        "using XY pixel size squared times Z pixel size when the control is in voxels, and label the "
+        "result as a preview value rather than ground truth."
     ),
     "apoc": (
-        "APOC direct instance segmentation is only for sparse, non-touching objects where every "
+        "APOC has per-cell-type Image Channel Inputs. After Generate Training Data finishes, select "
+        "only the channels the researcher identifies as informative for that model, including shared "
+        "channels when they contain useful target signal or context. Do not add a dead channel merely "
+        "as a negative class, to exclude dead cells, or to identify background: a dead target is still "
+        "the same target population. Include it only when the researcher confirms that its signal is "
+        "genuinely informative for that target model. If channel checkboxes are not ready, that means "
+        "training data is not "
+        "loaded; it does not mean APOC always uses every channel. Configure channels and classifier "
+        "features before training, even when saved annotations already exist. Small structures is the "
+        "normal feature preset for single cells and Large structures for organoid-scale objects. "
+        "Tune Features refers to custom feature scales in pixels and a filter grid containing Gaussian "
+        "blur, Difference of Gaussians, Laplacian of Gaussian, and Sobel-of-Gaussian (SoG). Small "
+        "structures selects all four filters at sigma 1, 2, and 5 pixels plus original intensity; "
+        "Medium structures uses 1, 2, 5, and 15; Large structures uses 1, 2, 5, 10, and 25. The "
+        "original-intensity checkbox adds raw pixel intensity as a feature, so never claim APOC "
+        "cannot learn from raw voxels. Tune Features never means Minimum size, EDT, Mask threshold, "
+        "Seed threshold, or Feature Extraction. A classifier is trained only when a classifier "
+        "file is actually found. APOC "
+        "direct instance segmentation is only for sparse, non-touching objects where every "
         "connected region should remain one instance. Mask + EDT is preferred for similarly sized "
         "touching objects. Probability Map + Watershed is the default and handles heterogeneous "
         "sizes. In probability mode, Mask threshold defines the foreground contour; Seed threshold "
@@ -92,7 +161,10 @@ GUIDANCE_CARDS = {
     ),
     "tracking": (
         "Read current values for the exact cell type and establish observed movement between "
-        "consecutive frames. Use Propagation for slow, non-dividing, non-touching structures that "
+        "consecutive frames. For a generic tracking guide when movement has not been supplied, ask "
+        "only how far the active structure moves or whether it remains overlapping, then stop without "
+        "listing or evaluating any named method. Once movement is known, use Propagation for slow, "
+        "non-dividing, non-touching structures that "
         "remain spatially overlapping. Use Reporter Propagation for genuinely static objects whose "
         "reporter signal flickers or disappears, such as calcium traces; it reuses one reference "
         "shape and is inappropriate for real movement or shape change. btrack is the routine default "
@@ -100,8 +172,13 @@ GUIDANCE_CARDS = {
         "identified routine advantage and should not be suggested without a specific reason. Set "
         "btrack maximum search radius from the fastest plausible one-frame displacement plus only a "
         "10-25% margin, using metadata time interval and units. Never invent a typical speed. Global "
-        "optimization is a separate second stage for reconnecting fragments; distance threshold "
-        "limits spatial gaps and time threshold limits missing frames. Change Step size only after an "
+        "optimization is Step 2, a separate refinement stage for reconnecting fragments and resolving "
+        "track hypotheses. After Step 1 has been previewed and its search radius looks correct, offer "
+        "to enable Step 2 as part of a complete btrack setup. Its normal starting hypotheses are false "
+        "positive, initialization, termination, and linking; enable branching, death, or merging only "
+        "when those events should be modeled. Distance threshold limits spatial gaps and Time threshold "
+        "limits missing frames, so ask for the largest gap to bridge rather than copying defaults. "
+        "Change Step size only after an "
         "out-of-memory error, lowering it to reduce RAM. When more than one organoid type exists, "
         "track all organoid types together with Propagation while preserving their origin types."
     ),
@@ -109,7 +186,9 @@ GUIDANCE_CARDS = {
         "Select feature families for the biological question. Morphology is the most expensive and "
         "should be computed only when shape matters. Movement is fast and is the default family for "
         "motility, but is usually unnecessary for organoids. Contact distance 0 means strict mask "
-        "touching; increase it only when proximity should count as contact. Any contact-distance "
+        "touching; increase it only when proximity should count as contact. A positive distance equal "
+        "to the XY pixel size permits a one-XY-pixel gap; it is not strict touching and is not a voxel "
+        "diagonal. Any contact-distance "
         "change requires feature extraction to be run again, so plan it as a batch decision rather "
         "than an interactive sweep. In the dead-threshold preview, green means alive and red means "
         "dead; hovering shows the dead-mask percentage. If ambiguous, ask what looks wrong before "
@@ -142,7 +221,9 @@ GUIDANCE_CARDS = {
         "estimate the result."
     ),
     "analysis": (
-        "First identify the research question and the active analysis view. Behavioral State assigns "
+        "First identify the research question and the active analysis view. The Choose analysis action "
+        "explains the available views and must not repeatedly navigate to the Analysis tab. Open a named "
+        "view directly when the researcher asks. Behavioral State assigns "
         "an HMM state per timepoint. State Trajectory clusters whole trajectories using dynamic time "
         "warping. They answer different questions and their controls must not be mixed. Treat 3D "
         "morphology cautiously when Z sampling is coarse. Group cells together when populations from "
@@ -193,6 +274,15 @@ def select_guidance_cards(
         selected.append(step)
     if context.get("experiment_reference"):
         selected.append("experiment_design")
+    example_request = any(phrase in query for phrase in (
+        "example value", "example setting", "example configuration",
+        "previous experiment", "past experiment", "historical value",
+        "historical setting", "reference profile", "reference configuration",
+        "similar experiment", "similar dataset", "values used before",
+        "what did you use", "used previously", "prior experiment",
+    ))
+    if example_request:
+        selected.append("reference_examples")
 
     segmentation_method = str(
         (context.get("segmentation") or {}).get("method") or ""
