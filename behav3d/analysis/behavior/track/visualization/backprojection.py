@@ -273,8 +273,12 @@ def export_track_cluster_backprojection(
         f"missing_tracks={int(missing_windows)}",
     )
 
-    from behav3d.analysis.behavior.state.utils import _get_classification_state_colors
+    from behav3d.analysis.behavior.state.utils import (
+        _get_classification_state_colors,
+        _get_classification_state_order,
+    )
     state_colors = _get_classification_state_colors(adata_tracks, cluster_col)
+    state_order = _get_classification_state_order(adata_tracks, cluster_col)
 
     adata_export = SimpleNamespace(
         obs=backproj_obs,
@@ -288,6 +292,7 @@ def export_track_cluster_backprojection(
         cell_type=cell_type,
         state_col=output_col,
         state_colors=state_colors,
+        state_order=state_order,
         sample_col=sample_col,
         track_col=track_col,
         time_col=time_col,
