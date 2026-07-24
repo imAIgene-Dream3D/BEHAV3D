@@ -394,7 +394,7 @@ def _plot_page_grouped_class_proportions_2d_grid(
 
         title_str = f"Grouped Track-Class Proportions — {group_label_title}"
 
-    legend_handles, legend_labels = _class_legend_handles(class_order, class_colors)
+    legend_handles, legend_labels = _class_legend_handles(list(reversed(class_order)), class_colors)
     fig.legend(
         handles=legend_handles, labels=legend_labels,
         loc="lower center", ncol=legend_ncol, frameon=False, fontsize=7,
@@ -446,7 +446,7 @@ def _plot_page_grouped_class_proportions_flat_grid(
     for i in range(len(groups), nrows * ncols):
         fig.add_subplot(outer[i]).axis("off")
 
-    legend_handles, legend_labels = _class_legend_handles(class_order, class_colors)
+    legend_handles, legend_labels = _class_legend_handles(list(reversed(class_order)), class_colors)
     fig.legend(
         handles=legend_handles, labels=legend_labels,
         loc="lower center", ncol=legend_ncol, frameon=False, fontsize=7,
@@ -582,7 +582,7 @@ def _plot_page_class_stack_grid(
 
         title_str = f"{title} — {col_y}"
 
-    legend_handles, legend_labels = _class_legend_handles(stack_order, colors)
+    legend_handles, legend_labels = _class_legend_handles(list(reversed(stack_order)), colors)
     fig.legend(
         handles=legend_handles, labels=legend_labels,
         loc="lower center", ncol=legend_ncol, frameon=False, fontsize=7,
@@ -600,7 +600,7 @@ def _plot_single_class_stack_panel(props_df, *, class_order, stack_order, colors
     fig, ax = plt.subplots(figsize=(panel_w_in, fig_h))
     draw_stacked_proportion_barv(ax, props_df, class_order, stack_order, colors, ymax=1.0, xtick_fontsize=8)
     ax.set_ylabel("Proportion")
-    legend_handles, legend_labels = _class_legend_handles(stack_order, colors)
+    legend_handles, legend_labels = _class_legend_handles(list(reversed(stack_order)), colors)
     fig.legend(
         handles=legend_handles, labels=legend_labels,
         loc="lower center", ncol=legend_ncol, frameon=False, fontsize=8,

@@ -458,7 +458,7 @@ def _save_diagnostics(
                     )
                     bottom = np.zeros(len(group_order_rep))
                     x_pos = np.arange(len(group_order_rep))
-                    for c in cluster_order:
+                    for c in reversed(list(cluster_order)):
                         vals = pivot_rep[c].to_numpy()
                         ax.bar(x_pos, vals, bottom=bottom, width=0.6, color=cluster_color_map[c], label=c)
                         bottom = bottom + vals

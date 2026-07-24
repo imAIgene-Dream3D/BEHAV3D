@@ -92,7 +92,7 @@ def draw_thin_stacked_proportion_barh(
     """
     half = float(bar_height_frac) / 2.0
     left = 0.0
-    for class_name in class_order:
+    for class_name in reversed(list(class_order)):
         val = float(values.get(class_name, 0.0))
         if val <= 0.0:
             continue
@@ -129,7 +129,7 @@ def draw_stacked_proportion_barv(
     """
     x = np.arange(len(class_order))
     bottom = np.zeros(len(class_order))
-    for stack_name in stack_order:
+    for stack_name in reversed(list(stack_order)):
         if stack_name in props_df.columns:
             vals = props_df[stack_name].reindex(class_order).fillna(0.0).to_numpy(dtype=float)
         else:
@@ -220,7 +220,7 @@ def plot_page_stacked_proportion_barh_grid(
         )
         axes[i].set_title(_wrap_row_label(key), fontsize=row_label_fontsize, pad=1, loc="left")
 
-    handles = [Patch(facecolor=colors[c], label=str(c)) for c in class_order]
+    handles = [Patch(facecolor=colors[c], label=str(c)) for c in reversed(list(class_order))]
     legend_ncol, _, legend_margin_in = legend_layout(len(handles), base_margin_in=0.58)
     fig.legend(handles=handles, loc="lower center", ncol=legend_ncol, frameon=False, fontsize=7)
     fig.tight_layout(rect=(0.03, legend_margin_in / fig_h, 1, 0.94), h_pad=0.3)

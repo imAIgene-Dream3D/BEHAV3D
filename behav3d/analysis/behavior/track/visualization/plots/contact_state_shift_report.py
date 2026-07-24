@@ -96,8 +96,9 @@ def _plot_contact_state_shift_page(
             ax2.axis("off")
         ax2.set_title(f"{_CONTACT_GROUP_TITLES[group]}\nState composition", fontsize=10)
 
-    handles = [plt.Rectangle((0, 0), 1, 1, color=colors[s]) for s in state_order]
-    fig.legend(handles, state_order, loc="lower center", ncol=min(len(state_order), 6), frameon=False, fontsize=8)
+    legend_state_order = list(reversed(state_order))
+    handles = [plt.Rectangle((0, 0), 1, 1, color=colors[s]) for s in legend_state_order]
+    fig.legend(handles, legend_state_order, loc="lower center", ncol=min(len(state_order), 6), frameon=False, fontsize=8)
     fig.suptitle("Contact-triggered behavioral-state shift (before vs. after)", fontsize=13, fontweight="bold")
     return fig, long_rows
 
