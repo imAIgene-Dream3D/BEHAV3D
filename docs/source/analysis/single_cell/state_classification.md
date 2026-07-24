@@ -191,10 +191,20 @@ In other words: use the binary flags as clues, but let the **combination of QC p
 
 ## Step 3 — Reports
 
-Two report buttons summarise the classification across your samples. Each has a **👁** button to reopen its PDF.
+Three report buttons summarise the classification across your samples. Each has a **👁** button to reopen its PDF.
 
 - **▶ State Composition Report** — what fraction of time each state occupies, broken down by sample and (optionally) by metadata groupings. The **Group composition plots by** list below it lets you pick one or more metadata columns to group the composition by, which combines samples with these same conditions (Ctrl/Cmd-click for several).
 - **▶ State Transition Report** — Which behavioral states cells transition into from each state, and how frequently these transitions occur.
+- **▶ Create condition comparison plot** — statistically compares state proportions between the levels of one metadata column, e.g. does state composition differ between organoid lines?
+
+  | Control | Default | Meaning |
+  |---|---|---|
+  | **Compare condition** | — | The metadata column whose levels are compared pairwise (Welch's t-test) for each state. |
+  | **Group in X** | — none — | Splits the comparison into side-by-side columns from a second condition. |
+  | **Group in Y** | — none — | With **Compare condition** set to the comparison conditions, adds a second grouping axis for a true 2D grid instead of one row per pairwise comparison. |
+  | **Group per page** | none selected | Additional column(s) that paginate rather than add another axis. |
+
+  Each state gets a signed bar showing the proportion difference between two condition levels, annotated with significance stars (`*`/`**`/`***`/`****`) — the same layout as Track Classification's [Condition Comparison Report](track_classification.md).
 
 Reports are saved as PDFs and can be reopened at any time with their **👁** button or from the shared **Results** panel.
 
@@ -273,14 +283,15 @@ The most important files there are:
 
 This is the file to **Browse…** to when applying an existing classification to new data (see *Two ways to run* above).
 
-The two reports are each saved as a PDF (the composition report also writes a CSV of the underlying curves).
+The three reports are each saved as a PDF (the composition and condition-comparison reports also write a CSV of the underlying values).
 
-**The State Composition Report** answers *"how much time do cells spend in each state?"*. It contains:
+**The State Composition Report** answers *"What is the proprotion of each state per timepoint and how does this change over time?"*. It contains:
 
 - **Relative state composition per sample** (stacked bars showing the proportion of each state).
 - **Absolute cell-count composition per sample** (the same, but as raw counts).
 - **Pooled per-sample summary bars** of overall state proportions.
 - Any **metadata groupings** you chose in the *Group composition plots by* list.
+
 
 **The State Transition Report** answers *"how do cells move between states?"*. It contains:
 
@@ -288,8 +299,12 @@ The two reports are each saved as a PDF (the composition report also writes a CS
 - **All-pairs Sankey diagrams** visualising the flow between states.
 - **Rankings of the most common state sequences** (n-grams) cells follow over time.
 
+**The Condition Comparison Report** answers *"does state composition differ between these conditions?"*. It writes `condition_comparison_<condition>.pdf`/`.csv` under `behavioral_states/state_composition/behavior_proportions/`, alongside the composition report's own CSVs.
+
+All reports, as well as backprojection, show states in the **display order set during renaming** (Step 2) rather than alphabetically, so axes and legends stay consistent with however you chose to arrange the clusters.
+
 ```{note}
-Reopen either report at any time with its **👁** button or from the shared **Results** panel rather than by typing a path.
+Reopen any report at any time with its **👁** button or from the shared **Results** panel rather than by typing a path.
 ```
 
 ## Tips & best practices

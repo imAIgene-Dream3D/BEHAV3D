@@ -229,6 +229,36 @@ Output:
 <output_dir>/analysis/<cell_type>/behavorial_trajectories/contact_analysis/<contact_col>/csv/
 ```
 
+### Contact State-Shift Analysis
+
+Where Contact-Based Grouping asks *which* clusters occur more in contacting vs. non-contacting tracks, this asks a different question: does a track's **behavioural-state mix change** once it makes contact? It compares each classified track's [State Classification](state_classification.md) state composition **before vs. after** its first sufficiently long contact bout, against a **timing-matched null** before/after split for tracks that never contact — so a state shift attributable to contact can be distinguished from a track-wide temporal trend that would show up either way.
+
+- **Contact tracks** use the same bout definition as Contact-Based Grouping: the first contiguous run of the chosen **Contact column** at least **Min. contiguous contact bout** timepoints long (both controls above are reused here, not duplicated).
+- **No-contact tracks** get a synthetic reference split point instead of a real bout — its relative position within the track is drawn from the empirical distribution of real bout-start positions seen elsewhere in the run (not simply the track midpoint), so the null is matched to *when* contact tends to happen.
+
+| Control | Default | Meaning |
+|---|---|---|
+| **Window mode** | Fixed | `Fixed` compares a fixed number of timepoints immediately before the bout starts vs. immediately after it ends. `Full` compares everything before the bout to everything after it, within the track's classified window. |
+| **Fixed window length (timepoints)** | 10 | Only used in `Fixed` mode — how many timepoints on each side of the bout to compare. |
+| **State column** | full_behavioral_cluster | Which state label to compare (`full_behavioral_cluster`, `intrinsic_behavioral_cluster`, or `raw_hmm_state`). |
+
+Click **▶ Run contact state-shift analysis** (**▶ Run State-Shift Analysis** in napari). This produces one combined PDF with a 2×2 layout — contact tracks vs. no-contact tracks (null) as columns, and for each:
+- a **diff-bar panel**: per-state before→after proportion change with Welch's t-test significance stars, one independent observation per track;
+- a **stacked-composition panel**: pooled per-timepoint before/after state composition.
+
+```{important}
+Only available for the **Categorical DTW** method, and only once **State Classification has been run** for this cell type (it reads the behavioral-states `.h5ad`).
+```
+
+Output, written as sibling artifacts to the Contact-Based Grouping report (so re-running one does not overwrite the other):
+
+```text
+<output_dir>/analysis/<cell_type>/behavorial_trajectories/contact_analysis/<contact_col>/contact_state_shift.pdf
+<output_dir>/analysis/<cell_type>/behavorial_trajectories/contact_analysis/<contact_col>/csv/state_shift_track_windows.csv
+<output_dir>/analysis/<cell_type>/behavorial_trajectories/contact_analysis/<contact_col>/csv/state_shift_diff_bars.csv
+<output_dir>/analysis/<cell_type>/behavorial_trajectories/contact_analysis/<contact_col>/csv/state_shift_stacked_composition.csv
+```
+
 ## Step 5 — Backprojection
 
 The final step paints the **trajectory clusters back onto the raw images**, so you can confirm that cells assigned to the same cluster really do behave alike. It is built directly into this sub-tab and works on the cell type selected at the top of Single Cell. It behaves exactly like State Backprojection, only it colours by trajectory cluster rather than per-timepoint state.
@@ -275,6 +305,7 @@ You will find there, depending on which steps you ran:
 - **Track-class proportion plots** under `behavior_proportions/`: `track_class_proportions_by_sample_<class>.pdf`/`.csv`, plus `track_class_proportions_by_group_<class>.csv` when grouping is used.
 - **Condition comparison reports** under `behavior_comparisons/`: `condition_comparison_<condition>.pdf`/`.csv`.
 - **Contact-based grouping analysis** under `contact_analysis/<contact_col>/`: `contact_analysis.pdf` plus a sibling `csv/` folder with the underlying tables.
+- **Contact state-shift analysis** in the same `contact_analysis/<contact_col>/` folder: `contact_state_shift.pdf` plus `csv/state_shift_track_windows.csv`, `csv/state_shift_diff_bars.csv` and `csv/state_shift_stacked_composition.csv`.
 - Optionally the **DTW distance matrix** CSV (if you ticked *Save distance matrix CSV*).
 
 The **Original feature-based BEHAV3D DTW** engine instead writes its UMAP cluster tables (`BEHAV3D_<cell_type>_UMAP_clusters.csv`, `..._combined_track_features_clustered.csv`, `..._UMAP_cluster_percentages.csv`) and diagnostic PDFs under `analysis/<cell_type>/results/`.

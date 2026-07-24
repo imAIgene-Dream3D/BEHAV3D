@@ -3,6 +3,7 @@
 .RData
 .Ruserdata
 .behav3d_dev
+.claude
 **/__pycache__
 *.ilp
 *.tiff
