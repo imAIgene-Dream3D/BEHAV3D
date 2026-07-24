@@ -53,6 +53,9 @@ See the exact `metadata.csv` structure [below](#metadatacsv-structure).
 
 No setup needed: the Co-pilot dock on the right of the napari panel is ready to use as soon as you open BEHAV3D. Ask it about any parameter or method, and confirm with one click to let it fill in the form for you.
 
+Developers extending the assistant should start with the
+[assistant architecture and change guide](chatbot/README.md).
+
 ---
 
 ## FAQ
