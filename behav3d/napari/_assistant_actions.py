@@ -824,6 +824,27 @@ def build_actions(
                 act.ok = False
                 act.message = "Choose a result first."
             actions.append(act)
+        elif name == "save_metadata":
+            act = ProposedAction("save_metadata")
+            act.preview = "Save and activate the Metadata Builder draft"
+            actions.append(act)
+        elif name == "load_metadata":
+            act = ProposedAction("load_metadata")
+            act.preview = "Load the selected metadata CSV"
+            actions.append(act)
+        elif name == "open_analysis_view":
+            view = str(args.get("view") or "")
+            act = ProposedAction("open_analysis_view", view=view)
+            labels = {
+                "death_dynamics": "Death Dynamics",
+                "behavioral_state": "Behavioral State",
+                "state_trajectory": "State Trajectory",
+            }
+            act.preview = f"Open {labels.get(view, 'analysis')}"
+            if view not in labels:
+                act.ok = False
+                act.message = "Choose an available analysis view."
+            actions.append(act)
     return actions
 
 
@@ -1232,7 +1253,50 @@ def apply_action(main_widget, action: ProposedAction) -> bool:
         return _apply_create_btrack_config_copy(main_widget, action)
     if action.kind == "open_result":
         return _apply_open_result(main_widget, action)
+    if action.kind == "save_metadata":
+        dp = _dp(main_widget)
+        callback = getattr(dp, "_on_save_metadata", None) if dp is not None else None
+        if callback is None or not bool(callback()):
+            return False
+        action.data["result_markdown"] = (
+            "Metadata was saved and activated for the other workflow tabs."
+        )
+        return True
+    if action.kind == "load_metadata":
+        dp = _dp(main_widget)
+        callback = getattr(dp, "_on_load_metadata", None) if dp is not None else None
+        if callback is None or not bool(callback()):
+            return False
+        action.data["result_markdown"] = (
+            "Metadata loading has started. The Metadata Loader status will update "
+            "when validation and image inspection finish."
+        )
+        return True
+    if action.kind == "open_analysis_view":
+        return _apply_open_analysis_view(main_widget, action.data.get("view"))
     return False
+
+
+def _apply_open_analysis_view(main_widget, view: str) -> bool:
+    if not apply_navigate(main_widget, "analysis"):
+        return False
+    analysis = getattr(main_widget, "analysis_tab", None)
+    tabs = getattr(analysis, "inner_tabs", None) if analysis is not None else None
+    if tabs is None:
+        return False
+    try:
+        if view == "death_dynamics":
+            tabs.setCurrentIndex(0)
+            return True
+        single = getattr(analysis, "single_cell_tab", None)
+        start = getattr(single, "_on_guided_start", None) if single is not None else None
+        if start is None:
+            return False
+        tabs.setCurrentIndex(1)
+        start("state" if view == "behavioral_state" else "track")
+        return True
+    except Exception:
+        return False
 
 
 def _apply_show_track_length_distribution(main_widget, action: ProposedAction) -> bool:
@@ -1465,8 +1529,8 @@ TOOL_SCHEMA = [
         "name": "set_ui_value",
         "description": (
             "Set one exact field that exists in ui_state.controls. Use its id exactly. "
-            "Never invent an id and never use internal configuration keys. Blank fields "
-            "may apply immediately; changing an existing value requires confirmation. "
+            "Never invent an id and never use internal configuration keys. Metadata and "
+            "Data Preparation edits always require confirmation, including blank fields. "
             "When the user explicitly asks to fill or change available values, emit the "
             "corresponding calls now instead of only describing the intended changes."
         ),
@@ -1714,6 +1778,47 @@ TOOL_SCHEMA = [
             "type": "object",
             "properties": {"result_id": {"type": "string"}},
             "required": ["result_id"],
+        },
+    },
+    {
+        "name": "save_metadata",
+        "description": (
+            "Save the current valid Metadata Builder draft to metadata.csv and "
+            "activate it for all workflow tabs. Use only when this action is "
+            "available and the user explicitly asks to save. The client requires "
+            "confirmation before writing."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "load_metadata",
+        "description": (
+            "Start loading and validating the metadata CSV already selected in the "
+            "Metadata Loader. Use only when this action is available and the user "
+            "explicitly asks to load it. Loading completes asynchronously."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "open_analysis_view",
+        "description": (
+            "Open one specific Analysis view. Use this instead of navigating to the "
+            "generic Analysis tab when the user names Death Dynamics, Behavioral "
+            "State, or State Trajectory."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "view": {
+                    "type": "string",
+                    "enum": [
+                        "death_dynamics",
+                        "behavioral_state",
+                        "state_trajectory",
+                    ],
+                },
+            },
+            "required": ["view"],
         },
     },
 ]

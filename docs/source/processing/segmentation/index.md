@@ -152,13 +152,13 @@ APOC, ConvPaint and the Pixel Classifier are *pixel* classifiers: their raw outp
 For **APOC**, **ConvPaint**, and the **Pixel Classifier**: tune **each cell type on its own tab**. Settings for **big** objects (e.g. organoids) are usually wrong for **small, crowded** ones (e.g. immune cells / T cells).
 
 - Work **one cell type at a time**: train (or paint), run a **preview**, look at the labels, adjust sliders, repeat. Settings on one tab do not apply to another.
-- **Big** (e.g. organoids): **large** minimum size; EDT around **10–12** so one object is not cut in pieces. Stuck together → **raise** EDT. Fuzzy outline → try a **probability-map** strategy if your method has one.
+- **Big** (e.g. organoids): use a larger minimum size than for single cells. Stuck together → **raise** EDT for Mask + EDT (the direction differs for Peak EDT). Fuzzy outline → try a **probability-map** strategy if your method has one.
 - **Small / crowded** (e.g. immune, T cells): **small** minimum size; **lower** EDT to start. One cell split into many → **lower** EDT further.
-- **Ballpark numbers:** see organoid vs immune defaults on the [Pixel Classifier](pixel_classifier) page (EDT **12** / min **1000** vs EDT **2.5** / min **10**); copy similar values in APOC or ConvPaint, then adjust by eye.
+- **Calculate before copying:** estimate a single cell's diameter from the image and convert it with the current XY/Z spacing. For Minimum size, a tolerant first preview is about half the estimated object volume. For EDT, use the object's pixel diameter and the active strategy, then adjust by preview. Historical experiment values are useful only as named examples from acquisition-matched data.
 - **Several cell types in one experiment?** In APOC or ConvPaint, **Advanced (per cell type)** lets each type use a different strategy; still tune post-processing separately on each tab.
 
 ```{note}
-Which sliders you see depends on the strategy you pick. Default numbers differ by method — see each method page. The [Pixel Classifier](pixel_classifier) fills in big-vs-small starting values from your metadata; on APOC and ConvPaint you enter similar numbers yourself. Always adjust for the **nature of your data** (big vs small, crowded vs sparse, sharp vs fuzzy boundaries).
+Which sliders you see depends on the strategy you pick. Default numbers differ by method — see each method page. Treat built-in values as UI defaults, not biological recommendations. Always adjust for the current resolution and the **nature of your data** (big vs small, crowded vs sparse, sharp vs fuzzy boundaries).
 ```
 
 (batch-segmentation-controls)=

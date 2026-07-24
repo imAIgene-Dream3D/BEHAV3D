@@ -18,11 +18,14 @@ from behav3d.napari._assistant_schema import (
     flatten_config_to_cards, cards_for_step, dump_cards_json,
 )
 from behav3d.napari._assistant_actions import (
-    get_by_dotted, set_by_dotted, validate_value, build_actions, apply_set_ui_value,
+    ProposedAction, get_by_dotted, set_by_dotted, validate_value, build_actions,
+    apply_action, apply_set_ui_value,
 )
 from behav3d.napari._assistant_context import (
     summarize_metadata, _diff_from_defaults, validate_metadata_records,
-    _metadata_builder_state, _experiment_reference_context, build_context,
+    _metadata_builder_state, _experiment_reference_context,
+    _image_dimensions_state, _current_log_state, _segmentation_state,
+    _interface_capabilities, build_context,
 )
 from behav3d.napari._assistant_controls import (
     CONTROL_CONTRACT_VERSION, active_cell_type, control_registry,
@@ -253,6 +256,33 @@ def test_app_tool_call_parsing_and_prompt():
     assert "at most the actions needed for this one user turn" in sp
 
 
+def test_api_streaming_text_sanitizes_split_internal_names():
+    import app
+
+    visible, pending = app.split_researcher_stream_buffer(
+        "Use percentage_"
+    )
+    assert visible == "Use "
+    visible2, pending = app.split_researcher_stream_buffer(
+        pending + "dead_mask and killing_"
+    )
+    visible3, pending = app.split_researcher_stream_buffer(
+        pending + "efficiency now."
+    )
+    visible4, pending = app.split_researcher_stream_buffer(pending, final=True)
+    assert visible2 + visible3 + visible4 == (
+        "dead-mask percentage and killing efficiency now."
+    )
+    assert pending == ""
+    assert app.researcher_facing_text(
+        "Use `percentage_dead_mask` and `killing_efficiency`."
+    ) == "Use dead-mask percentage and killing efficiency."
+    assert app.researcher_facing_text(
+        "Use time_interval with time_unit."
+    ) == "Use time interval with time unit."
+    assert app.researcher_facing_text("Use `APOC`.") == "Use APOC."
+
+
 def test_backend_hides_bulk_metadata_tool_after_forms_exist():
     import app
     tools = [
@@ -286,7 +316,7 @@ def test_backend_hides_bulk_metadata_tool_after_forms_exist():
         {"metadata": {"loaded": False}}, "What is metadata?", fresh,
     )
     forced_choice, forced_extra = app.model_tool_policy(True, True)
-    assert forced_choice is None
+    assert forced_choice == "required"
     assert forced_extra == {"thinking": {"type": "disabled"}}
     assert app.model_tool_policy(False, True) == ("auto", None)
     assert app.model_tool_policy(False, False) == (None, None)
@@ -315,6 +345,244 @@ def test_backend_hides_bulk_metadata_tool_after_forms_exist():
             "control_id": "tracking.tcell.btrack.maximum_search_radius", "value": 18,
         },
     }]
+
+
+def test_metadata_pixel_size_action_reuses_user_supplied_values():
+    import app
+
+    controls = []
+    for index in range(2):
+        controls.extend([
+            {
+                "id": f"metadata.samples.{index}.pixel_distance_xy",
+                "value": 0.5,
+            },
+            {
+                "id": f"metadata.samples.{index}.pixel_distance_z",
+                "value": 2.0,
+            },
+        ])
+    result = app.metadata_pixel_size_action(
+        {
+            "current_step": "data_preparation",
+            "ui_state": {"controls": controls},
+        },
+        [
+            {
+                "role": "user",
+                "content": "XY pixel size is 1.15 um and Z spacing is 4 um.",
+            },
+            {"role": "assistant", "content": "I can update the metadata."},
+            {"role": "user", "content": "Can you fill in the correct pixel size?"},
+        ],
+    )
+
+    changed = {
+        call["arguments"]["control_id"]: call["arguments"]["value"]
+        for call in result["calls"]
+    }
+    assert changed == {
+        "metadata.samples.0.pixel_distance_xy": 1.15,
+        "metadata.samples.0.pixel_distance_z": 4.0,
+        "metadata.samples.1.pixel_distance_xy": 1.15,
+        "metadata.samples.1.pixel_distance_z": 4.0,
+    }
+    assert "time unit is unchanged" in result["text"]
+
+
+def test_metadata_pixel_size_action_does_not_intercept_fresh_setup():
+    import app
+
+    result = app.metadata_pixel_size_action(
+        {
+            "current_step": "data_preparation",
+            "metadata": {"loaded": False},
+            "metadata_builder": {"open": False},
+            "ui_state": {"controls": []},
+        },
+        [{
+            "role": "user",
+            "content": (
+                "I want to set up an analysis with three movies. XY pixel size is "
+                "1.15 um and Z spacing is 4 um. Help me set up the analysis."
+            ),
+        }],
+    )
+
+    assert result is None
+
+
+def test_backend_exposes_metadata_persistence_only_when_available():
+    import app
+
+    tools = [
+        {"name": "save_metadata"},
+        {"name": "load_metadata"},
+        {"name": "set_ui_value"},
+    ]
+    unavailable = app.tools_for_context(tools, {
+        "metadata": {"loaded": False},
+        "metadata_builder": {"actions": {
+            "save_available": False, "load_available": False,
+        }},
+    })
+    assert {item["name"] for item in unavailable} == {"set_ui_value"}
+
+    available = app.tools_for_context(tools, {
+        "metadata": {"loaded": False},
+        "metadata_builder": {"actions": {
+            "save_available": True, "load_available": True,
+        }},
+    })
+    assert {item["name"] for item in available} == {
+        "save_metadata", "load_metadata", "set_ui_value",
+    }
+
+
+def test_organoid_lines_require_processing_group_confirmation():
+    import app
+
+    context = {"metadata": {"loaded": False}, "metadata_builder": {}}
+    messages = [{
+        "role": "user",
+        "content": (
+            "I co-culture T cells and macrophages with different organoid lines. "
+            "Can you set up the metadata?"
+        ),
+    }]
+    response = app.organoid_processing_question(context, messages)
+    assert "separate organoid types" in response
+    assert "one organoid type" in response
+    assert "segmented or tracked separately" in response
+
+    messages.append({"role": "assistant", "content": response})
+    messages.append({
+        "role": "user",
+        "content": "Treat them as one organoid type and record the line per sample.",
+    })
+    assert app.organoid_processing_question(context, messages) is None
+
+
+def test_metadata_completion_uses_mandatory_well_and_line_fields():
+    import app
+
+    context = {
+        "metadata": {
+            "records": [{"sample_name": "Sample01"}],
+            "validation": [
+                {"severity": "error", "message": "Sample01: mandatory well is missing."},
+                {
+                    "severity": "error",
+                    "message": "Sample01: mandatory T-cells line is missing.",
+                },
+            ],
+        },
+        "metadata_builder": {"sample_forms_created": True},
+    }
+    response = app.metadata_completion_summary(
+        context, [{"role": "user", "content": "Is this all that is needed?"}]
+    )
+    assert "mandatory well" in response
+    assert "mandatory T-cells line" in response
+    assert "condition" in response and "optional" in response
+    assert "1" in response
+
+
+def test_metadata_identifier_inferences_require_confirmation():
+    import app
+
+    response = app.metadata_identifier_confirmation_question(
+        {"metadata_builder": {"sample_forms_created": True}},
+        [{"role": "user", "content": (
+            "No well identifier. M21 and M23 are macrophage lines and "
+            "T-cells are GD2_CART."
+        )}],
+    )
+    assert "mandatory" in response
+    assert "condition is optional" in response
+    assert "M21/M23" in response
+    assert "None" in response
+    assert "confirm" in response
+
+
+def test_metadata_time_conversion_updates_every_sample_without_stale_action():
+    import app
+
+    controls = []
+    for index in range(3):
+        controls.extend([
+            {
+                "id": f"metadata.samples.{index}.time_interval",
+                "value": 2.0, "visible": True, "enabled": True,
+            },
+            {
+                "id": f"metadata.samples.{index}.time_unit",
+                "value": "s", "visible": True, "enabled": True,
+            },
+        ])
+    action = app.metadata_time_conversion_action(
+        {"ui_state": {"controls": controls}},
+        [{"role": "user", "content": "The time unit is s while I set 2 minutes."}],
+    )
+    assert "120 seconds" in action["text"]
+    assert len(action["calls"]) == 3
+    assert all(call["arguments"]["value"] == 120 for call in action["calls"])
+    assert all(
+        call["arguments"]["control_id"].endswith(".time_interval")
+        for call in action["calls"]
+    )
+
+
+def test_metadata_save_request_uses_real_action_or_reports_blocker():
+    import app
+
+    available = app.metadata_persistence_action(
+        {"metadata_builder": {"actions": {"save_available": True}}},
+        [{"role": "user", "content": "Yeah save it please"}],
+    )
+    assert available["calls"] == [{"name": "save_metadata", "arguments": {}}]
+    assert "confirm" in available["text"].lower()
+
+    blocked = app.metadata_persistence_action(
+        {"metadata_builder": {
+            "actions": {"save_available": False},
+            "draft_validation": [{
+                "severity": "error",
+                "message": "Sample01: mandatory well is missing.",
+            }],
+        }},
+        [{"role": "user", "content": "Save the metadata"}],
+    )
+    assert blocked["calls"] == []
+    assert "cannot save" in blocked["text"].lower()
+    assert "mandatory well" in blocked["text"]
+
+
+def test_analysis_choose_explains_and_named_view_opens_directly():
+    import app
+
+    summary = app.analysis_choice_summary(
+        {"assistant_session": {"intent": "choose_analysis"}},
+        [{"role": "user", "content": "Choose analysis"}],
+    )
+    assert "Death Dynamics" in summary
+    assert "Behavioral State" in summary
+    assert "State Trajectory" in summary
+
+    action = app.analysis_navigation_action(
+        {"current_step": "analysis", "analysis": {"view": "behavioral_state"}},
+        [{"role": "user", "content": "Can you take me to Death Dynamics?"}],
+    )
+    assert action["calls"] == [{
+        "name": "open_analysis_view",
+        "arguments": {"view": "death_dynamics"},
+    }]
+    already_open = app.analysis_navigation_action(
+        {"current_step": "analysis", "analysis": {"view": "death_dynamics"}},
+        [{"role": "user", "content": "Open Death Dynamics"}],
+    )
+    assert already_open["calls"] == []
+    assert "already" in already_open["text"].lower()
     ambiguous = app.recover_single_control_action(
         [],
         {"ui_state": {"controls": [
@@ -324,6 +592,628 @@ def test_backend_hides_bulk_metadata_tool_after_forms_exist():
         "Please adjust these.", "Set both to 3.",
     )
     assert ambiguous == []
+
+
+def test_generic_tracking_guide_asks_for_motion_before_method_context():
+    import app
+
+    context = {
+        "current_step": "tracking",
+        "active_cell_type": "Tcell_HIV",
+    }
+    question = app.tracking_motion_question(
+        context, [{"role": "user", "content": "Guide tracking"}],
+    )
+    assert "Tcell_HIV" in question
+    assert "consecutive frames" in question
+    assert not any(name in question.lower() for name in (
+        "btrack", "propagation", "trackpy", "laptrack",
+    ))
+    exact = app.tracking_motion_question(
+        context, [{"role": "user", "content": "Which method?"}],
+    )
+    assert "consecutive frames" in exact
+    assert "segmentation" not in exact.lower()
+    assert app.tracking_motion_question(
+        context,
+        [{"role": "user", "content": (
+            "The cells move about 12 microns per frame. Help me choose a tracking method."
+        )}],
+    ) is None
+    assert app.tracking_motion_question(
+        {"current_step": "filtering"},
+        [{"role": "user", "content": "Guide tracking"}],
+    ) is None
+
+
+def test_segmentation_method_gate_requires_signal_cleanliness():
+    import app
+
+    context = {
+        "current_step": "segmentation",
+        "assistant_session": {"intent": "compare_segmentation_methods"},
+    }
+    question = app.segmentation_signal_question(
+        context, [{"role": "user", "content": "Choose a method"}],
+    )
+    assert "clean" in question
+    assert "bleed-through" in question
+    assert "same channel" in question
+    assert app.segmentation_signal_question(
+        context,
+        [{"role": "user", "content": (
+            "The target is isolated in a clean channel. Which segmentation method?"
+        )}],
+    ) is None
+
+
+def test_stalled_operation_gate_requests_log_without_diagnosing():
+    import app
+
+    context = {
+        "current_step": "segmentation",
+        "current_log": {
+            "recent_lines": ["Loading training data..."],
+            "has_explicit_error": False,
+        },
+    }
+    question = app.missing_log_error_question(
+        context,
+        [{"role": "user", "content": (
+            "I clicked Generate Training Data but nothing appeared. What is wrong?"
+        )}],
+    )
+    assert "copy and paste" in question.lower()
+    assert "exact message" in question.lower()
+    assert not any(term in question.lower() for term in (
+        "file path", "dimension order", "gpu memory",
+    ))
+
+
+def test_tracking_radius_is_calculated_from_speed_and_cadence():
+    import app
+
+    result = app.tracking_radius_action(
+        {
+            "current_step": "tracking",
+            "active_cell_type": "Tcell_cmtrm",
+            "metadata": {"records": [{
+                "time_interval": 15, "time_unit": "s",
+            }]},
+            "ui_state": {"controls": [{
+                "id": "tracking.Tcell_cmtrm.btrack.maximum_search_radius",
+                "cell_type": "Tcell_cmtrm",
+                "visible": True,
+                "enabled": True,
+            }]},
+        },
+        [{"role": "user", "content": (
+            "The fastest cells move 60 um per minute. "
+            "Please adjust the maximum search radius."
+        )}],
+    )
+    assert result["calls"][0]["arguments"]["value"] == 18
+    assert "15 µm per frame" in result["text"]
+    assert "20% margin" in result["text"]
+
+
+def test_active_killing_action_is_cadence_grounded_and_explicitly_proposed():
+    import app
+
+    controls = [
+        {
+            "id": control_id,
+            "visible": True,
+            "enabled": True,
+        }
+        for control_id in (
+            "features.active_killing.target_types",
+            "features.active_killing.observation_window",
+            "features.active_killing.death_signal",
+            "features.active_killing.use_absolute_threshold",
+        )
+    ]
+    result = app.active_killing_action(
+        {
+            "current_step": "feature_extraction",
+            "metadata": {"records": [{
+                "time_interval": 2, "time_unit": "min",
+            }]},
+            "ui_state": {"controls": controls},
+        },
+        [{"role": "user", "content": (
+            "Configure active killing for tcell against organoid1 only. "
+            "I expect killing within 10 minutes."
+        )}],
+    )
+    values = {
+        call["arguments"]["control_id"]: call["arguments"]["value"]
+        for call in result["calls"]
+    }
+    assert values["features.active_killing.target_types"] == ["organoid1"]
+    assert values["features.active_killing.observation_window"] == 5
+    assert values["features.active_killing.death_signal"] == "Dead-mask pixel count"
+    assert values["features.active_killing.use_absolute_threshold"] is True
+    assert "proposing" in result["text"]
+    assert "require your confirmation" in result["text"]
+
+
+def test_equal_track_filter_review_explains_valid_fixed_length_workflow():
+    import app
+
+    controls = [
+        {"id": "filtering.tcell.minimum_length.enabled", "value": True},
+        {"id": "filtering.tcell.minimum_length.timepoints", "value": 30},
+        {"id": "filtering.tcell.maximum_length.enabled", "value": True},
+        {"id": "filtering.tcell.maximum_length.timepoints", "value": 30},
+    ]
+    summary = app.equal_track_filter_summary(
+        {
+            "current_step": "filtering",
+            "active_cell_type": "tcell",
+            "ui_state": {"controls": controls},
+        },
+        [{"role": "user", "content": "Review filters"}],
+    )
+    assert "valid" in summary
+    assert "removes tracks shorter" in summary
+    assert "trims retained longer tracks" in summary
+    assert "uniform window" in summary
+
+
+def test_merged_probability_watershed_guidance_explains_seed_confidence():
+    import app
+
+    result = app.merged_probability_watershed_guidance(
+        {
+            "current_step": "segmentation",
+            "active_cell_type": "tcell",
+            "segmentation": {"apoc": {"cell_type_strategies": {
+                "tcell": "APOC Probability Map + Watershed",
+            }}},
+            "ui_state": {"controls": [
+                {"id": "segmentation.apoc.tcell.seed_threshold", "value": 0.7},
+                {"id": "segmentation.apoc.tcell.mask_threshold", "value": 0.4},
+            ]},
+        },
+        [{"role": "user", "content": "Touching cells are still not split."}],
+    )
+    assert "raise it in small increments" in result
+    assert "higher-confidence seed cores" in result
+    assert "less confidence" not in result
+
+
+def test_metadata_channel_mapping_stays_out_of_metadata_builder():
+    import app
+
+    messages = [
+        {"role": "user", "content": (
+            "Two replicates have the immune channels swapped. How should I set that up?"
+        )},
+        {"role": "assistant", "content": "Tell me where you want to map them."},
+        {"role": "user", "content": (
+            "Walk me through exactly where I name them and set the channels."
+        )},
+    ]
+    result = app.metadata_channel_mapping_guidance({}, messages)
+    assert "does not map raw channel indices" in result
+    assert "line" in result.lower()
+    assert "cellpose controls as metadata fields" in result.lower()
+    assert "same for all" not in result.lower()
+
+
+def test_apoc_channel_guidance_rejects_invalid_index_and_dead_negative_class():
+    import app
+
+    context = {
+        "current_step": "segmentation",
+        "metadata": {"image_dimensions": [{"channel_count": 4}]},
+    }
+    invalid = app.apoc_channel_selection_guidance(
+        context,
+        [{"role": "user", "content": (
+            "13T is ch1, blue ch0, green ch4. Which channels do I pick for APOC?"
+        )}],
+    )
+    assert "indexed 0-3" in invalid
+    assert "conflicts with the data" in invalid
+    assert "before recommending" in invalid
+
+    corrected = app.apoc_channel_selection_guidance(
+        context,
+        [{"role": "user", "content": (
+            "13T is ch1, blue ch0, green ch3, dead ch2. "
+            "Which channels do I pick for APOC?"
+        )}],
+    )
+    assert "13t -> channel 1" in corrected.lower()
+    assert "blue -> channel 0" in corrected.lower()
+    assert "green -> channel 3" in corrected.lower()
+    assert "do not automatically add **channel 2**" in corrected.lower()
+    assert "negative/background class" in corrected.lower()
+
+
+def test_apoc_channel_guidance_waits_for_training_controls():
+    import app
+
+    result = app.apoc_channel_selection_guidance(
+        {
+            "current_step": "segmentation",
+            "active_cell_type": "tcell",
+            "segmentation": {"apoc": {
+                "training_data_loaded": False,
+                "cell_types": {"tcell": {"channel_controls_ready": False}},
+            }},
+        },
+        [{"role": "user", "content": (
+            "How do I choose the APOC image channel inputs?"
+        )}],
+    )
+    assert "Generate Training Data" in result
+    assert "does not mean APOC uses every channel" in result
+    assert "not a reason to switch" in result
+
+
+def test_apoc_feature_grid_guidance_names_real_filters_and_scope():
+    import app
+
+    result = app.apoc_feature_grid_guidance(
+        {
+            "current_step": "segmentation",
+            "segmentation": {"method": "APOC (GPU)"},
+            "ui_state": {"controls": [
+                {
+                    "id": "segmentation.apoc.tcell.feature_scales",
+                    "value": "1, 2, 5",
+                },
+                {
+                    "id": "segmentation.apoc.tcell.feature_filters",
+                    "value": ["Gaussian blur at sigma 1 px"],
+                },
+            ]},
+        },
+        [{"role": "user", "content": (
+            "Can I tune the actual APOC feature values and filter sigmas?"
+        )}],
+    )
+    for phrase in (
+        "feature scales in pixels", "Gaussian blur", "Difference of Gaussians",
+        "Laplacian of Gaussian", "Sobel-of-Gaussian",
+        "not a structure tensor", "Small structures", "1, 2, 5, 10, 25",
+        "original intensity", "Feature Extraction",
+    ):
+        assert phrase.lower() in result.lower()
+    assert "present in the current live apoc controls" in result.lower()
+
+
+def test_apoc_feature_grid_follow_up_recommends_organoid_preset():
+    import app
+
+    result = app.apoc_feature_grid_guidance(
+        {
+            "current_step": "segmentation",
+            "segmentation": {"method": "APOC (GPU)"},
+            "metadata": {"cell_types": {"organoid": ["MDO"]}},
+            "ui_state": {"controls": [
+                {
+                    "id": "segmentation.apoc.MDO.feature_scales",
+                    "cell_type": "MDO",
+                    "value": "1, 2, 5",
+                },
+                {
+                    "id": "segmentation.apoc.MDO.feature_filters",
+                    "cell_type": "MDO",
+                    "value": ["Gaussian blur at sigma 1 px"],
+                },
+            ]},
+        },
+        [
+            {"role": "user", "content": "Explain how to tune the APOC features."},
+            {"role": "assistant", "content": "The Tune Features panel controls filters."},
+            {"role": "user", "content": "What do you recommend for MDO?"},
+        ],
+    )
+
+    for phrase in (
+        "Large structures", "1, 2, 5, 10, and 25 pixels", "Retrain",
+        "probability-map preview",
+    ):
+        assert phrase.lower() in result.lower()
+
+
+def test_apoc_feature_preset_action_targets_segmentation_organoids():
+    import app
+
+    controls = []
+    for cell_type in ("27T", "MDO"):
+        controls.extend([
+            {
+                "id": f"segmentation.apoc.{cell_type}.feature_preset",
+                "cell_type": cell_type,
+                "value": "Medium structures",
+                "visible": True,
+                "enabled": True,
+            },
+            {
+                "id": f"segmentation.apoc.{cell_type}.show_feature_tuning",
+                "cell_type": cell_type,
+                "value": False,
+                "visible": True,
+                "enabled": True,
+            },
+        ])
+    result = app.apoc_feature_preset_action(
+        {
+            "current_step": "segmentation",
+            "segmentation": {"method": "APOC (GPU)"},
+            "metadata": {"cell_types": {
+                "organoid": ["27T", "MDO"], "immune": ["tcell"],
+            }},
+            "ui_state": {"controls": controls},
+        },
+        [{"role": "user", "content": (
+            "Fill in the correct features for the MDO and the 27T for me."
+        )}],
+    )
+    changed = {
+        call["arguments"]["control_id"]: call["arguments"]["value"]
+        for call in result["calls"]
+    }
+    assert changed["segmentation.apoc.27T.feature_preset"] == "Large structures"
+    assert changed["segmentation.apoc.MDO.feature_preset"] == "Large structures"
+    assert changed["segmentation.apoc.27T.show_feature_tuning"] is True
+    assert changed["segmentation.apoc.MDO.show_feature_tuning"] is True
+    assert "Segmentation > APOC > Tune Features" in result["text"]
+    assert "Feature Extraction or instance post-processing" in result["text"]
+
+
+def test_apoc_feature_preset_action_honors_explicit_small_preset():
+    import app
+
+    result = app.apoc_feature_preset_action(
+        {
+            "current_step": "segmentation",
+            "active_cell_type": "tcell",
+            "segmentation": {"method": "APOC (GPU)"},
+            "metadata": {"cell_types": {}},
+            "ui_state": {"controls": [{
+                "id": "segmentation.apoc.tcell.feature_preset",
+                "cell_type": "tcell",
+                "value": "Large structures",
+            }]},
+        },
+        [{
+            "role": "user",
+            "content": (
+                "These are individual T cells. Please tune the APOC features using "
+                "the normal preset for Small structures."
+            ),
+        }],
+    )
+
+    changed = {
+        call["arguments"]["control_id"]: call["arguments"]["value"]
+        for call in result["calls"]
+    }
+    assert changed == {
+        "segmentation.apoc.tcell.feature_preset": "Small structures",
+    }
+    assert "1, 2, and 5 pixels" in result["text"]
+
+
+def test_btrack_step2_action_enables_then_calibrates_gap_controls():
+    import app
+
+    base_controls = [
+        {
+            "id": "tracking.tcell.btrack.use_global_optimization",
+            "cell_type": "tcell",
+            "value": False,
+            "visible": True,
+            "enabled": True,
+        },
+        {
+            "id": "tracking.tcell.btrack.distance_threshold",
+            "cell_type": "tcell",
+            "value": 60,
+            "unit": "um",
+            "visible": False,
+            "enabled": False,
+        },
+        {
+            "id": "tracking.tcell.btrack.time_threshold",
+            "cell_type": "tcell",
+            "value": 3,
+            "unit": "frames",
+            "visible": False,
+            "enabled": False,
+        },
+    ]
+    enable = app.btrack_step2_action(
+        {
+            "current_step": "tracking",
+            "active_cell_type": "tcell",
+            "ui_state": {"controls": base_controls},
+        },
+        [{"role": "user", "content": "I mean Step 2 of tracking."}],
+    )
+    assert enable["calls"] == [{
+        "name": "set_ui_value",
+        "arguments": {
+            "control_id": "tracking.tcell.btrack.use_global_optimization",
+            "value": True,
+        },
+    }]
+    assert "Global Hypothesis Optimizer" in enable["text"]
+    assert "not the organoid Propagation" in enable["text"]
+    assert "saved but inactive" in enable["text"]
+
+    enabled_controls = [dict(control) for control in base_controls]
+    enabled_controls[0]["value"] = True
+    for control in enabled_controls[1:]:
+        control["visible"] = True
+        control["enabled"] = True
+    enabled_controls.append({
+        "id": "tracking.tcell.btrack.hypotheses",
+        "cell_type": "tcell",
+        "value": ["P_FP", "P_init", "P_term", "P_link"],
+        "visible": True,
+        "enabled": True,
+    })
+    tune = app.btrack_step2_action(
+        {
+            "current_step": "tracking",
+            "active_cell_type": "tcell",
+            "ui_state": {"controls": enabled_controls},
+        },
+        [{"role": "user", "content": (
+            "For Step 2, bridge gaps up to 4 frames and 40 um."
+        )}],
+    )
+    changed = {
+        call["arguments"]["control_id"]: call["arguments"]["value"]
+        for call in tune["calls"]
+    }
+    assert changed["tracking.tcell.btrack.distance_threshold"] == 40
+    assert changed["tracking.tcell.btrack.time_threshold"] == 4
+    assert "P_FP, P_init, P_term, P_link" in tune["text"]
+
+
+def test_segmentation_minimum_size_uses_half_estimated_cell_volume():
+    import app
+
+    result = app.segmentation_minimum_size_action(
+        {
+            "current_step": "segmentation",
+            "active_cell_type": "tcell",
+            "metadata": {"records": [{
+                "pixel_distance_xy": 1.0,
+                "pixel_distance_z": 2.0,
+                "distance_unit": "um",
+            }]},
+            "ui_state": {"controls": [{
+                "id": "segmentation.apoc.tcell.minimum_size",
+                "cell_type": "tcell",
+                "value": 10,
+                "unit": "voxels",
+                "visible": True,
+                "enabled": True,
+            }]},
+        },
+        [{"role": "user", "content": (
+            "My T cells are about 10 um across. Set the minimum size."
+        )}],
+    )
+    assert "full object volume of about **524 µm³**" in result["text"]
+    assert "start Minimum size at 50%" in result["text"]
+    assert "**131 voxels**" in result["text"]
+    assert result["calls"] == [{
+        "name": "set_ui_value",
+        "arguments": {
+            "control_id": "segmentation.apoc.tcell.minimum_size",
+            "value": 131,
+        },
+    }]
+
+
+def test_edt_direction_guidance_is_strategy_specific_and_mentions_fallback():
+    import app
+
+    base = {
+        "current_step": "segmentation",
+        "active_cell_type": "13T",
+        "segmentation": {"apoc": {"cell_type_strategies": {
+            "13T": "APOC Mask + EDT/Watershed Resegmentation",
+        }}},
+    }
+    mask_edt = app.edt_direction_guidance(
+        base,
+        [{"role": "user", "content": (
+            "Does higher EDT mean more splitting? Explain the direction."
+        )}],
+    )
+    assert "higher edt generally means more splitting" in mask_edt.lower()
+    assert "raise for more splitting, lower for less" in mask_edt.lower()
+    assert "falls back to the original unsplit component" in mask_edt.lower()
+
+    peak = app.edt_direction_guidance(
+        {
+            **base,
+            "segmentation": {"apoc": {"cell_type_strategies": {
+                "13T": "APOC Peak EDT/Watershed",
+            }}},
+        },
+        [{"role": "user", "content": "Which EDT direction gives more splitting?"}],
+    )
+    assert "lower edt generally means more splitting" in peak.lower()
+    assert "minimum peak-height filter" in peak.lower()
+
+
+def test_contact_distance_guidance_uses_xy_pixel_not_diagonal():
+    import app
+
+    result = app.feature_threshold_guidance(
+        {
+            "current_step": "feature_extraction",
+            "active_cell_type": "tcell",
+            "metadata": {"records": [{"pixel_distance_xy": 1.01}]},
+            "ui_state": {"controls": [{
+                "id": "features.tcell.contact_distance",
+                "cell_type": "tcell",
+                "value": 1.01,
+            }]},
+        },
+        [{"role": "user", "content": (
+            "How can I set the contact and dead-mask percentage threshold correctly?"
+        )}],
+    )
+    assert "0 µm means strict mask touching" in result
+    assert "one xy pixel" in result.lower()
+    assert "not a voxel diagonal" in result.lower()
+    assert "one-pixel xy gap" in result.lower()
+    assert "green is below" in result.lower()
+    assert "universal numeric range" in result.lower()
+
+
+def test_interface_capabilities_report_current_exposure_without_cross_module_mapping():
+    capabilities = _interface_capabilities([
+        {"id": "segmentation.apoc.tcell.feature_scales"},
+        {"id": "segmentation.apoc.tcell.feature_filters"},
+    ])
+    metadata = capabilities["metadata_builder"]
+    apoc = capabilities["segmentation"]["apoc"]
+    assert "raw-channel-to-cell-type mapping" in metadata["does_not_own"]
+    assert apoc["custom_feature_scales_currently_exposed"] is True
+    assert apoc["custom_feature_filters_currently_exposed"] is True
+    assert "Sobel-of-Gaussian" in apoc["feature_filters"]
+
+
+def test_safety_profile_summary_preserves_reference_without_claiming_execution():
+    import app
+
+    summary = app.safety_profile_summary(
+        {
+            "current_step": "analysis",
+            "metadata": {"records": [{
+                "time_interval": 2, "time_unit": "min",
+            }]},
+            "experiment_reference": {"notes": [{"text": (
+                "Exp010 is multi-organoid safety profiling with 27T and MDO. "
+                "Active killing is a contact-associated rise to 1.5 times baseline "
+                "within 5 frames after one frame of contact."
+            )}]},
+            "results": [],
+        },
+        [{"role": "user", "content": (
+            "How should I frame the safety comparison, and what exactly does "
+            "active killing mean here?"
+        )}],
+    )
+    assert "TEG cells are the immune effector" in summary
+    assert "tumor 27T and healthy MDO" in summary
+    assert "5 frames (10 minutes)" in summary
+    assert "not a completed analysis" in summary
+    assert "configured" not in summary.lower()
 
 
 def test_tool_call_parsing_tolerates_malformed_markers():
@@ -436,13 +1326,17 @@ def test_new_tools_registered():
     names = {t["name"] for t in TOOL_SCHEMA}
     assert {"set_ui_value", "bulk_fill_metadata", "show_track_length_distribution",
             "create_cell_type_group", "create_btrack_config_copy", "open_result",
-            "recommend_edt", "summarize_track_counts"} <= names
+            "recommend_edt", "summarize_track_counts", "save_metadata",
+            "load_metadata", "open_analysis_view"} <= names
     assert "set_parameter" not in names
     # the backend text-fallback parser must also recognise the new tool names
     assert "bulk_fill_metadata" in app._TOOL_NAMES
     assert "set_ui_value" in app._TOOL_NAMES
     assert "recommend_edt" in app._TOOL_NAMES
     assert "summarize_track_counts" in app._TOOL_NAMES
+    assert "save_metadata" in app._TOOL_NAMES
+    assert "load_metadata" in app._TOOL_NAMES
+    assert "open_analysis_view" in app._TOOL_NAMES
 
 
 def test_build_actions_for_edt_and_track_count_queries():
@@ -458,6 +1352,36 @@ def test_build_actions_for_edt_and_track_count_queries():
     assert actions[0].ok and actions[0].kind == "recommend_edt"
     assert actions[1].ok and actions[1].data["minimum_lengths"] == [30, 200]
     assert actions[1].data["position_t"] == 200
+
+
+def test_build_actions_for_metadata_persistence_and_analysis_view():
+    actions = build_actions([
+        {"name": "save_metadata", "arguments": {}},
+        {"name": "load_metadata", "arguments": {}},
+        {"name": "open_analysis_view", "arguments": {"view": "death_dynamics"}},
+        {"name": "open_analysis_view", "arguments": {"view": "unknown"}},
+    ], [], {})
+    assert actions[0].ok and actions[0].kind == "save_metadata"
+    assert actions[1].ok and actions[1].kind == "load_metadata"
+    assert actions[2].ok and actions[2].data["view"] == "death_dynamics"
+    assert not actions[3].ok
+
+
+def test_metadata_persistence_actions_call_existing_ui_handlers():
+    from types import SimpleNamespace
+
+    invoked = []
+    main = SimpleNamespace(data_prep_tab=SimpleNamespace(
+        _on_save_metadata=lambda: invoked.append("save") or True,
+        _on_load_metadata=lambda: invoked.append("load") or True,
+    ))
+    save = ProposedAction("save_metadata")
+    load = ProposedAction("load_metadata")
+    assert apply_action(main, save)
+    assert apply_action(main, load)
+    assert invoked == ["save", "load"]
+    assert "saved and activated" in save.data["result_markdown"]
+    assert "loading has started" in load.data["result_markdown"]
 
 
 def test_prompt_data_prep_reconciles_state_and_lists_tools():
@@ -537,6 +1461,81 @@ def test_experiment_reference_discovers_notes_and_compacts_configuration(tmp_pat
     assert "not proof that a module ran" in reference["configuration_caveat"]
 
 
+def test_experiment_reference_discovers_calcium_and_compacts_historical_settings(
+    tmp_path=None,
+):
+    import tempfile
+    from pathlib import Path
+
+    root = Path(tmp_path or tempfile.mkdtemp())
+    (root / "README_Calcium_example.md").write_text(
+        "# Calcium experiment\nNear-static reporter cells.",
+        encoding="utf-8",
+    )
+    (root / "behav3d_parameters.yml").write_text(
+        "\n".join([
+            "paths:",
+            "  output_dir: /private/results",
+            "pixel_classifier:",
+            "  convpaint_strategy: ConvPaint Probability + Watershed",
+            "  convpaint_fe_alias: vgg",
+            "  tcell_edt_threshold: 2.5",
+            "  tcell_segment_size_min: 12",
+            "track_filtering:",
+            "  tcell:",
+            "    min_length_enabled: true",
+            "    min_track_length: 15",
+            "  active_killing:",
+            "    observation_window: 7",
+            "    killing_threshold_multiplier: 2",
+            "state_classification:",
+            "  tcell:",
+            "    n_states: 3",
+            "    feature_smoothing_window: 5",
+            "    selected_features: [speed, displacement]",
+            "track_classification:",
+            "  tcell:",
+            "    behavioral_trajectory_size: 15",
+            "    n_clusters: 3",
+            "    linkage: average",
+            "cell_type_groups:",
+            "  Tcells: [tcell, tcell_control]",
+            "single_cell:",
+            "  selected_cell_type: Tcells",
+        ]),
+        encoding="utf-8",
+    )
+
+    reference = _experiment_reference_context(str(root), {})
+    assert reference["notes"][0]["source"] == "README_Calcium_example.md"
+    settings = reference["saved_configurations"][0]["settings"]
+    assert settings["segmentation"]["convpaint_fe_alias"] == "vgg"
+    assert settings["segmentation"]["saved_instance_by_cell_type"]["tcell"] == {
+        "edt_threshold": 2.5,
+        "segment_size_min": 12,
+    }
+    assert settings["active_killing"] == {
+        "observation_window": 7,
+        "killing_threshold_multiplier": 2,
+    }
+    assert settings["state_classification"]["by_cell_type"]["tcell"] == {
+        "n_states": 3,
+        "selected_features": ["speed", "displacement"],
+        "feature_smoothing_window": 5,
+    }
+    assert settings["track_classification"]["by_cell_type"]["tcell"] == {
+        "behavioral_trajectory_size": 15,
+        "n_clusters": 3,
+        "linkage": "average",
+    }
+    assert settings["cell_type_groups"] == {
+        "Tcells": ["tcell", "tcell_control"],
+    }
+    assert settings["single_cell"]["selected_cell_type"] == "Tcells"
+    assert "live metadata" in reference["source_policy"]
+    assert "/private/results" not in str(reference)
+
+
 def test_prompt_scopes_experiment_reference_and_requires_result_evidence():
     import app
     reference = {
@@ -567,6 +1566,78 @@ def test_prompt_scopes_experiment_reference_and_requires_result_evidence():
     assert "Safety profiling with tumor and healthy organoids" in sp
 
 
+def test_historical_reference_profiles_are_selected_and_never_auto_applied():
+    from guidance import select_guidance_cards
+    import app
+
+    cards = select_guidance_cards(
+        {"current_step": "tracking"},
+        "Do you have values from a previous experiment for btrack?",
+    )
+    profile = next(item for item in cards if item["id"] == "reference_examples")
+    for phrase in (
+        "never defaults", "IVM HIV", "CD4/CD8-13T",
+        "never edit a live control from an example alone",
+    ):
+        assert phrase.lower() in profile["text"].lower()
+
+    prompt = app.build_system_prompt(
+        {
+            "current_step": "tracking",
+            "metadata": {"loaded": True, "records": []},
+        },
+        cards,
+        [{"name": "set_ui_value"}],
+    )
+    assert "HISTORICAL REFERENCE PROFILES are examples" in prompt
+    assert "Never issue a form action from a historical value alone" in prompt
+    assert "README notes for study intent" in prompt
+
+
+def test_historical_reference_guidance_preserves_provenance_and_calibration():
+    import app
+
+    btrack = app.historical_reference_guidance(
+        {
+            "metadata": {"records": [{
+                "time_interval": 30,
+                "time_unit": "s",
+            }]},
+        },
+        [{
+            "role": "user",
+            "content": (
+                "Do you have example values from a previous experiment for btrack "
+                "on T cells? Can I copy them?"
+            ),
+        }],
+    )
+    for phrase in (
+        "IVM HIV", "CD4/CD8-13T", "should not be copied directly",
+        "one-frame displacement", "largest spatial gap",
+        "largest missing-frame gap",
+    ):
+        assert phrase.lower() in btrack["text"].lower()
+    assert btrack["calls"] == []
+
+    calcium = app.historical_reference_guidance(
+        {},
+        [{
+            "role": "user",
+            "content": (
+                "Was there a previous experiment with near-static calcium reporter "
+                "cells? What method and example values did it use?"
+            ),
+        }],
+    )
+    for phrase in (
+        "Cellpose-SAM", "imported", "Reporter Propagation", "100-voxel",
+        "10% overlap", "example values, not defaults",
+    ):
+        assert phrase.lower() in calcium["text"].lower()
+    assert calcium["calls"] == []
+
+
 def test_prompt_encodes_pi_feedback_scenarios():
     import app
     sp = app.build_system_prompt(
@@ -590,12 +1661,21 @@ def test_prompt_encodes_pi_feedback_scenarios():
     assert "Reporter Propagation" in sp
     assert "60 um/min at 15 seconds per frame is 15 um/frame" in sp
     assert "Do not provide a numeric example speed" in sp
-    assert "merely because its inherited thresholds contain defaults" in sp
+    assert "btrack Step 2 is the Global Hypothesis Optimizer" in sp
+    assert "offer to enable Step 2 for a complete setup" in sp
+    assert "do not present disabled defaults as recommendations" in sp
     assert "Filtering must be run even when all filters are disabled" in sp
     assert "keep Start offset at 1" in sp
     assert "Average linkage is the default" in sp
     assert "Never call that combination contradictory" in sp
     assert "Do not call a chosen minimum reasonable" in sp
+    assert "Never use 'already selected' as evidence" in sp
+    assert "Bleed-through is not recorded in metadata" in sp
+    assert "Fluorophore names such as GFP/RFP are not needed" in sp
+    assert "APOC has separate Image Channel Inputs" in sp
+    assert "does not mean APOC uses all channels" in sp
+    assert "'Tune Features' means the classifier feature preset" in sp
+    assert "ask them to copy and paste the latest error lines" in sp
 
 
 class _FakeSpin:
@@ -620,6 +1700,13 @@ class _FakeCheck:
     def isHidden(self): return False
 
 
+class _FakeNamedCheck(_FakeCheck):
+    def __init__(self, text, checked=False):
+        super().__init__(checked)
+        self._text = text
+    def text(self): return self._text
+
+
 class _FakeLine:
     def __init__(self, value=""): self._value = value
     def text(self): return self._value
@@ -642,8 +1729,16 @@ class _FakeCombo:
     def currentText(self): return self.items[self.index]
     def currentIndex(self): return self.index
     def setCurrentIndex(self, index): self.index = index
+    def setCurrentText(self, text):
+        if text in self.items:
+            self.index = self.items.index(text)
     def isEnabled(self): return True
     def isHidden(self): return False
+
+
+class _FakeLog:
+    def __init__(self, text): self._text = text
+    def toPlainText(self): return self._text
 
 
 class _FakeListItem:
@@ -720,8 +1815,8 @@ def test_live_control_registry_targets_actual_cell_type_only():
     by_id = {item["id"]: item for item in controls}
     assert by_id["tracking.tcell.btrack.use_global_optimization"]["visible"] is True
     assert by_id["tracking.tcell.btrack.maximum_search_radius"]["unit"] == "um"
-    assert "tracking.tcell.btrack.distance_threshold" not in by_id
-    assert "tracking.tcell.btrack.hypotheses" not in by_id
+    assert by_id["tracking.tcell.btrack.distance_threshold"]["visible"] is False
+    assert by_id["tracking.tcell.btrack.hypotheses"]["visible"] is False
     assert by_id["tracking.organoid1.btrack.distance_threshold"]["visible"] is True
     assert by_id["tracking.organoid1.btrack.hypotheses"]["visible"] is True
     assert active_cell_type(main, "tracking") == "tcell"
@@ -845,6 +1940,31 @@ def test_metadata_records_are_complete_and_validated():
                for issue in summary["validation"])
 
 
+def test_metadata_validation_matches_required_well_and_population_lines():
+    records = [{
+        "sample_name": "Sample01",
+        "exp_nr": 91,
+        "well": "",
+        "raw_image_path": "/missing/sample.zarr",
+        "pixel_distance_xy": 1.77,
+        "pixel_distance_z": 1.77,
+        "distance_unit": "um",
+        "time_interval": 120,
+        "time_unit": "s",
+        "cell_types": {
+            "organoid": {"line": "DO7", "condition": ""},
+            "T-cells": {"line": "", "condition": ""},
+            "Macrophages": {"line": "None", "condition": ""},
+        },
+    }]
+    issues = validate_metadata_records(records)
+    errors = [item["message"] for item in issues if item["severity"] == "error"]
+    assert any("mandatory well" in message for message in errors)
+    assert any("mandatory T-cells line" in message for message in errors)
+    assert not any("condition" in message for message in errors)
+    assert not any("Macrophages line" in message for message in errors)
+
+
 def test_metadata_builder_draft_validation_uses_live_form_value():
     from types import SimpleNamespace
     form = {
@@ -915,6 +2035,51 @@ def test_context_keeps_builder_draft_authoritative_after_tab_switch():
     assert context["metadata_builder"]["open"] is True
 
 
+def test_unchanged_loaded_metadata_copy_does_not_require_save():
+    import pandas as pd
+    from types import SimpleNamespace
+
+    form = {
+        "group": _FakeGroup(),
+        "basic": {
+            "sample_name": _FakeLine("Sample01"),
+            "raw_image_path": _FakeLine("/missing/sample.zarr"),
+            "dimension_order": _FakeLine("TCZYX"),
+            "pixel_distance_xy": _FakeSpin(0.5),
+            "pixel_distance_z": _FakeSpin(2.0),
+            "time_interval": _FakeSpin(5.0),
+            "time_unit": _FakeCombo(["s", "m", "h"], 1),
+        },
+        "dead_channel": {}, "cell_types": {},
+    }
+    dp = SimpleNamespace(
+        metadata=pd.DataFrame([{
+            "sample_name": "Sample01",
+            "raw_image_path": "/missing/sample.zarr",
+            "dimension_order": "TCZYX",
+            "pixel_distance_xy": 0.5,
+            "pixel_distance_z": 2.0,
+            "time_interval": 5.0,
+            "time_unit": "m",
+        }]),
+        output_dir="", behav3d_parameters={},
+        builder_grp=_FakeGroup(checked=True), _sample_forms=[form],
+        n_samples_spin=_FakeSpin(1), n_organoid_spin=_FakeSpin(0),
+        n_immune_spin=_FakeSpin(0), n_other_spin=_FakeSpin(0),
+        include_dead_cb=_FakeCheck(False), _organoid_name_edits=[],
+        _immune_name_edits=[], _other_name_edits=[],
+        _metadata_builder_dirty=False,
+    )
+    state = _metadata_builder_state(dp)
+    assert state["record_source"] == "loaded_metadata_copy"
+    assert state["save_required"] is False
+    context = build_context(SimpleNamespace(
+        tabs=_FakeWorkflowTabs(2), data_prep_tab=dp,
+    ))
+    assert context["metadata"].get("record_source") != "metadata_builder_draft"
+    assert context["metadata_builder"]["save_required"] is False
+
+
 def test_live_registry_covers_filtering_and_hmm_controls():
     from types import SimpleNamespace
     filter_panel = SimpleNamespace(
@@ -982,8 +2147,15 @@ def test_active_killing_registry_targets_one_selected_type():
     ))
     controls = {item["id"]: item for item in control_registry(main)}
     target_id = "features.active_killing.target_types"
+    signal_id = "features.active_killing.death_signal"
     assert controls[target_id]["visible"] is True
     assert controls[target_id]["value"] == ["organoid1", "organoid2"]
+    assert controls[signal_id]["value"] == "Dead-mask percentage"
+    assert controls[signal_id]["choices"] == [
+        "Dead-mask percentage", "Mean dead-dye intensity", "Dead-mask pixel count",
+    ]
+    assert apply_set_ui_value(main, signal_id, "Dead-mask pixel count")
+    assert active.death_signal_combo.currentText() == "nr_dead_mask_pixels"
     assert apply_set_ui_value(main, target_id, ["organoid2"])
     assert controls["features.active_killing.absolute_threshold"]["visible"] is False
     assert active_cell_type(main, "feature_extraction") == "tcell"
@@ -1061,9 +2233,15 @@ def test_edt_recommendations_use_per_sample_xy_resolution():
 
 def test_streamed_assistant_text_uses_researcher_facing_labels():
     text = researcher_facing_text(
-        "pixel_distance_xy is 0.5; position_t is 10 for sample_name and TrackID."
+        "pixel_distance_xy is 0.5; position_t is 10 for sample_name and TrackID. "
+        "Use summarize_track_counts with nr_dead_mask_pixels, percentage_dead_mask, "
+        "mean_dead_dye, and killing_efficiency."
     )
-    assert text == "XY pixel size is 0.5; timepoint is 10 for sample name and track ID."
+    assert text == (
+        "XY pixel size is 0.5; timepoint is 10 for sample name and track ID. "
+        "Use track-count preview with dead-mask pixel count, dead-mask percentage, "
+        "mean dead-dye intensity, and killing efficiency."
+    )
 
 
 def test_segmentation_registry_exposes_exact_edt_control():
@@ -1132,6 +2310,174 @@ def test_segmentation_registry_exposes_probability_thresholds_and_strategy():
     assert tab.prob_mask_threshold_spin.value() == 0.45
     assert tab.prob_seed_threshold_spin.value() == 0.75
     assert len(persisted) == 2
+
+
+def test_apoc_registry_exposes_channel_and_feature_controls():
+    from types import SimpleNamespace
+
+    persisted = []
+    channels = [
+        _FakeNamedCheck("Channel 0", True),
+        _FakeNamedCheck("Channel 1", True),
+        _FakeNamedCheck("Channel 2", True),
+    ]
+    filters = {
+        ("gaussian_blur", "1"): _FakeCheck(True),
+        ("difference_of_gaussian", "1"): _FakeCheck(True),
+        ("sobel_of_gaussian_blur", "2"): _FakeCheck(False),
+    }
+    tab = SimpleNamespace(
+        channel_checkboxes=channels,
+        feature_combo=_FakeCombo([
+            "small_preset", "medium_preset", "large_preset", "custom",
+        ], 2),
+        tune_group=_FakeCheck(False),
+        sigma_input=_FakeLine("1, 2, 5"),
+        _feat_sigma_checks=filters,
+        consider_original_cb=_FakeCheck(True),
+        max_depth_spin=_FakeSpin(5),
+        num_ensembles_spin=_FakeSpin(100),
+        _per_tab_strategy_combo=_FakeCombo([
+            "APOC Probability Map + Watershed",
+        ]),
+        prob_mask_threshold_spin=_FakeSpin(0.5, 0.0, 1.0),
+        prob_seed_threshold_spin=_FakeSpin(0.8, 0.0, 1.0),
+        _update_preview=lambda: None,
+        _on_update_grid=lambda: None,
+    )
+    training = SimpleNamespace(tabs={"27t": tab}, strategy_combo=None)
+    apoc = SimpleNamespace(
+        spin_examples=_FakeSpin(3),
+        _training_widget=training,
+        _collect_apoc_tab_config=lambda: {"apoc_27t_channels": []},
+        _save_apoc_params_to_yaml=lambda **kwargs: persisted.append(kwargs),
+    )
+    main = SimpleNamespace(segmentation_tab=SimpleNamespace(
+        method_combo=_FakeCombo([
+            "APOC (GPU)", "ConvPaint", "Pixel Classifier (Random Forest)",
+            "Cellpose", "Cellpose-SAM (zero-shot)", "Import segmentation",
+        ]),
+        apoc_page=apoc,
+        convpaint_page=SimpleNamespace(spin_examples=_FakeSpin(3)),
+        pixel_classifier_page=SimpleNamespace(spin_examples=_FakeSpin(3)),
+        cellpose_page=SimpleNamespace(),
+    ))
+
+    controls = {item["id"]: item for item in control_registry(main)}
+    base = "segmentation.apoc.27t"
+    assert controls[f"{base}.input_channels"]["choices"] == [
+        "Channel 0", "Channel 1", "Channel 2",
+    ]
+    assert controls[f"{base}.feature_preset"]["value"] == "Large structures"
+    assert controls[f"{base}.feature_preset"]["choices"] == [
+        "Small structures", "Medium structures",
+        "Large structures", "Custom feature selection",
+    ]
+    assert "Gaussian blur at sigma 1 px" in controls[
+        f"{base}.feature_filters"
+    ]["choices"]
+
+    assert apply_set_ui_value(main, f"{base}.input_channels", [
+        "Channel 1", "Channel 2",
+    ])
+    assert apply_set_ui_value(main, f"{base}.feature_preset", "Small structures")
+    assert apply_set_ui_value(main, f"{base}.feature_filters", [
+        "Gaussian blur at sigma 1 px",
+        "Sobel edge at sigma 2 px",
+    ])
+    assert [check.isChecked() for check in channels] == [False, True, True]
+    assert tab.feature_combo.currentText() == "custom"
+    assert tab.tune_group.isChecked() is True
+    assert filters[("gaussian_blur", "1")].isChecked() is True
+    assert filters[("difference_of_gaussian", "1")].isChecked() is False
+    assert filters[("sobel_of_gaussian_blur", "2")].isChecked() is True
+    assert len(persisted) == 3
+
+
+def test_segmentation_context_reports_apoc_training_state(tmp_path=None):
+    import tempfile
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    root = Path(tmp_path or tempfile.mkdtemp())
+    classifier = root / "PixelClassifier_27t.cl"
+    classifier.write_text("classifier", encoding="utf-8")
+    tab = SimpleNamespace(
+        channel_checkboxes=[
+            _FakeNamedCheck("Channel 0", False),
+            _FakeNamedCheck("Channel 1", True),
+            _FakeNamedCheck("Channel 2", True),
+        ],
+        feature_combo=_FakeCombo([
+            "small_preset", "medium_preset", "large_preset", "custom",
+        ], 2),
+        tune_group=_FakeCheck(False),
+        sigma_input=_FakeLine("1, 2, 5, 10, 25"),
+        _feat_sigma_checks={
+            ("gaussian_blur", "1"): _FakeCheck(True),
+        },
+        consider_original_cb=_FakeCheck(True),
+        _per_tab_strategy_combo=_FakeCombo([
+            "APOC Probability Map + Watershed",
+        ]),
+        _get_clf_path=lambda: classifier,
+    )
+    training = SimpleNamespace(tabs={"27t": tab}, strategy_combo=None)
+    main = SimpleNamespace(segmentation_tab=SimpleNamespace(
+        method_combo=_FakeCombo([
+            "APOC (GPU)", "ConvPaint", "Pixel Classifier (Random Forest)",
+            "Cellpose", "Cellpose-SAM (zero-shot)", "Import segmentation",
+        ]),
+        apoc_page=SimpleNamespace(
+            _training_widget=training, _is_session_active=True,
+        ),
+    ))
+    state = _segmentation_state(main)
+    apoc = state["apoc"]
+    assert apoc["training_data_loaded"] is True
+    assert apoc["cell_types"]["27t"]["available_input_channels"] == [
+        "Channel 0", "Channel 1", "Channel 2",
+    ]
+    assert apoc["cell_types"]["27t"]["selected_input_channels"] == [
+        "Channel 1", "Channel 2",
+    ]
+    assert apoc["cell_types"]["27t"]["trained_classifier_found"] is True
+
+
+def test_image_dimensions_and_current_log_are_serialized():
+    from types import SimpleNamespace
+
+    class _Item:
+        def __init__(self, value): self.value = value
+        def text(self): return self.value
+
+    class _Table:
+        def rowCount(self): return 1
+        def item(self, row, column):
+            return _Item(["Sample01", "(20, 4, 8, 256, 256)"][column])
+        def cellWidget(self, row, column):
+            return _FakeCombo(["TCZYX"])
+
+    dimensions = _image_dimensions_state(SimpleNamespace(dim_table=_Table()))
+    assert dimensions == [{
+        "sample_name": "Sample01",
+        "shape": "(20, 4, 8, 256, 256)",
+        "dimension_order": "TCZYX",
+        "channel_count": 4,
+        "timepoint_count": 20,
+    }]
+    log_state = _current_log_state(
+        SimpleNamespace(segmentation_tab=SimpleNamespace(log=_FakeLog(
+            "[13:24:25] Loading training data...\n"
+            "[13:24:26] Running _load_training_images...\n"
+            "[13:24:27] Error: image could not be opened"
+        ))),
+        "segmentation",
+    )
+    assert log_state["has_explicit_error"] is True
+    assert log_state["errors"] == [
+        "[13:24:27] Error: image could not be opened",
+    ]
 
 
 def test_active_segmentation_cell_type_uses_method_subtab():
@@ -1221,7 +2567,7 @@ def test_feedback_guidance_fixtures():
 
     fixture = Path(__file__).parent / "fixtures" / "assistant_feedback_transcripts.json"
     cases = json.loads(fixture.read_text(encoding="utf-8"))
-    assert KNOWLEDGE_VERSION == "2026.07.23.2"
+    assert KNOWLEDGE_VERSION == "2026.07.24.23"
     for case in cases:
         cards = select_guidance_cards(
             {"current_step": case["step"]}, case["user"], case.get("intent"))
@@ -1255,7 +2601,7 @@ def test_assistant_has_no_hidden_model_continuation():
     assert "def _auto_continue" not in source
     assert "_dispatch_proactive" not in source
     assert "Checking your setup" not in source
-    assert CONTROL_CONTRACT_VERSION == "2.6"
+    assert CONTROL_CONTRACT_VERSION == "3.1"
 
 
 # --------------------------------------------------------------------------
