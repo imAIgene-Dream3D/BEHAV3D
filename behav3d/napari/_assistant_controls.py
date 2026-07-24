@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 
-CONTROL_CONTRACT_VERSION = "2.6"
+CONTROL_CONTRACT_VERSION = "3.1"
 
 
 def _safe(fn: Callable, default=None):
@@ -151,6 +151,60 @@ def _checkset_binding(control_id, label, checks, **kwargs):
 
     first = next(iter(checks.values()), None)
     item = _binding(control_id, label, first, getter=get, setter=set_, **kwargs)
+    item["choices"] = list(checks)
+    item["enabled"] = any(_is_enabled(check) for check in checks.values())
+    return item
+
+
+_APOC_FEATURE_LABELS = {
+    "gaussian_blur": "Gaussian blur",
+    "difference_of_gaussian": "Difference of Gaussians",
+    "laplace_box_of_gaussian_blur": "Laplacian of Gaussian",
+    "sobel_of_gaussian_blur": "Sobel edge",
+}
+
+
+_ACTIVE_KILLING_SIGNAL_LABELS = {
+    "percentage_dead_mask": "Dead-mask percentage",
+    "mean_dead_dye": "Mean dead-dye intensity",
+    "nr_dead_mask_pixels": "Dead-mask pixel count",
+}
+
+
+def _apoc_feature_grid_binding(control_id, label, tab, **kwargs):
+    checks_by_key = getattr(tab, "_feat_sigma_checks", {}) or {}
+    checks = {
+        f"{_APOC_FEATURE_LABELS.get(str(feature), str(feature))} at sigma {sigma} px": check
+        for (feature, sigma), check in checks_by_key.items()
+    }
+
+    def get():
+        return [name for name, check in checks.items() if _safe(check.isChecked, False)]
+
+    def set_(value):
+        if not isinstance(value, (list, tuple, set)):
+            return False
+        selected = {str(item) for item in value}
+        if not selected.issubset(set(checks)):
+            return False
+        tune_group = getattr(tab, "tune_group", None)
+        if tune_group is not None and hasattr(tune_group, "setChecked"):
+            tune_group.setChecked(True)
+        preset = getattr(tab, "feature_combo", None)
+        if preset is not None and hasattr(preset, "setCurrentText"):
+            preset.setCurrentText("custom")
+        for name, check in checks.items():
+            if _is_enabled(check):
+                check.setChecked(name in selected)
+        update = getattr(tab, "_update_preview", None)
+        if callable(update):
+            update()
+        return True
+
+    first = next(iter(checks.values()), None)
+    item = _binding(
+        control_id, label, first, getter=get, setter=set_, **kwargs
+    )
     item["choices"] = list(checks)
     item["enabled"] = any(_is_enabled(check) for check in checks.values())
     return item
@@ -306,6 +360,111 @@ def _segmentation_bindings(main_widget) -> list[dict]:
             )
 
         strategy = instance_strategy(apoc_training, tab)
+        apoc_visible = current_index == 0
+        channel_checks = {
+            str(check.text()): check
+            for check in (getattr(tab, "channel_checkboxes", []) or [])
+        }
+        if channel_checks:
+            out.append(_checkset_binding(
+                f"segmentation.apoc.{cell_type}.input_channels",
+                f"{cell_type}: APOC image channel inputs",
+                channel_checks,
+                step="segmentation", method="APOC",
+                cell_type=str(cell_type), visible=apoc_visible,
+                persist=persist_apoc,
+            ))
+
+        preset_widget = getattr(tab, "feature_combo", None)
+        if preset_widget is not None:
+            preset_labels = {
+                "small_preset": "Small structures",
+                "medium_preset": "Medium structures",
+                "large_preset": "Large structures",
+                "custom": "Custom feature selection",
+            }
+            preset_values = {label.lower(): value for value, label in preset_labels.items()}
+
+            def get_preset(widget=preset_widget, labels=preset_labels):
+                value = _safe(widget.currentText, "")
+                return labels.get(str(value), str(value))
+
+            def set_preset(value, widget=preset_widget, values=preset_values):
+                token = values.get(str(value).strip().lower())
+                if token is None:
+                    return False
+                widget.setCurrentText(token)
+                return True
+
+            item = _binding(
+                f"segmentation.apoc.{cell_type}.feature_preset",
+                f"{cell_type}: APOC feature scale preset",
+                preset_widget,
+                step="segmentation", method="APOC",
+                cell_type=str(cell_type), visible=apoc_visible,
+                getter=get_preset, setter=set_preset, persist=persist_apoc,
+            )
+            item["choices"] = list(preset_labels.values())
+            out.append(item)
+
+        tune_group = getattr(tab, "tune_group", None)
+        if tune_group is not None:
+            out.append(_binding(
+                f"segmentation.apoc.{cell_type}.show_feature_tuning",
+                f"{cell_type}: show APOC custom feature tuning",
+                tune_group,
+                step="segmentation", method="APOC",
+                cell_type=str(cell_type), visible=apoc_visible,
+            ))
+
+        sigma_input = getattr(tab, "sigma_input", None)
+        if sigma_input is not None:
+            def set_sigmas(value, training_tab=tab, widget=sigma_input):
+                if not set_widget_value(widget, value):
+                    return False
+                update_grid = getattr(training_tab, "_on_update_grid", None)
+                if not callable(update_grid):
+                    return False
+                update_grid()
+                return True
+
+            out.append(_binding(
+                f"segmentation.apoc.{cell_type}.feature_scales",
+                f"{cell_type}: APOC custom feature scales",
+                sigma_input,
+                step="segmentation", unit="pixels", method="APOC",
+                cell_type=str(cell_type), visible=apoc_visible,
+                setter=set_sigmas, persist=persist_apoc,
+            ))
+
+        if getattr(tab, "_feat_sigma_checks", None):
+            out.append(_apoc_feature_grid_binding(
+                f"segmentation.apoc.{cell_type}.feature_filters",
+                f"{cell_type}: APOC custom feature filters",
+                tab,
+                step="segmentation", method="APOC",
+                cell_type=str(cell_type), visible=apoc_visible,
+                persist=persist_apoc,
+            ))
+
+        for suffix, label, attr, default in (
+            ("include_original_intensity", "include original image intensity",
+             "consider_original_cb", True),
+            ("tree_depth", "classifier tree depth", "max_depth_spin", 5),
+            ("number_of_trees", "number of classifier trees",
+             "num_ensembles_spin", 100),
+        ):
+            widget = getattr(tab, attr, None)
+            if widget is not None:
+                out.append(_binding(
+                    f"segmentation.apoc.{cell_type}.{suffix}",
+                    f"{cell_type}: APOC {label}",
+                    widget,
+                    step="segmentation", default=default, method="APOC",
+                    cell_type=str(cell_type), visible=apoc_visible,
+                    persist=persist_apoc,
+                ))
+
         strategy_combo = getattr(tab, "_per_tab_strategy_combo", None)
         if strategy_combo is not None:
             out.append(_binding(
@@ -313,7 +472,7 @@ def _segmentation_bindings(main_widget) -> list[dict]:
                 f"{cell_type}: APOC instance segmentation strategy",
                 strategy_combo, step="segmentation", method="APOC",
                 strategy=strategy, cell_type=str(cell_type),
-                visible=current_index == 0, persist=persist_apoc,
+                visible=apoc_visible, persist=persist_apoc,
             ))
         distance_unit = _display_unit(
             getattr(tab, "_unit_mgr", None), "distance", "pixels"
@@ -341,7 +500,7 @@ def _segmentation_bindings(main_widget) -> list[dict]:
                 f"{cell_type}: APOC {label}", widget,
                 step="segmentation", unit=unit, method="APOC",
                 strategy=strategy, cell_type=str(cell_type),
-                visible=current_index == 0, persist=persist_apoc,
+                visible=apoc_visible, persist=persist_apoc,
             ))
 
     convpaint = getattr(seg, "convpaint_page", None)
@@ -578,10 +737,6 @@ def _tracking_bindings(main_widget) -> list[dict]:
             getattr(panel, "bt_use_optimize", None).isChecked, False
         )) if getattr(panel, "bt_use_optimize", None) is not None else False
         for suffix, label, attr, unit, method in specs:
-            if suffix in {
-                "btrack.distance_threshold", "btrack.time_threshold",
-            } and not optimizer_enabled:
-                continue
             widget = getattr(panel, attr, None)
             if widget is None:
                 continue
@@ -596,6 +751,10 @@ def _tracking_bindings(main_widget) -> list[dict]:
                 visible = method_index == 3
             elif method == "btrack":
                 visible = method_index == 4
+                if suffix in {
+                    "btrack.distance_threshold", "btrack.time_threshold",
+                }:
+                    visible = visible and optimizer_enabled
             if unit == "distance":
                 manager = {
                     "LAP": getattr(panel, "_lap_unit_mgr", None),
@@ -608,12 +767,12 @@ def _tracking_bindings(main_widget) -> list[dict]:
                                 unit=unit, method=method, cell_type=str(cell_type),
                                 visible=visible, persist=getattr(panel, "_persist", None)))
         checks = getattr(panel, "bt_hyp_checks", {}) or {}
-        if checks and optimizer_enabled:
+        if checks:
             out.append(_checkset_binding(
                 f"tracking.{cell_type}.btrack.hypotheses",
                 f"{cell_type}: btrack optimization hypotheses", checks,
                 step="tracking", method="btrack", cell_type=str(cell_type),
-                visible=method_index == 4,
+                visible=method_index == 4 and optimizer_enabled,
                 persist=getattr(panel, "_persist", None),
             ))
     return out
@@ -683,13 +842,40 @@ def _feature_bindings(main_widget) -> list[dict]:
         for suffix, label, attr, unit, relevant in specs:
             widget = getattr(active, attr, None)
             if widget is not None:
-                out.append(_binding(
+                binding_kwargs = {}
+                if suffix == "death_signal":
+                    labels = _ACTIVE_KILLING_SIGNAL_LABELS
+                    values = {
+                        display.lower(): token
+                        for token, display in labels.items()
+                    }
+
+                    def get_signal(combo=widget, display_labels=labels):
+                        token = str(_safe(combo.currentText, "") or "")
+                        return display_labels.get(token, token)
+
+                    def set_signal(value, combo=widget, signal_values=values):
+                        token = signal_values.get(str(value).strip().lower())
+                        if token is None:
+                            return False
+                        combo.setCurrentText(token)
+                        return str(_safe(combo.currentText, "") or "") == token
+
+                    binding_kwargs = {
+                        "getter": get_signal,
+                        "setter": set_signal,
+                    }
+                item = _binding(
                     f"features.active_killing.{suffix}",
                     f"Active Killing: {label}", widget,
                     step="feature_extraction", unit=unit,
                     method="Active Killing", cell_type=immune,
                     visible=expanded and relevant,
-                ))
+                    **binding_kwargs,
+                )
+                if suffix == "death_signal":
+                    item["choices"] = list(_ACTIVE_KILLING_SIGNAL_LABELS.values())
+                out.append(item)
         target_list = getattr(active, "target_list", None)
         if target_list is not None:
             out.append(_selection_binding(

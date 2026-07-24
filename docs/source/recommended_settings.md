@@ -1,16 +1,15 @@
 # Recommended Settings & Practical Tips
 
 This page collects **hands-on recommendations** for the BEHAV3D EXPLORER napari
-workflow — typical parameter values and practical techniques distilled from
-training sessions. It complements the per-step method pages (which explain *what*
-each setting does) by suggesting *where to start* and *what tends to work in
-practice*.
+workflow and practical techniques distilled from training sessions. It
+complements the per-step method pages, which explain *what* each setting does.
 
 ```{note}
-These are **recommended starting points, not hard rules**. They may differ from a
-form's built-in default, and the best value always depends on your data
-(magnification, frame interval, cell type, signal quality). Preview / inspect the
-result and adjust. Treat the numbers below as a sensible first guess.
+Numeric values on this page are **historical examples, not general starting
+points**. Use the loaded image spacing, frame interval, measured object size,
+observed motion, and a preview to derive settings for the current experiment.
+The assistant should mention a historical number only when the researcher asks
+for an example and should name its provenance.
 ```
 
 ## Pipeline order
@@ -46,7 +45,7 @@ Per-sample fields:
 | Image path | Path to the image file for this sample |
 | Dim order | Typically `TCZYX` |
 | Pixel size | Read it from Zen / IMARIS / ImageJ for your acquisition |
-| Time interval | Often ~120 seconds (use your real acquisition interval) |
+| Time interval | The real interval recorded by the acquisition |
 | Dead channel # | **Zero-based** index (so `0` = the first channel) |
 
 - Use **Fill All from Sample 1** to copy shared values (pixel size, time interval)
@@ -127,8 +126,9 @@ training data without training first.
 
 ### Training parameters (per cell type)
 
-- **Organoids** — input channels: organoid + dead only (leave out the T-cell
-  channel; it adds little and slows things down). Feature preset: `medium_preset`
+- **Organoids** — select channels where the organoid is visible or that the
+  researcher confirms provide useful boundary context. Do not add or remove
+  immune/dead channels by rule. Feature preset: `medium_preset`
   (sigmas `1, 2, 5, 15`), or `large_preset` (sigmas `1, 2, 5, 10, 25`) for
   multi-scale data.
 - **T cells** — pick the channels/features relevant to T cells. Feature preset:
@@ -143,7 +143,7 @@ Shared random-forest / instance settings:
 | Foreground / mask threshold | 0.50 | |
 | Seed threshold | 0.80 | Used for splitting touching objects |
 | Opening (px) | 0 | Can smooth the outside of organoids |
-| Minimum size filter | 0 during training; ~500–1000 px for organoids once trained | |
+| Minimum size filter | Derive from the object's physical size and XY/Z spacing | Start near half the estimated object volume for a tolerant first preview |
 
 - Use **Apply Config to All Tabs** after configuring one cell type, then customize
   channels/features for the others.
@@ -165,13 +165,12 @@ Shared random-forest / instance settings:
 - **Organoids — propagation:** select the organoid layer; the method auto-sets to
   propagation. It copies segmentation frame-to-frame, so there's nothing to tune.
   It is the slower of the two methods.
-- **T cells — btrack:** select btrack, enable **global track optimization**, and
-  set workers around 4 on most laptops (keeps the machine usable). Useful
-  starting parameters:
-  - **Max search radius:** ~100 px (how far ahead to look for the next-frame
-    candidate along the predicted trajectory).
-  - **Distance threshold:** ~60 px (used to link tracklets during global
-    optimization).
+- **T cells — btrack:** select btrack and tune Step 1 from observed
+  displacement per frame. After the Step 1 preview looks correct, enable global
+  optimization. Set its distance threshold from the largest spatial gap to
+  reconnect and its time threshold from the largest missing-frame gap. Values
+  such as 100/60/3 occur in one historical CD4/CD8 experiment but are not
+  general T-cell defaults.
 - **Run batch tracking (all cell types)** tracks organoids first, then T cells
   (choose "skip existing" if already tracked).
 - **Verify it worked:** tracked segments keep the **same colour/ID across time**;
@@ -309,7 +308,7 @@ first, then merge and run feature extraction and analysis jointly.
 | Tracking | T-cell method | btrack |
 | Tracking | Global track optimization | Enabled |
 | Tracking | Workers | ~4 |
-| Tracking | Max search radius / distance threshold | ~100 px / ~60 px |
+| Tracking | Max search radius / optimizer thresholds | Derive from observed per-frame displacement and spatial/time gaps |
 | Feature extraction | Organoid death threshold | ~5 % (0.05) |
 | Feature extraction | T-cell death threshold | ~10 % (0.1) |
 | Active killing | Immune cell type | `tcell` |
@@ -322,3 +321,7 @@ first, then merge and run feature extraction and analysis jointly.
 | Data prep | Dim order | `TCZYX` |
 | Data prep | Time interval | ~120 s (use your real value) |
 | Data prep | Zarr conversion workers | what your machine can handle |
+
+For provenance-labeled examples from IVM HIV, CD4/CD8 active killing,
+multi-organoid safety profiling, and calcium-reporter experiments, see
+[Historical experiment profiles](assistant/reference_experiment_profiles.md).
