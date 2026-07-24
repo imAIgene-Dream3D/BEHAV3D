@@ -305,7 +305,11 @@ def _show_intrinsic_hmm_backprojection(
         sample_name=sample_name,
         cell_type=cell_type,
     )
-    code_map = _build_code_map(adata.obs, state_col=INTRINSIC_STATE_COL)
+    code_map = _build_code_map(
+        adata.obs,
+        state_col=INTRINSIC_STATE_COL,
+        state_order=_get_classification_state_order(adata, INTRINSIC_STATE_COL),
+    )
     if track_features_csv_path is None or not Path(track_features_csv_path).exists():
         raise FileNotFoundError("Track-features CSV is required for intrinsic HMM backprojection.")
 
@@ -518,7 +522,11 @@ def _show_hmm_state_backprojection(
         sample_name=sample_name,
         cell_type=cell_type,
     )
-    code_map = _build_code_map(adata.obs, state_col=state_col)
+    code_map = _build_code_map(
+        adata.obs,
+        state_col=state_col,
+        state_order=_get_classification_state_order(adata, state_col),
+    )
     if track_features_csv_path is None or not Path(track_features_csv_path).exists():
         raise FileNotFoundError("Track-features CSV is required for HMM backprojection.")
 
@@ -799,10 +807,6 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
             placeholder="Path to saved HMM deployment artifact .pkl",
             width="100%",
         )
-
-    def _model_adata_path(self, cell_type=None):
-        ct = self._current_cell_type() if cell_type is None else str(cell_type)
-        return _resolve_state_paths(self.output_dir, ct).full_output_adata_path
 
     def _default_hmm_deployment_artifact_path(self, cell_type=None):
         ct = self._current_cell_type() if cell_type is None else str(cell_type)
@@ -2012,6 +2016,41 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
             write=write,
         )
 
+    def _sync_and_save_full_adata(self, verbose=True):
+        """Push the current color/order mapping from `self.model_adata.uns` into
+        `self.adata_full.uns`, and persist `self.adata_full` to the canonical full-dataset
+        path. No-ops gracefully if `self.adata_full` has not been populated yet."""
+        adata_full = getattr(self, "adata_full", None)
+        if adata_full is None or self.model_adata is None:
+            return None
+
+        state_paths = _resolve_state_paths(self.output_dir, self._current_cell_type())
+        synced_any = False
+        for state_col in (FULL_STATE_COL, INTRINSIC_STATE_COL):
+            if state_col not in getattr(adata_full, "obs", {}).columns:
+                continue
+            if state_col not in getattr(self.model_adata, "obs", {}).columns:
+                continue
+            colors = _get_classification_state_colors(self.model_adata, state_col)
+            order = _get_classification_state_order(self.model_adata, state_col)
+            if colors:
+                _set_classification_state_colors(adata_full, state_col, colors)
+            if order:
+                _set_classification_state_order(adata_full, state_col, order)
+            synced_any = True
+
+        if not synced_any:
+            return None
+
+        state_paths.full_output_adata_path.parent.mkdir(parents=True, exist_ok=True)
+        adata_full.write(state_paths.full_output_adata_path, compression="gzip")
+        if verbose:
+            _winfo(
+                "state-hmm-widget",
+                f"Synced colors/order and saved full dataset: {state_paths.full_output_adata_path}",
+            )
+        return state_paths.full_output_adata_path
+
     def _remap_full_state_colors(self, mapping, existing_labels):
         old_labels = sorted([str(v) for v in list(existing_labels or [])], key=_mixed_label_sort_key)
         old_colors = self._current_full_state_color_mapping(labels=old_labels, prefer_pickers=True)
@@ -2318,8 +2357,25 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
             str(normalized_mapping.get(label, label)) != str(label)
             for label in existing_labels
         )
+        new_intrinsic_order = list(dict.fromkeys(
+            normalized_mapping.get(n, n) for n in getattr(self, "_intrinsic_row_order", [])
+        ))
+        order_changes = list(new_intrinsic_order) != list(
+            _get_classification_state_order(self.model_adata, INTRINSIC_STATE_COL)
+        )
         if not has_changes:
-            return {"changed": False}
+            if not order_changes:
+                return {"changed": False}
+            adata_full = getattr(self, "adata_full", None)
+            _set_classification_state_order(self.model_adata, INTRINSIC_STATE_COL, new_intrinsic_order)
+            if adata_full is not None and INTRINSIC_STATE_COL in getattr(adata_full, "obs", {}).columns:
+                _set_classification_state_order(adata_full, INTRINSIC_STATE_COL, new_intrinsic_order)
+            self._save_model_adata(compression=save_compression)
+            self._sync_and_save_full_adata(verbose=False)
+            yaml_path = self._write_cluster_name_mappings_yaml(latest_intrinsic_mapping=normalized_mapping)
+            self._rebuild_intrinsic_rename_rows()
+            self._rebuild_full_rename_rows()
+            return {"changed": True, "order_changed": True, "mapping_yaml_path": str(yaml_path)}
 
         relabel_cluster_ids(
             adata=self.model_adata,
@@ -2328,10 +2384,8 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
             new_key=INTRINSIC_STATE_COL,
             keep_unmapped=True,
             overwrite_original=True,
+            categories=new_intrinsic_order,
         )
-        new_intrinsic_order = list(dict.fromkeys(
-            normalized_mapping.get(n, n) for n in getattr(self, "_intrinsic_row_order", [])
-        ))
         _set_classification_state_order(self.model_adata, INTRINSIC_STATE_COL, new_intrinsic_order)
         clustering_meta = self.model_adata.uns.get("clustering", {})
         binary_group_constraints = None
@@ -2373,6 +2427,7 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
                 new_key=INTRINSIC_STATE_COL,
                 keep_unmapped=True,
                 overwrite_original=True,
+                categories=new_intrinsic_order,
             )
         if (
             adata_full is not None
@@ -2389,12 +2444,6 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
                 keep_unmapped=True,
             )
         self._ensure_full_state_colors(write=True)
-        if adata_full is not None and FULL_STATE_COL in getattr(adata_full, "obs", {}).columns:
-            _set_classification_state_colors(
-                adata_full,
-                FULL_STATE_COL,
-                _get_classification_state_colors(self.model_adata, FULL_STATE_COL),
-            )
         self._invalidate_curated_state_reports(
             reason="State reports were cleared after curated HMM renaming. Recreate them from 'Create analysis plots'."
         )
@@ -2415,6 +2464,7 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
         except Exception as exc:
             qc_warning = str(exc)
         self._save_model_adata(compression=save_compression)
+        self._sync_and_save_full_adata(verbose=False)
         yaml_path = self._write_cluster_name_mappings_yaml(latest_intrinsic_mapping=normalized_mapping)
         self._rebuild_intrinsic_rename_rows()
         self._rebuild_full_rename_rows()
@@ -2454,12 +2504,13 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
             for label in existing_labels
         )
         color_changes = dict(saved_colors) != dict(remapped_colors)
+        order_changes = list(new_full_order) != list(_get_classification_state_order(self.model_adata, FULL_STATE_COL))
         adata_full = getattr(self, "adata_full", None)
         adata_full_has_full_state = (
             adata_full is not None and FULL_STATE_COL in getattr(adata_full, "obs", {}).columns
         )
         if not has_changes:
-            if color_changes:
+            if color_changes or order_changes:
                 _set_classification_state_colors(self.model_adata, FULL_STATE_COL, remapped_colors)
                 _set_classification_state_order(self.model_adata, FULL_STATE_COL, new_full_order)
                 if adata_full_has_full_state:
@@ -2467,7 +2518,12 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
                     _set_classification_state_order(adata_full, FULL_STATE_COL, new_full_order)
                 yaml_path = self._write_cluster_name_mappings_yaml(latest_full_mapping=normalized_mapping)
                 self._rebuild_full_rename_rows()
-                result = {"changed": True, "colors_changed": True, "mapping_yaml_path": str(yaml_path)}
+                result = {
+                    "changed": True,
+                    "colors_changed": bool(color_changes),
+                    "order_changed": bool(order_changes),
+                    "mapping_yaml_path": str(yaml_path),
+                }
             else:
                 result = {"changed": False}
         else:
@@ -2477,6 +2533,7 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
                 cluster_key=FULL_STATE_COL,
                 overwrite_original=True,
                 keep_unmapped=True,
+                categories=new_full_order,
             )
             if adata_full_has_full_state:
                 relabel_cluster_ids(
@@ -2485,6 +2542,7 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
                     cluster_key=FULL_STATE_COL,
                     overwrite_original=True,
                     keep_unmapped=True,
+                    categories=new_full_order,
                 )
                 _set_classification_state_colors(adata_full, FULL_STATE_COL, remapped_colors)
                 _set_classification_state_order(adata_full, FULL_STATE_COL, new_full_order)
@@ -2519,6 +2577,7 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
             except Exception as exc:
                 qc_warning = str(exc)
             self._save_model_adata(compression=save_compression)
+            self._sync_and_save_full_adata(verbose=False)
             result["deployment_warning"] = deployment_warning
             result["quality_control_warning"] = qc_warning
             result["quality_control_outputs"] = dict(qc_out)
@@ -2695,6 +2754,7 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
         if not isinstance(clustering_meta, dict):
             clustering_meta = {}
         full_state_colors = self._current_full_state_color_mapping(write=True)
+        full_state_order = _get_classification_state_order(adata_for_plots, FULL_STATE_COL)
         if adata_for_plots is not self.model_adata and FULL_STATE_COL in getattr(adata_for_plots, "obs", {}).columns:
             observed_labels = set(
                 pd.Series(adata_for_plots.obs[FULL_STATE_COL]).dropna().astype(str).unique().tolist()
@@ -2730,6 +2790,7 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
                     sample_col="sample_name",
                     include_pooled_summary=True,
                     state_colors=full_state_colors,
+                    state_order=full_state_order,
                     verbose=verbose,
                     group_cols=group_cols if group_cols else None,
                     group_x=group_x,
@@ -2762,6 +2823,7 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
                     id_cols=("sample_name", "TrackID"),
                     time_col="position_t",
                     state_colors=full_state_colors,
+                    state_order=full_state_order,
                     verbose=verbose,
                 )
                 transition_dir = str(transition_out.get("output_dir", transitions_outdir))
@@ -2879,6 +2941,7 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
                     raise ValueError("No model adata loaded.")
 
                 full_state_colors = self._current_full_state_color_mapping(write=True)
+                full_state_order = _get_classification_state_order(adata_for_plots, FULL_STATE_COL)
                 state_paths = _resolve_state_paths(self.output_dir, self._current_cell_type())
                 out_dir = Path(state_paths.state_composition_outdir) / "behavior_proportions"
                 out_dir.mkdir(parents=True, exist_ok=True)
@@ -2896,6 +2959,7 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
                     group_cols=group_cols,
                     group_x=group_x,
                     state_colors=full_state_colors,
+                    state_order=full_state_order,
                     verbose=True,
                 )
                 _winfo(

@@ -628,6 +628,7 @@ class RenameClusterDialog(QDialog):
                 cluster_key=col,
                 overwrite_original=True,
                 keep_unmapped=True,
+                categories=new_order,
             )
 
         # Rebuild full_behavioral_cluster so its prefix reflects the renamed intrinsic labels

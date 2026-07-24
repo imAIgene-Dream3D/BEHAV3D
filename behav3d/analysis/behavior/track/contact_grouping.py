@@ -50,6 +50,64 @@ def _normalize_id_column(series):
 _WINDOW_COL = "trajectory_window_id"
 
 
+def _missing_keys(required_df, available_df, cols):
+    """Set of unique ``cols`` tuples present in ``required_df`` but absent from ``available_df``."""
+    cols = list(cols)
+    required_keys = set(map(tuple, required_df[cols].drop_duplicates().to_numpy()))
+    available_keys = set(map(tuple, available_df[cols].drop_duplicates().to_numpy()))
+    return required_keys - available_keys
+
+
+def _assert_tracks_covered_by_csv(
+    h5ad_df, csv_df, *, groupby_cols, h5ad_label, available_label="the filtered track-features CSV",
+):
+    """Hard-error if any track key in ``h5ad_df`` (already ``_normalize_id_column``-normalized
+    on ``groupby_cols``) is entirely absent from ``csv_df`` (same normalization).
+
+    A track missing from ``available_label`` altogether means the data sources no longer match —
+    almost always because one was regenerated (e.g. filtering re-run) after the other was created.
+    """
+    missing = _missing_keys(h5ad_df, csv_df, groupby_cols)
+    if missing:
+        example = sorted(missing)[:10]
+        raise ValueError(
+            f"{len(missing)} track(s) present in {h5ad_label} are missing entirely from "
+            f"{available_label} (matched on {list(groupby_cols)}). The underlying data no longer "
+            f"matches {h5ad_label} — this almost always means the input data was regenerated "
+            f"(e.g. Filtering re-run) after the behavioral analysis was run. Re-run the "
+            f"Behavioral Analysis step to regenerate {h5ad_label} from the current filtered data "
+            f"before running this analysis. Missing example track key(s) (first 10, "
+            f"{list(groupby_cols)}): {example}"
+        )
+
+
+def _assert_tracks_have_window_data(windows_df, matched_df, *, key_cols, h5ad_label):
+    """Hard-error if any track/window key in ``windows_df`` (the full required set, e.g.
+    ``adata_tracks.obs``) has zero rows in ``matched_df`` (the CSV already restricted to that
+    track's ``[position_t_min, position_t_max]`` window).
+
+    ``position_t_min``/``position_t_max`` are always derived as the min/max of real ``position_t``
+    values from rows of this same CSV (only ever dropped upstream, never padded or resampled), so
+    on genuinely in-sync data a track's own window bounds are guaranteed to have matching rows.
+    Zero overlap therefore only happens when the CSV and h5ad are out of sync — never a legitimate
+    "no contact recorded" result — so this must never be silently defaulted or dropped.
+    """
+    missing = _missing_keys(windows_df, matched_df, key_cols)
+    if missing:
+        example = sorted(missing)[:10]
+        raise ValueError(
+            f"{len(missing)} track(s)/window(s) in {h5ad_label} have no matching timepoints in "
+            f"the filtered track-features CSV within their classified window (position_t_min–"
+            f"position_t_max) (matched on {list(key_cols)}). Since {h5ad_label} is built directly "
+            f"from this CSV, this should be impossible on in-sync data — it means the filtering/"
+            f"tracking data no longer matches {h5ad_label} (most likely it was regenerated, e.g. "
+            f"Filtering re-run, after the behavioral analysis was run). Re-run the Behavioral "
+            f"Analysis step to regenerate {h5ad_label} from the current filtered data before "
+            f"running this analysis. Missing example track key(s) (first 10, {list(key_cols)}): "
+            f"{example}"
+        )
+
+
 def compute_track_contact_features(
     df_timepoints,
     adata_tracks,
@@ -76,12 +134,10 @@ def compute_track_contact_features(
     - ``{contact_col}_mean_fraction``: mean of ``contact_col`` (0-1) over the window.
     - ``{contact_col}_max_bout_length``: longest contiguous truthy run length (timepoints).
 
-    Every classified track (row of ``windows``) is guaranteed exactly one output row — a track
-    with no matching contact timepoints resolves to "no_contact" (max_bout=0) rather than being
-    dropped, since ``adata_tracks``/``df_timepoints`` are expected to share the same underlying
-    per-timepoint source data. With ``verbose=True``, any such zero-match tracks are logged, since
-    they can indicate a stale CSV or track-ID drift even though they now resolve to a definite
-    label.
+    Every classified track (row of ``windows``) is required to have at least one matching
+    timepoint in ``df_timepoints`` within its classified window — raises ``ValueError`` otherwise
+    (see ``_assert_tracks_have_window_data``), since that can only happen when ``df_timepoints``
+    no longer matches ``adata_tracks`` (never a legitimate zero-contact result).
 
     Returns a DataFrame indexed by ``groupby_cols`` (plus ``trajectory_window_id`` when present in
     ``adata_tracks.obs``) with those three columns.
@@ -118,39 +174,32 @@ def compute_track_contact_features(
     df[contact_col] = pd.to_numeric(df[contact_col], errors="coerce").fillna(0).astype(bool)
 
     # Inner-join the classified windows onto the raw contact timepoints to find, per window, which
-    # timepoints actually fall inside it; windows with no match simply won't appear here — they're
-    # restored below via a left-merge against the full `windows` key set, so no classified track is
-    # ever silently dropped (unlike the previous inner-join-only approach).
+    # timepoints actually fall inside it.
     matched = windows.merge(df, on=groupby_cols, how="inner")
     matched = matched[
         (matched[time_col] >= matched["position_t_min"]) & (matched[time_col] <= matched["position_t_max"])
     ]
 
-    if len(matched) > 0:
-        stats = matched.groupby(key_cols, sort=False, observed=True)[contact_col].agg(
-            **{mean_col: "mean", max_bout_col: lambda s: _max_true_run_length(s.tolist())}
-        ).reset_index()
-    else:
-        stats = pd.DataFrame(columns=key_cols + [mean_col, max_bout_col])
+    _assert_tracks_have_window_data(
+        windows, matched, key_cols=key_cols,
+        h5ad_label="adata_tracks.obs (track classification h5ad)",
+    )
 
+    stats = matched.groupby(key_cols, sort=False, observed=True)[contact_col].agg(
+        **{mean_col: "mean", max_bout_col: lambda s: _max_true_run_length(s.tolist())}
+    ).reset_index()
+
+    # The assert above guarantees every window key has >=1 row in `matched`, so this merge can
+    # never leave a NaN row.
     out = windows[key_cols].merge(stats, on=key_cols, how="left")
-
-    unmatched_mask = out[max_bout_col].isna()
-    n_unmatched = int(unmatched_mask.sum())
-    out[mean_col] = out[mean_col].fillna(0.0)
-    out[max_bout_col] = out[max_bout_col].fillna(0).astype(int)
+    out[max_bout_col] = out[max_bout_col].astype(int)
     out[group_col] = np.where(out[max_bout_col] >= min_bout_length, "contact", "no_contact")
-
-    if verbose and n_unmatched:
-        unmatched_keys = out.loc[unmatched_mask, key_cols].to_records(index=False).tolist()[:10]
-        print(
-            f"Contact grouping on '{contact_col}': {n_unmatched} classified track(s) had no "
-            f"matching timepoints in df_timepoints and were labeled 'no_contact' by default "
-            f"(possible stale CSV or track-ID mismatch), e.g. {unmatched_keys}"
-            + (" ..." if n_unmatched > 10 else "")
-        )
-
     out[group_col] = pd.Categorical(out[group_col], categories=["no_contact", "contact"])
+
+    if verbose:
+        n_contact = int((out[group_col] == "contact").sum())
+        n_no_contact = int((out[group_col] == "no_contact").sum())
+        print(f"Contact grouping on '{contact_col}': {n_contact} contact / {n_no_contact} no_contact tracks.")
     return out.set_index(key_cols)[[mean_col, max_bout_col, group_col]]
 
 

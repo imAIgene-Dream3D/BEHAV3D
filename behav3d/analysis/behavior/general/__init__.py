@@ -1,6 +1,8 @@
 import numpy as np
 import pandas as pd
 
+from behav3d.analysis.behavior.utils import _mixed_label_sort_key
+
 
 def relabel_cluster_ids(
     adata,
@@ -10,6 +12,7 @@ def relabel_cluster_ids(
     keep_unmapped=True,
     unmapped_label="unlabeled",
     overwrite_original=False,
+    categories=None,
 ):
     if cluster_key not in adata.obs.columns:
         raise ValueError(f"{cluster_key} not found in adata.obs")
@@ -38,6 +41,15 @@ def relabel_cluster_ids(
         out = mapped.fillna(unmapped_label)
 
     out_col = new_key if new_key is not None else cluster_key
-    adata.obs[out_col] = pd.Categorical(out)
+    present = sorted({str(x) for x in out.dropna().unique()}, key=_mixed_label_sort_key)
+    if categories is not None:
+        requested = [str(c) for c in categories]
+        present_set = set(present)
+        cats = [c for c in requested if c in present_set] + [
+            c for c in present if c not in requested
+        ]
+    else:
+        cats = present
+    adata.obs[out_col] = pd.Categorical(out, categories=cats)
 
     return adata

@@ -85,6 +85,7 @@ from behav3d.analysis.behavior.general.visualization.plots.proportion_bars impor
     draw_stacked_proportion_barv,
     compute_class_by_stack_proportions,
     compute_condition_diff_stats_pairwise,
+    legend_layout,
     plot_condition_diff_grid,
     plot_condition_diff_grid_2d,
     plot_page_stacked_proportion_barh_grid,
@@ -173,7 +174,7 @@ def _apply_best_pdf_orientation(fig, default_orientation="landscape"):
     return "landscape" if float(width) >= float(height) else "portrait"
 
 
-def _rank_cluster_counts(adata_tracks, cluster_key):
+def _rank_cluster_counts(adata_tracks, cluster_key, cluster_order=None):
     if cluster_key not in adata_tracks.obs.columns:
         raise ValueError(f"Missing '{cluster_key}' in adata_tracks.obs.")
 
@@ -184,22 +185,35 @@ def _rank_cluster_counts(adata_tracks, cluster_key):
         .astype(str)
     )
     counts = labels.value_counts(dropna=False).to_dict()
-    ranked = sorted(
-        [(str(label), int(n)) for label, n in counts.items()],
-        key=lambda x: (-int(x[1]), _mixed_label_sort_key(x[0])),
-    )
+    if cluster_order:
+        ranked = [(str(label), int(counts.get(str(label), 0))) for label in cluster_order]
+        leftovers = sorted(
+            [(label, n) for label, n in counts.items() if str(label) not in {str(o) for o in cluster_order}],
+            key=lambda x: (-int(x[1]), _mixed_label_sort_key(x[0])),
+        )
+        ranked = ranked + leftovers
+    else:
+        ranked = sorted(
+            [(str(label), int(n)) for label, n in counts.items()],
+            key=lambda x: (-int(x[1]), _mixed_label_sort_key(x[0])),
+        )
     return ranked
 
 
-def _plot_cluster_rankings(adata_tracks, cluster_key):
-    ranked = _rank_cluster_counts(adata_tracks=adata_tracks, cluster_key=cluster_key)
+def _plot_cluster_rankings(adata_tracks, cluster_key, cluster_order=None, cluster_colors=None):
+    ranked = _rank_cluster_counts(adata_tracks=adata_tracks, cluster_key=cluster_key, cluster_order=cluster_order)
     cluster_labels = [x[0] for x in ranked]
     cluster_counts = [x[1] for x in ranked]
+    bar_colors = (
+        [cluster_colors.get(label, "#2E6FBA") for label in cluster_labels]
+        if cluster_colors
+        else "#2E6FBA"
+    )
 
     fig_h = max(4.5, 0.45 * len(cluster_labels) + 2.0)
     fig, ax = plt.subplots(figsize=(10.5, fig_h))
     y = np.arange(len(cluster_labels))
-    bars = ax.barh(y, cluster_counts, color="#2E6FBA")
+    bars = ax.barh(y, cluster_counts, color=bar_colors)
     ax.set_yticks(y)
     ax.set_yticklabels(cluster_labels)
     ax.invert_yaxis()
@@ -284,6 +298,7 @@ def _plot_page_grouped_class_proportions_2d_grid(
     conditions are present.
     """
     panel_h_in = panel_w_in * _GRID_PANEL_ASPECT
+    legend_ncol, _, legend_margin_in = legend_layout(len(class_order), base_margin_in=_GRID_BOTTOM_MARGIN_IN)
 
     if len(group_cols) == 2:
         if axis_cols is not None:
@@ -297,7 +312,7 @@ def _plot_page_grouped_class_proportions_2d_grid(
         ncols_data = max(1, len(col_x_vals))
 
         fig_w = _GRID_HEADER_W_IN + ncols_data * panel_w_in
-        fig_h = _GRID_TOP_MARGIN_IN + _GRID_HEADER_H_IN + nrows_data * panel_h_in + _GRID_BOTTOM_MARGIN_IN
+        fig_h = _GRID_TOP_MARGIN_IN + _GRID_HEADER_H_IN + nrows_data * panel_h_in + legend_margin_in
         fig = plt.figure(figsize=(fig_w, fig_h))
         outer = GridSpec(
             nrows=nrows_data + 1,
@@ -308,7 +323,7 @@ def _plot_page_grouped_class_proportions_2d_grid(
             hspace=0.6,
             wspace=0.3,
             top=1.0 - _GRID_TOP_MARGIN_IN / fig_h,
-            bottom=_GRID_BOTTOM_MARGIN_IN / fig_h,
+            bottom=legend_margin_in / fig_h,
         )
 
         ax_corner = fig.add_subplot(outer[0, 0])
@@ -353,7 +368,7 @@ def _plot_page_grouped_class_proportions_2d_grid(
         nrows_data = max(1, len(col_y_vals))
 
         fig_w = max(4.0 * panel_w_in, 6.0)
-        fig_h = _GRID_TOP_MARGIN_IN + nrows_data * panel_h_in + _GRID_BOTTOM_MARGIN_IN
+        fig_h = _GRID_TOP_MARGIN_IN + nrows_data * panel_h_in + legend_margin_in
         fig = plt.figure(figsize=(fig_w, fig_h))
         outer = GridSpec(
             nrows=nrows_data,
@@ -362,7 +377,7 @@ def _plot_page_grouped_class_proportions_2d_grid(
             height_ratios=[panel_h_in] * nrows_data,
             hspace=0.5,
             top=1.0 - _GRID_TOP_MARGIN_IN / fig_h,
-            bottom=_GRID_BOTTOM_MARGIN_IN / fig_h,
+            bottom=legend_margin_in / fig_h,
         )
 
         for r, col_y_val in enumerate(col_y_vals):
@@ -379,10 +394,10 @@ def _plot_page_grouped_class_proportions_2d_grid(
 
         title_str = f"Grouped Track-Class Proportions — {group_label_title}"
 
-    legend_handles, legend_labels = _class_legend_handles(class_order, class_colors)
+    legend_handles, legend_labels = _class_legend_handles(list(reversed(class_order)), class_colors)
     fig.legend(
         handles=legend_handles, labels=legend_labels,
-        loc="lower center", ncol=min(len(legend_labels), 8), frameon=False, fontsize=7,
+        loc="lower center", ncol=legend_ncol, frameon=False, fontsize=7,
     )
     fig.suptitle(title_str, y=0.99, fontsize=10, fontweight="bold", wrap=True)
     return fig
@@ -408,9 +423,10 @@ def _plot_page_grouped_class_proportions_flat_grid(
     ncols = max(1, int(grid_ncols))
     nrows = max(1, int(np.ceil(float(len(groups)) / float(ncols))))
     panel_h_in = panel_w_in * _GRID_PANEL_ASPECT
+    legend_ncol, _, legend_margin_in = legend_layout(len(class_order), base_margin_in=_GRID_BOTTOM_MARGIN_IN)
 
     fig_w = ncols * panel_w_in
-    fig_h = _GRID_TOP_MARGIN_IN + nrows * panel_h_in + _GRID_BOTTOM_MARGIN_IN
+    fig_h = _GRID_TOP_MARGIN_IN + nrows * panel_h_in + legend_margin_in
     fig = plt.figure(figsize=(fig_w, fig_h))
     outer = GridSpec(
         nrows=nrows,
@@ -419,7 +435,7 @@ def _plot_page_grouped_class_proportions_flat_grid(
         hspace=0.6,
         wspace=0.3,
         top=1.0 - _GRID_TOP_MARGIN_IN / fig_h,
-        bottom=_GRID_BOTTOM_MARGIN_IN / fig_h,
+        bottom=legend_margin_in / fig_h,
     )
 
     for i, grp in enumerate(groups):
@@ -430,10 +446,10 @@ def _plot_page_grouped_class_proportions_flat_grid(
     for i in range(len(groups), nrows * ncols):
         fig.add_subplot(outer[i]).axis("off")
 
-    legend_handles, legend_labels = _class_legend_handles(class_order, class_colors)
+    legend_handles, legend_labels = _class_legend_handles(list(reversed(class_order)), class_colors)
     fig.legend(
         handles=legend_handles, labels=legend_labels,
-        loc="lower center", ncol=min(len(legend_labels), 8), frameon=False, fontsize=7,
+        loc="lower center", ncol=legend_ncol, frameon=False, fontsize=7,
     )
     fig.suptitle(
         f"Grouped Track-Class Proportions — {group_label_title}",
@@ -468,6 +484,7 @@ def _plot_page_class_stack_grid(
     """
     panel_w_in = panel_w_in if panel_w_in is not None else max(0.45 * len(class_order), _STACK_GRID_MIN_PANEL_W_IN)
     panel_h_in = _STACK_GRID_PANEL_H_IN
+    legend_ncol, _, legend_margin_in = legend_layout(len(stack_order), base_margin_in=_STACK_GRID_BOTTOM_MARGIN_IN)
 
     if len(facet_cols) == 2:
         if axis_cols is not None:
@@ -481,7 +498,7 @@ def _plot_page_class_stack_grid(
         ncols_data = max(1, len(col_x_vals))
 
         fig_w = _GRID_HEADER_W_IN + ncols_data * panel_w_in
-        fig_h = _GRID_TOP_MARGIN_IN + _GRID_HEADER_H_IN + nrows_data * panel_h_in + _STACK_GRID_BOTTOM_MARGIN_IN
+        fig_h = _GRID_TOP_MARGIN_IN + _GRID_HEADER_H_IN + nrows_data * panel_h_in + legend_margin_in
         fig = plt.figure(figsize=(fig_w, fig_h))
         outer = GridSpec(
             nrows=nrows_data + 1,
@@ -492,7 +509,7 @@ def _plot_page_class_stack_grid(
             hspace=1.1,
             wspace=0.35,
             top=1.0 - _GRID_TOP_MARGIN_IN / fig_h,
-            bottom=_STACK_GRID_BOTTOM_MARGIN_IN / fig_h,
+            bottom=legend_margin_in / fig_h,
         )
 
         ax_corner = fig.add_subplot(outer[0, 0])
@@ -539,7 +556,7 @@ def _plot_page_class_stack_grid(
         nrows_data = max(1, len(col_y_vals))
 
         fig_w = max(panel_w_in, _STACK_GRID_MIN_PANEL_W_IN)
-        fig_h = _GRID_TOP_MARGIN_IN + nrows_data * panel_h_in + _STACK_GRID_BOTTOM_MARGIN_IN
+        fig_h = _GRID_TOP_MARGIN_IN + nrows_data * panel_h_in + legend_margin_in
         fig = plt.figure(figsize=(fig_w, fig_h))
         outer = GridSpec(
             nrows=nrows_data,
@@ -548,7 +565,7 @@ def _plot_page_class_stack_grid(
             height_ratios=[panel_h_in] * nrows_data,
             hspace=1.1,
             top=1.0 - _GRID_TOP_MARGIN_IN / fig_h,
-            bottom=_STACK_GRID_BOTTOM_MARGIN_IN / fig_h,
+            bottom=legend_margin_in / fig_h,
         )
 
         for r, col_y_val in enumerate(col_y_vals):
@@ -565,10 +582,10 @@ def _plot_page_class_stack_grid(
 
         title_str = f"{title} — {col_y}"
 
-    legend_handles, legend_labels = _class_legend_handles(stack_order, colors)
+    legend_handles, legend_labels = _class_legend_handles(list(reversed(stack_order)), colors)
     fig.legend(
         handles=legend_handles, labels=legend_labels,
-        loc="lower center", ncol=min(len(legend_labels), 8), frameon=False, fontsize=7,
+        loc="lower center", ncol=legend_ncol, frameon=False, fontsize=7,
     )
     fig.suptitle(title_str, y=0.99, fontsize=10, fontweight="bold", wrap=True)
     return fig
@@ -578,16 +595,18 @@ def _plot_single_class_stack_panel(props_df, *, class_order, stack_order, colors
     """A single vertical stacked-bar panel (no facet grid) — used when only page-pooling
     columns are selected (no group_x/group_y), so each page is one plain bar chart."""
     panel_w_in = max(0.45 * len(class_order), 4.0)
-    fig, ax = plt.subplots(figsize=(panel_w_in, 4.2))
+    legend_ncol, _, legend_margin_in = legend_layout(len(stack_order), base_margin_in=0.42)
+    fig_h = 3.78 + legend_margin_in
+    fig, ax = plt.subplots(figsize=(panel_w_in, fig_h))
     draw_stacked_proportion_barv(ax, props_df, class_order, stack_order, colors, ymax=1.0, xtick_fontsize=8)
     ax.set_ylabel("Proportion")
-    legend_handles, legend_labels = _class_legend_handles(stack_order, colors)
+    legend_handles, legend_labels = _class_legend_handles(list(reversed(stack_order)), colors)
     fig.legend(
         handles=legend_handles, labels=legend_labels,
-        loc="lower center", ncol=len(legend_labels), frameon=False, fontsize=8,
+        loc="lower center", ncol=legend_ncol, frameon=False, fontsize=8,
     )
     fig.suptitle(title, fontsize=11, fontweight="bold", wrap=True)
-    fig.tight_layout(rect=(0.0, 0.1, 1.0, 0.92))
+    fig.tight_layout(rect=(0.0, legend_margin_in / fig_h, 1.0, 0.92))
     return fig
 
 
@@ -978,9 +997,9 @@ def save_track_condition_comparison_report(
         resolved_class_order = [str(c) for c in class_order]
     else:
         resolved_class_order = sorted(df[class_col].dropna().unique().tolist(), key=_mixed_label_sort_key)
-        resolved_class_order = _apply_state_order(
-            resolved_class_order, _get_classification_state_order(adata_tracks, class_col)
-        )
+    resolved_class_order = _apply_state_order(
+        resolved_class_order, _get_classification_state_order(adata_tracks, class_col)
+    )
 
     proportions_by_sample, _, _ = _compute_grouped_class_proportions(
         df, group_cols=[sample_col], class_col=class_col, class_order=resolved_class_order,
@@ -1146,7 +1165,7 @@ def save_track_contact_group_analysis(
             group_x=group_x,
             group_y=group_y,
             group_cols=list(extra_group_cols),
-            class_order=class_order,
+            class_order=resolved_class_order,
             class_colors=class_colors,
             verbose=verbose,
             pdf_pages=pdf,
@@ -1219,6 +1238,18 @@ def generate_track_clustering_report_pdfs(
 
     if cluster_key not in adata_tracks.obs.columns:
         raise ValueError(f"Missing '{cluster_key}' in adata_tracks.obs.")
+
+    resolved_order = _apply_state_order(
+        sorted(adata_tracks.obs[cluster_key].astype(str).unique().tolist(), key=_mixed_label_sort_key),
+        _get_classification_state_order(adata_tracks, cluster_key),
+    )
+    adata_tracks.obs[cluster_key] = pd.Categorical(
+        adata_tracks.obs[cluster_key].astype(str), categories=resolved_order,
+    )
+    resolved_colors = _normalize_label_color_map(
+        resolved_order, colors=_get_classification_state_colors(adata_tracks, cluster_key),
+    )
+    adata_tracks.uns[f"{cluster_key}_colors"] = [resolved_colors[c] for c in resolved_order]
 
     if "X_umap" not in adata_tracks.obsm:
         sc.tl.umap(adata_tracks, random_state=0)
@@ -1304,7 +1335,12 @@ def generate_track_clustering_report_pdfs(
         pdf.savefig(fig, dpi=int(plot_dpi), bbox_inches="tight")
         plt.close(fig)
 
-        fig = _plot_cluster_rankings(adata_tracks=adata_tracks, cluster_key=cluster_key)
+        fig = _plot_cluster_rankings(
+            adata_tracks=adata_tracks,
+            cluster_key=cluster_key,
+            cluster_order=resolved_order,
+            cluster_colors=resolved_colors,
+        )
         _apply_best_pdf_orientation(fig, default_orientation="landscape")
         pdf.savefig(fig, dpi=int(plot_dpi), bbox_inches="tight")
         plt.close(fig)
