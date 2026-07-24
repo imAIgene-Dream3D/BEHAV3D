@@ -62,6 +62,7 @@ from behav3d.analysis.behavior.track.visualization.plots.reports import (
 )
 from behav3d.analysis.behavior.track.visualization.plots.contact_state_shift_report import (
     save_track_contact_state_shift_report,
+    save_track_contact_overview_report,
 )
 from behav3d.analysis.behavior.track.contact_grouping import list_available_contact_columns
 from behav3d.analysis.behavior.track.utils import (
@@ -458,6 +459,19 @@ class TrackClassificationPanel:
         self.contact_state_shift_spinner = widgets.HTML(value=spinning_loader)
         self.contact_state_shift_spinner.layout.display = "none"
 
+        self.track_overview_rows_per_page = widgets.IntText(
+            description="Tracks per page:", value=6,
+            style={"description_width": "130px"}, layout=widgets.Layout(width="360px"),
+        )
+        self.btn_track_contact_overview = widgets.Button(
+            description="Create track contact overview",
+            button_style="info",
+            layout=widgets.Layout(width="280px"),
+            disabled=True,
+        )
+        self.track_contact_overview_spinner = widgets.HTML(value=spinning_loader)
+        self.track_contact_overview_spinner.layout.display = "none"
+
         self.run_section = widgets.VBox(
             [
                 self.state_col_html,
@@ -556,16 +570,28 @@ class TrackClassificationPanel:
                 "Compares each track's behavioral-state composition before vs. after its first "
                 "sufficiently long contact bout (contact tracks; uses the same 'Min. contiguous "
                 "contact bout' setting above), against a timing-matched null before/after split "
-                "for no-contact tracks."
+                "for no-contact tracks. 'Track contact overview' instead plots each contact "
+                "track's full, untrimmed state trajectory with a grey/green bar marking every "
+                "qualifying contact bout, grouped into pages by sample."
             ),
-            run_row=widgets.HBox(
-                [self.btn_contact_state_shift, self.contact_state_shift_spinner],
-                layout=widgets.Layout(gap="8px"),
+            run_row=widgets.VBox(
+                [
+                    widgets.HBox(
+                        [self.btn_contact_state_shift, self.contact_state_shift_spinner],
+                        layout=widgets.Layout(gap="8px"),
+                    ),
+                    widgets.HBox(
+                        [self.btn_track_contact_overview, self.track_contact_overview_spinner],
+                        layout=widgets.Layout(gap="8px"),
+                    ),
+                ],
+                layout=widgets.Layout(gap="6px"),
             ),
             settings=[
                 self.contact_shift_window_mode_dd,
                 self.contact_shift_window_length,
                 self.contact_shift_state_col_dd,
+                self.track_overview_rows_per_page,
             ],
         )
         exemplar_box = build_plot_box(
@@ -848,6 +874,7 @@ class TrackClassificationPanel:
         self.btn_track_proportions.on_click(self._on_track_proportions_clicked)
         self.btn_contact_analysis.on_click(self._on_contact_analysis_clicked)
         self.btn_contact_state_shift.on_click(self._on_contact_state_shift_clicked)
+        self.btn_track_contact_overview.on_click(self._on_track_contact_overview_clicked)
         self.btn_exemplars.on_click(self._on_exemplars_clicked)
         self.make_overview_statebars.observe(self._on_exemplar_output_changed, names="value")
         self.make_backprojection_pdf.observe(self._on_exemplar_output_changed, names="value")
@@ -1313,6 +1340,9 @@ class TrackClassificationPanel:
         self.contact_col_dd.disabled = len(contact_columns) == 0
         self.btn_contact_analysis.disabled = len(contact_columns) == 0 or not model_path.exists()
         self.btn_contact_state_shift.disabled = (
+            len(contact_columns) == 0 or not model_path.exists() or not self._has_behavioral_states()
+        )
+        self.btn_track_contact_overview.disabled = (
             len(contact_columns) == 0 or not model_path.exists() or not self._has_behavioral_states()
         )
         if bool(self.use_original_behav3d.value):
@@ -2130,6 +2160,60 @@ class TrackClassificationPanel:
                 traceback.print_exc()
             finally:
                 self._set_busy(self.btn_contact_state_shift, self.contact_state_shift_spinner, busy=False)
+
+    def _on_track_contact_overview_clicked(self, _):
+        self._set_busy(self.btn_track_contact_overview, self.track_contact_overview_spinner, busy=True)
+        self.out_plots.clear_output()
+        with self.out_plots:
+            try:
+                if bool(self.use_original_behav3d.value):
+                    raise ValueError(
+                        "Track contact overview is only available for the one-hot dtaidistance method."
+                    )
+                contact_col = self.contact_col_dd.value
+                if not contact_col:
+                    raise ValueError("Select a contact column to analyze.")
+                min_bout_length = int(self.contact_min_bout_length.value)
+                if min_bout_length < 1:
+                    raise ValueError("Min. contiguous contact bout must be at least 1 timepoint.")
+                if not self._has_behavioral_states():
+                    raise FileNotFoundError(
+                        "Behavioral states h5ad not found. Run State Classification first."
+                    )
+                rows_per_page = int(self.track_overview_rows_per_page.value)
+                if rows_per_page < 1:
+                    raise ValueError("Tracks per page must be at least 1.")
+
+                state_col_choice = self.contact_shift_state_col_dd.value
+                state_col = (
+                    FULL_STATE_COL if state_col_choice == "full_behavioral_cluster" else state_col_choice
+                )
+                adata_tracks = self._load_model_adata()
+                df_timepoints = pd.read_csv(self._original_track_features_path())
+                full_adata = ad.read_h5ad(str(self._state_adata_path()))
+                paths = _resolve_dtaidistance_paths(self.output_dir, self._current_cell_type())
+                result = save_track_contact_overview_report(
+                    adata_tracks,
+                    df_timepoints,
+                    full_adata,
+                    paths["outfolder"],
+                    contact_col=contact_col,
+                    min_bout_length=min_bout_length,
+                    state_col=state_col,
+                    rows_per_page=rows_per_page,
+                    verbose=True,
+                )
+                self.plot_status_html.value = (
+                    "<b>Track contact overview ready:</b> plot was written."
+                )
+                _winfo(
+                    "trajectory-dtai-widget",
+                    f"Created track contact overview: {result.get('pdf_path')}",
+                )
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self._set_busy(self.btn_track_contact_overview, self.track_contact_overview_spinner, busy=False)
 
     def _on_exemplars_clicked(self, _):
         self._set_busy(self.btn_exemplars, self.exemplar_spinner, busy=True)

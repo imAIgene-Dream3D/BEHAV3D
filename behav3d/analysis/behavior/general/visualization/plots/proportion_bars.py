@@ -228,8 +228,12 @@ def plot_page_stacked_proportion_barh_grid(
     return fig
 
 
+SIGNIFICANCE_LEGEND_TEXT = "n.s. p≥0.05    * p<0.05    ** p<0.01    *** p<0.001    **** p<0.0001"
+
+
 def welch_ttest_stars(p_value):
-    """'' if p is NaN/>=0.05, else '*' p<0.05, '**' p<0.01, '***' p<0.001, '****' p<0.0001."""
+    """'' if p is NaN (test not run, e.g. too few samples), 'n.s.' if p>=0.05, else '*' p<0.05,
+    '**' p<0.01, '***' p<0.001, '****' p<0.0001."""
     if p_value is None or not np.isfinite(p_value):
         return ""
     if p_value < 1e-4:
@@ -240,7 +244,14 @@ def welch_ttest_stars(p_value):
         return "**"
     if p_value < 5e-2:
         return "*"
-    return ""
+    return "n.s."
+
+
+def add_significance_legend(fig, *, y=0.005, fontsize=7):
+    """Draw the shared star-notation legend ('n.s.'/'*'/'**'/'***'/'****' thresholds) centered
+    near the bottom of `fig`, so every panel using `welch_ttest_stars` stays self-explanatory
+    even when nothing is significant."""
+    fig.text(0.5, y, SIGNIFICANCE_LEGEND_TEXT, ha="center", va="bottom", fontsize=fontsize)
 
 
 def _welch_diff_rows(class_order, vals_a_panel, vals_b_panel):
@@ -468,7 +479,8 @@ def plot_condition_diff_grid(
                     long_rows.append(df_long)
 
             fig.suptitle(title, fontsize=11, fontweight="bold", y=0.99)
-            fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+            add_significance_legend(fig)
+            fig.tight_layout(rect=(0.0, 0.02, 1.0, 0.95))
             pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
 
@@ -622,7 +634,8 @@ def plot_condition_diff_grid_2d(
             if page_key != "(all)":
                 page_title += f" ({', '.join(extra_group_cols)}: {page_key})"
             fig.suptitle(page_title, fontsize=11, fontweight="bold", y=0.99)
-            fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+            add_significance_legend(fig)
+            fig.tight_layout(rect=(0.0, 0.02, 1.0, 0.95))
             pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
 

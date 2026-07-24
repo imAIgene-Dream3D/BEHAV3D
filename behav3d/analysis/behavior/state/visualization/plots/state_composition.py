@@ -287,7 +287,7 @@ def _prepare_state_composition_df(
     return df, state_order, sample_order
 
 
-def _compute_relative_matrix(panel_df, *, time_col, state_col, state_order):
+def compute_relative_state_time_matrix(panel_df, *, time_col, state_col, state_order):
     """Build relative state-composition matrix (time x state) for a panel."""
     mat = (
         panel_df.groupby([time_col, state_col], observed=True)
@@ -316,14 +316,14 @@ def _compute_relative_matrices_by_sample(
     relative_by_sample = {}
     for sample in sample_order:
         panel = df[df[sample_col] == sample]
-        relative_by_sample[str(sample)] = _compute_relative_matrix(
+        relative_by_sample[str(sample)] = compute_relative_state_time_matrix(
             panel,
             time_col=time_col,
             state_col=state_col,
             state_order=state_order,
         )
 
-    relative_pooled = _compute_relative_matrix(
+    relative_pooled = compute_relative_state_time_matrix(
         df,
         time_col=time_col,
         state_col=state_col,
@@ -870,7 +870,7 @@ def _compute_grouped_relative_matrices(
     overall_by_group = {}
     for grp in unique_groups:
         panel = tmp[tmp["_group_label"] == grp]
-        relative_by_group[str(grp)] = _compute_relative_matrix(
+        relative_by_group[str(grp)] = compute_relative_state_time_matrix(
             panel,
             time_col=time_col,
             state_col=state_col,

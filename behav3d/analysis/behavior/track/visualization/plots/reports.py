@@ -1001,13 +1001,24 @@ def save_track_condition_comparison_report(
         resolved_class_order, _get_classification_state_order(adata_tracks, class_col)
     )
 
-    proportions_by_sample, _, _ = _compute_grouped_class_proportions(
-        df, group_cols=[sample_col], class_col=class_col, class_order=resolved_class_order,
-    )
-    per_sample_df = pd.DataFrame(proportions_by_sample).T.reindex(columns=resolved_class_order, fill_value=0.0)
+    # The unit compared below is (sample, condition_col level), not the sample alone.
+    # condition_col is usually constant within a sample (e.g. a per-well treatment), in which
+    # case this is a no-op relabeling. But for a contact/no_contact style grouping, condition_col
+    # is a per-track tag that varies *within* a sample. Collapsing straight to one row per sample
+    # would arbitrarily keep whichever level happened to appear first and silently leave a single
+    # degenerate condition level with zero pairs left to compare (empty report). Using this
+    # composite unit lets a sample that contains multiple condition levels contribute one row per
+    # level. Mirrors the same fix in state_composition.save_state_condition_comparison_report.
+    unit_col = "__comparison_unit__"
+    df[unit_col] = df[sample_col] + " | " + df[condition_col]
 
-    metadata_cols = [sample_col, condition_col] + valid_group_cols
-    sample_metadata = df[metadata_cols].drop_duplicates(subset=[sample_col]).set_index(sample_col)
+    proportions_by_unit, _, _ = _compute_grouped_class_proportions(
+        df, group_cols=[unit_col], class_col=class_col, class_order=resolved_class_order,
+    )
+    per_sample_df = pd.DataFrame(proportions_by_unit).T.reindex(columns=resolved_class_order, fill_value=0.0)
+
+    metadata_cols = [unit_col, condition_col] + valid_group_cols
+    sample_metadata = df[metadata_cols].drop_duplicates(subset=[unit_col]).set_index(unit_col)
 
     resolved_colors = dict(class_colors) if class_colors else _get_classification_state_colors(adata_tracks, class_col)
     resolved_colors = _normalize_label_color_map(resolved_class_order, colors=resolved_colors, cmap_name="tab20")
