@@ -3169,6 +3169,25 @@ class TrackClassificationSubTab(QWidget):
         shift_row.addWidget(self.btn_view_contact_state_shift)
         g_contact.addLayout(shift_row)
 
+        g_contact.addWidget(QLabel(
+            "Track contact overview (full state trajectory + contact-bout markers, one page per sample):"
+        ))
+        overview_form = QFormLayout()
+        overview_form.setSpacing(3)
+        self.spin_track_overview_rows_per_page = QSpinBox()
+        self.spin_track_overview_rows_per_page.setRange(1, 100)
+        self.spin_track_overview_rows_per_page.setValue(6)
+        self.spin_track_overview_rows_per_page.setMaximumWidth(100)
+        overview_form.addRow("Tracks per page:", self.spin_track_overview_rows_per_page)
+        g_contact.addLayout(overview_form)
+        overview_row = QHBoxLayout()
+        self.btn_track_contact_overview = QPushButton("▶ Create Track Contact Overview")
+        _style_secondary(self.btn_track_contact_overview)
+        overview_row.addWidget(self.btn_track_contact_overview, stretch=1)
+        self.btn_view_track_contact_overview = _make_view_btn()
+        overview_row.addWidget(self.btn_view_track_contact_overview)
+        g_contact.addLayout(overview_row)
+
         self.grp_exemplar = QGroupBox("Exemplar Tracks")
         g_exemplar = QVBoxLayout(self.grp_exemplar)
         g_exemplar.setSpacing(4)
@@ -3378,6 +3397,8 @@ class TrackClassificationSubTab(QWidget):
         self.btn_view_contact_analysis.clicked.connect(lambda: self._on_view("contact_analysis"))
         self.btn_contact_state_shift.clicked.connect(self._on_contact_state_shift_analysis)
         self.btn_view_contact_state_shift.clicked.connect(lambda: self._on_view("contact_state_shift"))
+        self.btn_track_contact_overview.clicked.connect(self._on_track_contact_overview)
+        self.btn_view_track_contact_overview.clicked.connect(lambda: self._on_view("track_contact_overview"))
         self.btn_browse_pretrained_clf.clicked.connect(self._browse_pretrained_clf)
         self.btn_browse_pretrained_states.clicked.connect(self._browse_pretrained_states)
         self.btn_run_apply_pretrained.clicked.connect(self._on_apply_pretrained)
@@ -4017,6 +4038,9 @@ class TrackClassificationSubTab(QWidget):
         self.btn_contact_state_shift.setEnabled(
             len(contact_cols) > 0 and self._track_adata is not None and has_states
         )
+        self.btn_track_contact_overview.setEnabled(
+            len(contact_cols) > 0 and self._track_adata is not None and has_states
+        )
 
     def _update_view_buttons(self):
         ct = self._cell_type()
@@ -4026,7 +4050,7 @@ class TrackClassificationSubTab(QWidget):
                 self.btn_view_apply_track, self.btn_view_exemplars,
                 self.btn_view_diagnostics, self.btn_view_track_proportions,
                 self.btn_view_track_condition_comparison, self.btn_view_contact_analysis,
-                self.btn_view_contact_state_shift,
+                self.btn_view_contact_state_shift, self.btn_view_track_contact_overview,
             ):
                 btn.setEnabled(False)
             return
@@ -4074,6 +4098,13 @@ class TrackClassificationSubTab(QWidget):
                 contact_dir
                 and contact_dir.exists()
                 and any(contact_dir.glob("*/contact_state_shift.pdf"))
+            )
+        )
+        self.btn_view_track_contact_overview.setEnabled(
+            bool(
+                contact_dir
+                and contact_dir.exists()
+                and any(contact_dir.glob("*/track_contact_overview.pdf"))
             )
         )
 
@@ -5116,6 +5147,77 @@ class TrackClassificationSubTab(QWidget):
             on_failed=lambda e: self._log(f"❌ Contact state-shift analysis failed: {e}"),
         )
 
+    def _on_track_contact_overview(self):
+        ct = self._cell_type()
+        if not ct:
+            return
+        if self._track_adata is None:
+            QMessageBox.warning(self, "No data", "Run track clustering first.")
+            return
+        if self._bg.is_running():
+            QMessageBox.warning(self, "Busy", "Another operation is running.")
+            return
+        contact_col = self.combo_contact_col.currentText()
+        if not contact_col:
+            QMessageBox.warning(self, "Missing selection", "Select a contact column to analyze.")
+            return
+        state_adata_path = self._state_adata_path(ct)
+        if not state_adata_path or not state_adata_path.exists():
+            QMessageBox.warning(
+                self, "No data",
+                "Behavioral states h5ad not found. Run State Classification first.",
+            )
+            return
+        csv_path = self._track_features_csv_path(ct)
+        if not csv_path or not csv_path.exists():
+            QMessageBox.warning(self, "No data", "Track-features CSV not found. Run feature extraction first.")
+            return
+        min_bout_length = int(self.spin_contact_min_bout.value())
+        state_col_choice = self.combo_contact_shift_state_col.currentText()
+        rows_per_page = int(self.spin_track_overview_rows_per_page.value())
+        out = self._out_dir()
+        track_adata = self._track_adata
+        self._log(f"▶ Creating track contact overview for '{ct}'…")
+
+        def _run(**kw):
+            import pandas as pd
+            import anndata as _ad
+            from behav3d.analysis.behavior.state.classification import FULL_STATE_COL
+            from behav3d.analysis.behavior.track.utils import _resolve_dtaidistance_paths
+            from behav3d.analysis.behavior.track.visualization.plots.contact_state_shift_report import (
+                save_track_contact_overview_report,
+            )
+            state_col = FULL_STATE_COL if state_col_choice == "full_behavioral_cluster" else state_col_choice
+            full_adata = _ad.read_h5ad(str(state_adata_path))
+            df_timepoints = pd.read_csv(csv_path)
+            contact_dir = _resolve_dtaidistance_paths(str(out) if out else "", ct)["outfolder"]
+            return save_track_contact_overview_report(
+                track_adata,
+                df_timepoints,
+                full_adata,
+                contact_dir,
+                contact_col=contact_col,
+                min_bout_length=min_bout_length,
+                state_col=state_col,
+                rows_per_page=rows_per_page,
+                verbose=True,
+            )
+
+        self._bg.run(
+            fn=_run,
+            desc=f"Track contact overview ({ct})…",
+            progress_row=self.progress_row,
+            buttons=[self.btn_track_contact_overview],
+            viewer=self.viewer,
+            inject_progress=False,
+            on_done=lambda r: (
+                self._log(f"✅ Track contact overview done for '{ct}'."),
+                self._update_view_buttons(),
+                self._notify_results(),
+            ),
+            on_failed=lambda e: self._log(f"❌ Track contact overview failed: {e}"),
+        )
+
     # ── Backprojection ───────────────────────────────────────────────────
 
     def _on_bp_layer_display_changed(self, event=None):
@@ -5362,6 +5464,12 @@ class TrackClassificationSubTab(QWidget):
             candidates = [
                 (f.parent.name, f)
                 for f in sorted(contact_dir.glob("*/contact_state_shift.pdf"))
+            ]
+        elif kind == "track_contact_overview" and traj_dir:
+            contact_dir = traj_dir / "contact_analysis"
+            candidates = [
+                (f.parent.name, f)
+                for f in sorted(contact_dir.glob("*/track_contact_overview.pdf"))
             ]
 
         existing = [(lbl, p) for lbl, p in candidates if p and p.exists()]

@@ -548,34 +548,19 @@ class TrackClassificationPanel:
                 "Groups tracks by whether they had a sufficiently long contiguous bout of contact "
                 "with another cell type ('contact' vs 'no_contact'), then writes cluster proportions "
                 "for each group (and the reverse view), a condition-comparison report between the two "
-                "groups, and violin plots of mean contact fraction / max contact-bout length per cluster."
-            ),
-            run_row=widgets.HBox(
-                [self.btn_contact_analysis, self.contact_analysis_spinner],
-                layout=widgets.Layout(gap="8px"),
-            ),
-            settings=[
-                self.contact_col_dd,
-                self.contact_min_bout_length,
-                self.contact_group_cols_html,
-                self.contact_group_x_dd,
-                self.contact_group_y_dd,
-                widgets.HTML("<span style='color:#555;font-size:11px;'>Group per page:</span>"),
-                self.contact_group_cols_select,
-            ],
-        )
-        contact_state_shift_box = build_plot_box(
-            title="Contact state-shift analysis",
-            description=(
-                "Compares each track's behavioral-state composition before vs. after its first "
-                "sufficiently long contact bout (contact tracks; uses the same 'Min. contiguous "
-                "contact bout' setting above), against a timing-matched null before/after split "
-                "for no-contact tracks. 'Track contact overview' instead plots each contact "
-                "track's full, untrimmed state trajectory with a grey/green bar marking every "
-                "qualifying contact bout, grouped into pages by sample."
+                "groups, and violin plots of mean contact fraction / max contact-bout length per cluster. "
+                "'Run contact state-shift analysis' compares each track's behavioral-state composition "
+                "before vs. after its first sufficiently long contact bout (contact tracks), against a "
+                "timing-matched null before/after split for no-contact tracks. 'Create track contact "
+                "overview' plots each contact track's full, untrimmed state trajectory with a grey/green "
+                "bar marking every qualifying contact bout, grouped into pages by sample."
             ),
             run_row=widgets.VBox(
                 [
+                    widgets.HBox(
+                        [self.btn_contact_analysis, self.contact_analysis_spinner],
+                        layout=widgets.Layout(gap="8px"),
+                    ),
                     widgets.HBox(
                         [self.btn_contact_state_shift, self.contact_state_shift_spinner],
                         layout=widgets.Layout(gap="8px"),
@@ -588,6 +573,13 @@ class TrackClassificationPanel:
                 layout=widgets.Layout(gap="6px"),
             ),
             settings=[
+                self.contact_col_dd,
+                self.contact_min_bout_length,
+                self.contact_group_cols_html,
+                self.contact_group_x_dd,
+                self.contact_group_y_dd,
+                widgets.HTML("<span style='color:#555;font-size:11px;'>Group per page:</span>"),
+                self.contact_group_cols_select,
                 self.contact_shift_window_mode_dd,
                 self.contact_shift_window_length,
                 self.contact_shift_state_col_dd,
@@ -618,7 +610,6 @@ class TrackClassificationPanel:
                 track_proportions_box,
                 track_condition_comparison_box,
                 contact_group_box,
-                contact_state_shift_box,
                 exemplar_box,
                 self.out_plots,
             ],

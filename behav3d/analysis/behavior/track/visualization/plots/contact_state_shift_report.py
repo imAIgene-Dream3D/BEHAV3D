@@ -308,9 +308,15 @@ def _compute_contact_bar_segments(times, is_contact, min_bout_length):
 
 def _plot_track_contact_overview_page(page_rows, *, sample_name, contact_col, min_bout_length):
     """One PDF page: each track gets its state-over-time bar (top) with the matching contact bar
-    (bottom, grey/green) directly underneath, sharing the same time axis.
+    (bottom, grey/green) directly underneath. All rows share one page-wide time axis (rather than
+    each track being independently stretched to the same width), so a track's bar width in the
+    page reflects its actual duration relative to the other tracks on that page.
     """
     n = len(page_rows)
+    page_xlim = (
+        min(r["xlim"][0] for r in page_rows),
+        max(r["xlim"][1] for r in page_rows),
+    )
     fig = plt.figure(figsize=(11.0, max(2.4, 1.7 * n)))
     outer = fig.add_gridspec(nrows=n, ncols=1, hspace=0.75, top=0.90, bottom=0.10)
 
@@ -322,7 +328,7 @@ def _plot_track_contact_overview_page(page_rows, *, sample_name, contact_col, mi
         _plot_statebar_segments_on_ax(
             ax_state,
             segments=row_data["state_segments"],
-            xlim=row_data["xlim"],
+            xlim=page_xlim,
             title=f"{row_data['sample_name']} | Track {row_data['track_id']}",
         )
         ax_state.set_xlabel("")
@@ -330,7 +336,7 @@ def _plot_track_contact_overview_page(page_rows, *, sample_name, contact_col, mi
 
         for start, width, color in row_data["contact_segments"]:
             ax_contact.broken_barh([(start, width)], (0.0, 1.0), facecolors=color)
-        ax_contact.set_xlim(*row_data["xlim"])
+        ax_contact.set_xlim(*page_xlim)
         ax_contact.set_ylim(0.0, 1.0)
         ax_contact.set_yticks([])
         ax_contact.set_xlabel("position_t", fontsize=8)
