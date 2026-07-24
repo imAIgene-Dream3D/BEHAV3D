@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 
-KNOWLEDGE_VERSION = "2026.07.24.23"
+KNOWLEDGE_VERSION = "2026.07.24.24"
 
 
 GUIDANCE_CARDS = {
@@ -185,7 +185,12 @@ GUIDANCE_CARDS = {
     "feature_extraction": (
         "Select feature families for the biological question. Morphology is the most expensive and "
         "should be computed only when shape matters. Movement is fast and is the default family for "
-        "motility, but is usually unnecessary for organoids. Contact distance 0 means strict mask "
+        "motility, but is usually unnecessary for organoids. The live UI makes Intensity and Contact "
+        "mandatory for every population, Movement mandatory for immune/other populations, and Death "
+        "mandatory when a dead channel is configured. Intensity includes mean dead-dye and channel "
+        "intensities, so never suggest dropping it from T cells with a configured dead channel. Only "
+        "optional groups such as Morphology and Invasiveness should be presented as removable. "
+        "Contact distance 0 means strict mask "
         "touching; increase it only when proximity should count as contact. A positive distance equal "
         "to the XY pixel size permits a one-XY-pixel gap; it is not strict touching and is not a voxel "
         "diagonal. Any contact-distance "
@@ -196,16 +201,20 @@ GUIDANCE_CARDS = {
         "requiring tracks to be recomputed."
     ),
     "active_killing": (
-        "Active Killing scores an effector against one target type per run; when there are multiple "
-        "organoid types, run each separately. Observation window counts forward from contact and must "
+        "Active Killing accepts multiple selected targets in one setup. The implementation runs each "
+        "target independently and also creates a combined analysis when more than one target is selected. "
+        "Observation window counts forward from contact and must "
         "be calibrated to expected killing delay and the metadata time interval, not copied as a "
         "universal number. Dead-mask pixel count with an absolute increase threshold is the general "
         "default. Percentage is reasonable only when target sizes are comparable; mean dye intensity "
         "is useful for diffuse reporters or when no dead-mask segmentation exists. A multiplier is "
         "reserved for a single target line or heterogeneous baselines within one well and can be "
-        "biased across target lines with different baselines. Calibrate an absolute pixel threshold "
-        "from cell size and XY pixel size, then inspect it visually; do not reuse 20-30 pixels "
-        "blindly. Minimum contact duration must reflect imaging cadence and plausible biology."
+        "biased across target lines with different baselines. Calibrate an absolute dead-mask voxel "
+        "threshold from cell size and XY and Z sampling, then inspect it visually; do not reuse 20-30 "
+        "pixels blindly. Absolute-threshold mode is incomplete while its value is 0. When the user "
+        "accepts a proposed setup, include targets, signal, threshold mode and value, observation "
+        "window, and minimum contact duration in one proposal. Minimum contact duration must reflect "
+        "imaging cadence and plausible biology."
     ),
     "filtering": (
         "Filtering must be run even when every filter is disabled: it creates the downstream CSV and "
@@ -243,7 +252,13 @@ GUIDANCE_CARDS = {
         "only after inspecting a heavily right-skewed non-negative distribution; speed is a common "
         "zero-inflated example. Do not use percentile clipping routinely because it has degraded HMM "
         "results. Binary groups are applied post hoc to split HMM motion states; they are not HMM "
-        "inputs. Use fixed state selection because automatic selection has not performed well. Keep "
+        "inputs. For movement-only analysis, enumerate all movement columns available in the live "
+        "Timepoint features control and all rolling choices in Additional window features. These can "
+        "include speed, displacement, cumulative displacement, displacement from origin, directional "
+        "persistence, turning/reversal measures, net displacement, straightness, and mean square "
+        "displacement, depending on the loaded CSV. Never imply that the two currently selected "
+        "features are the complete list; offer the available choices before changing them. Use fixed "
+        "state selection because automatic selection has not performed well. Keep "
         "Start offset at 1 so the undefined first-frame speed does not make every track begin static. "
         "Name, order, and color states from the feature heatmap and per-state distributions in "
         "behavioral_clustering_diagnostics.pdf; those labels propagate to later reports."

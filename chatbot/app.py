@@ -46,7 +46,7 @@ _TOOL_NAMES = (
     "open_analysis_view",
 )
 _TOOL_NAME_PATTERN = "|".join(re.escape(name) for name in _TOOL_NAMES)
-CONTROL_CONTRACT_VERSION = "3.1"
+CONTROL_CONTRACT_VERSION = "3.2"
 _RESEARCHER_LABELS = {
     "pixel_distance_xy": "XY pixel size",
     "pixel_distance_z": "Z pixel size",
@@ -69,6 +69,20 @@ _RESEARCHER_LABELS = {
     "open_analysis_view": "open analysis view",
     "line_condition": "line and condition",
 }
+_MOVEMENT_FEATURE_NAMES = (
+    "displacement",
+    "cumulative_displacement",
+    "displacement_from_origin",
+    "mean_square_displacement",
+    "speed",
+    "mean_speed",
+    "summed_displacement",
+    "net_displacement",
+    "straightness",
+    "directional_persistence",
+    "median_turning_angle",
+    "fraction_reversed_movement",
+)
 
 
 def researcher_facing_text(text: str) -> str:
@@ -89,6 +103,26 @@ def split_researcher_stream_buffer(buffer: str, final: bool = False) -> tuple[st
         return "", buffer
     cutoff = whitespace[-1].end()
     return researcher_facing_text(buffer[:cutoff]), buffer[cutoff:]
+
+
+def _feature_label(value: str) -> str:
+    return str(value or "").replace("_", " ").strip().capitalize()
+
+
+def _previous_assistant_message(messages: list[dict]) -> str:
+    return next((
+        str(message.get("content") or "")
+        for message in reversed(messages[:-1])
+        if message.get("role") == "assistant"
+    ), "")
+
+
+def _visible_control_map(context: dict) -> dict[str, dict]:
+    return {
+        str(control.get("id") or ""): control
+        for control in ((context.get("ui_state", {}) or {}).get("controls", []) or [])
+        if control.get("id") and control.get("visible", True)
+    }
 
 
 def tools_for_context(tools: list[dict], context: dict) -> list[dict]:
@@ -1558,6 +1592,398 @@ def segmentation_minimum_size_action(
     return {"text": text, "calls": calls}
 
 
+def feature_group_requirement_guidance(
+    context: dict, messages: list[dict],
+) -> str | None:
+    """Explain mandatory feature groups before the model suggests removing one."""
+    if context.get("current_step") != "feature_extraction":
+        return None
+    latest = _latest_user_message(messages).lower()
+    if not (
+        re.search(r"\badjust\s+(?:the\s+)?(?:t[\s-]?cells?|tcell)", latest)
+        or re.search(r"\b(?:drop|remove|disable)\s+intensity\b", latest)
+        or (
+            "feature group" in latest
+            and any(word in latest for word in ("adjust", "review", "which", "keep"))
+        )
+    ):
+        return None
+
+    cell_type = str(context.get("active_cell_type") or "")
+    controls = _visible_control_map(context)
+    control = next((
+        item for control_id, item in controls.items()
+        if control_id == f"features.{cell_type}.feature_groups"
+    ), None)
+    if control is None:
+        return None
+    required = list(control.get("required_choices") or [])
+    if not required:
+        return None
+    choices = list(control.get("choices") or [])
+    optional = [choice for choice in choices if choice not in required]
+    required_text = ", ".join(_feature_label(item) for item in required)
+    optional_text = ", ".join(_feature_label(item) for item in optional) or "none"
+    dead_context = (
+        " Because a dead channel is configured, Death is also required. "
+        "Intensity is kept because it calculates channel intensities, including "
+        "mean dead-dye intensity for this population."
+        if "death" in required else
+        " Intensity remains required because it provides the channel-intensity "
+        "measurements used downstream."
+    )
+    return (
+        f"For **{cell_type or 'the selected cell type'}**, the live panel marks "
+        f"**{required_text}** as required, so I will not suggest removing them."
+        f"{dead_context} The optional groups are **{optional_text}**. Tell me which "
+        "optional groups matter to your biological question and I can adjust those."
+    )
+
+
+def _hmm_feature_controls(context: dict) -> dict[str, dict]:
+    if context.get("current_step") != "analysis":
+        return {}
+    analysis = context.get("analysis", {}) or {}
+    if analysis.get("view") != "behavioral_state":
+        return {}
+    cell_type = str(
+        analysis.get("selected_cell_type")
+        or context.get("active_cell_type")
+        or ""
+    )
+    prefix = f"analysis.state_classification.{cell_type or 'selected'}."
+    controls = _visible_control_map(context)
+    return {
+        suffix: controls[control_id]
+        for suffix in (
+            "timepoint_features", "window_features", "binary_feature_groups",
+        )
+        if (control_id := prefix + suffix) in controls
+    }
+
+
+def _movement_options(context: dict) -> dict[str, list[str]]:
+    controls = _hmm_feature_controls(context)
+    timepoint = controls.get("timepoint_features", {})
+    window = controls.get("window_features", {})
+    movement = set(_MOVEMENT_FEATURE_NAMES)
+    return {
+        "timepoint": [
+            str(choice) for choice in (timepoint.get("choices") or [])
+            if str(choice) in movement
+        ],
+        "window": [
+            str(choice) for choice in (window.get("choices") or [])
+            if str(choice) in movement
+        ],
+        "selected_timepoint": [
+            str(value) for value in (timepoint.get("value") or [])
+            if str(value) in movement
+        ],
+        "selected_window": [
+            str(value) for value in (window.get("value") or [])
+            if str(value) in movement
+        ],
+        "binary_available": [
+            str(choice)
+            for choice in (
+                controls.get("binary_feature_groups", {}).get("choices") or []
+            )
+        ],
+        "binary_selected": [
+            str(value)
+            for value in (
+                controls.get("binary_feature_groups", {}).get("value") or []
+            )
+        ],
+    }
+
+
+def hmm_movement_setup_action(
+    context: dict, messages: list[dict],
+) -> dict | None:
+    """Apply an explicit movement-feature choice across both HMM feature lists."""
+    controls = _hmm_feature_controls(context)
+    if not controls:
+        return None
+    latest = _latest_user_message(messages)
+    previous = _previous_assistant_message(messages)
+    if "available movement" not in previous.lower():
+        return None
+
+    options = _movement_options(context)
+    normalized = " ".join(latest.lower().replace("_", " ").split())
+    choose_all = bool(re.search(
+        r"\b(?:all|every)\b.*\bmovement\b|\buse all\b", normalized
+    ))
+    selected_timepoint = []
+    selected_window = []
+    if choose_all:
+        selected_timepoint = options["timepoint"]
+        selected_window = options["window"]
+    else:
+        for value in options["timepoint"]:
+            label = " ".join(value.lower().replace("_", " ").split())
+            if re.search(rf"\b{re.escape(label)}\b", normalized):
+                selected_timepoint.append(value)
+        for value in options["window"]:
+            label = " ".join(value.lower().replace("_", " ").split())
+            if re.search(rf"\b{re.escape(label)}\b", normalized):
+                selected_window.append(value)
+        if not selected_timepoint and not selected_window:
+            return None
+
+    calls = []
+    for suffix, values in (
+        ("timepoint_features", selected_timepoint),
+        ("window_features", selected_window),
+    ):
+        control = controls.get(suffix)
+        if control is not None and list(control.get("value") or []) != values:
+            calls.append({
+                "name": "set_ui_value",
+                "arguments": {"control_id": control["id"], "value": values},
+            })
+    timepoint_text = ", ".join(
+        _feature_label(value) for value in selected_timepoint
+    ) or "none"
+    window_text = ", ".join(
+        _feature_label(value) for value in selected_window
+    ) or "none"
+    binary_text = ", ".join(
+        _feature_label(value) for value in options["binary_selected"]
+    ) or "none"
+    return {
+        "text": (
+            "I am proposing the complete movement-only selection: timepoint "
+            f"features **{timepoint_text}** and window features **{window_text}**. "
+            f"The currently selected binary comparison groups are **{binary_text}**; "
+            "they stratify results after the HMM and do not train the states. "
+            + (
+                "Apply the action cards before running the analysis."
+                if calls else
+                "Those movement selections are already present, so no change is needed."
+            )
+        ),
+        "calls": calls,
+    }
+
+
+def hmm_movement_feature_guidance(
+    context: dict, messages: list[dict],
+) -> str | None:
+    """List every movement input available in the loaded HMM feature file."""
+    controls = _hmm_feature_controls(context)
+    if not controls:
+        return None
+    latest = _latest_user_message(messages).lower()
+    asks_movement = (
+        "movement feature" in latest
+        or "movement-only" in latest
+        or "only movement" in latest
+    )
+    asks_behavior_setup = (
+        "behavior" in latest
+        and any(word in latest for word in ("interaction", "contact", "tumor"))
+        and any(word in latest for word in ("fill", "set", "configure", "select"))
+    )
+    asks_selection_review = (
+        "all the features" in latest
+        or ("is it ready" in latest and "feature" in latest)
+    )
+    if not (asks_movement or asks_behavior_setup or asks_selection_review):
+        return None
+
+    options = _movement_options(context)
+    timepoint = ", ".join(
+        _feature_label(value) for value in options["timepoint"]
+    ) or "none found in the loaded feature file"
+    window = ", ".join(
+        _feature_label(value) for value in options["window"]
+    ) or "none available"
+    current_tp = ", ".join(
+        _feature_label(value) for value in options["selected_timepoint"]
+    ) or "none"
+    current_window = ", ".join(
+        _feature_label(value) for value in options["selected_window"]
+    ) or "none"
+    binary = ", ".join(
+        _feature_label(value) for value in options["binary_available"]
+    ) or "none detected"
+    return (
+        "The loaded T-cell feature file offers these **movement inputs**:\n\n"
+        f"- Per-timepoint features: **{timepoint}**\n"
+        f"- Rolling/window features: **{window}**\n\n"
+        f"Currently selected: per-timepoint **{current_tp}**; window "
+        f"**{current_window}**. Available binary comparison groups are "
+        f"**{binary}**. Binary contact groups are applied after the HMM, so they "
+        "compare state frequencies without defining the states. Choose the feature "
+        "names you want, or say **use all available movement features**, and I will "
+        "propose both feature lists together."
+    )
+
+
+def _number_from_proposal(text: str, patterns: tuple[str, ...]) -> float | None:
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            try:
+                return float(match.group(1))
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def active_killing_confirmation_action(
+    context: dict, messages: list[dict],
+) -> dict | None:
+    """Turn acceptance of a multi-field Active Killing proposal into one batch."""
+    if context.get("current_step") != "feature_extraction":
+        return None
+    latest = " ".join(_latest_user_message(messages).lower().split())
+    if not any(phrase in latest for phrase in (
+        "settings seem ok", "settings seem okay", "looks good", "apply them",
+        "apply these", "use those settings", "use these settings",
+        "yes set it up", "yes, set it up",
+    )):
+        return None
+    previous = _previous_assistant_message(messages)
+    if "active killing" not in previous.lower():
+        return None
+
+    controls = _visible_control_map(context)
+    expected: dict[str, object] = {}
+    by_suffix = {
+        suffix: controls.get(f"features.active_killing.{suffix}")
+        for suffix in (
+            "target_types", "observation_window", "death_signal",
+            "use_absolute_threshold", "absolute_threshold",
+            "minimum_contact_duration",
+        )
+    }
+    previous_lower = previous.lower()
+    target_control = by_suffix["target_types"]
+    if target_control is not None:
+        selected_targets = [
+            str(choice) for choice in (target_control.get("choices") or [])
+            if re.search(
+                rf"\b{re.escape(str(choice).lower())}\b", previous_lower
+            )
+        ]
+        if selected_targets:
+            expected["target_types"] = selected_targets
+
+    for label in (
+        "Dead-mask pixel count", "Dead-mask percentage",
+        "Mean dead-dye intensity",
+    ):
+        if label.lower() in previous_lower:
+            expected["death_signal"] = label
+            break
+
+    absolute_mode = "absolute threshold" in previous_lower
+    if absolute_mode:
+        expected["use_absolute_threshold"] = True
+        absolute_value = _number_from_proposal(previous, (
+            r"absolute (?:signal-increase )?threshold[^\d]{0,50}"
+            r"(\d+(?:\.\d+)?)\s*(?:dead[- ]mask |dead )?(?:pixels|voxels)",
+            r"minimum rise[^\d]{0,30}(\d+(?:\.\d+)?)\s*"
+            r"(?:dead[- ]mask |dead )?(?:pixels|voxels)",
+            r"(\d+(?:\.\d+)?)\s*(?:dead[- ]mask |dead )?(?:pixels|voxels)"
+            r"[^\n.]{0,35}(?:minimum|threshold|rise)",
+        ))
+        if absolute_value is None or absolute_value <= 0:
+            return {
+                "text": (
+                    "I have not applied a partial Active Killing setup. The agreed "
+                    "absolute-threshold mode still needs a positive minimum "
+                    "dead-mask pixel increase. Tell me that value, then I can propose "
+                    "the threshold, signal, timing, contact duration, and targets "
+                    "together."
+                ),
+                "calls": [],
+            }
+        expected["absolute_threshold"] = absolute_value
+
+    observation = _number_from_proposal(previous, (
+        r"observation window[^\d]{0,45}(\d+(?:\.\d+)?)\s*"
+        r"(?:timepoints?|frames?|tp)\b",
+        r"currently[^\n.]{0,25}(\d+(?:\.\d+)?)\s*"
+        r"(?:timepoints?|frames?|tp)\b",
+    ))
+    if observation is not None:
+        expected["observation_window"] = int(round(observation))
+    minimum_contact = _number_from_proposal(previous, (
+        r"(?:minimum|min\.?) contact duration[^\d]{0,45}"
+        r"(\d+(?:\.\d+)?)\s*(?:timepoints?|frames?|tp)\b",
+    ))
+    if minimum_contact is not None:
+        expected["minimum_contact_duration"] = int(round(minimum_contact))
+
+    calls = []
+    for suffix, value in expected.items():
+        control = by_suffix.get(suffix)
+        if control is not None:
+            calls.append({
+                "name": "set_ui_value",
+                "arguments": {"control_id": control["id"], "value": value},
+            })
+    if not calls:
+        return None
+    targets = expected.get("target_types") or (
+        target_control.get("value") if target_control else []
+    )
+    target_text = ", ".join(str(value) for value in targets) or "the selected targets"
+    return {
+        "text": (
+            "I am proposing the complete agreed Active Killing setup in one batch, "
+            f"for effector cells against **{target_text}**. BEHAV3D will run each "
+            "selected target independently and also create a combined analysis when "
+            "more than one target is selected. The setup is not ready until every "
+            "action card below has been applied; after that the live readiness state "
+            "will confirm it."
+        ),
+        "calls": calls,
+    }
+
+
+def active_killing_readiness_summary(
+    context: dict, messages: list[dict],
+) -> str | None:
+    if context.get("current_step") != "feature_extraction":
+        return None
+    latest = _latest_user_message(messages).lower()
+    if "active killing" not in " ".join(
+        str(message.get("content") or "").lower() for message in messages
+    ):
+        return None
+    if not any(phrase in latest for phrase in (
+        "is it set", "is it ready", "ready now", "setup complete",
+    )):
+        return None
+    state = (
+        (context.get("feature_extraction", {}) or {}).get("active_killing", {})
+        or {}
+    )
+    issues = list(state.get("setup_issues") or [])
+    if issues:
+        return (
+            "Active Killing is **not ready yet**. "
+            + " ".join(issues)
+            + " I will not describe the setup as complete until the live controls "
+            "contain every required value."
+        )
+    targets = ", ".join(state.get("target_cell_types") or []) or "none"
+    return (
+        "Active Killing is **ready** in the live controls: effector "
+        f"**{state.get('effector_cell_type')}**, targets **{targets}**, observation "
+        f"window **{state.get('observation_window')} timepoints**, and minimum "
+        f"contact **{state.get('minimum_contact_duration')} timepoints**. "
+        "When multiple targets are selected, BEHAV3D produces independent target "
+        "analyses and a combined analysis."
+    )
+
+
 def active_killing_action(context: dict, messages: list[dict]) -> dict | None:
     """Build the standard Active Killing proposal from target and cadence."""
     if context.get("current_step") != "feature_extraction":
@@ -1570,11 +1996,14 @@ def active_killing_action(context: dict, messages: list[dict]) -> dict | None:
     text = latest.lower()
     if "configure active killing" not in text:
         return None
-    target_match = re.search(r"\bagainst\s+([a-z0-9_ -]+?)\s+only\b", text)
+    target_match = re.search(
+        r"\bagainst\s+([a-z0-9_ ,&/-]+?)(?:\s+only)?(?:[.;]|\s+within\b)",
+        text,
+    )
     window_match = re.search(r"\bwithin\s+(\d+(?:\.\d+)?)\s+minutes?\b", text)
     if target_match is None or window_match is None:
         return None
-    target = target_match.group(1).strip()
+    target_text = target_match.group(1).strip()
     duration_minutes = float(window_match.group(1))
 
     records = (context.get("metadata", {}) or {}).get("records", []) or []
@@ -1603,11 +2032,39 @@ def active_killing_action(context: dict, messages: list[dict]) -> dict | None:
         for control in controls
         if control.get("visible", True) and control.get("enabled", True)
     }
+    target_control = by_id.get("features.active_killing.target_types", {})
+    target_choices = [str(value) for value in (target_control.get("choices") or [])]
+    targets = [
+        choice for choice in target_choices
+        if re.search(rf"\b{re.escape(choice.lower())}\b", target_text)
+    ]
+    if not targets:
+        targets = [
+            value.strip()
+            for value in re.split(r"\s*(?:,|&|\band\b)\s*", target_text)
+            if value.strip()
+        ]
+    absolute_threshold = _number_from_proposal(latest, (
+        r"absolute (?:signal-increase )?threshold[^\d]{0,30}"
+        r"(\d+(?:\.\d+)?)\s*(?:dead[- ]mask |dead )?(?:pixels|voxels)",
+    ))
+    if absolute_threshold is None or absolute_threshold <= 0:
+        return {
+            "text": (
+                f"The timing converts to **{window} timepoints** at {interval:g} "
+                f"{record.get('time_unit') or ''} per frame. Before I propose the "
+                "complete Active Killing setup, I still need one value: the positive "
+                "minimum dead-mask pixel increase for the absolute threshold. I will "
+                "not enable absolute-threshold mode while that value remains 0."
+            ),
+            "calls": [],
+        }
     expected = {
-        "features.active_killing.target_types": [target],
+        "features.active_killing.target_types": targets,
         "features.active_killing.observation_window": window,
         "features.active_killing.death_signal": "Dead-mask pixel count",
         "features.active_killing.use_absolute_threshold": True,
+        "features.active_killing.absolute_threshold": absolute_threshold,
     }
     if not set(expected).issubset(by_id):
         return None
@@ -1615,9 +2072,11 @@ def active_killing_action(context: dict, messages: list[dict]) -> dict | None:
         "text": (
             f"Based on {duration_minutes:g} minutes at {interval:g} "
             f"{record.get('time_unit') or ''} per frame, I’m proposing an Observation "
-            f"window of {window} timepoints, target {target} only, Dead-mask pixel "
-            "count, and an absolute threshold. These changes still require your "
-            "confirmation in the action cards."
+            f"window of {window} timepoints, target{'s' if len(targets) != 1 else ''} "
+            f"{', '.join(targets)}, Dead-mask pixel count, and an absolute threshold "
+            f"of {absolute_threshold:g}. BEHAV3D runs every selected target "
+            "independently and adds a combined analysis when multiple targets are "
+            "selected. These changes still require your confirmation in the action cards."
         ),
         "calls": [
             {
@@ -1754,8 +2213,8 @@ def safety_profile_summary(context: dict, messages: list[dict]) -> str | None:
         "**Active Killing definition:** The experiment reference defines an event "
         "as a contact-associated relative rise in dead-mask percentage to at least "
         f"1.5× baseline within {window_text}, after at least one frame of contact. "
-        "If you run the module, analyse 27T and MDO separately because it accepts "
-        f"one target type per run. {result_note}"
+        "If you run the module, select both 27T and MDO: BEHAV3D creates an "
+        f"independent analysis for each target plus a combined analysis. {result_note}"
     )
 
 
@@ -2059,16 +2518,28 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "lowering it to reduce RAM. When multiple organoid types exist, "
         "recommend tracking all organoid types together with Propagation.\n"
         "- In Feature Extraction, recommend Morphology only when shape is biologically relevant and Movement "
-        "for motility. Contact distance 0 means strict touching; larger values mean proximity, and any change "
+        "for motility. Read required_choices on every feature-group control before recommending a removal. "
+        "Intensity and Contact are required for every cell type, Movement is required for immune/other cells, "
+        "and Death is required when a dead channel is configured. Intensity includes mean dead-dye and other "
+        "channel-intensity measurements, so never suggest dropping it from a T-cell population with a dead "
+        "channel. Contact distance 0 means strict touching; larger values mean proximity, and any change "
         "requires feature extraction to be run again. A positive contact distance equal to the XY pixel "
         "size permits a one-XY-pixel gap; it is not strict touching and is not a voxel diagonal.\n"
-        "- In Active Killing, configure one target type per run. Derive Observation window and Minimum contact "
+        "- In Active Killing, the target selector may contain multiple target types. One run automatically "
+        "produces an independent analysis for each selected target and an additional combined analysis when "
+        "more than one is selected; never tell the user to configure separate UI runs. Derive Observation "
+        "window and Minimum contact "
         "duration from the biological timescale and metadata time interval. Prefer dead-mask pixel count with "
         "an absolute threshold by default; calibrate that threshold from cell size and XY pixel size. Do not "
         "reuse a 20-30 pixel example blindly. Use relative multipliers only in the limited baseline contexts "
         "described in the guidance. In study-design explanations, call the immune cell the effector and the "
         "organoid or cell being contacted the target; never describe an immune effector such as TEG as a "
         "target. With one immune type and two organoid types, say one effector type and two target types. "
+        "An accepted multi-parameter setup must propose every agreed value in the same response: targets, "
+        "death signal, threshold mode and value, observation window, and minimum contact duration. Never "
+        "apply only the mode checkbox while leaving an agreed absolute threshold at 0. The dependent "
+        "threshold controls remain editable when inactive; read their active flag rather than omitting them. "
+        "Do not say the setup is ready until the live Active Killing state reports setup_ready true. "
         "When an experiment reference defines Active Killing settings, say the reference 'defines' or "
         "'describes' them, never 'you have configured' or 'already configured' unless live controls/results "
         "prove that. Preserve a stated one-frame minimum exactly; do not replace it with a generic 1-3-frame "
@@ -2084,7 +2555,12 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "- Behavioral State and State Trajectory are different analysis views. For HMM state classification, "
         "use fixed state count, keep Start offset at 1, use Window size 5 by default or 1 for single-frame "
         "events, and usually match Smooth window to Window size. Log-scale only inspected skewed features, do "
-        "not routinely percentile-clip, and explain that binary groups are applied after the HMM.\n"
+        "not routinely percentile-clip, and explain that binary groups are applied after the HMM. When the "
+        "researcher asks for movement-only states or asks whether movement features are complete, enumerate "
+        "all movement choices from both the live Timepoint features and Additional window features controls. "
+        "Distinguish instantaneous/accumulated movement, directionality, and rolling trajectory summaries. "
+        "Do not present the currently selected speed and net displacement as the complete option set. Ask the "
+        "researcher to choose, then propose both feature lists together rather than partially setting one.\n"
         "- For State Trajectory, Trajectory size cannot exceed the Filtering trim. Average linkage is the "
         "default, Complete is a reasonable comparison, and Single performs poorly. Original BEHAV3D mode is "
         "deprecated. Be transparent that contact-based comparison plots and exemplar-track exports are known "
@@ -2391,6 +2867,8 @@ if modal is not None:
                 or segmentation_minimum_size_action(context, messages)
                 or tracking_radius_action(context, messages)
                 or btrack_step2_action(context, messages)
+                or hmm_movement_setup_action(context, messages)
+                or active_killing_confirmation_action(context, messages)
                 or active_killing_action(context, messages)
             )
             available_tool_names = {tool.get("name") for tool in tools}
@@ -2420,6 +2898,9 @@ if modal is not None:
                 or metadata_completion_summary(context, messages)
                 or analysis_choice_summary(context, messages)
                 or safety_profile_summary(context, messages)
+                or active_killing_readiness_summary(context, messages)
+                or feature_group_requirement_guidance(context, messages)
+                or hmm_movement_feature_guidance(context, messages)
                 or apoc_channel_selection_guidance(context, messages)
                 or apoc_feature_grid_guidance(context, messages)
                 or edt_direction_guidance(context, messages)

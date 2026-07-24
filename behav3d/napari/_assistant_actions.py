@@ -598,6 +598,14 @@ def _coerce_control_value(control: dict, value: Any) -> tuple[bool, Any, str]:
                 return False, coerced, f"Choose a value shown in {control.get('label', 'this control')}."
             resolved.append(match)
         coerced = resolved if isinstance(coerced, list) else resolved[0]
+    required_choices = control.get("required_choices") or []
+    if isinstance(coerced, list) and not set(required_choices).issubset(set(coerced)):
+        required_labels = ", ".join(str(item) for item in required_choices)
+        return (
+            False,
+            coerced,
+            f"{control.get('label', 'This selection')} must keep: {required_labels}.",
+        )
     minimum, maximum = control.get("minimum"), control.get("maximum")
     if minimum is not None and isinstance(coerced, (int, float)) and coerced < minimum:
         return False, coerced, f"{control.get('label')} must be at least {minimum}."

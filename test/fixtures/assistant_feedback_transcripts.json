@@ -107,16 +107,44 @@
     ]
   },
   {
+    "id": "feature_mandatory_dead_dye",
+    "step": "feature_extraction",
+    "user": "Can I drop intensity from the T-cell feature groups?",
+    "required": [
+      "intensity and contact mandatory",
+      "death mandatory when a dead channel is configured",
+      "mean dead-dye",
+      "never suggest dropping it"
+    ]
+  },
+  {
     "id": "active_killing_calibration",
     "step": "feature_extraction",
     "user": "How should I choose the active killing window and threshold?",
     "required": [
-      "one target type per run",
+      "multiple selected targets",
+      "runs each target independently",
+      "combined analysis",
       "metadata time interval",
       "dead-mask pixel count",
       "absolute increase threshold",
+      "incomplete while its value is 0",
       "do not reuse 20-30 pixels blindly",
       "minimum contact duration"
+    ]
+  },
+  {
+    "id": "hmm_movement_options",
+    "step": "analysis",
+    "user": "For Behavioral State, which movement features can I choose?",
+    "required": [
+      "enumerate all movement columns",
+      "timepoint features",
+      "additional window features",
+      "speed",
+      "directional persistence",
+      "straightness",
+      "never imply that the two currently selected features are the complete list"
     ]
   },
   {

@@ -35,8 +35,10 @@ def _control(
     unit: str | None = None,
     visible: bool = True,
     enabled: bool = True,
+    required_choices: list[str] | None = None,
+    active: bool | None = None,
 ) -> dict:
-    return {
+    control = {
         "id": control_id,
         "label": label,
         "value": value,
@@ -48,6 +50,11 @@ def _control(
         "cell_type": cell_type,
         "unit": unit,
     }
+    if required_choices is not None:
+        control["required_choices"] = required_choices
+    if active is not None:
+        control["active"] = active
+    return control
 
 
 def _metadata_records() -> list[dict]:
@@ -999,6 +1006,15 @@ def _active_killing_case() -> dict:
             method="Active Killing",
             cell_type="tcell",
         ),
+        _control(
+            "features.active_killing.absolute_threshold",
+            "Active Killing: Absolute signal-increase threshold",
+            0.0,
+            unit="pixels",
+            method="Active Killing",
+            cell_type="tcell",
+            active=False,
+        ),
     ]
     metadata = {
         "loaded": True,
@@ -1017,8 +1033,8 @@ def _active_killing_case() -> dict:
             "role": "user",
             "content": (
                 "Configure active killing for tcell against organoid1 only. I expect "
-                "killing within 10 minutes and images are every 2 minutes. Use the "
-                "generally recommended death signal and threshold mode."
+                "killing within 10 minutes and images are every 2 minutes. Use an "
+                "absolute threshold of 30 dead pixels."
             ),
         }],
         "context": _context(
@@ -1027,6 +1043,211 @@ def _active_killing_case() -> dict:
             feature_extraction={"active_killing_open": True},
         ),
         "check": _check_active_killing,
+    }
+
+
+def _feature_group_dead_dye_case() -> dict:
+    choices = [
+        "movement", "intensity", "morphology", "contact",
+        "invasiveness", "death",
+    ]
+    controls = [_control(
+        "features.tcell.feature_groups",
+        "tcell: feature groups",
+        choices,
+        choices=choices,
+        cell_type="tcell",
+        required_choices=["movement", "intensity", "contact", "death"],
+    )]
+    return {
+        "name": "tcell_features_keep_dead_dye_intensity",
+        "messages": [{
+            "role": "user",
+            "content": "Now adjust T cells. Should I drop intensity?",
+        }],
+        "context": _context(
+            "feature_extraction", controls, active_cell_type="tcell",
+        ),
+        "check": _check_feature_group_dead_dye,
+    }
+
+
+def _active_killing_complete_acceptance_case() -> dict:
+    controls = [
+        _control(
+            "features.active_killing.target_types",
+            "Active Killing: Target cell type",
+            ["27t", "mdo"],
+            choices=["27t", "mdo"],
+            method="Active Killing",
+            cell_type="tcell",
+        ),
+        _control(
+            "features.active_killing.observation_window",
+            "Active Killing: Observation window",
+            5,
+            unit="timepoints",
+            method="Active Killing",
+            cell_type="tcell",
+        ),
+        _control(
+            "features.active_killing.death_signal",
+            "Active Killing: Death or reporter signal",
+            "Dead-mask percentage",
+            choices=[
+                "Dead-mask percentage", "Mean dead-dye intensity",
+                "Dead-mask pixel count",
+            ],
+            method="Active Killing",
+            cell_type="tcell",
+        ),
+        _control(
+            "features.active_killing.use_absolute_threshold",
+            "Active Killing: Use an absolute signal-increase threshold",
+            False,
+            method="Active Killing",
+            cell_type="tcell",
+        ),
+        _control(
+            "features.active_killing.absolute_threshold",
+            "Active Killing: Absolute signal-increase threshold",
+            0.0,
+            unit="pixels",
+            method="Active Killing",
+            cell_type="tcell",
+            active=False,
+        ),
+        _control(
+            "features.active_killing.minimum_contact_duration",
+            "Active Killing: Minimum contact duration",
+            1,
+            unit="timepoints",
+            method="Active Killing",
+            cell_type="tcell",
+        ),
+    ]
+    return {
+        "name": "active_killing_accepts_complete_setup",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": (
+                    "Active Killing configuration for tcell against 27t and mdo: "
+                    "Death signal: Dead-mask pixel count. Absolute threshold: "
+                    "30 dead pixels. Observation window: 5 timepoints. "
+                    "Minimum contact duration: 1 frame."
+                ),
+            },
+            {"role": "user", "content": "Ok, these settings seem ok"},
+        ],
+        "context": _context(
+            "feature_extraction", controls, active_cell_type="tcell",
+            feature_extraction={
+                "active_killing_open": True,
+                "active_killing": {
+                    "setup_ready": True,
+                    "setup_issues": [],
+                },
+            },
+        ),
+        "check": _check_active_killing_complete_acceptance,
+    }
+
+
+def _hmm_movement_controls() -> list[dict]:
+    prefix = "analysis.state_classification.tcell."
+    return [
+        _control(
+            prefix + "timepoint_features",
+            "tcell: Timepoint features",
+            ["speed"],
+            choices=[
+                "speed", "displacement", "cumulative_displacement",
+                "displacement_from_origin", "directional_persistence",
+                "median_turning_angle", "mean_dead_dye",
+            ],
+            method="HMM",
+            cell_type="tcell",
+        ),
+        _control(
+            prefix + "window_features",
+            "tcell: Additional window features",
+            ["net_displacement"],
+            choices=[
+                "net_displacement", "straightness",
+                "mean_square_displacement",
+            ],
+            method="HMM",
+            cell_type="tcell",
+        ),
+        _control(
+            prefix + "binary_feature_groups",
+            "tcell: Binary feature groups",
+            ["27t_contact", "mdo_contact"],
+            choices=["27t_contact", "mdo_contact"],
+            method="HMM",
+            cell_type="tcell",
+        ),
+    ]
+
+
+def _hmm_movement_options_case() -> dict:
+    controls = _hmm_movement_controls()
+    return {
+        "name": "hmm_lists_all_movement_options",
+        "messages": [{
+            "role": "user",
+            "content": "Only movement features of relevance",
+        }],
+        "context": _context(
+            "analysis", controls, active_cell_type="tcell",
+            analysis={"view": "behavioral_state", "selected_cell_type": "tcell"},
+        ),
+        "check": _check_hmm_movement_options,
+    }
+
+
+def _hmm_apply_all_movement_case() -> dict:
+    return {
+        "name": "hmm_applies_all_offered_movement_features",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": (
+                    "Choose the feature names you want, or say use all available "
+                    "movement features."
+                ),
+            },
+            {"role": "user", "content": "Use all available movement features"},
+        ],
+        "context": _context(
+            "analysis", _hmm_movement_controls(), active_cell_type="tcell",
+            analysis={"view": "behavioral_state", "selected_cell_type": "tcell"},
+        ),
+        "check": _check_hmm_apply_all_movement,
+    }
+
+
+def _active_killing_zero_threshold_readiness_case() -> dict:
+    return {
+        "name": "active_killing_zero_threshold_is_not_ready",
+        "messages": [
+            {"role": "assistant", "content": "Active Killing setup"},
+            {"role": "user", "content": "Is it ready?"},
+        ],
+        "context": _context(
+            "feature_extraction", [], active_cell_type="tcell",
+            feature_extraction={
+                "active_killing_open": True,
+                "active_killing": {
+                    "setup_ready": False,
+                    "setup_issues": [
+                        "Absolute signal-increase threshold must be greater than 0."
+                    ],
+                },
+            },
+        ),
+        "check": _check_active_killing_zero_threshold_readiness,
     }
 
 
@@ -2140,6 +2361,7 @@ def _check_active_killing(result: dict) -> list[str]:
         "features.active_killing.observation_window": 5,
         "features.active_killing.death_signal": "Dead-mask pixel count",
         "features.active_killing.use_absolute_threshold": True,
+        "features.active_killing.absolute_threshold": 30,
     }
     errors = []
     for control_id, value in expected.items():
@@ -2156,6 +2378,101 @@ def _check_active_killing(result: dict) -> list[str]:
         "i've set", "i have set", "changes are applied", "changes were applied",
     )):
         errors.append("claimed proposed Active Killing changes were already applied")
+    return errors
+
+
+def _check_feature_group_dead_dye(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "required", "intensity", "mean dead-dye intensity",
+        "will not suggest removing",
+    ):
+        if phrase not in text:
+            errors.append(f"missing mandatory feature guidance: {phrase}")
+    if "drop intensity" in text or "remove intensity" in text:
+        errors.append("still suggested removing required T-cell intensity")
+    if result["calls"]:
+        errors.append("changed feature groups before the optional-group choice")
+    return errors
+
+
+def _check_active_killing_complete_acceptance(result: dict) -> list[str]:
+    changed = _changed_values(result)
+    expected = {
+        "features.active_killing.target_types": ["27t", "mdo"],
+        "features.active_killing.observation_window": 5,
+        "features.active_killing.death_signal": "Dead-mask pixel count",
+        "features.active_killing.use_absolute_threshold": True,
+        "features.active_killing.absolute_threshold": 30,
+        "features.active_killing.minimum_contact_duration": 1,
+    }
+    errors = []
+    for control_id, value in expected.items():
+        if changed.get(control_id) != value:
+            errors.append(
+                f"{control_id} was {changed.get(control_id)!r}, expected {value!r}"
+            )
+    text = result["text"].lower()
+    for phrase in (
+        "complete agreed active killing setup",
+        "independently",
+        "combined analysis",
+        "not ready until every action card",
+    ):
+        if phrase not in text:
+            errors.append(f"missing setup-completeness guidance: {phrase}")
+    return errors
+
+
+def _check_hmm_movement_options(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "speed", "displacement", "cumulative displacement",
+        "displacement from origin", "directional persistence",
+        "median turning angle", "net displacement", "straightness",
+        "mean square displacement", "use all available movement features",
+    ):
+        if phrase not in text:
+            errors.append(f"missing movement option: {phrase}")
+    if "mean dead dye" in text:
+        errors.append("included a non-movement intensity feature")
+    if result["calls"]:
+        errors.append("changed HMM inputs before the researcher chose features")
+    return errors
+
+
+def _check_hmm_apply_all_movement(result: dict) -> list[str]:
+    changed = _changed_values(result)
+    prefix = "analysis.state_classification.tcell."
+    errors = []
+    expected_timepoint = [
+        "speed", "displacement", "cumulative_displacement",
+        "displacement_from_origin", "directional_persistence",
+        "median_turning_angle",
+    ]
+    expected_window = [
+        "net_displacement", "straightness", "mean_square_displacement",
+    ]
+    if changed.get(prefix + "timepoint_features") != expected_timepoint:
+        errors.append("did not propose all offered timepoint movement features")
+    if changed.get(prefix + "window_features") != expected_window:
+        errors.append("did not propose all offered window movement features")
+    if "mean_dead_dye" in str(changed):
+        errors.append("included a non-movement intensity feature")
+    if "complete movement-only selection" not in result["text"].lower():
+        errors.append("did not describe the two-list selection as complete")
+    return errors
+
+
+def _check_active_killing_zero_threshold_readiness(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    if "not ready yet" not in text or "greater than 0" not in text:
+        errors.append("did not report the zero absolute threshold as incomplete")
+    if result["calls"]:
+        errors.append("attempted another partial edit instead of reporting readiness")
     return errors
 
 
@@ -2334,6 +2651,11 @@ SCENARIOS = [
     _filtering_case,
     _reporter_propagation_case,
     _active_killing_case,
+    _feature_group_dead_dye_case,
+    _active_killing_complete_acceptance_case,
+    _hmm_movement_options_case,
+    _hmm_apply_all_movement_case,
+    _active_killing_zero_threshold_readiness_case,
     _hmm_single_frame_case,
     _trajectory_linkage_case,
     _functional_experiment_context_case,
