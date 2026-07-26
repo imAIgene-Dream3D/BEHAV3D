@@ -730,10 +730,17 @@ def run_feature_extraction(
                     print(f"{get_current_time()} - Calculating fold change over baseline for intensity features...")
                     df_tracks = calculate_fold_change_over_baseline(df_tracks, intensity_cols)
 
-                top_quantile_cols = [c for c in df_tracks.columns if c.startswith("q75_mean_intensity_ch")]
+                top_quantile_cols = [
+                    c for c in df_tracks.columns
+                    if c.startswith("q") and "_mean_intensity_ch" in c
+                    and c.split("_mean_intensity_ch", 1)[0][1:].isdigit()
+                ]
                 if top_quantile_cols:
-                    print(f"{get_current_time()} - Calculating fold change over track minimum for top-quartile intensity features...")
+                    print(f"{get_current_time()} - Calculating fold change over track minimum for top-quantile (hot-pixel) intensity features...")
                     df_tracks = calculate_fold_change_over_track_min(df_tracks, top_quantile_cols)
+
+                    print(f"{get_current_time()} - Calculating previous-frame fold change / flicker score for top-quantile intensity features...")
+                    df_tracks = calculate_fold_change_over_previous_frame(df_tracks, top_quantile_cols)
 
             print(f"{get_current_time()} - Interpolating missing timepoints based on time interval")
             # As sometimes 1 or several timepoints are missing in a track, interpolate these missing rows
@@ -949,11 +956,16 @@ def calculate_image_based_track_features(
         df_intensity = _normalize_merge_keys(df_intensity, keys=merge_keys)
         df_tracks = pd.merge(df_tracks, df_intensity, how="left", on=merge_keys)
 
-        print(f"{get_current_time()} - Calculating top-quartile (hot-pixel) intensities...")
+        print(f"{get_current_time()} - Calculating top-quartile/decile (hot-pixel) intensities...")
+        df_top_quantile_intensity = None
         if df_top_quantile_intensity_outpath.exists() and not overwrite:
-            print("Top-quartile intensity calculation .csv already exists. Loading in top-quartile intensity information...")
-            df_top_quantile_intensity = pd.read_csv(df_top_quantile_intensity_outpath)
-        else:
+            df_cached = pd.read_csv(df_top_quantile_intensity_outpath)
+            if any(c.startswith("q90_mean_intensity_ch") for c in df_cached.columns):
+                print("Top-quartile/decile intensity calculation .csv already exists. Loading in top-quantile intensity information...")
+                df_top_quantile_intensity = df_cached
+            else:
+                print("Cached top-quantile intensity .csv predates the top-decile (q90) feature - recalculating...")
+        if df_top_quantile_intensity is None:
             df_top_quantile_intensity = calculate_segment_top_quantile_intensity(
                 segments=segments_path,
                 intensity_image=raw_image_path,
@@ -1955,7 +1967,7 @@ def calculate_segment_intensity(segments, intensity_image, calculation="mean", n
 
 
 def _calculate_segment_top_quantile_intensity_single_timepoint(args):
-    t, segments_path, intensity_image_path, quantile = args
+    t, segments_path, intensity_image_path, quantiles = args
     label_stack = np.asarray(load_image_timepoint(segments_path, t))
     intensity_stack = np.asarray(load_image_timepoint(intensity_image_path, t)).transpose(1, 2, 3, 0)
 
@@ -1969,12 +1981,14 @@ def _calculate_segment_top_quantile_intensity_single_timepoint(args):
         row = {"label": int(label), "position_t": t}
         for c in range(n_channels):
             values = intensity_stack[..., c][mask]
-            if values.size == 0:
-                row[f"q75_mean_intensity_ch{c}"] = np.nan
-                continue
-            cutoff = np.percentile(values, quantile * 100)
-            top_values = values[values >= cutoff]
-            row[f"q75_mean_intensity_ch{c}"] = float(top_values.mean()) if top_values.size else np.nan
+            for q in quantiles:
+                col_name = f"q{int(round(q * 100))}_mean_intensity_ch{c}"
+                if values.size == 0:
+                    row[col_name] = np.nan
+                    continue
+                cutoff = np.percentile(values, q * 100)
+                top_values = values[values >= cutoff]
+                row[col_name] = float(top_values.mean()) if top_values.size else np.nan
         rows.append(row)
 
     if not rows:
@@ -1982,18 +1996,27 @@ def _calculate_segment_top_quantile_intensity_single_timepoint(args):
     return pd.DataFrame(rows)
 
 
-def calculate_segment_top_quantile_intensity(segments, intensity_image, quantile=0.75, n_workers=1):
-    """Per-segment, per-timepoint mean intensity of the pixels at/above the
+def calculate_segment_top_quantile_intensity(segments, intensity_image, quantiles=(0.75, 0.9), n_workers=1):
+    """Per-segment, per-timepoint mean intensity of the pixels at/above each
     given quantile of that segment's own pixel intensity distribution (e.g.
-    quantile=0.75 -> mean of the brightest 25% of pixels), for each channel.
+    quantile=0.75 -> mean of the brightest 25% of pixels, quantile=0.9 ->
+    mean of the brightest 10% of pixels), for each channel.
 
     Unlike ``calculate_segment_intensity``'s whole-segment mean, this tracks
     a segment's brightest sub-region rather than being diluted by the rest
-    of the cell body - the "hot-pixel mean" feature.
+    of the cell body - the "hot-pixel mean" feature. Each quantile is
+    computed from the same per-segment pixel values in a single pass and
+    produces its own column, named ``q{int(quantile*100)}_mean_intensity_ch{N}``
+    (e.g. ``q75_mean_intensity_ch0``, ``q90_mean_intensity_ch0``).
     """
-    assert 0.0 <= quantile < 1.0
+    if isinstance(quantiles, (int, float)):
+        quantiles = (quantiles,)
+    quantiles = tuple(quantiles)
+    assert len(quantiles) > 0
+    for q in quantiles:
+        assert 0.0 <= q < 1.0
     timepoints = int(load_image(segments).shape[0])
-    args_list = [(t, segments, intensity_image, quantile) for t in range(timepoints)]
+    args_list = [(t, segments, intensity_image, quantiles) for t in range(timepoints)]
     if n_workers > 1:
         results = _run_parallel_with_fallback(_calculate_segment_top_quantile_intensity_single_timepoint, args_list, n_workers)
     else:
@@ -2074,23 +2097,65 @@ def calculate_fold_change_over_baseline(df, intensity_cols, baseline_percentile=
     return df
 
 
-def calculate_fold_change_over_track_min(df, intensity_cols, groupby=("sample_name", "TrackID")):
+def calculate_fold_change_over_track_min(df, intensity_cols, groupby=("sample_name", "TrackID"), baseline_n_lowest=5):
     """Per-track fold change of each intensity column over that track's own
-    minimum value (the literal lowest value ever observed for that track,
-    not a percentile). Intended for hot-pixel-mean columns (e.g.
-    ``q75_mean_intensity_ch{N}``, the mean of a segment's brightest quartile
-    of pixels) where the caller specifically wants the strictest possible
-    baseline rather than the more noise-robust percentile baseline used by
-    ``calculate_fold_change_over_baseline``.
+    low-end baseline: the median of the ``baseline_n_lowest`` lowest values
+    ever observed for that track (not the literal single minimum, and not a
+    percentile). Intended for hot-pixel-mean columns (e.g.
+    ``q75_mean_intensity_ch{N}`` / ``q90_mean_intensity_ch{N}``, the mean of
+    a segment's brightest quartile/decile of pixels) where the caller wants a
+    strict low baseline without letting one anomalously dim frame (noise,
+    segmentation glitch) single-handedly set the denominator for the whole
+    track, as a literal min would.
     """
     df = df.sort_values(list(groupby) + ["position_t"]).copy()
     grouped = df.groupby(list(groupby), sort=False, observed=True)
+    n_lowest = int(baseline_n_lowest)
     for col in intensity_cols:
         if col not in df.columns:
             continue
-        baseline = grouped[col].transform("min")
+        baseline = grouped[col].transform(lambda s: s.nsmallest(n_lowest).median())
         baseline = baseline.where(baseline > 0, np.nan)
         df[f"{col}_fold_change"] = df[col] / baseline
+    return df
+
+
+def calculate_fold_change_over_previous_frame(
+    df, intensity_cols, groupby=("sample_name", "TrackID"),
+    baseline_n_lowest=5, floor=1.0, ceiling=3.0,
+):
+    """Per-frame fold change of each intensity column over its own previous
+    timepoint within the same track (a frame-to-frame ratio), meant to catch
+    abrupt brief jumps ("flickers") that a whole-track baseline dilutes by
+    comparing every frame against the track's overall dim history instead of
+    against what it looked like one frame ago.
+
+    Guarded against an anomalously low previous frame: if the previous
+    value is below the track's own low-end baseline (the median of its
+    ``baseline_n_lowest`` lowest values, see ``calculate_fold_change_over_track_min``),
+    that baseline is used as the denominator instead, so a single near-zero
+    noisy dip can't blow up the ratio. The first timepoint of each track
+    (no previous frame) also uses this baseline as its denominator.
+
+    Produces two columns per input column:
+      - ``{col}_fold_change_prevframe``: the raw, unclipped ratio.
+      - ``{col}_flicker_score``: the same ratio clipped to ``[floor, ceiling]``
+        (decreases collapsed to ``floor``, jumps at/above ``ceiling`` treated
+        as equally flicker-worthy) - a bounded score for thresholding.
+    """
+    df = df.sort_values(list(groupby) + ["position_t"]).copy()
+    grouped = df.groupby(list(groupby), sort=False, observed=True)
+    n_lowest = int(baseline_n_lowest)
+    for col in intensity_cols:
+        if col not in df.columns:
+            continue
+        track_floor = grouped[col].transform(lambda s: s.nsmallest(n_lowest).median())
+        prev = grouped[col].shift(1)
+        baseline = prev.where(prev >= track_floor, track_floor)
+        baseline = baseline.where(baseline > 0, np.nan)
+        ratio = df[col] / baseline
+        df[f"{col}_fold_change_prevframe"] = ratio
+        df[f"{col}_flicker_score"] = ratio.clip(lower=floor, upper=ceiling)
     return df
 
 
