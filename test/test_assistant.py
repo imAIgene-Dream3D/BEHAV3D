@@ -472,6 +472,33 @@ def test_organoid_lines_require_processing_group_confirmation():
     assert app.organoid_processing_question(context, messages) is None
 
 
+def test_analysis_question_on_metadata_tab_is_not_hijacked_by_organoid_setup():
+    import app
+
+    context = {
+        "current_step": "data_preparation",
+        "metadata": {"loaded": False, "records": []},
+        "metadata_builder": {"sample_forms_created": False},
+    }
+    messages = [{
+        "role": "user",
+        "content": (
+            "I have an experiment with T cells, Macrophages and Organoids of "
+            "different lines. What analysis would be possible for this data?"
+        ),
+    }]
+    assert app.organoid_processing_question(context, messages) is None
+    result = app.deterministic_turn_response(context, messages, [])
+    text = result["text"]
+    assert "No metadata is loaded" in text
+    assert "Interaction Analysis" in text
+    assert "Invasiveness Analysis" in text
+    assert "Contact-Based Grouping" in text
+    assert "Contact State-Shift Analysis" in text
+    assert "Before I build the metadata" not in text
+    assert "separate organoid types" not in text
+
+
 def test_metadata_completion_uses_mandatory_well_and_line_fields():
     import app
 
@@ -509,10 +536,18 @@ def test_metadata_identifier_inferences_require_confirmation():
     )
     assert "mandatory" in response
     assert "condition is optional" in response
-    assert "M21/M23" in response
     assert "not_added" in response
-    assert "not added" in response
     assert "confirm" in response
+    assert "filenames" in response
+    assert "M21" not in response and "M23" not in response
+    assert "GD2" not in response
+
+    missing_lines = app.metadata_identifier_confirmation_question(
+        {"metadata_builder": {"sample_forms_created": True}},
+        [{"role": "user", "content": "I have not specified lines yet."}],
+    )
+    assert "line for every configured" in missing_lines
+    assert "not_added" in missing_lines
 
 
 def test_metadata_time_conversion_updates_every_sample_without_stale_action():
@@ -575,6 +610,7 @@ def test_analysis_choose_explains_and_named_view_opens_directly():
         {
             "assistant_session": {"intent": "choose_analysis"},
             "metadata": {
+                "loaded": True,
                 "n_samples": 8,
                 "cell_types": {
                     "organoid": ["Organoids"],
@@ -593,12 +629,14 @@ def test_analysis_choose_explains_and_named_view_opens_directly():
     )
     for name in (
         "Death Dynamics", "Interaction Analysis", "Invasiveness Analysis",
-        "Active Killing", "Behavioral State", "State Trajectory", "Backprojection",
+        "Active Killing", "Behavioral State", "State Trajectory",
+        "Contact-Based Grouping", "Contact State-Shift Analysis", "Backprojection",
     ):
         assert name in summary
     assert "8 samples" in summary
     assert "DO7" in summary and "GD2_CART" in summary and "M21" in summary
     assert "Questions suggested by your metadata" in summary
+    assert "Categorical DTW" in summary
 
     action = app.analysis_navigation_action(
         {"current_step": "analysis", "analysis": {"view": "behavioral_state"}},
@@ -3089,7 +3127,7 @@ def test_feedback_guidance_fixtures():
 
     fixture = Path(__file__).parent / "fixtures" / "assistant_feedback_transcripts.json"
     cases = json.loads(fixture.read_text(encoding="utf-8"))
-    assert KNOWLEDGE_VERSION == "2026.07.27.25"
+    assert KNOWLEDGE_VERSION == "2026.07.27.27"
     for case in cases:
         cards = select_guidance_cards(
             {"current_step": case["step"]}, case["user"], case.get("intent"))

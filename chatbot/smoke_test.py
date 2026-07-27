@@ -1834,6 +1834,25 @@ def _choose_analysis_case() -> dict:
     }
 
 
+def _analysis_question_on_metadata_tab_case() -> dict:
+    return {
+        "name": "analysis_question_is_not_hijacked_by_metadata_clarification",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "I have an experiment with T cells, Macrophages and Organoids of "
+                "different lines. What analysis would be possible for this data?"
+            ),
+        }],
+        "context": _context(
+            "data_preparation", [],
+            metadata={"loaded": False, "records": [], "validation": []},
+            metadata_builder={"open": False, "sample_forms_created": False},
+        ),
+        "check": _check_analysis_question_on_metadata_tab,
+    }
+
+
 def _metadata_not_added_case() -> dict:
     control_id = "metadata.samples.0.cell_types.Macrophages.line"
     return {
@@ -1898,11 +1917,13 @@ def _check_metadata_identifier_confirmation(result: dict) -> list[str]:
     text = result["text"].lower()
     errors = []
     for phrase in (
-        "well", "mandatory", "condition is optional", "m21/m23",
-        "not added", "not_added",
+        "well", "mandatory", "condition is optional", "filenames", "not_added",
     ):
         if phrase not in text:
             errors.append(f"missing identifier guidance: {phrase}")
+    for experiment_value in ("m21", "m23", "gd2_cart"):
+        if experiment_value in text:
+            errors.append(f"embedded experiment-specific identifier: {experiment_value}")
     if result["calls"]:
         errors.append("filled filename-derived values before confirmation")
     return errors
@@ -1953,7 +1974,8 @@ def _check_choose_analysis(result: dict) -> list[str]:
     errors = []
     for phrase in (
         "death dynamics", "interaction analysis", "invasiveness analysis",
-        "active killing", "behavioral state", "state trajectory", "backprojection",
+        "active killing", "behavioral state", "state trajectory",
+        "contact-based grouping", "contact state-shift analysis", "backprojection",
     ):
         if phrase not in text:
             errors.append(f"did not explain {phrase}")
@@ -1962,6 +1984,23 @@ def _check_choose_analysis(result: dict) -> list[str]:
             errors.append(f"did not ground the recommendation in metadata: {phrase}")
     if result["calls"]:
         errors.append("Choose analysis navigated instead of explaining options")
+    return errors
+
+
+def _check_analysis_question_on_metadata_tab(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "no metadata is loaded", "interaction analysis", "invasiveness analysis",
+        "contact-based grouping", "contact state-shift analysis",
+    ):
+        if phrase not in text:
+            errors.append(f"missing analysis overview detail: {phrase}")
+    for hijack in ("before i build the metadata", "separate organoid types"):
+        if hijack in text:
+            errors.append(f"analysis question was hijacked by metadata prompt: {hijack}")
+    if result["calls"]:
+        errors.append("analysis overview attempted an action")
     return errors
 
 
@@ -2859,6 +2898,7 @@ SCENARIOS = [
     _metadata_completion_case,
     _metadata_save_case,
     _choose_analysis_case,
+    _analysis_question_on_metadata_tab_case,
     _metadata_not_added_case,
     _open_death_dynamics_case,
     _metadata_setup_case,

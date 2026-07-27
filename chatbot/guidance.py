@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 
-KNOWLEDGE_VERSION = "2026.07.27.25"
+KNOWLEDGE_VERSION = "2026.07.27.27"
 
 
 GUIDANCE_CARDS = {
@@ -29,7 +29,10 @@ GUIDANCE_CARDS = {
         "line identity recorded per sample. Well and each configured population's line are mandatory; "
         "condition is optional. When no physical wells exist, propose one shared identifier such as "
         "'1'. When a configured population is confirmed absent, describe it as not added and use "
-        "the literal CSV-safe line value 'not_added'; never use None."
+        "the literal CSV-safe line value 'not_added'; never use None. Metadata clarification "
+        "prompts must stay experiment-neutral: do not introduce example strain, line, or population "
+        "names that were not read from the live context, and do not interrupt an informational "
+        "analysis question with a metadata-building clarification."
     ),
     "experiment_design": (
         "Use the loaded experiment reference only for the current dataset. Preserve explicit "
@@ -233,7 +236,8 @@ GUIDANCE_CARDS = {
     "analysis": (
         "First identify the research question and the active analysis view. A general analysis overview "
         "must include Death Dynamics, Interaction Analysis, Invasiveness Analysis, Active Killing, "
-        "Behavioral State, State Trajectory, and Backprojection, then use the live metadata to suggest "
+        "Behavioral State, State Trajectory, Contact-Based Grouping, Contact State-Shift Analysis, "
+        "and Backprojection, then use the live metadata to suggest "
         "dataset-specific questions and a sensible sequence. It must not repeatedly navigate to the "
         "Analysis tab. Open a named "
         "view directly when the researcher asks. Behavioral State assigns "
@@ -278,10 +282,13 @@ GUIDANCE_CARDS = {
         "set in Filtering. Average linkage is the default; Complete is a reasonable comparison, while "
         "Single linkage performs poorly. If Behavioral State should remain unfiltered, trim or divide "
         "tracks here instead. Original BEHAV3D feature-based mode is deprecated and requires equal "
-        "track lengths. The UMAP may look poor even when agglomerative clusters are sensible. The "
-        "contact-based comparison plots are currently known to produce empty output, and exemplar "
-        "track PDF/MP4 generation is also known to error; state these limitations rather than implying "
-        "those outputs are reliable."
+        "track lengths. The UMAP may look poor even when agglomerative clusters are sensible. "
+        "Categorical DTW supports Contact-Based Grouping, which compares trajectory clusters for "
+        "tracks with and without a sufficiently long contact bout. It also supports Contact State-Shift "
+        "Analysis, which compares behavioral-state composition before and after contact against "
+        "timing-matched no-contact tracks and therefore additionally requires Behavioral State results. "
+        "Do not repeat the obsolete claim that these current contact analyses inherently produce empty "
+        "output."
     ),
 }
 
