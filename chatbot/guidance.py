@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 
-KNOWLEDGE_VERSION = "2026.07.27.25"
+KNOWLEDGE_VERSION = "2026.07.27.28"
 
 
 GUIDANCE_CARDS = {
@@ -29,7 +29,10 @@ GUIDANCE_CARDS = {
         "line identity recorded per sample. Well and each configured population's line are mandatory; "
         "condition is optional. When no physical wells exist, propose one shared identifier such as "
         "'1'. When a configured population is confirmed absent, describe it as not added and use "
-        "the literal CSV-safe line value 'not_added'; never use None."
+        "the literal CSV-safe line value 'not_added'; never use None. Metadata clarification "
+        "prompts must stay experiment-neutral: do not introduce example strain, line, or population "
+        "names that were not read from the live context, and do not interrupt an informational "
+        "analysis question with a metadata-building clarification."
     ),
     "experiment_design": (
         "Use the loaded experiment reference only for the current dataset. Preserve explicit "
@@ -68,7 +71,13 @@ GUIDANCE_CARDS = {
         "Cellpose-SAM import; Reporter Propagation for near-static intermittent detections; historical "
         "100-voxel noise and 10% overlap values; a five-state HMM on one reporter-intensity fold-change "
         "feature with smoothing 1 and a full 32-frame trajectory. Use it to explain intensity-driven "
-        "behavior, not as a motility template. For any spatial btrack value, calculate or measure "
+        "behavior, not as a motility template. Exp91 microglia example: eight DMG-organoid/GD2-CAR-T "
+        "wells with optional M21 or M23 macrophage/microglia, 1.77 um isotropic sampling and 120 s "
+        "frames; APOC Probability Map + Watershed; organoid and macrophage Propagation; T-cell btrack; "
+        "absolute Active Killing at a 30-dead-mask-pixel increase over 5 frames. The matrix is incomplete "
+        "and every included combination has n=1. Its historical CSV uses None_None for absent macrophages, "
+        "and the YAML Start offset 0 conflicts with README Start offset 1. Preserve both source values. "
+        "For any spatial btrack value, calculate or measure "
         "per-frame displacement; for optimizer values, ask for the largest spatial and missing-frame "
         "gap; for segmentation thresholds, use the current resolution and preview."
     ),
@@ -116,7 +125,12 @@ GUIDANCE_CARDS = {
         "Medium structures uses 1, 2, 5, and 15; Large structures uses 1, 2, 5, 10, and 25. The "
         "original-intensity checkbox adds raw pixel intensity as a feature, so never claim APOC "
         "cannot learn from raw voxels. Tune Features never means Minimum size, EDT, Mask threshold, "
-        "Seed threshold, or Feature Extraction. A classifier is trained only when a classifier "
+        "Seed threshold, or Feature Extraction. Treat a preset as a first pass. If needed, train a "
+        "broader candidate set of scales, then use Show classifier statistics: greener importance "
+        "cells are more informative and redder cells are less informative. Remove only consistently "
+        "low-importance features, retrain, and compare the probability-map preview again. Do not infer "
+        "classifier quality from object size or sigma selection alone. A classifier is trained only "
+        "when a classifier "
         "file is actually found. APOC "
         "direct instance segmentation is only for sparse, non-touching objects where every "
         "connected region should remain one instance. Mask + EDT is preferred for similarly sized "
@@ -196,7 +210,9 @@ GUIDANCE_CARDS = {
         "to the XY pixel size permits a one-XY-pixel gap; it is not strict touching and is not a voxel "
         "diagonal. Any contact-distance "
         "change requires feature extraction to be run again, so plan it as a batch decision rather "
-        "than an interactive sweep. In the dead-threshold preview, green means alive and red means "
+        "than an interactive sweep. For a first-time death threshold, prioritize Preview Dead Threshold "
+        "in Viewer before result PDFs or a numeric suggestion: select a sample and population, open the "
+        "preview, then adjust the threshold while the overlay updates. Green means alive and red means "
         "dead; hovering shows the dead-mask percentage. If ambiguous, ask what looks wrong before "
         "recommending a threshold. Cell-type grouping creates a merged metadata type without "
         "requiring tracks to be recomputed."
@@ -233,7 +249,8 @@ GUIDANCE_CARDS = {
     "analysis": (
         "First identify the research question and the active analysis view. A general analysis overview "
         "must include Death Dynamics, Interaction Analysis, Invasiveness Analysis, Active Killing, "
-        "Behavioral State, State Trajectory, and Backprojection, then use the live metadata to suggest "
+        "Behavioral State, State Trajectory, Contact-Based Grouping, Contact State-Shift Analysis, "
+        "and Backprojection, then use the live metadata to suggest "
         "dataset-specific questions and a sensible sequence. It must not repeatedly navigate to the "
         "Analysis tab. Open a named "
         "view directly when the researcher asks. Behavioral State assigns "
@@ -278,10 +295,13 @@ GUIDANCE_CARDS = {
         "set in Filtering. Average linkage is the default; Complete is a reasonable comparison, while "
         "Single linkage performs poorly. If Behavioral State should remain unfiltered, trim or divide "
         "tracks here instead. Original BEHAV3D feature-based mode is deprecated and requires equal "
-        "track lengths. The UMAP may look poor even when agglomerative clusters are sensible. The "
-        "contact-based comparison plots are currently known to produce empty output, and exemplar "
-        "track PDF/MP4 generation is also known to error; state these limitations rather than implying "
-        "those outputs are reliable."
+        "track lengths. The UMAP may look poor even when agglomerative clusters are sensible. "
+        "Categorical DTW supports Contact-Based Grouping, which compares trajectory clusters for "
+        "tracks with and without a sufficiently long contact bout. It also supports Contact State-Shift "
+        "Analysis, which compares behavioral-state composition before and after contact against "
+        "timing-matched no-contact tracks and therefore additionally requires Behavioral State results. "
+        "Do not repeat the obsolete claim that these current contact analyses inherently produce empty "
+        "output."
     ),
 }
 

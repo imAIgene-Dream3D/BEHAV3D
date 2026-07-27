@@ -203,8 +203,9 @@
       "complete is a reasonable comparison",
       "single linkage performs poorly",
       "original behav3d feature-based mode is deprecated",
-      "contact-based comparison plots",
-      "exemplar track"
+      "categorical dtw supports contact-based grouping",
+      "contact state-shift analysis",
+      "requires behavioral state results"
     ]
   },
   {
@@ -279,8 +280,11 @@
       "active killing",
       "behavioral state",
       "state trajectory",
+      "contact-based grouping",
+      "contact state-shift analysis",
       "backprojection"
-    ]
+    ],
+    "forbidden": ["contact-based comparison plots are currently known to produce empty output"]
   },
   {
     "id": "metadata_does_not_own_channel_mapping",

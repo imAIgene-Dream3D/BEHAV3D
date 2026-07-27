@@ -788,6 +788,58 @@ def _contact_and_dead_threshold_case() -> dict:
     }
 
 
+def _first_dead_threshold_preview_case() -> dict:
+    return {
+        "name": "dead_threshold_uses_viewer_preview_first",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "In Feature Extraction, how should I set the correct dead-mask "
+                "percentage threshold for the first time?"
+            ),
+        }],
+        "context": _context(
+            "feature_extraction", [], active_cell_type="tcell",
+            results=[{
+                "id": "analysis/tcell/BEHAV3D_dead_dye_distribution.pdf",
+                "label": "Dead dye distribution",
+                "description": "Distribution used to tune the dead-dye threshold.",
+                "kind": "pdf",
+                "category": "filtering",
+                "cell_type": "tcell",
+                "viewable": True,
+            }],
+        ),
+        "check": _check_first_dead_threshold_preview,
+    }
+
+
+def _failed_result_opening_correction_case() -> dict:
+    return {
+        "name": "failed_result_opening_does_not_loop",
+        "messages": [
+            {
+                "role": "user",
+                "content": "How should I set the dead-mask percentage threshold?",
+            },
+            {
+                "role": "assistant",
+                "content": "The result is listed as viewable. Let me open it.",
+            },
+            {"role": "user", "content": "I think you cannot open it."},
+        ],
+        "context": _context(
+            "feature_extraction", [], active_cell_type="tcell",
+            results=[{
+                "id": "analysis/tcell/BEHAV3D_dead_dye_distribution.pdf",
+                "label": "Dead dye distribution",
+                "viewable": True,
+            }],
+        ),
+        "check": _check_failed_result_opening_correction,
+    }
+
+
 def _loaded_metadata_not_unsaved_case() -> dict:
     return {
         "name": "loaded_metadata_is_not_called_unsaved",
@@ -1598,6 +1650,38 @@ def _historical_calcium_example_case() -> dict:
     }
 
 
+def _historical_microglia_example_case() -> dict:
+    return {
+        "name": "historical_microglia_exp91_preserves_sources_and_caveats",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "What design and settings were used in the previous microglia "
+                "Exp91 experiment?"
+            ),
+        }],
+        "context": _context(
+            "analysis", [], active_cell_type="tcell",
+            metadata={
+                "loaded": True,
+                "records": [{
+                    "sample_name": "CurrentMicroglia",
+                    "pixel_distance_xy": 0.8,
+                    "pixel_distance_z": 2.0,
+                    "time_interval": 3,
+                    "time_unit": "min",
+                }],
+                "cell_types": {
+                    "organoid": ["organoid"],
+                    "immune": ["microglia", "tcell"],
+                },
+                "validation": [],
+            },
+        ),
+        "check": _check_historical_microglia_example,
+    }
+
+
 def _experiment_reference_metadata_conflict_case() -> dict:
     reference = {
         "notes": [{
@@ -1834,6 +1918,25 @@ def _choose_analysis_case() -> dict:
     }
 
 
+def _analysis_question_on_metadata_tab_case() -> dict:
+    return {
+        "name": "analysis_question_is_not_hijacked_by_metadata_clarification",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "I have an experiment with T cells, Macrophages and Organoids of "
+                "different lines. What analysis would be possible for this data?"
+            ),
+        }],
+        "context": _context(
+            "data_preparation", [],
+            metadata={"loaded": False, "records": [], "validation": []},
+            metadata_builder={"open": False, "sample_forms_created": False},
+        ),
+        "check": _check_analysis_question_on_metadata_tab,
+    }
+
+
 def _metadata_not_added_case() -> dict:
     control_id = "metadata.samples.0.cell_types.Macrophages.line"
     return {
@@ -1898,11 +2001,13 @@ def _check_metadata_identifier_confirmation(result: dict) -> list[str]:
     text = result["text"].lower()
     errors = []
     for phrase in (
-        "well", "mandatory", "condition is optional", "m21/m23",
-        "not added", "not_added",
+        "well", "mandatory", "condition is optional", "filenames", "not_added",
     ):
         if phrase not in text:
             errors.append(f"missing identifier guidance: {phrase}")
+    for experiment_value in ("m21", "m23", "gd2_cart"):
+        if experiment_value in text:
+            errors.append(f"embedded experiment-specific identifier: {experiment_value}")
     if result["calls"]:
         errors.append("filled filename-derived values before confirmation")
     return errors
@@ -1953,7 +2058,8 @@ def _check_choose_analysis(result: dict) -> list[str]:
     errors = []
     for phrase in (
         "death dynamics", "interaction analysis", "invasiveness analysis",
-        "active killing", "behavioral state", "state trajectory", "backprojection",
+        "active killing", "behavioral state", "state trajectory",
+        "contact-based grouping", "contact state-shift analysis", "backprojection",
     ):
         if phrase not in text:
             errors.append(f"did not explain {phrase}")
@@ -1962,6 +2068,23 @@ def _check_choose_analysis(result: dict) -> list[str]:
             errors.append(f"did not ground the recommendation in metadata: {phrase}")
     if result["calls"]:
         errors.append("Choose analysis navigated instead of explaining options")
+    return errors
+
+
+def _check_analysis_question_on_metadata_tab(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "no metadata is loaded", "interaction analysis", "invasiveness analysis",
+        "contact-based grouping", "contact state-shift analysis",
+    ):
+        if phrase not in text:
+            errors.append(f"missing analysis overview detail: {phrase}")
+    for hijack in ("before i build the metadata", "separate organoid types"):
+        if hijack in text:
+            errors.append(f"analysis question was hijacked by metadata prompt: {hijack}")
+    if result["calls"]:
+        errors.append("analysis overview attempted an action")
     return errors
 
 
@@ -2168,14 +2291,17 @@ def _check_swapped_channel_metadata(result: dict) -> list[str]:
     errors = []
     for phrase in (
         "metadata builder does not map raw channel indices",
-        "line", "processing slots", "segmentation method",
+        "line", "processing slots", "segmentation",
+        "not independent per sample", "shared multiclass model",
     ):
         if phrase not in text:
             errors.append(f"missing swapped-channel boundary guidance: {phrase}")
     if any(phrase in text for phrase in (
-        "each sample form has a channel", "same for all", "per-sample dropdown",
+        "each sample form has a channel", "per-sample dropdown",
+        "choose different channel numbers for the same processing slot",
+        "i should not", "my rules say",
     )):
-        errors.append("invented metadata channel-mapping controls")
+        errors.append("invented per-sample channel mapping or exposed internal rules")
     if result["calls"]:
         errors.append("attempted edits before the slot workflow was confirmed")
     return errors
@@ -2221,6 +2347,7 @@ def _check_apoc_feature_grid(result: dict) -> list[str]:
         "feature scales in pixels", "gaussian blur", "difference of gaussians",
         "laplacian of gaussian", "sobel-of-gaussian",
         "not a structure tensor", "current live apoc controls",
+        "show classifier statistics", "greener", "redder",
     ):
         if phrase not in text:
             errors.append(f"missing APOC feature-grid detail: {phrase}")
@@ -2249,6 +2376,7 @@ def _check_apoc_tune_features_explanation(result: dict) -> list[str]:
         "laplacian of gaussian", "sobel-of-gaussian",
         "small structures", "medium", "large",
         "original intensity", "changes here require retraining",
+        "show classifier statistics", "greener", "redder",
     ):
         if phrase not in text:
             errors.append(f"missing Tune Features explanation: {phrase}")
@@ -2267,7 +2395,7 @@ def _check_apoc_mdo_feature_recommendation(result: dict) -> list[str]:
     errors = []
     for phrase in (
         "mdo", "organoid", "large structures", "1, 2, 5, 10, and 25 pixels",
-        "probability-map preview",
+        "probability-map preview", "show classifier statistics", "greener", "redder",
     ):
         if phrase not in text:
             errors.append(f"missing MDO Tune Features recommendation: {phrase}")
@@ -2412,6 +2540,44 @@ def _check_contact_and_dead_threshold(result: dict) -> list[str]:
         errors.append("misstated the 1.01 µm contact scale")
     if result["calls"]:
         errors.append("attempted a threshold edit without a requested value")
+    return errors
+
+
+def _check_first_dead_threshold_preview(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "preview dead threshold in viewer", "select the sample and population",
+        "green is below the threshold", "red is above it", "hovering",
+        "universal numeric range", "re-run feature extraction",
+    ):
+        if phrase not in text:
+            errors.append(f"missing first-time death-threshold workflow: {phrase}")
+    if any(phrase in text for phrase in (
+        "let me open", "i'll open", "i will open", "try opening",
+        "30% is fine", "start at 2%",
+    )):
+        errors.append("claimed an unsupported result opening or invented a threshold")
+    if result["calls"]:
+        errors.append("attempted to open a result or change a threshold")
+    return errors
+
+
+def _check_failed_result_opening_correction(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "no result was opened", "listed as viewable does not mean it has opened",
+        "results", "preview dead threshold in viewer",
+    ):
+        if phrase not in text:
+            errors.append(f"missing failed-opening correction: {phrase}")
+    if any(phrase in text for phrase in (
+        "let me open", "try opening", "i'll open", "i will open",
+    )):
+        errors.append("repeated the unsupported result-opening claim")
+    if result["calls"]:
+        errors.append("retried a result action after the user reported failure")
     return errors
 
 
@@ -2832,6 +2998,26 @@ def _check_historical_calcium_example(result: dict) -> list[str]:
     return errors
 
 
+def _check_historical_microglia_example(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "exp91", "eight wells", "1.77 µm", "120-second", "none_none",
+        "apoc probability map + watershed", "maximum search radius 150",
+        "absolute increase of 30", "start offset", "yaml", "readme", "n=1",
+        "historical values, not defaults",
+    ):
+        if phrase not in text:
+            errors.append(f"missing Exp91 reference detail: {phrase}")
+    if not all(value in text for value in ("0", "1")):
+        errors.append("did not preserve both sides of the Start offset conflict")
+    if not any(term in text for term in ("descriptive", "exploratory")):
+        errors.append("omitted the unreplicated-design interpretation caveat")
+    if result["calls"]:
+        errors.append("attempted to apply historical Exp91 values")
+    return errors
+
+
 def _check_experiment_reference_metadata_conflict(result: dict) -> list[str]:
     text = result["text"].lower()
     errors = []
@@ -2859,6 +3045,7 @@ SCENARIOS = [
     _metadata_completion_case,
     _metadata_save_case,
     _choose_analysis_case,
+    _analysis_question_on_metadata_tab_case,
     _metadata_not_added_case,
     _open_death_dynamics_case,
     _metadata_setup_case,
@@ -2883,6 +3070,8 @@ SCENARIOS = [
     _segmentation_minimum_size_case,
     _mask_edt_direction_case,
     _contact_and_dead_threshold_case,
+    _first_dead_threshold_preview_case,
+    _failed_result_opening_correction_case,
     _loaded_metadata_not_unsaved_case,
     _external_zarr_reload_case,
     _missing_log_error_case,
@@ -2907,6 +3096,7 @@ SCENARIOS = [
     _safety_profiling_context_case,
     _historical_btrack_examples_case,
     _historical_calcium_example_case,
+    _historical_microglia_example_case,
     _experiment_reference_metadata_conflict_case,
 ]
 

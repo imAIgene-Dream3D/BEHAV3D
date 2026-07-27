@@ -158,6 +158,38 @@ def _latest_user_message(messages: list[dict]) -> str:
     ), "")
 
 
+def _normalized_user_message(messages: list[dict]) -> str:
+    return " ".join(_latest_user_message(messages).lower().split())
+
+
+def _asks_general_analysis_question(messages: list[dict]) -> bool:
+    """Recognize an analysis overview without stealing requests for one view."""
+    latest = _normalized_user_message(messages)
+    targeted = any(phrase in latest for phrase in (
+        "death dynamics", "interaction analysis", "invasiveness analysis",
+        "active killing", "behavioral state", "behavioural state",
+        "state trajectory", "contact-based grouping", "contact based grouping",
+        "state-shift", "state shift", "backprojection",
+    ))
+    if targeted:
+        return False
+    return bool(
+        re.search(
+            r"\b(?:what|which|choose|pick)\b.{0,36}\banalys(?:is|es)\b",
+            latest,
+        )
+        or re.search(
+            r"\banalys(?:is|es)\b.{0,48}"
+            r"\b(?:possible|available|options?|recommend|suitable|useful|nice)\b",
+            latest,
+        )
+        or any(phrase in latest for phrase in (
+            "help me choose an analysis", "help me choose analysis",
+            "help me pick an analysis", "help me pick what analysis",
+        ))
+    )
+
+
 def organoid_processing_question(context: dict, messages: list[dict]) -> str | None:
     """Resolve whether organoid lines are processing types before any bulk fill."""
     metadata = context.get("metadata", {}) or {}
@@ -166,6 +198,8 @@ def organoid_processing_question(context: dict, messages: list[dict]) -> str | N
         return None
 
     latest = _latest_user_message(messages)
+    if _asks_general_analysis_question(messages):
+        return None
     user_history = " ".join(
         str(message.get("content") or "").lower()
         for message in messages
@@ -183,11 +217,17 @@ def organoid_processing_question(context: dict, messages: list[dict]) -> str | N
         return None
 
     latest_normalized = " ".join(latest.lower().split())
+    explicit_metadata_request = (
+        "metadata" in latest_normalized
+        and any(phrase in latest_normalized for phrase in (
+            "build", "create", "set up", "setup", "fill", "prepare",
+            "help me", "walk through",
+        ))
+    )
     setup_turn = (
         "organoid" in latest_normalized
-        and any(phrase in latest_normalized for phrase in (
-            "metadata", "set up", "setup", "line", "co-culture", "coculture",
-        ))
+        and "line" in latest_normalized
+        and explicit_metadata_request
     )
     previous_assistant = next((
         str(message.get("content") or "").lower()
@@ -219,20 +259,29 @@ def metadata_identifier_confirmation_question(
     builder = context.get("metadata_builder", {}) or {}
     if not builder.get("sample_forms_created"):
         return None
-    latest = " ".join(_latest_user_message(messages).lower().split())
-    if not (
-        any(phrase in latest for phrase in ("no well", "without well", "no wells"))
-        and any(token in latest for token in (" line", "m21", "m23", "t-cell", "t cell"))
-    ):
+    latest = _normalized_user_message(messages)
+    missing_well = any(phrase in latest for phrase in (
+        "no well", "without well", "no wells", "not using a well",
+        "not using wells", "don't have well", "do not have well",
+    ))
+    missing_line = any(phrase in latest for phrase in (
+        "no line", "without line", "no lines", "line is missing",
+        "lines are missing", "haven't specified the line",
+        "haven't specified lines", "have not specified the line",
+        "have not specified lines", "line not specified", "lines not specified",
+    ))
+    if not (missing_well or missing_line):
         return None
     return (
         "Well and the line for every configured cell or organoid type are mandatory; "
-        "condition is optional. Since there are no physical well identifiers, I can "
-        "propose **1** for every sample. Before I fill the line fields, please confirm: "
-        "should each line you gave apply to all relevant samples, should M21/M23 be "
-        "inferred only where those suffixes appear in a filename, and should a sample "
-        "without a macrophage suffix be described as **not added** and use the line "
-        "value **not_added**?"
+        "condition is optional. If the experiment has no physical well identifiers, "
+        "you can use one consistent placeholder such as **1**, after confirming that "
+        "choice. Enter the actual line for every population present in each sample; "
+        "for a configured population that was **not added** to a sample, use "
+        "**not_added**. I will not "
+        "infer line values from filenames or apply one line to multiple samples unless "
+        "you confirm that mapping. Tell me which identifiers are missing, or ask me to "
+        "check the current metadata form."
     )
 
 
@@ -415,31 +464,29 @@ def _metadata_analysis_profile(context: dict) -> dict:
 
 def analysis_choice_summary(context: dict, messages: list[dict]) -> str | None:
     """List every analysis route and connect it to the live experiment design."""
-    latest = " ".join(_latest_user_message(messages).lower().split())
+    latest = _normalized_user_message(messages)
     intent = str((context.get("assistant_session") or {}).get("intent") or "")
     targeted_single_cell = any(phrase in latest for phrase in (
         "classify behavioral tracks", "classify behavioural tracks",
         "state trajectory", "track classification",
     ))
-    asks_general = (
-        bool(re.search(
-            r"\b(?:what|which|choose|pick)\b.{0,28}\banalys(?:is|es)\b",
-            latest,
-        ))
-        or "analysis would be nice" in latest
-        or "analysis is possible" in latest
-        or "help me choose an analysis" in latest
-    )
+    asks_general = _asks_general_analysis_question(messages)
     if (intent != "choose_analysis" and not asks_general) or targeted_single_cell:
         return None
 
+    metadata = context.get("metadata", {}) or {}
+    has_live_metadata = bool(
+        metadata.get("loaded")
+        or metadata.get("record_source") in {
+            "metadata_builder_draft", "loaded_metadata_copy",
+        }
+    )
     profile = _metadata_analysis_profile(context)
     populations = profile["populations"]
     all_populations = (
         populations["organoid"] + populations["immune"] + populations["other"]
     )
-    snapshot = ""
-    if profile["n_samples"] or all_populations:
+    if has_live_metadata and (profile["n_samples"] or all_populations):
         sample_text = (
             f"**{profile['n_samples']} samples**"
             if profile["n_samples"] else "the loaded samples"
@@ -453,30 +500,76 @@ def analysis_choice_summary(context: dict, messages: list[dict]) -> str | None:
             + (f" Recorded lines/conditions include **{lines}**." if lines else "")
             + "\n\n"
         )
+    elif has_live_metadata:
+        snapshot = (
+            "Metadata is loaded, but I cannot identify configured populations from "
+            "the current records, so the overview below is not yet prioritized.\n\n"
+        )
+    else:
+        described = []
+        for terms, label in (
+            (("t cell", "t-cell", "tcell"), "T cells"),
+            (("macrophage",), "macrophages"),
+            (("organoid",), "organoids"),
+        ):
+            if any(term in latest for term in terms):
+                described.append(label)
+        description = (
+            f" You described **{', '.join(described)}**, so I can still suggest "
+            "relevant routes conditionally."
+            if described else ""
+        )
+        snapshot = (
+            "No metadata is loaded, so I cannot yet confirm sample counts, configured "
+            f"populations, lines, or death-signal availability.{description}\n\n"
+        )
+
+    described_organoid = "organoid" in latest
+    described_immune_labels = []
+    for terms, label in (
+        (("t cell", "t-cell", "tcell"), "T cells"),
+        (("macrophage",), "macrophages"),
+        (("immune",), "immune cells"),
+    ):
+        if any(term in latest for term in terms) and label not in described_immune_labels:
+            described_immune_labels.append(label)
+    described_immune = bool(described_immune_labels)
+    has_organoid = bool(populations["organoid"]) or described_organoid
+    has_immune = bool(populations["immune"]) or described_immune
+    immune_labels = populations["immune"] or described_immune_labels
+    immune_subject = " or ".join(immune_labels[:4]) or "immune cells"
 
     questions = []
-    if populations["organoid"]:
+    if has_organoid:
         questions.append(
-            "Do target or organoid lines differ in death timing? Start with "
-            "**Death Dynamics**."
+            "Do organoid lines differ in survival or death timing? Use **Death "
+            "Dynamics** if a death signal is available."
         )
-    if populations["organoid"] and populations["immune"]:
+    if has_organoid and has_immune:
         questions.extend([
-            "Do immune contacts differ by target condition, and are they associated "
-            "with death? Use **Interaction Analysis**.",
-            "Do immune cells engage or enter targets to different degrees? Use "
-            "**Invasiveness Analysis**, if invasiveness features were extracted.",
+            f"Do {immune_subject} contact different organoid lines differently, "
+            "and is contact associated with death? Use **Interaction Analysis**.",
+            "How much of each immune cell surface engages an organoid? Use "
+            "**Invasiveness Analysis** after extracting invasiveness features.",
+            "Do sustained-contact tracks occupy different trajectory clusters, or do "
+            "cell states change after contact? Use **Contact-Based Grouping** and "
+            "**Contact State-Shift Analysis** under State Trajectory.",
         ])
-    if populations["immune"]:
+    if has_immune:
         questions.append(
             "Do immune populations occupy different dynamic states or complete "
             "different behavioral programs? Use **Behavioral State**, then "
             "**State Trajectory**."
         )
-    if populations["organoid"] and populations["immune"] and profile["dead_signal"]:
+    if has_organoid and has_immune:
+        availability = (
+            "The loaded metadata includes a death signal."
+            if profile["dead_signal"] else
+            "This requires a configured death signal and the relevant extracted features."
+        )
         questions.append(
             "Which individual immune cells show contact-associated target killing? "
-            "Use **Active Killing** after feature extraction."
+            f"Use **Active Killing** after feature extraction. {availability}"
         )
     if not questions:
         questions.append(
@@ -484,22 +577,38 @@ def analysis_choice_summary(context: dict, messages: list[dict]) -> str | None:
             "prerequisites before running it."
         )
     question_text = "\n".join(f"- {question}" for question in questions)
+    question_heading = (
+        "Questions suggested by your metadata"
+        if has_live_metadata else "Questions suggested from your description"
+    )
     return (
         f"{snapshot}"
-        "BEHAV3D offers these analysis routes:\n"
-        "1. **Death Dynamics** - target survival, death timing, and disappearance.\n"
-        "2. **Interaction Analysis** - target-centered contact patterns and their "
-        "relationship to death.\n"
-        "3. **Invasiveness Analysis** - immune-cell engagement with targets over time "
-        "and per movie.\n"
-        "4. **Active Killing** - contact-associated target death attributed to "
-        "individual immune cells; configured under Feature Extraction.\n"
-        "5. **Behavioral State** - an HMM state for each selected-cell timepoint.\n"
-        "6. **State Trajectory** - clusters whole state sequences into behavioral "
-        "programs.\n"
-        "7. **Backprojection** - overlays state, trajectory, or killing results on the "
-        "images for visual validation.\n\n"
-        "**Questions suggested by your metadata**\n"
+        "| Analysis | What it answers |\n"
+        "|---|---|\n"
+        "| **Death Dynamics** | How target survival and death timing differ across "
+        "samples or conditions. |\n"
+        "| **Interaction Analysis** | How target-contact patterns differ and whether "
+        "they are associated with target death. |\n"
+        "| **Invasiveness Analysis** | How much of an immune cell's surface engages a "
+        "target over time and per movie. |\n"
+        "| **Active Killing** | Which individual immune cells have contact-associated "
+        "target-death events; configured during Feature Extraction. |\n"
+        "| **Behavioral State** | Which recurring state each selected cell occupies at "
+        "each timepoint. |\n"
+        "| **State Trajectory** | Which whole-track behavioral programs occur and how "
+        "their proportions differ by condition. |\n"
+        "| **Contact-Based Grouping** | Whether State Trajectory clusters differ "
+        "between tracks with and without a sustained contact bout. |\n"
+        "| **Contact State-Shift Analysis** | Whether behavioral-state composition "
+        "changes before versus after contact, compared with matched no-contact tracks. |\n"
+        "| **Backprojection** | Where state, trajectory, or killing labels occur in the "
+        "original images for visual validation. |\n\n"
+        "Interaction and Invasiveness are in the **Death Dynamics** analysis tab. "
+        "State Trajectory also provides diagnostics, track-proportion plots, condition "
+        "comparisons, exemplar tracks, and the two contact analyses above. Contact-Based "
+        "Grouping requires contact features and Categorical DTW classification; Contact "
+        "State-Shift additionally requires Behavioral State results.\n\n"
+        f"**{question_heading}**\n"
         f"{question_text}\n\n"
         "For an immune-cell behavior question, the usual sequence is **Behavioral "
         "State -> rename or merge states -> State Trajectory -> Backprojection**. "
@@ -886,15 +995,23 @@ def metadata_channel_mapping_guidance(
     return (
         "The **Metadata Builder does not map raw channel indices to cell types**. "
         "Its sample forms hold image/acquisition details plus each processing "
-        "population's **Line** and **Condition**. Channel-input or channel-label "
-        "controls belong to the selected segmentation method, so I should not "
-        "describe Cellpose controls as metadata fields.\n\n"
+        "population's **Line** and **Condition**. Channel inputs are configured in "
+        "Segmentation.\n\n"
         "For swapped-channel replicates, a valid metadata structure is to name two "
         "generic processing slots for the physical immune channels (for example, "
         "**blue** and **green**) and record the true identity, such as CD4 or CD8, "
-        "in each slot's **Line** field for every sample. Should those two processing "
-        "slots follow the physical channels, with Line carrying the biological "
-        "identity per sample?"
+        "in each slot's **Line** field for every sample. A slot must stay tied to "
+        "the same physical raw channel across all samples processed by that model; "
+        "the channel choice is not independent per sample.\n\n"
+        "The model scope also differs by method: **APOC** trains one binary model "
+        "per processing population and exposes channel inputs for each model; the "
+        "CPU **Pixel Classifier** also trains one classifier per population; "
+        "**ConvPaint** trains one shared multiclass model with one shared channel "
+        "set; and **Cellpose-SAM** exposes channel inputs per population. If the raw "
+        "channel order itself changes between samples, normalize the order first or "
+        "process those samples as separate model groups. Should the generic slots "
+        "follow fixed physical channels, with Line carrying the biological identity "
+        "per sample?"
     )
 
 
@@ -1122,8 +1239,12 @@ def apoc_feature_preset_action(
         "I am configuring the **Segmentation > APOC > Tune Features** controls, "
         f"not Feature Extraction or instance post-processing: {details}. Each preset "
         "selects Gaussian, DoG, LoG, and SoG at those scales and includes original "
-        "intensity. Retrain each classifier and inspect its probability-map preview "
-        "after applying the changes."
+        "intensity. Use this as a first pass, retrain, inspect the probability-map "
+        "preview, and open **Show classifier statistics**. In that table, greener "
+        "importance cells are more informative and redder cells are less informative. "
+        "Remove only consistently low-importance features, then retrain and preview "
+        "again; a broader custom scale set is useful when the first preset misses an "
+        "important object scale."
     )
     if not calls:
         text += " Those presets and Tune Features panels are already set, so no edit is needed."
@@ -1215,7 +1336,13 @@ def apoc_feature_grid_guidance(
         "rows at sigma **1, 2, 5**; Medium uses **1, 2, 5, 15**; Large uses "
         "**1, 2, 5, 10, 25**. All three presets include original intensity, which "
         "adds raw pixel values as a classifier feature. "
-        f"{availability}{scale_text}{recommendation} Changes here require retraining. "
+        f"{availability}{scale_text}{recommendation} Treat the preset as the first "
+        "pass rather than the final answer. If it misses relevant object scales, try "
+        "a broader candidate set, retrain, and inspect **Show classifier statistics**. "
+        "The importance table runs from greener, more informative cells toward redder, "
+        "less informative cells. Remove only features that remain uninformative, then "
+        "retrain and compare the probability-map preview again. Changes here require "
+        "retraining. "
         "These controls are separate from Minimum size, EDT, Mask threshold, Seed "
         "threshold, and the later Feature Extraction tab."
     )
@@ -1305,10 +1432,30 @@ def feature_threshold_guidance(
     if context.get("current_step") != "feature_extraction":
         return None
     latest = " ".join(_latest_user_message(messages).lower().split())
-    if "contact" not in latest or not any(term in latest for term in (
+    contact_request = "contact" in latest and any(term in latest for term in (
         "distance", "threshold", "set", "correct", "mean", "1.01", "touch",
-    )):
+    ))
+    death_request = any(term in latest for term in ("dead", "death")) and any(
+        term in latest for term in (
+            "threshold", "percentage", "percent", "set", "correct", "preview",
+            "first time", "calibrat",
+        )
+    )
+    if not contact_request and not death_request:
         return None
+
+    death_text = (
+        "Use **Preview Dead Threshold in Viewer** before relying on result PDFs or "
+        "choosing a number. Select the sample and population, open the preview, and "
+        "adjust the threshold above it: the overlay updates live; **green is below "
+        "the threshold (alive)** and **red is above it (dead)**; hovering an object shows "
+        "its measured dead-mask percentage. Calibrate against cells or organoids you "
+        "can confidently identify as alive or dead. The live context does not justify "
+        "a universal numeric range. Re-run Feature Extraction after choosing the "
+        "threshold."
+    )
+    if not contact_request:
+        return death_text
 
     controls = (context.get("ui_state", {}) or {}).get("controls", []) or []
     active = str(context.get("active_cell_type") or "")
@@ -1339,22 +1486,14 @@ def feature_threshold_guidance(
             "one-pixel XY gap, so it is close-proximity contact rather than strict "
             "mask touching."
         )
-    death_text = ""
-    if "dead" in latest or "death" in latest:
-        death_text = (
-            " For the dead-mask percentage, use the Feature Extraction preview: "
-            "green is below the threshold (alive), red is above it (dead), and hover "
-            "shows the measured percentage. Calibrate from cells you can confidently "
-            "classify as alive or dead; the live context does not justify a universal "
-            "numeric range."
-        )
+    appended_death = f" {death_text}" if death_request else ""
     return (
         "**Contact distance 0 µm means strict mask touching.** Any positive value "
         "permits that much physical separation between masks and therefore changes "
         "the biological definition from touching to proximity."
         + current_text + scale_text
         + " Re-run Feature Extraction after changing the contact distance."
-        + death_text
+        + appended_death
     )
 
 
@@ -1383,6 +1522,44 @@ def missing_log_error_question(context: dict, messages: list[dict]) -> str | Non
     )
 
 
+def result_opening_correction(
+    context: dict, messages: list[dict],
+) -> str | None:
+    """Stop repeated claims after the researcher reports that nothing opened."""
+    latest = " ".join(_latest_user_message(messages).lower().split())
+    correction = any(phrase in latest for phrase in (
+        "you cannot open", "you can not open", "you can't open",
+        "nothing opened", "it did not open", "it didn't open",
+        "not opening", "cannot open it", "can't open it",
+    ))
+    history = " ".join(
+        str(message.get("content") or "").lower()
+        for message in messages[:-1]
+        if message.get("role") == "assistant"
+    )
+    if not correction or not any(term in history for term in ("open", "opening")):
+        return None
+    preview = ""
+    prior_conversation = " ".join(
+        str(message.get("content") or "").lower()
+        for message in messages[:-1]
+    )
+    if context.get("current_step") == "feature_extraction" and any(
+        term in prior_conversation for term in ("dead", "death", "threshold")
+    ):
+        preview = (
+            " For death-threshold calibration, use **Preview Dead Threshold in "
+            "Viewer** in Feature Extraction; it provides the green alive/red dead "
+            "overlay and the measured percentage on hover."
+        )
+    return (
+        "**No result was opened.** A file being listed as viewable does not mean it "
+        "has opened. Open the exact item from the **Results** panel, or name the exact "
+        "result you want opened so it can be matched to a viewable result."
+        + preview
+    )
+
+
 def historical_reference_guidance(
     context: dict, messages: list[dict],
 ) -> dict | None:
@@ -1394,9 +1571,49 @@ def historical_reference_guidance(
         "historical setting", "reference profile", "reference configuration",
         "similar experiment", "similar dataset", "values used before",
         "what did you use", "used previously", "prior experiment",
-    ))
+    )) or (
+        any(term in latest for term in ("previous", "past", "prior", "historical"))
+        and "experiment" in latest
+    )
     if not historical_request:
         return None
+
+    if any(term in latest for term in (
+        "microglia", "macrophage", "exp91", "dmg", "dipg", "gd2",
+    )):
+        return {
+            "text": (
+                "**Historical example: Exp91 DMG organoid, macrophage/microglia, "
+                "and GD2 CAR-T co-culture.** The metadata CSV records eight wells, "
+                "1.77 µm isotropic sampling, 120-second frames, TCZYX order, and "
+                "five channels: brightfield 0, T cell 1, macrophage/microglia 2, "
+                "dead-cell dye 3, and organoid 4. The three organoid lines were kept "
+                "as one processing population because only one line occurred per "
+                "movie; line identity was retained for analysis. Macrophage/microglia "
+                "conditions were no added cells, M21, and M23. The historical CSV "
+                "uses the legacy value **None_None** for no added macrophages; track "
+                "paths in those wells contain segmentation noise and are not evidence "
+                "that macrophages were present.\n\n"
+                "The saved YAML uses APOC Probability Map + Watershed: organoid "
+                "channels 3 and 4 with mask/seed thresholds 0.5/0.8 and minimum size "
+                "1000 voxels; macrophage channel 2 and T-cell channel 1 with "
+                "0.5/0.6 and minimum sizes 100 and 30 voxels. Organoids and "
+                "macrophages used Propagation; T cells used btrack with maximum "
+                "search radius 150, optimizer distance 100, time threshold 5 frames, "
+                "and global optimization enabled. Active Killing was configured as "
+                "an absolute increase of 30 dead-mask pixels within 5 frames after "
+                "at least one contact frame.\n\n"
+                "Only T cells had behavioral classification: four HMM states and "
+                "50-timepoint trajectory windows. One source conflict must remain "
+                "visible: the saved YAML has HMM Start offset **0**, while the README "
+                "describes **1**. The design is also incomplete and unreplicated: "
+                "DIPG002ns has no M21 well, and each included combination has n=1, "
+                "so comparisons are descriptive or exploratory. These are sourced "
+                "historical values, not defaults, and I am not proposing form edits "
+                "from them."
+            ),
+            "calls": [],
+        }
 
     if (
         any(term in latest for term in ("calcium", "reporter", "islet"))
@@ -2784,7 +3001,9 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "You are the BEHAV3D Assistant for researchers analysing 3D fluorescence imaging. "
         "Answer the user's actual question first, then add only context that helps them decide "
         "or act. Use concise researcher-facing labels and never expose control IDs, variable "
-        "names, dotted configuration keys, JSON, or tool names in normal prose.\n\n"
+        "names, dotted configuration keys, JSON, or tool names in normal prose. Never narrate "
+        "internal rules, policies, prompting, capability checks, or reasoning with phrases such "
+        "as 'I should not' or 'my rules say'; give the resulting researcher-facing answer directly.\n\n"
         "TRUST AND SCOPE\n"
         "- The LIVE CONTEXT is authoritative. Read all loaded metadata records and current control "
         "values before asking for information. Never ask for a value already present.\n"
@@ -2866,12 +3085,16 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "as multiple organoid types or together as one organoid type with line identity per sample. "
         "Recommend separate types when multiple organoid identities coexist in the same movie and must "
         "be processed separately; otherwise one processing type is normally appropriate. Do not emit "
-        "metadata actions until the researcher explicitly chooses.\n"
+        "metadata actions until the researcher explicitly chooses. Ask this only for an explicit metadata "
+        "creation/editing request; never override an informational or analysis question merely because it "
+        "mentions organoid lines.\n"
         "- Metadata Well and the line for every configured population in every sample are mandatory. "
         "Population condition is optional. If there are no physical well identifiers, propose one "
         "deterministic shared value such as '1' and ask for confirmation. Before filling population "
         "lines, establish whether each line is shared across all samples. Filename suffixes are only "
-        "proposed inferences. For a sample where a configured population is confirmed absent, set its "
+        "proposed inferences. Keep clarification wording experiment-neutral and never introduce example "
+        "line, strain, or population names that are not in the live context. For a sample where a configured "
+        "population is confirmed absent, set its "
         "line to the literal CSV-safe value 'not_added' and describe it to the researcher as 'not "
         "added'; never write None and never leave a mandatory line blank.\n"
         "- Use only controls matching the selected method and exact cell type. Do not apply a change to "
@@ -2888,6 +3111,12 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "- Never tell the user to click a field that you can edit with set_ui_value.\n"
         "- Do not claim an action succeeded in prose. State the intended change briefly; the client "
         "reports whether it was applied.\n"
+        "- Opening a result requires an open_result call with the exact id of a viewable item from "
+        "LIVE CONTEXT in the same response. Never say 'I will open', 'let me open', 'I am opening', "
+        "or 'try opening' without that call. A result merely listed as viewable has not been opened. "
+        "If no single exact result can be identified, say that it was not opened and direct the "
+        "researcher to the Results panel or the relevant built-in preview. Even when the call is "
+        "present, describe the intended opening rather than claiming it succeeded.\n"
         "- For EDT advice, use recommend_edt so the conversion comes from metadata. Use a 10 um cell "
         "diameter by default. For an organoid, first ask how many cell widths span its diameter. Treat "
         "the returned values as preview starting points, not ground truth.\n"
@@ -3028,11 +3257,14 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "manually edited outside BEHAV3D.\n"
         "- For State Trajectory, Trajectory size cannot exceed the Filtering trim. Average linkage is the "
         "default, Complete is a reasonable comparison, and Single performs poorly. Original BEHAV3D mode is "
-        "deprecated. Be transparent that contact-based comparison plots and exemplar-track exports are known "
-        "to be unreliable in the current implementation.\n"
+        "deprecated. Categorical DTW supports Contact-Based Grouping for sustained-contact versus no-contact "
+        "tracks and Contact State-Shift Analysis for before/after-contact state composition; the latter also "
+        "requires Behavioral State results. Do not claim these current contact analyses are unavailable or "
+        "known to produce empty output.\n"
         "- A general analysis-choice request must enumerate all relevant routes: Death Dynamics, Interaction "
-        "Analysis, Invasiveness Analysis, Active Killing, Behavioral State, State Trajectory, and "
-        "Backprojection. Then use the loaded metadata populations, lines/conditions, and dead-signal "
+        "Analysis, Invasiveness Analysis, Active Killing, Behavioral State, State Trajectory, Contact-Based "
+        "Grouping, Contact State-Shift Analysis, and Backprojection. Then use the loaded metadata "
+        "populations, lines/conditions, and dead-signal "
         "availability to propose concrete biological questions and a sensible sequence, while distinguishing "
         "configured prerequisites from results that actually exist. Do not navigate for this overview. When the "
         "user names a specific view and asks to open it, use open_analysis_view. Never repeatedly navigate "
@@ -3235,10 +3467,11 @@ def deterministic_turn_response(
 
     preflight_question = (
         metadata_channel_mapping_guidance(context, messages)
+        or result_opening_correction(context, messages)
+        or analysis_choice_summary(context, messages)
         or organoid_processing_question(context, messages)
         or metadata_identifier_confirmation_question(context, messages)
         or metadata_completion_summary(context, messages)
-        or analysis_choice_summary(context, messages)
         or safety_profile_summary(context, messages)
         or active_killing_readiness_summary(context, messages)
         or feature_group_requirement_guidance(context, messages)
