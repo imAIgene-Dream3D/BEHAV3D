@@ -440,7 +440,7 @@ def validate_metadata_records(records: list[dict]) -> list[dict]:
 
         # Draft builder records keep line and condition as separate nested
         # fields. A line is mandatory for every configured population; condition
-        # is optional. Use the literal value "None" for a confirmed absent
+        # is optional. Use the literal value "not_added" for a confirmed absent
         # population so absence is explicit rather than indistinguishable from an
         # unfinished row.
         for cell_type, fields in (record.get("cell_types") or {}).items():
@@ -534,7 +534,7 @@ _METADATA_FIELD_REQUIREMENTS = {
         "Dead-mask path",
     ],
     "absence_value": (
-        'Use "None" as the line only after the researcher confirms that a '
+        'Use "not_added" as the line only after the researcher confirms that a '
         "configured population is absent from that sample."
     ),
 }

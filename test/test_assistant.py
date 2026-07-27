@@ -19,7 +19,7 @@ from behav3d.napari._assistant_schema import (
 )
 from behav3d.napari._assistant_actions import (
     ProposedAction, get_by_dotted, set_by_dotted, validate_value, build_actions,
-    apply_action, apply_set_ui_value,
+    apply_action, apply_set_ui_value, normalize_metadata_line_value,
 )
 from behav3d.napari._assistant_context import (
     summarize_metadata, _diff_from_defaults, validate_metadata_records,
@@ -33,7 +33,9 @@ from behav3d.napari._assistant_controls import (
 from behav3d.napari._assistant_recommendations import (
     calculate_edt_recommendations, format_edt_recommendations,
 )
-from behav3d.napari._assistant import researcher_facing_text
+from behav3d.napari._assistant import (
+    researcher_facing_text, streaming_transcript_block, transcript_block_role,
+)
 from behav3d.analysis.track_counts import (
     calculate_track_count_table, format_track_count_summary,
     generate_track_count_summary,
@@ -329,6 +331,13 @@ def test_backend_hides_bulk_metadata_tool_after_forms_exist():
     assert sanitized == {"samples": [{
         "pixel_distance_xy": 1.15, "pixel_distance_z": 4, "time_interval": 15,
     }]}
+    absent = app.sanitize_bulk_metadata_arguments({"samples": [{
+        "cell_types": {
+            "T cells": {"line": "GD2_CART"},
+            "Macrophages": {"line": None},
+        },
+    }]}, "T cells are GD2_CART and macrophages were not added")
+    assert absent["samples"][0]["cell_types"]["Macrophages"]["line"] == "not_added"
     recovered = app.recover_single_control_action(
         [],
         {"ui_state": {"controls": [{
@@ -501,7 +510,8 @@ def test_metadata_identifier_inferences_require_confirmation():
     assert "mandatory" in response
     assert "condition is optional" in response
     assert "M21/M23" in response
-    assert "None" in response
+    assert "not_added" in response
+    assert "not added" in response
     assert "confirm" in response
 
 
@@ -562,12 +572,33 @@ def test_analysis_choose_explains_and_named_view_opens_directly():
     import app
 
     summary = app.analysis_choice_summary(
-        {"assistant_session": {"intent": "choose_analysis"}},
-        [{"role": "user", "content": "Choose analysis"}],
+        {
+            "assistant_session": {"intent": "choose_analysis"},
+            "metadata": {
+                "n_samples": 8,
+                "cell_types": {
+                    "organoid": ["Organoids"],
+                    "immune": ["Macrophages", "T-cells"],
+                    "other": [],
+                },
+                "records": [{
+                    "or_Organoids_line_condition": "DO7",
+                    "im_T-cells_line_condition": "GD2_CART",
+                    "im_Macrophages_line_condition": "M21",
+                    "dead_channel": 3,
+                }],
+            },
+        },
+        [{"role": "user", "content": "Can you help me pick what analysis is nice?"}],
     )
-    assert "Death Dynamics" in summary
-    assert "Behavioral State" in summary
-    assert "State Trajectory" in summary
+    for name in (
+        "Death Dynamics", "Interaction Analysis", "Invasiveness Analysis",
+        "Active Killing", "Behavioral State", "State Trajectory", "Backprojection",
+    ):
+        assert name in summary
+    assert "8 samples" in summary
+    assert "DO7" in summary and "GD2_CART" in summary and "M21" in summary
+    assert "Questions suggested by your metadata" in summary
 
     action = app.analysis_navigation_action(
         {"current_step": "analysis", "analysis": {"view": "behavioral_state"}},
@@ -952,6 +983,152 @@ def test_hmm_all_movement_choice_updates_both_feature_lists():
         "net_displacement", "straightness",
     ]
     assert "mean_dead_dye" not in str(values)
+
+
+def _tcell_hmm_context():
+    prefix = "analysis.state_classification.T-cells."
+    return {
+        "current_step": "analysis",
+        "active_cell_type": "T-cells",
+        "analysis": {
+            "view": "behavioral_state",
+            "selected_cell_type": "T-cells",
+        },
+        "ui_state": {"controls": [
+            {
+                "id": prefix + "timepoint_features",
+                "visible": True, "enabled": True,
+                "choices": ["speed", "elongation"],
+                "value": ["speed"],
+            },
+            {
+                "id": prefix + "window_features",
+                "visible": True, "enabled": True,
+                "choices": ["net_displacement", "straightness"],
+                "value": ["net_displacement"],
+            },
+            {
+                "id": prefix + "binary_feature_groups",
+                "visible": True, "enabled": True,
+                "choices": [
+                    "Organoid_contact", "Macrophages_contact", "dead",
+                ],
+                "value": [],
+            },
+            {
+                "id": prefix + "n_states",
+                "visible": True, "enabled": True, "value": 6,
+            },
+        ]},
+    }
+
+
+def test_hmm_guidance_uses_live_selected_cell_type():
+    import app
+
+    context = _tcell_hmm_context()
+    setup = app.hmm_setup_guidance(
+        context,
+        [{"role": "user", "content": (
+            "I want to do behavioral analysis, can you take me through the steps?"
+        )}],
+    )
+    assert "T-cells" in setup
+    assert "currently have" in setup
+    assert "rename" in setup.lower() and "merge" in setup.lower()
+
+    groups = app.hmm_binary_group_guidance(
+        context,
+        [{"role": "user", "content": (
+            "Would it be worth adding macrophage contact?"
+        )}],
+    )
+    assert "T-cells" in groups
+    assert "a cell from T-cells is directly touching Macrophages".lower() in groups.lower()
+    assert "not a different population" in groups
+
+
+def test_hmm_binary_group_edit_targets_selected_cell_control():
+    import app
+
+    context = _tcell_hmm_context()
+    result = app.hmm_binary_group_action(
+        context,
+        [{"role": "user", "content": "Add organoid contact and also add dead"}],
+    )
+    assert "T-cells" in result["text"]
+    assert result["calls"] == [{
+        "name": "set_ui_value",
+        "arguments": {
+            "control_id": (
+                "analysis.state_classification.T-cells.binary_feature_groups"
+            ),
+            "value": ["Organoid_contact", "dead"],
+        },
+    }]
+
+
+def test_hmm_states_can_be_merged_by_reusing_names():
+    import app
+
+    response = app.hmm_state_merge_guidance(
+        _tcell_hmm_context(),
+        [{"role": "user", "content": (
+            "If I have 6 states, can I select which ones to keep?"
+        )}],
+    )
+    assert "T-cells" in response
+    assert "same name" in response
+    assert "merge" in response
+    assert "Rename Primary Dynamic State Clusters" in response
+    assert "outside BEHAV3D" not in response
+
+
+def test_chat_transcript_shows_waiting_block_and_tracks_role_colors():
+    assert streaming_transcript_block(True, "") == (
+        "**BEHAV3D Assistant**\n\n*Preparing a response...*"
+    )
+    assert streaming_transcript_block(False, None) is None
+    role = transcript_block_role("You")
+    assert role == "user"
+    assert transcript_block_role("My question", role) == "user"
+    assert transcript_block_role("BEHAV3D Assistant", role) == "assistant"
+
+
+def test_metadata_absence_values_are_csv_safe():
+    import app
+
+    assert normalize_metadata_line_value(None) == "not_added"
+    assert normalize_metadata_line_value("None") == "not_added"
+    assert normalize_metadata_line_value("(not_added)") == "not_added"
+    assert normalize_metadata_line_value("M21") == "M21"
+    controls = [{
+        "id": "metadata.samples.0.cell_types.Macrophages.line",
+        "label": "Sample 1, Macrophages: line",
+        "value": "",
+        "visible": True,
+        "enabled": True,
+    }]
+    action = build_actions([{
+        "name": "set_ui_value",
+        "arguments": {
+            "control_id": "metadata.samples.0.cell_types.Macrophages.line",
+            "value": None,
+        },
+    }], [], {}, controls=controls)[0]
+    assert action.ok
+    assert action.data["value"] == "not_added"
+    result = app.metadata_absence_action(
+        {
+            "current_step": "data_preparation",
+            "ui_state": {"controls": controls},
+        },
+        [{"role": "user", "content": (
+            "Macrophages were not added in Sample 1; set that line."
+        )}],
+    )
+    assert "not added" in result["text"]
+    assert result["calls"][0]["arguments"]["value"] == "not_added"
 
 
 def test_equal_track_filter_review_explains_valid_fixed_length_workflow():
@@ -1900,6 +2077,10 @@ def test_prompt_encodes_pi_feedback_scenarios():
     assert "setup_ready true" in sp
     assert "enumerate all movement choices" in sp
     assert "currently selected speed and net displacement" in sp
+    assert "read analysis.selected_cell_type" in sp
+    assert "assigning the same name to multiple primary clusters merges them" in sp
+    assert "Death Dynamics, Interaction Analysis, Invasiveness Analysis" in sp
+    assert "line to the literal CSV-safe value 'not_added'" in sp
 
 
 class _FakeSpin:
@@ -2180,7 +2361,7 @@ def test_metadata_validation_matches_required_well_and_population_lines():
         "cell_types": {
             "organoid": {"line": "DO7", "condition": ""},
             "T-cells": {"line": "", "condition": ""},
-            "Macrophages": {"line": "None", "condition": ""},
+            "Macrophages": {"line": "not_added", "condition": ""},
         },
     }]
     issues = validate_metadata_records(records)
@@ -2908,7 +3089,7 @@ def test_feedback_guidance_fixtures():
 
     fixture = Path(__file__).parent / "fixtures" / "assistant_feedback_transcripts.json"
     cases = json.loads(fixture.read_text(encoding="utf-8"))
-    assert KNOWLEDGE_VERSION == "2026.07.24.24"
+    assert KNOWLEDGE_VERSION == "2026.07.27.25"
     for case in cases:
         cards = select_guidance_cards(
             {"current_step": case["step"]}, case["user"], case.get("intent"))

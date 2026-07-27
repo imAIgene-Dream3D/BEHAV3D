@@ -568,6 +568,18 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def normalize_metadata_line_value(value: Any) -> Any:
+    """Use the CSV-safe sentinel for a configured population that is absent."""
+    if value is None:
+        return "not_added"
+    normalized = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in {
+        "none", "null", "n/a", "na", "absent", "not_added", "(not_added)",
+    }:
+        return "not_added"
+    return value
+
+
 def _coerce_control_value(control: dict, value: Any) -> tuple[bool, Any, str]:
     current = control.get("value")
     try:
@@ -629,8 +641,11 @@ def build_actions(
         if name == "set_ui_value":
             control_id = str(args.get("control_id") or "")
             control = next((c for c in (controls or []) if c.get("id") == control_id), None)
+            requested_value = args.get("value")
+            if control_id.startswith("metadata.samples.") and control_id.endswith(".line"):
+                requested_value = normalize_metadata_line_value(requested_value)
             act = ProposedAction("set_ui_value", control_id=control_id,
-                                 value=args.get("value"))
+                                 value=requested_value)
             if control is None:
                 act.ok = False
                 act.message = "That field is not available in the current interface."
@@ -641,7 +656,7 @@ def build_actions(
                 act.ok = False
                 act.message = "That field belongs to a different method than the one selected."
             else:
-                ok, coerced, message = _coerce_control_value(control, args.get("value"))
+                ok, coerced, message = _coerce_control_value(control, requested_value)
                 act.ok, act.message = ok, message
                 act.data.update(value=coerced, label=control.get("label"),
                                 old_value=control.get("value"))
@@ -693,6 +708,8 @@ def build_actions(
         elif name == "fill_metadata_builder":
             field = args.get("field")
             value = args.get("value")
+            if field == "cell_line":
+                value = normalize_metadata_line_value(value)
             index = _safe_int(args.get("index", 0), 0)
             act = ProposedAction(
                 "fill_metadata_builder",
@@ -714,6 +731,12 @@ def build_actions(
             actions.append(act)
         elif name == "bulk_fill_metadata":
             samples = args.get("samples", []) or []
+            for sample in samples:
+                if not isinstance(sample, dict):
+                    continue
+                for values in (sample.get("cell_types") or {}).values():
+                    if isinstance(values, dict) and "line" in values:
+                        values["line"] = normalize_metadata_line_value(values["line"])
             act = ProposedAction(
                 "bulk_fill_metadata",
                 n_samples=args.get("n_samples"),
@@ -1677,9 +1700,10 @@ TOOL_SCHEMA = [
                         "sample_name, exp_nr, well, raw_image_path, dimension_order, "
                         "pixel_distance_xy, pixel_distance_z, time_interval, time_unit, "
                         "dead_channel_number, dead_mask_path, and an optional "
-                        "'cell_types' object mapping each visible cell-type name to "
-                        "{line, condition, segments_image_path, tracks_image_path, "
-                        "tracks_csv_path}."
+                "'cell_types' object mapping each visible cell-type name to "
+                "{line, condition, segments_image_path, tracks_image_path, "
+                "tracks_csv_path}. For a configured population confirmed absent "
+                "from a sample, use the literal line value 'not_added'."
                     ),
                     "items": {"type": "object"},
                 },

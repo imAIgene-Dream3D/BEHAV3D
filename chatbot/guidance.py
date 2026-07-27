@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 
-KNOWLEDGE_VERSION = "2026.07.24.24"
+KNOWLEDGE_VERSION = "2026.07.27.25"
 
 
 GUIDANCE_CARDS = {
@@ -28,7 +28,8 @@ GUIDANCE_CARDS = {
         "one movie and need separate segmentation/tracking, or should share one organoid type with "
         "line identity recorded per sample. Well and each configured population's line are mandatory; "
         "condition is optional. When no physical wells exist, propose one shared identifier such as "
-        "'1'. Use line 'None' only after absence of that population is confirmed."
+        "'1'. When a configured population is confirmed absent, describe it as not added and use "
+        "the literal CSV-safe line value 'not_added'; never use None."
     ),
     "experiment_design": (
         "Use the loaded experiment reference only for the current dataset. Preserve explicit "
@@ -230,8 +231,11 @@ GUIDANCE_CARDS = {
         "estimate the result."
     ),
     "analysis": (
-        "First identify the research question and the active analysis view. The Choose analysis action "
-        "explains the available views and must not repeatedly navigate to the Analysis tab. Open a named "
+        "First identify the research question and the active analysis view. A general analysis overview "
+        "must include Death Dynamics, Interaction Analysis, Invasiveness Analysis, Active Killing, "
+        "Behavioral State, State Trajectory, and Backprojection, then use the live metadata to suggest "
+        "dataset-specific questions and a sensible sequence. It must not repeatedly navigate to the "
+        "Analysis tab. Open a named "
         "view directly when the researcher asks. Behavioral State assigns "
         "an HMM state per timepoint. State Trajectory clusters whole trajectories using dynamic time "
         "warping. They answer different questions and their controls must not be mixed. Treat 3D "
@@ -245,7 +249,10 @@ GUIDANCE_CARDS = {
         "normalizes by elapsed time."
     ),
     "hmm": (
-        "For Behavioral State, begin with a small biologically interpretable feature set. Window size "
+        "For Behavioral State, always read and state the live selected cell type before giving setup or "
+        "binary-group advice. Interpret a contact group from the selected cell's perspective: for example, "
+        "Macrophages contact while T-cells are selected means a T-cell touching a macrophage. Begin with "
+        "a small biologically interpretable feature set. Window size "
         "5 is the default for rolling features; use 1 for genuinely single-timepoint events such as "
         "calcium peaks. Smooth window usually matches Window size and suppresses one-frame "
         "segmentation errors. Continuous features are standardized. Apply log scaling selectively "
@@ -261,7 +268,10 @@ GUIDANCE_CARDS = {
         "state selection because automatic selection has not performed well. Keep "
         "Start offset at 1 so the undefined first-frame speed does not make every track begin static. "
         "Name, order, and color states from the feature heatmap and per-state distributions in "
-        "behavioral_clustering_diagnostics.pdf; those labels propagate to later reports."
+        "behavioral_clustering_diagnostics.pdf. In Step 2, assigning the same biological name to "
+        "multiple primary clusters merges them. Then review and rename the full behavioral clusters "
+        "formed with binary groups, which can collapse unwanted state-plus-binary combinations. "
+        "Those labels propagate to later reports."
     ),
     "trajectory": (
         "State Trajectory clusters whole tracks. Trajectory size cannot exceed the trim length already "
