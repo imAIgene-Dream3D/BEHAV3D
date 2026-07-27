@@ -232,7 +232,14 @@ The order in `POST /chat` is intentional:
 
 Within the deterministic and preflight chains, the first non-`None` handler
 wins. Place a new handler carefully and add a regression test for interactions
-with neighboring handlers.
+with neighboring handlers. A preflight handler must require explicit task intent,
+not just a topic word: mentioning an organoid line in an analysis question, for
+example, is not a metadata-building request. Put broad informational answers
+before setup clarifications when both could match.
+
+Keep deterministic response templates experiment-neutral. They may repeat names
+found in live metadata or an explicitly matched experiment reference, but must not
+embed line, strain, or population names copied from a previous feedback example.
 
 Use a deterministic handler when the answer or action can be derived from
 structured context. Use a guidance card for stable explanatory knowledge. Use
