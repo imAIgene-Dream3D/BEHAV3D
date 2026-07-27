@@ -3159,11 +3159,39 @@ class SAMChannelSelector(QGroupBox):
         if metadata is None:
             self._n_channels = 0
             return
-        n = (len(detect_organoid_types_from_metadata(metadata))
-             + len(detect_immune_cell_types_from_metadata(metadata))
-             + len(detect_other_cell_types_from_metadata(metadata)))
-        if has_dead_channel(metadata):
-            n += 1
+
+        # Prefer the true physical channel count read from a sample's raw
+        # image shape + dimension_order - the checkboxes represent actual
+        # raw channels, not configured cell-type metadata columns (which may
+        # still be incomplete for a channel the user hasn't assigned a role
+        # to yet, undercounting real channels).
+        n = None
+        for _, row in metadata.iterrows():
+            raw_path = row.get("raw_image_path")
+            dim_order = row.get("dimension_order")
+            if not raw_path or pd.isna(raw_path) or not dim_order or pd.isna(dim_order):
+                continue
+            dim_order = str(dim_order).strip().upper()
+            if "C" not in dim_order:
+                continue
+            try:
+                shape = get_image_shape(raw_path)
+            except Exception:
+                continue
+            if len(shape) != len(dim_order):
+                continue
+            n = int(shape[dim_order.index("C")])
+            break
+
+        if n is None:
+            # Raw image not readable yet (e.g. before zarr conversion) -
+            # fall back to the cell-type-column proxy.
+            n = (len(detect_organoid_types_from_metadata(metadata))
+                 + len(detect_immune_cell_types_from_metadata(metadata))
+                 + len(detect_other_cell_types_from_metadata(metadata)))
+            if has_dead_channel(metadata):
+                n += 1
+
         classic_cfg = _cfg_get(self.metadata_loader.behav3d_parameters, "cellpose", {}) or {}
         manual_n = classic_cfg.get("manual_n_channels")
         self._n_channels = manual_n if manual_n is not None else n
@@ -4340,14 +4368,17 @@ class CellposeSAMWidget(QWidget):
                 for sn in md["sample_name"].unique():
                     if (out_dir / "images" / sn / f"{sn}_{ct}_segments.zarr").exists():
                         existing.append(f"{ct} segments for {sn}")
-            if not existing:
-                existing = ["existing Cellpose-SAM results"]
-            choice = prompt_overwrite_batch(self, "Existing Segmentation Results", existing)
-            if choice == "cancel":
-                self.log("Cellpose-SAM segmentation cancelled.")
-                fire_extra_callback(extra_callbacks, "on_failed", "cancelled")
-                return
-            overwrite = (choice == "overwrite")
+            if existing:
+                choice = prompt_overwrite_batch(self, "Existing Segmentation Results", existing)
+                if choice == "cancel":
+                    self.log("Cellpose-SAM segmentation cancelled.")
+                    fire_extra_callback(extra_callbacks, "on_failed", "cancelled")
+                    return
+                overwrite = (choice == "overwrite")
+                skip_existing = (choice == "skip")
+            else:
+                overwrite = True
+                skip_existing = False
         else:
             overwrite = not skip_existing
 

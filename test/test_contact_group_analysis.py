@@ -202,9 +202,10 @@ def _group_col():
     return "macro_contact_group"
 
 
-def test_track_missing_from_df_timepoints_resolves_to_no_contact(capsys):
-    """A classified track absent from df_timepoints (e.g. stale CSV, ID typo) must still get a
-    definite label instead of silently disappearing — previously this left NaN."""
+def test_track_missing_from_df_timepoints_raises():
+    """A classified track absent from df_timepoints entirely (e.g. stale CSV, ID typo) must raise
+    a hard error rather than silently resolving to "no_contact" — that would misrepresent a
+    stale/mismatched input as a real negative result. See _assert_tracks_have_window_data."""
     obs = pd.DataFrame(
         {
             "sample_name": ["sample_1", "sample_1"],
@@ -226,26 +227,51 @@ def test_track_missing_from_df_timepoints_resolves_to_no_contact(capsys):
         }
     )
 
-    features = compute_track_contact_features(
-        df_timepoints,
-        adata_tracks,
-        contact_col="macro_contact",
-        min_bout_length=5,
-        verbose=True,
-    )
-    # TrackID keys are normalized to strings internally (see _normalize_id_column).
-    assert set(features.index) == {("sample_1", "0"), ("sample_1", "1")}
-    assert features.loc[("sample_1", "1"), "macro_contact_group"] == "no_contact"
-    assert features.loc[("sample_1", "1"), "macro_contact_max_bout_length"] == 0
+    with pytest.raises(ValueError, match="have no matching timepoints in the filtered track-features CSV"):
+        compute_track_contact_features(
+            df_timepoints,
+            adata_tracks,
+            contact_col="macro_contact",
+            min_bout_length=5,
+            verbose=True,
+        )
 
-    captured = capsys.readouterr()
-    assert "1 classified track(s) had no matching timepoints" in captured.out
 
-    merge_track_contact_features_into_obs(
-        adata_tracks, features, contact_col="macro_contact", min_bout_length=5
+def test_track_present_in_csv_but_no_timepoints_in_window_raises():
+    """A track present in df_timepoints but with zero timepoints falling inside its classified
+    [position_t_min, position_t_max] window must also raise. adata_tracks is built directly from
+    this CSV, so position_t_min/max are always the min/max of real rows for that track — zero
+    overlap can only mean the CSV and h5ad are out of sync, never a legitimate "no contact"
+    result. See _assert_tracks_have_window_data."""
+    obs = pd.DataFrame(
+        {
+            "sample_name": ["sample_1", "sample_1"],
+            "TrackID": [0, 1],
+            "position_t_min": [0, 100],
+            "position_t_max": [9, 109],
+        }
     )
-    assert adata_tracks.obs[_group_col()].notna().all()
-    assert set(adata_tracks.obs[_group_col()]) == {"no_contact"}
+    obs.index = ["0", "1"]
+    adata_tracks = ad.AnnData(X=np.zeros((2, 1)), obs=obs)
+
+    # TrackID 1 is present in df_timepoints, but only at t=0-9 — outside its [100, 109] window.
+    df_timepoints = pd.DataFrame(
+        {
+            "sample_name": ["sample_1"] * 20,
+            "TrackID": [0] * 10 + [1] * 10,
+            "position_t": list(range(10)) + list(range(10)),
+            "macro_contact": [0] * 20,
+        }
+    )
+
+    with pytest.raises(ValueError, match="have no matching timepoints in the filtered track-features CSV"):
+        compute_track_contact_features(
+            df_timepoints,
+            adata_tracks,
+            contact_col="macro_contact",
+            min_bout_length=5,
+            verbose=True,
+        )
 
 
 def test_split_long_track_windows_get_independent_contact_groups():

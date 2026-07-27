@@ -39,6 +39,7 @@ from behav3d.core.metadata import (
     detect_organoid_types_from_metadata,
     detect_immune_cell_types_from_metadata,
     detect_other_cell_types_from_metadata,
+    resolve_metadata_csv_path,
 )
 from behav3d.preprocessing.segmentation.cpsam_env import (
     build_worker_env,
@@ -695,7 +696,15 @@ def run_cellpose_sam_and_sync_metadata(
         **kwargs,
     )
     metadata_loader.metadata = updated_metadata
-    updated_metadata.to_csv(metadata_loader.metadata_csv_path, index=False)
+    csv_path = resolve_metadata_csv_path(metadata_loader)
+    if not csv_path:
+        raise RuntimeError(
+            "Cellpose-SAM finished but could not find a metadata CSV path to save to "
+            "(no metadata_csv_path/_loaded_csv_path, and no paths.metadata_csv in "
+            "behav3d_parameters). The updated metadata is still in memory - save it "
+            "manually to avoid losing this run's results."
+        )
+    updated_metadata.to_csv(csv_path, index=False)
     return updated_metadata, summary
 
 

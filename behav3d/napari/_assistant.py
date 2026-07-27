@@ -22,7 +22,7 @@ from typing import Optional
 from qtpy.QtCore import Qt, QThread, QTimer, Signal
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
-    QTextBrowser, QFrame, QSizePolicy,
+    QPlainTextEdit, QProgressBar, QTextBrowser, QFrame, QSizePolicy,
 )
 
 from behav3d.napari._assistant_context import build_context, context_summary_line
@@ -44,6 +44,11 @@ _METADATA_FIELD_DEFAULTS = {
     "pixel_distance_z": 2.0,
     "time_interval": 1.0,
     "time_unit": "s",
+}
+
+_CHAT_ROLE_COLORS = {
+    "assistant": "#30363b",
+    "user": "#173847",
 }
 
 
@@ -213,6 +218,18 @@ _RESEARCHER_LABELS = {
     "cell_type": "cell type",
     "organoid_cells_across": "organoid size in cell widths",
     "minimum_lengths": "minimum track lengths",
+    "summarize_track_counts": "track-count preview",
+    "nr_dead_mask_pixels": "dead-mask pixel count",
+    "percentage_dead_mask": "dead-mask percentage",
+    "mean_dead_dye": "mean dead-dye intensity",
+    "killing_efficiency": "killing efficiency",
+    "is_active_killing": "active-killing flag",
+    "{target}_invasiveness_perc": "target invasiveness percentage",
+    "recommend_edt": "EDT recommendation",
+    "save_metadata": "Save Metadata",
+    "load_metadata": "Load Metadata",
+    "open_analysis_view": "open analysis view",
+    "line_condition": "line and condition",
 }
 
 
@@ -221,7 +238,46 @@ def researcher_facing_text(text: str) -> str:
     result = str(text or "")
     for technical, label in _RESEARCHER_LABELS.items():
         result = result.replace(technical, label)
-    return result
+        result = result.replace(f"`{label}`", label)
+    return result.replace("`", "")
+
+
+def streaming_transcript_block(request_active: bool, streaming_text: str | None) -> str | None:
+    """Return the visible assistant block while a request is in progress."""
+    if streaming_text is None:
+        return None
+    body = streaming_text or (
+        "*Preparing a response...*" if request_active else ""
+    )
+    if not body:
+        return None
+    return f"**BEHAV3D Assistant**\n\n{body}"
+
+
+def transcript_block_role(text: str, current_role: str | None = None) -> str | None:
+    """Track the speaker while walking blocks produced by ``setMarkdown``."""
+    label = str(text or "").strip()
+    if label == "You":
+        return "user"
+    if label == "BEHAV3D Assistant":
+        return "assistant"
+    return current_role
+
+
+class _ChatInput(QPlainTextEdit):
+    """Multiline chat input: Enter sends, while Shift+Enter adds a new line."""
+
+    sendRequested = Signal()
+
+    def keyPressEvent(self, event):
+        if (
+            event.key() in (Qt.Key_Return, Qt.Key_Enter)
+            and not event.modifiers() & Qt.ShiftModifier
+        ):
+            event.accept()
+            self.sendRequested.emit()
+            return
+        super().keyPressEvent(event)
 
 
 class _ActionCard(QFrame):
@@ -254,7 +310,11 @@ class _ActionCard(QFrame):
         row = QHBoxLayout()
         row.addStretch(1)
         if action.ok:
-            btn_apply = QPushButton("Apply change")
+            apply_labels = {
+                "save_metadata": "Save metadata",
+                "load_metadata": "Load metadata",
+            }
+            btn_apply = QPushButton(apply_labels.get(action.kind, "Apply change"))
             btn_apply.setStyleSheet("font-size:10px;")
             btn_apply.clicked.connect(lambda: self.confirmed.emit(self.action))
             row.addWidget(btn_apply)
@@ -307,12 +367,12 @@ class AssistantDock(QWidget):
                 font-size: 13px;
                 selection-background-color: #3d6b8a;
             }
-            QLineEdit {
+            QLineEdit, QPlainTextEdit {
                 background-color: #2f3338; color: #e6e6e6;
                 border: 1px solid #3a3f44; border-radius: 4px;
                 padding: 7px 10px; font-size: 13px;
             }
-            QLineEdit:focus { border: 1px solid #5285a6; }
+            QLineEdit:focus, QPlainTextEdit:focus { border: 1px solid #5285a6; }
             QPushButton {
                 background-color: #353a3f; color: #e6e6e6;
                 border: 1px solid #454b50; border-radius: 4px;
@@ -327,18 +387,32 @@ class AssistantDock(QWidget):
         root.setSpacing(8)
 
         # --- context bar --------------------------------------------------
+        context_row = QHBoxLayout()
+        context_row.setSpacing(6)
         self.context_bar = QLabel("BEHAV3D Assistant")
         self.context_bar.setStyleSheet(
             "background:#2f3338; color:#9fc6e0; padding:7px 10px;"
             "border:1px solid #3a3f44; border-radius:4px; font-size:11px; font-weight:600;"
         )
         self.context_bar.setWordWrap(True)
-        root.addWidget(self.context_bar)
+        context_row.addWidget(self.context_bar, stretch=1)
+        self.btn_new_chat = QPushButton("New chat")
+        self.btn_new_chat.setToolTip("Clear this conversation and start again")
+        self.btn_new_chat.setStyleSheet("padding:7px 9px; font-size:11px;")
+        self.btn_new_chat.clicked.connect(self._reset_conversation)
+        context_row.addWidget(self.btn_new_chat)
+        root.addLayout(context_row)
 
         self.status_label = QLabel("")
         self.status_label.setStyleSheet("color:#9aa4aa; font-size:11px; padding:0 2px;")
         self.status_label.setVisible(False)
         root.addWidget(self.status_label)
+        self.thinking_progress = QProgressBar()
+        self.thinking_progress.setRange(0, 0)
+        self.thinking_progress.setTextVisible(False)
+        self.thinking_progress.setFixedHeight(3)
+        self.thinking_progress.setVisible(False)
+        root.addWidget(self.thinking_progress)
 
         # --- transcript ---------------------------------------------------
         self.transcript = QTextBrowser()
@@ -363,9 +437,11 @@ class AssistantDock(QWidget):
 
         # --- input row ----------------------------------------------------
         input_row = QHBoxLayout()
-        self.input = QLineEdit()
+        self.input = _ChatInput()
         self.input.setPlaceholderText("Ask about parameters, methods, your data…")
-        self.input.returnPressed.connect(self._on_send)
+        self.input.setMaximumHeight(72)
+        self.input.setTabChangesFocus(True)
+        self.input.sendRequested.connect(self._on_send)
         input_row.addWidget(self.input, stretch=1)
         self.btn_send = QPushButton("Send")
         self.btn_send.clicked.connect(self._on_send)
@@ -400,6 +476,33 @@ class AssistantDock(QWidget):
             "(you confirm first). Try *“Explain this screen”* to start."
         )
 
+    def _reset_conversation(self):
+        """Clear conversation and pending proposals while preserving live app state."""
+        if self._request_active:
+            return
+        self._history = []
+        self._md_log = []
+        self._streaming_text = None
+        self._guided_flow_active = False
+        self._md_current = None
+        self._md_queue = []
+        self._md_phase = None
+        self._current_intent = "free_form"
+        self._render_timer.stop()
+        self.input.clear()
+        for i in reversed(range(self.action_tray_layout.count())):
+            widget = self.action_tray_layout.itemAt(i).widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        self._greet()
+        self.refresh_context_bar()
+        try:
+            self._set_quick_buttons(self.main_widget.tabs.currentIndex())
+        except Exception:
+            pass
+        self.input.setFocus()
+
     # ------------------------------------------------------------------
     # Transcript helpers
     # ------------------------------------------------------------------
@@ -416,11 +519,13 @@ class AssistantDock(QWidget):
         # Any direct/full render supersedes a pending throttled one.
         self._render_timer.stop()
         blocks = list(self._md_log)
-        if self._streaming_text:
-            blocks.append(f"**BEHAV3D Assistant**\n\n{self._streaming_text}")
+        streaming = streaming_transcript_block(
+            self._request_active, self._streaming_text
+        )
+        if streaming:
+            blocks.append(streaming)
         try:
-            # A thin rule between turns gives clear visual separation.
-            self.transcript.setMarkdown("\n\n---\n\n".join(blocks))
+            self.transcript.setMarkdown("\n\n".join(blocks))
             if style:
                 self._style_blocks()
         except Exception:
@@ -444,22 +549,35 @@ class AssistantDock(QWidget):
         """setMarkdown renders paragraphs/lists very tightly. Walk the document
         and add line spacing + paragraph spacing so responses are readable."""
         try:
-            from qtpy.QtGui import QTextCursor, QTextBlockFormat
+            from qtpy.QtGui import (
+                QBrush, QColor, QTextCursor, QTextBlockFormat,
+            )
         except Exception:
             return
         doc = self.transcript.document()
         block = doc.begin()
+        role = None
         while block.isValid():
             cur = QTextCursor(block)
             bf = cur.blockFormat()
+            previous_role = role
+            role = transcript_block_role(block.text(), role)
+            is_role_label = role != previous_role
             bf.setLineHeight(140, QTextBlockFormat.ProportionalHeight)  # 1.4× line spacing
-            bf.setTopMargin(2.0)
-            bf.setBottomMargin(9.0)                                     # gap between paragraphs
+            bf.setTopMargin(8.0 if is_role_label else 2.0)
+            bf.setBottomMargin(5.0)
+            if role in _CHAT_ROLE_COLORS:
+                bf.setBackground(QBrush(QColor(_CHAT_ROLE_COLORS[role])))
+                bf.setLeftMargin(10.0)
+                bf.setRightMargin(10.0)
             cur.setBlockFormat(bf)
             block = block.next()
 
     def _append_md(self, markdown: str):
-        self._md_log.append(markdown)
+        content = str(markdown or "").lstrip()
+        if not content.startswith(("**You**", "**BEHAV3D Assistant**")):
+            content = f"**BEHAV3D Assistant**\n\n{content}"
+        self._md_log.append(content)
         self._render()
 
     def _append_user(self, text: str):
@@ -480,7 +598,7 @@ class AssistantDock(QWidget):
             return
         if self._request_active:
             try:
-                self.input.setText(prompt)
+                self.input.setPlainText(prompt)
             except Exception:
                 pass
             return
@@ -488,7 +606,7 @@ class AssistantDock(QWidget):
         self._send_message(prompt, intent="free_form")
 
     def _on_send(self):
-        text = self.input.text().strip()
+        text = self.input.toPlainText().strip()
         if not text:
             return
         self.input.clear()
@@ -560,8 +678,10 @@ class AssistantDock(QWidget):
     def _set_busy(self, busy: bool):
         self._request_active = bool(busy)
         self.btn_send.setEnabled(not busy)
-        self.status_label.setText("Thinking..." if busy else "")
+        self.btn_new_chat.setEnabled(not busy)
+        self.status_label.setText("Assistant is thinking..." if busy else "")
         self.status_label.setVisible(bool(busy))
+        self.thinking_progress.setVisible(bool(busy))
         # Leave the input box editable while a turn is in flight so the user can
         # type their next answer without waiting for the stream to finish.
         for i in range(self._quick_layout.count()):
@@ -607,11 +727,36 @@ class AssistantDock(QWidget):
             params = getattr(self.main_widget.data_prep_tab, "behav3d_parameters", {})
             actions = build_actions(calls, cards, params,
                                     controls=(ctx.get("ui_state", {}) or {}).get("controls", []))
+            for action in actions:
+                if (
+                    action.kind == "navigate_to_step"
+                    and action.data.get("step") == ctx.get("current_step")
+                ):
+                    action.ok = False
+                    action.data["no_op"] = True
+                    action.data["label"] = ctx.get("current_tab_label") or "That tab"
+                    action.data["value"] = "already open"
+                    action.message = "That tab is already open."
+                if (
+                    action.kind == "open_analysis_view"
+                    and action.data.get("view")
+                    == (ctx.get("analysis") or {}).get("view")
+                ):
+                    action.ok = False
+                    action.data["no_op"] = True
+                    action.data["label"] = "That analysis view"
+                    action.data["value"] = "already open"
+                    action.message = "That analysis view is already open."
         except Exception:
             actions = []
-        if actions and all(self._is_noop_action(action) for action in actions):
+        if (
+            actions
+            and all(self._is_noop_action(action) for action in actions)
+            and not str(self._streaming_text or "").strip()
+        ):
             # A model may still narrate a future action despite the live value
-            # already matching. Replace that stale promise with the verified fact.
+            # already matching. Only synthesize a status when the model supplied
+            # no useful answer; never overwrite substantive streamed guidance.
             self._streaming_text = self._noop_response(actions)
         if actions and self._streaming_text is not None:
             # Tool calls arrive after streamed prose. Finalise that prose before
@@ -699,6 +844,9 @@ class AssistantDock(QWidget):
         if action.kind == "navigate_to_step":
             return True  # navigation never overwrites anything
 
+        if action.kind == "open_analysis_view":
+            return True
+
         if action.kind == "add_queue_step":
             return False  # adding to the queue is a deliberate action
 
@@ -721,16 +869,9 @@ class AssistantDock(QWidget):
             if field in ("open_builder", "configure_cell_types",
                          "create_sample_forms", "fill_down"):
                 return True
-            dp = getattr(self.main_widget, "data_prep_tab", None)
-            idx = int(action.data.get("index", 0))
-            cell_type = action.data.get("cell_type")
-            if not _metadata_field_has_value(dp, field, idx, cell_type):
-                return True   # blank field — auto-apply
-            # Field already has a value; auto-apply only if the proposed value is the
-            # same (bot redundantly repeating itself). Different value → confirm card.
-            return _fill_value_matches_current(
-                dp, field, idx, action.data.get("value"), cell_type
-            )
+            # LLM-proposed metadata values always use the same confirmation path.
+            # The deterministic wizard still applies answers the user typed directly.
+            return False
 
         if action.kind == "set_parameter":
             try:
@@ -750,6 +891,9 @@ class AssistantDock(QWidget):
             return True
 
         if action.kind == "set_ui_value":
+            control_id = str(action.data.get("control_id") or "")
+            if control_id.startswith(("metadata.", "data.")):
+                return False
             old = action.data.get("old_value")
             # Empty text fields can be filled immediately. Existing values require
             # the explicit Apply change card.
@@ -762,6 +906,9 @@ class AssistantDock(QWidget):
             return True
 
         if action.kind in ("create_cell_type_group", "create_btrack_config_copy"):
+            return False
+
+        if action.kind in ("save_metadata", "load_metadata"):
             return False
 
         return True  # unknown action kind: auto-apply

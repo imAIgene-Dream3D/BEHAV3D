@@ -61,6 +61,21 @@ def hash_stable_label_color_map(labels, colors=None, cmap_name="tab20"):
     return {label: saved.get(label, hash_stable_label_color(label, cmap_name=cmap_name)) for label in labels}
 
 
+def legend_layout(n_labels, *, max_ncol=8, row_height_in=0.22, base_margin_in):
+    """(ncol, nrows, margin_in) for a bottom-center fig.legend that scales with label count.
+
+    `base_margin_in` is the margin needed for a single legend row (i.e. today's
+    existing fixed constant at each call site); each extra wrapped row beyond the
+    first adds `row_height_in` so the reserved space keeps up with `ncol=min(n, 8)`
+    wrapping into more rows and doesn't get overlapped by the panel grid above it.
+    """
+    n_labels = max(0, int(n_labels))
+    ncol = max(1, min(n_labels, int(max_ncol))) if n_labels > 0 else 1
+    nrows = max(1, int(np.ceil(n_labels / ncol))) if n_labels > 0 else 1
+    margin_in = float(base_margin_in) + float(row_height_in) * (nrows - 1)
+    return ncol, nrows, margin_in
+
+
 def draw_thin_stacked_proportion_barh(
     ax,
     values,
@@ -77,7 +92,7 @@ def draw_thin_stacked_proportion_barh(
     """
     half = float(bar_height_frac) / 2.0
     left = 0.0
-    for class_name in class_order:
+    for class_name in reversed(list(class_order)):
         val = float(values.get(class_name, 0.0))
         if val <= 0.0:
             continue
@@ -114,7 +129,7 @@ def draw_stacked_proportion_barv(
     """
     x = np.arange(len(class_order))
     bottom = np.zeros(len(class_order))
-    for stack_name in stack_order:
+    for stack_name in reversed(list(stack_order)):
         if stack_name in props_df.columns:
             vals = props_df[stack_name].reindex(class_order).fillna(0.0).to_numpy(dtype=float)
         else:
@@ -205,9 +220,10 @@ def plot_page_stacked_proportion_barh_grid(
         )
         axes[i].set_title(_wrap_row_label(key), fontsize=row_label_fontsize, pad=1, loc="left")
 
-    handles = [Patch(facecolor=colors[c], label=str(c)) for c in class_order]
-    fig.legend(handles=handles, loc="lower center", ncol=min(len(handles), 8), frameon=False, fontsize=7)
-    fig.tight_layout(rect=(0.03, 0.05, 1, 0.94), h_pad=0.3)
+    handles = [Patch(facecolor=colors[c], label=str(c)) for c in reversed(list(class_order))]
+    legend_ncol, _, legend_margin_in = legend_layout(len(handles), base_margin_in=0.58)
+    fig.legend(handles=handles, loc="lower center", ncol=legend_ncol, frameon=False, fontsize=7)
+    fig.tight_layout(rect=(0.03, legend_margin_in / fig_h, 1, 0.94), h_pad=0.3)
     fig.suptitle(title, y=0.97, fontsize=12, fontweight="bold")
     return fig
 
@@ -288,7 +304,11 @@ def compute_condition_diff_stats_pairwise(
     class_order = [str(c) for c in list(class_order)]
     joined = per_sample_class_props.join(sample_metadata, how="inner")
 
-    valid_group_cols = [c for c in (group_cols or []) if c in joined.columns]
+    # Excluding condition_col here too (not just at the caller) guards against
+    # any other caller passing an overlapping group_cols/condition_col combo -
+    # joined[condition_col] would otherwise be ambiguous if condition_col were
+    # duplicated among the selected columns, since DataFrame.unique() doesn't exist.
+    valid_group_cols = [c for c in (group_cols or []) if c in joined.columns and c != condition_col]
     if valid_group_cols:
         group_labels = _make_group_label(joined, valid_group_cols).astype(str)
         groups = {label: joined[group_labels == label] for label in group_labels.unique().tolist()}

@@ -45,6 +45,13 @@ def _mixed_label_sort_key(value):
     return (1, text)
 
 
+def _natural_sort_key(value):
+    """Natural/human sort key: splits into alternating text/digit chunks so e.g.
+    'contact_2' sorts before 'contact_10' (unlike plain lexicographic comparison)."""
+    parts = re.split(r"(\d+)", str(value))
+    return [int(p) if p.isdigit() else p.lower() for p in parts]
+
+
 def _sanitize_filename_token(value, fallback="value"):
     token = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value).strip())
     token = token.strip("._-")

@@ -923,7 +923,7 @@ class BaseStateClassificationPanel:
         preselected = set(cfg.get("selected_features", [])) if isinstance(cfg, dict) else set()
         if len(preselected) == 0:
             # fallback to basic sensible defaults when present
-            for f in ["percentage_dead_mask", "speed", "extent", "elongation", "sphericity", "solidity"]:
+            for f in ["speed", "elongation", "sphericity", "extent", "solidity"]:
                 if f in usable_cols:
                     preselected.add(f)
 

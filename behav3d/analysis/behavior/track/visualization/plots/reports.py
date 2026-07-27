@@ -85,6 +85,7 @@ from behav3d.analysis.behavior.general.visualization.plots.proportion_bars impor
     draw_stacked_proportion_barv,
     compute_class_by_stack_proportions,
     compute_condition_diff_stats_pairwise,
+    legend_layout,
     plot_condition_diff_grid,
     plot_condition_diff_grid_2d,
     plot_page_stacked_proportion_barh_grid,
@@ -103,6 +104,18 @@ from behav3d.analysis.behavior.track.contact_grouping import (
     _contact_group_col_name,
     _contact_mean_col_name,
     _contact_max_bout_col_name,
+)
+from behav3d.analysis.behavior.state.visualization.plots.state_composition import (
+    _compute_relative_matrices_by_sample,
+    _compute_overall_relative_composition_by_sample,
+    _compute_grouped_relative_matrices,
+    _plot_page_relative_stacked_grid,
+    _plot_page_grouped_2d_grid,
+    _plot_page_grouped_stacked_grid,
+    _build_relative_plot_data_table,
+    _build_overall_summary_plot_data_table,
+    _panels_per_a4_page,
+    _paginate_samples,
 )
 from behav3d.analysis.behavior.state.utils import (
     _apply_state_order,
@@ -173,7 +186,7 @@ def _apply_best_pdf_orientation(fig, default_orientation="landscape"):
     return "landscape" if float(width) >= float(height) else "portrait"
 
 
-def _rank_cluster_counts(adata_tracks, cluster_key):
+def _rank_cluster_counts(adata_tracks, cluster_key, cluster_order=None):
     if cluster_key not in adata_tracks.obs.columns:
         raise ValueError(f"Missing '{cluster_key}' in adata_tracks.obs.")
 
@@ -184,22 +197,35 @@ def _rank_cluster_counts(adata_tracks, cluster_key):
         .astype(str)
     )
     counts = labels.value_counts(dropna=False).to_dict()
-    ranked = sorted(
-        [(str(label), int(n)) for label, n in counts.items()],
-        key=lambda x: (-int(x[1]), _mixed_label_sort_key(x[0])),
-    )
+    if cluster_order:
+        ranked = [(str(label), int(counts.get(str(label), 0))) for label in cluster_order]
+        leftovers = sorted(
+            [(label, n) for label, n in counts.items() if str(label) not in {str(o) for o in cluster_order}],
+            key=lambda x: (-int(x[1]), _mixed_label_sort_key(x[0])),
+        )
+        ranked = ranked + leftovers
+    else:
+        ranked = sorted(
+            [(str(label), int(n)) for label, n in counts.items()],
+            key=lambda x: (-int(x[1]), _mixed_label_sort_key(x[0])),
+        )
     return ranked
 
 
-def _plot_cluster_rankings(adata_tracks, cluster_key):
-    ranked = _rank_cluster_counts(adata_tracks=adata_tracks, cluster_key=cluster_key)
+def _plot_cluster_rankings(adata_tracks, cluster_key, cluster_order=None, cluster_colors=None):
+    ranked = _rank_cluster_counts(adata_tracks=adata_tracks, cluster_key=cluster_key, cluster_order=cluster_order)
     cluster_labels = [x[0] for x in ranked]
     cluster_counts = [x[1] for x in ranked]
+    bar_colors = (
+        [cluster_colors.get(label, "#2E6FBA") for label in cluster_labels]
+        if cluster_colors
+        else "#2E6FBA"
+    )
 
     fig_h = max(4.5, 0.45 * len(cluster_labels) + 2.0)
     fig, ax = plt.subplots(figsize=(10.5, fig_h))
     y = np.arange(len(cluster_labels))
-    bars = ax.barh(y, cluster_counts, color="#2E6FBA")
+    bars = ax.barh(y, cluster_counts, color=bar_colors)
     ax.set_yticks(y)
     ax.set_yticklabels(cluster_labels)
     ax.invert_yaxis()
@@ -284,6 +310,7 @@ def _plot_page_grouped_class_proportions_2d_grid(
     conditions are present.
     """
     panel_h_in = panel_w_in * _GRID_PANEL_ASPECT
+    legend_ncol, _, legend_margin_in = legend_layout(len(class_order), base_margin_in=_GRID_BOTTOM_MARGIN_IN)
 
     if len(group_cols) == 2:
         if axis_cols is not None:
@@ -297,7 +324,7 @@ def _plot_page_grouped_class_proportions_2d_grid(
         ncols_data = max(1, len(col_x_vals))
 
         fig_w = _GRID_HEADER_W_IN + ncols_data * panel_w_in
-        fig_h = _GRID_TOP_MARGIN_IN + _GRID_HEADER_H_IN + nrows_data * panel_h_in + _GRID_BOTTOM_MARGIN_IN
+        fig_h = _GRID_TOP_MARGIN_IN + _GRID_HEADER_H_IN + nrows_data * panel_h_in + legend_margin_in
         fig = plt.figure(figsize=(fig_w, fig_h))
         outer = GridSpec(
             nrows=nrows_data + 1,
@@ -308,7 +335,7 @@ def _plot_page_grouped_class_proportions_2d_grid(
             hspace=0.6,
             wspace=0.3,
             top=1.0 - _GRID_TOP_MARGIN_IN / fig_h,
-            bottom=_GRID_BOTTOM_MARGIN_IN / fig_h,
+            bottom=legend_margin_in / fig_h,
         )
 
         ax_corner = fig.add_subplot(outer[0, 0])
@@ -353,7 +380,7 @@ def _plot_page_grouped_class_proportions_2d_grid(
         nrows_data = max(1, len(col_y_vals))
 
         fig_w = max(4.0 * panel_w_in, 6.0)
-        fig_h = _GRID_TOP_MARGIN_IN + nrows_data * panel_h_in + _GRID_BOTTOM_MARGIN_IN
+        fig_h = _GRID_TOP_MARGIN_IN + nrows_data * panel_h_in + legend_margin_in
         fig = plt.figure(figsize=(fig_w, fig_h))
         outer = GridSpec(
             nrows=nrows_data,
@@ -362,7 +389,7 @@ def _plot_page_grouped_class_proportions_2d_grid(
             height_ratios=[panel_h_in] * nrows_data,
             hspace=0.5,
             top=1.0 - _GRID_TOP_MARGIN_IN / fig_h,
-            bottom=_GRID_BOTTOM_MARGIN_IN / fig_h,
+            bottom=legend_margin_in / fig_h,
         )
 
         for r, col_y_val in enumerate(col_y_vals):
@@ -379,10 +406,10 @@ def _plot_page_grouped_class_proportions_2d_grid(
 
         title_str = f"Grouped Track-Class Proportions — {group_label_title}"
 
-    legend_handles, legend_labels = _class_legend_handles(class_order, class_colors)
+    legend_handles, legend_labels = _class_legend_handles(list(reversed(class_order)), class_colors)
     fig.legend(
         handles=legend_handles, labels=legend_labels,
-        loc="lower center", ncol=min(len(legend_labels), 8), frameon=False, fontsize=7,
+        loc="lower center", ncol=legend_ncol, frameon=False, fontsize=7,
     )
     fig.suptitle(title_str, y=0.99, fontsize=10, fontweight="bold", wrap=True)
     return fig
@@ -408,9 +435,10 @@ def _plot_page_grouped_class_proportions_flat_grid(
     ncols = max(1, int(grid_ncols))
     nrows = max(1, int(np.ceil(float(len(groups)) / float(ncols))))
     panel_h_in = panel_w_in * _GRID_PANEL_ASPECT
+    legend_ncol, _, legend_margin_in = legend_layout(len(class_order), base_margin_in=_GRID_BOTTOM_MARGIN_IN)
 
     fig_w = ncols * panel_w_in
-    fig_h = _GRID_TOP_MARGIN_IN + nrows * panel_h_in + _GRID_BOTTOM_MARGIN_IN
+    fig_h = _GRID_TOP_MARGIN_IN + nrows * panel_h_in + legend_margin_in
     fig = plt.figure(figsize=(fig_w, fig_h))
     outer = GridSpec(
         nrows=nrows,
@@ -419,7 +447,7 @@ def _plot_page_grouped_class_proportions_flat_grid(
         hspace=0.6,
         wspace=0.3,
         top=1.0 - _GRID_TOP_MARGIN_IN / fig_h,
-        bottom=_GRID_BOTTOM_MARGIN_IN / fig_h,
+        bottom=legend_margin_in / fig_h,
     )
 
     for i, grp in enumerate(groups):
@@ -430,10 +458,10 @@ def _plot_page_grouped_class_proportions_flat_grid(
     for i in range(len(groups), nrows * ncols):
         fig.add_subplot(outer[i]).axis("off")
 
-    legend_handles, legend_labels = _class_legend_handles(class_order, class_colors)
+    legend_handles, legend_labels = _class_legend_handles(list(reversed(class_order)), class_colors)
     fig.legend(
         handles=legend_handles, labels=legend_labels,
-        loc="lower center", ncol=min(len(legend_labels), 8), frameon=False, fontsize=7,
+        loc="lower center", ncol=legend_ncol, frameon=False, fontsize=7,
     )
     fig.suptitle(
         f"Grouped Track-Class Proportions — {group_label_title}",
@@ -468,6 +496,7 @@ def _plot_page_class_stack_grid(
     """
     panel_w_in = panel_w_in if panel_w_in is not None else max(0.45 * len(class_order), _STACK_GRID_MIN_PANEL_W_IN)
     panel_h_in = _STACK_GRID_PANEL_H_IN
+    legend_ncol, _, legend_margin_in = legend_layout(len(stack_order), base_margin_in=_STACK_GRID_BOTTOM_MARGIN_IN)
 
     if len(facet_cols) == 2:
         if axis_cols is not None:
@@ -481,7 +510,7 @@ def _plot_page_class_stack_grid(
         ncols_data = max(1, len(col_x_vals))
 
         fig_w = _GRID_HEADER_W_IN + ncols_data * panel_w_in
-        fig_h = _GRID_TOP_MARGIN_IN + _GRID_HEADER_H_IN + nrows_data * panel_h_in + _STACK_GRID_BOTTOM_MARGIN_IN
+        fig_h = _GRID_TOP_MARGIN_IN + _GRID_HEADER_H_IN + nrows_data * panel_h_in + legend_margin_in
         fig = plt.figure(figsize=(fig_w, fig_h))
         outer = GridSpec(
             nrows=nrows_data + 1,
@@ -492,7 +521,7 @@ def _plot_page_class_stack_grid(
             hspace=1.1,
             wspace=0.35,
             top=1.0 - _GRID_TOP_MARGIN_IN / fig_h,
-            bottom=_STACK_GRID_BOTTOM_MARGIN_IN / fig_h,
+            bottom=legend_margin_in / fig_h,
         )
 
         ax_corner = fig.add_subplot(outer[0, 0])
@@ -539,7 +568,7 @@ def _plot_page_class_stack_grid(
         nrows_data = max(1, len(col_y_vals))
 
         fig_w = max(panel_w_in, _STACK_GRID_MIN_PANEL_W_IN)
-        fig_h = _GRID_TOP_MARGIN_IN + nrows_data * panel_h_in + _STACK_GRID_BOTTOM_MARGIN_IN
+        fig_h = _GRID_TOP_MARGIN_IN + nrows_data * panel_h_in + legend_margin_in
         fig = plt.figure(figsize=(fig_w, fig_h))
         outer = GridSpec(
             nrows=nrows_data,
@@ -548,7 +577,7 @@ def _plot_page_class_stack_grid(
             height_ratios=[panel_h_in] * nrows_data,
             hspace=1.1,
             top=1.0 - _GRID_TOP_MARGIN_IN / fig_h,
-            bottom=_STACK_GRID_BOTTOM_MARGIN_IN / fig_h,
+            bottom=legend_margin_in / fig_h,
         )
 
         for r, col_y_val in enumerate(col_y_vals):
@@ -565,10 +594,10 @@ def _plot_page_class_stack_grid(
 
         title_str = f"{title} — {col_y}"
 
-    legend_handles, legend_labels = _class_legend_handles(stack_order, colors)
+    legend_handles, legend_labels = _class_legend_handles(list(reversed(stack_order)), colors)
     fig.legend(
         handles=legend_handles, labels=legend_labels,
-        loc="lower center", ncol=min(len(legend_labels), 8), frameon=False, fontsize=7,
+        loc="lower center", ncol=legend_ncol, frameon=False, fontsize=7,
     )
     fig.suptitle(title_str, y=0.99, fontsize=10, fontweight="bold", wrap=True)
     return fig
@@ -578,16 +607,18 @@ def _plot_single_class_stack_panel(props_df, *, class_order, stack_order, colors
     """A single vertical stacked-bar panel (no facet grid) — used when only page-pooling
     columns are selected (no group_x/group_y), so each page is one plain bar chart."""
     panel_w_in = max(0.45 * len(class_order), 4.0)
-    fig, ax = plt.subplots(figsize=(panel_w_in, 4.2))
+    legend_ncol, _, legend_margin_in = legend_layout(len(stack_order), base_margin_in=0.42)
+    fig_h = 3.78 + legend_margin_in
+    fig, ax = plt.subplots(figsize=(panel_w_in, fig_h))
     draw_stacked_proportion_barv(ax, props_df, class_order, stack_order, colors, ymax=1.0, xtick_fontsize=8)
     ax.set_ylabel("Proportion")
-    legend_handles, legend_labels = _class_legend_handles(stack_order, colors)
+    legend_handles, legend_labels = _class_legend_handles(list(reversed(stack_order)), colors)
     fig.legend(
         handles=legend_handles, labels=legend_labels,
-        loc="lower center", ncol=len(legend_labels), frameon=False, fontsize=8,
+        loc="lower center", ncol=legend_ncol, frameon=False, fontsize=8,
     )
     fig.suptitle(title, fontsize=11, fontweight="bold", wrap=True)
-    fig.tight_layout(rect=(0.0, 0.1, 1.0, 0.92))
+    fig.tight_layout(rect=(0.0, legend_margin_in / fig_h, 1.0, 0.92))
     return fig
 
 
@@ -723,6 +754,36 @@ def _save_contact_cluster_stack_grid_page(
     return {"n_pages": n_pages, "csv_path": str(csv_path) if csv_path is not None else None}
 
 
+def _expand_track_windows_to_timepoints(df, *, time_col="position_t", tmin_col="position_t_min", tmax_col="position_t_max"):
+    """Expand one row per track (with an active [tmin, tmax] window) into one row
+    per (track, timepoint) for every integer timepoint in its window, repeating all
+    other columns unchanged.
+
+    Track-cluster labels are one label per whole track (or, when tracks are split
+    for clustering, per sub-track), not one label per timepoint - so unlike
+    per-timepoint behavioral states, they can't be fed directly into the existing
+    relative-composition-over-time machinery. Expanding each track's window into
+    per-timepoint rows first lets that same machinery be reused as-is: a track
+    counts toward every timepoint it was actually alive/tracked for, which is what's
+    needed since split tracks can start/end at different times per track.
+    """
+    columns = list(df.columns)
+    if len(df) == 0:
+        return df.copy().assign(**{time_col: pd.Series(dtype=float)})[columns + ([time_col] if time_col not in columns else [])]
+    tmin = np.floor(pd.to_numeric(df[tmin_col], errors="coerce").to_numpy(dtype=float)).astype("int64")
+    tmax = np.floor(pd.to_numeric(df[tmax_col], errors="coerce").to_numpy(dtype=float)).astype("int64")
+    lengths = np.clip(tmax - tmin + 1, 0, None)
+    total = int(lengths.sum())
+    out_cols = columns + ([time_col] if time_col not in columns else [])
+    if total == 0:
+        return df.iloc[0:0].copy().assign(**{time_col: pd.Series(dtype=float)})[out_cols]
+    repeat_idx = np.repeat(np.arange(len(df)), lengths)
+    expanded = df.iloc[repeat_idx].reset_index(drop=True)
+    offsets = np.concatenate([np.arange(int(n)) for n in lengths])
+    expanded[time_col] = (tmin[repeat_idx] + offsets).astype(float)
+    return expanded
+
+
 def save_track_class_proportions_by_sample_plot(
     adata_tracks,
     out_dir,
@@ -739,12 +800,23 @@ def save_track_class_proportions_by_sample_plot(
     class_colors=None,
     pdf_pages=None,
     csv_dir=None,
+    time_col="position_t",
+    tmin_col="position_t_min",
+    tmax_col="position_t_max",
 ):
     """
     Save one horizontal stacked bar per sample showing track-class proportions,
     plus optional grouped grid pages (1-2 effective group columns: true 2D grid;
     3+: flat grid). ``group_x``/``group_y`` explicitly pick the 2D grid's axes;
     ``group_cols`` is the "group per page" column list (unaffected in meaning).
+
+    If ``tmin_col``/``tmax_col`` (each track's active timepoint window) are present
+    in ``adata_tracks.obs``, this also adds track-class proportions *over time*:
+    at each timepoint, the proportion of currently-active tracks/sub-tracks in
+    each class, using the same sample/group breakdown as the static bars above -
+    a track counts toward every timepoint within its own window, so tracks split
+    into sub-tracks at different points in time are each counted only over their
+    own active span.
 
     If ``pdf_pages`` (an open ``PdfPages``) is given, pages are appended to it instead of a
     standalone PDF being created. ``csv_dir`` overrides where CSVs are written (defaults to
@@ -840,6 +912,7 @@ def save_track_class_proportions_by_sample_plot(
     colors = _normalize_label_color_map(class_order, colors=resolved_colors, cmap_name=cmap_name)
     grouped_csv_path = None
     n_grouped_pages = 0
+    time_csv_path = None
 
     with (nullcontext(pdf_pages) if pdf_pages is not None else PdfPages(pdf_path)) as pdf:
         rows_per_page = stacked_proportion_barh_rows_per_page()
@@ -908,6 +981,147 @@ def save_track_class_proportions_by_sample_plot(
             grouped_csv_path = csv_dir / f"track_class_proportions_by_group_{class_token}.csv"
             pd.DataFrame(grouped_long_rows).to_csv(grouped_csv_path, index=False)
 
+        # --- Track-class proportions OVER TIME ---
+        # Each track/sub-track contributes to every timepoint within its own
+        # [tmin_col, tmax_col] window, so tracks split at different points in
+        # time are each counted only over their own active span, not the whole
+        # original track's span.
+        has_time_cols = tmin_col in adata_tracks.obs.columns and tmax_col in adata_tracks.obs.columns
+        if has_time_cols:
+            time_plot_df = (
+                adata_tracks.obs[[sample_col, class_col, tmin_col, tmax_col] + valid_group_cols]
+                .dropna(subset=[tmin_col, tmax_col])
+                .copy()
+            )
+            time_plot_df[sample_col] = (
+                time_plot_df[sample_col].astype("string").fillna("unassigned").astype(str).str.strip().replace("", "unassigned")
+            )
+            time_plot_df[class_col] = (
+                time_plot_df[class_col].astype("string").fillna("unassigned").astype(str).str.strip().replace("", "unassigned")
+            )
+            for gc in valid_group_cols:
+                time_plot_df[gc] = time_plot_df[gc].astype("string").fillna("(unknown)").astype(str)
+
+            expanded_df = _expand_track_windows_to_timepoints(
+                time_plot_df, time_col=time_col, tmin_col=tmin_col, tmax_col=tmax_col,
+            )
+
+            if len(expanded_df) > 0:
+                panels_per_page, ncols_eff, max_rows = _panels_per_a4_page(grid_ncols)
+                time_tables = []
+
+                relative_by_sample_time, _ = _compute_relative_matrices_by_sample(
+                    expanded_df, time_col=time_col, state_col=class_col, sample_col=sample_col,
+                    state_order=class_order, sample_order=sample_order,
+                )
+                overall_by_sample_time = _compute_overall_relative_composition_by_sample(
+                    expanded_df, state_col=class_col, sample_col=sample_col,
+                    state_order=class_order, sample_order=sample_order,
+                )
+                for page_samples in _paginate_samples(sample_order, samples_per_page=panels_per_page):
+                    page_rel = {s: relative_by_sample_time[s] for s in page_samples if s in relative_by_sample_time}
+                    page_overall = {s: overall_by_sample_time[s] for s in page_samples if s in overall_by_sample_time}
+                    fig_t = _plot_page_relative_stacked_grid(
+                        page_rel,
+                        overall_by_sample=page_overall,
+                        state_order=class_order,
+                        time_col=time_col,
+                        sample_col=sample_col,
+                        grid_ncols=ncols_eff,
+                        figsize_per_panel=(4.0, 2.8),
+                        state_colors=colors,
+                    )
+                    pdf.savefig(fig_t, dpi=dpi)
+                    plt.close(fig_t)
+
+                time_tables.extend([
+                    _build_relative_plot_data_table(relative_by_sample_time, plot_view="stacked_by_sample").assign(
+                        plot_component="timecourse"
+                    ),
+                    _build_overall_summary_plot_data_table(overall_by_sample_time, plot_view="stacked_by_sample").assign(
+                        plot_component="overall_summary"
+                    ),
+                ])
+
+                if valid_group_cols:
+                    relative_by_group_time, overall_by_group_time = _compute_grouped_relative_matrices(
+                        expanded_df, group_cols=valid_group_cols, time_col=time_col,
+                        state_col=class_col, state_order=class_order,
+                    )
+                    time_group_label_title = ", ".join(valid_group_cols)
+                    time_unique_vals_per_col = {}
+                    if len(valid_group_cols) in (1, 2):
+                        for col in valid_group_cols:
+                            time_unique_vals_per_col[col] = sorted(
+                                expanded_df[col].astype(str).dropna().unique().tolist()
+                            )
+
+                    if len(valid_group_cols) in (1, 2):
+                        if len(valid_group_cols) == 2:
+                            row_col = axis_cols[0] if axis_cols is not None else max(
+                                valid_group_cols, key=lambda c: len(time_unique_vals_per_col[c])
+                            )
+                            col_y_vals = time_unique_vals_per_col[row_col]
+                        else:
+                            col_y_vals = time_unique_vals_per_col[valid_group_cols[0]]
+                        for row_start in range(0, max(1, len(col_y_vals)), max_rows):
+                            row_end = min(row_start + max_rows, len(col_y_vals))
+                            fig_gt = _plot_page_grouped_2d_grid(
+                                relative_by_group_time,
+                                overall_by_group=overall_by_group_time,
+                                group_cols=valid_group_cols,
+                                unique_vals_per_col=time_unique_vals_per_col,
+                                state_order=class_order,
+                                time_col=time_col,
+                                group_label_title=time_group_label_title,
+                                state_colors=colors,
+                                row_slice=(row_start, row_end),
+                                axis_cols=axis_cols,
+                            )
+                            pdf.savefig(fig_gt, dpi=dpi)
+                            plt.close(fig_gt)
+                    else:
+                        time_group_keys = list(relative_by_group_time.keys())
+                        for page_groups in _chunk_list(time_group_keys, panels_per_page):
+                            page_rel_g = {k: relative_by_group_time[k] for k in page_groups}
+                            page_overall_g = {k: overall_by_group_time[k] for k in page_groups}
+                            fig_gt = _plot_page_grouped_stacked_grid(
+                                page_rel_g,
+                                overall_by_group=page_overall_g,
+                                state_order=class_order,
+                                time_col=time_col,
+                                group_label_title=time_group_label_title,
+                                grid_ncols=ncols_eff,
+                                figsize_per_panel=(4.0, 2.8),
+                                state_colors=colors,
+                            )
+                            pdf.savefig(fig_gt, dpi=dpi)
+                            plt.close(fig_gt)
+
+                    time_group_label_lookup = (
+                        expanded_df.assign(_group_label=_make_group_label(expanded_df, valid_group_cols).values)
+                        .drop_duplicates(subset=["_group_label"])
+                        .set_index("_group_label")[valid_group_cols]
+                    )
+                    time_group_timecourse = _build_relative_plot_data_table(
+                        relative_by_group_time, plot_view="stacked_by_group", label_col_name="group_label"
+                    ).assign(plot_component="group_timecourse")
+                    time_group_overall = _build_overall_summary_plot_data_table(
+                        overall_by_group_time, plot_view="stacked_by_group", label_col_name="group_label"
+                    ).assign(plot_component="group_overall_summary")
+                    for gtable in (time_group_timecourse, time_group_overall):
+                        if len(gtable) > 0:
+                            for col in valid_group_cols:
+                                gtable[col] = gtable["group_label"].map(time_group_label_lookup[col])
+                    time_tables.extend([time_group_timecourse, time_group_overall])
+
+                time_csv_path = csv_dir / f"track_class_proportions_over_time_{class_token}.csv"
+                pd.concat(time_tables, ignore_index=True).to_csv(time_csv_path, index=False)
+            elif verbose:
+                print(f"  Note: no valid {tmin_col}/{tmax_col} rows — skipping proportions-over-time.")
+        elif verbose:
+            print(f"  Note: '{tmin_col}'/'{tmax_col}' not found in adata_tracks.obs — skipping proportions-over-time.")
+
     color_hex = {str(k): str(to_hex(v)) for k, v in colors.items()}
     return {
         "pdf_path": str(pdf_path),
@@ -918,6 +1132,7 @@ def save_track_class_proportions_by_sample_plot(
         "group_cols": valid_group_cols,
         "grouped_csv_path": str(grouped_csv_path) if grouped_csv_path is not None else None,
         "n_grouped_pages": n_grouped_pages,
+        "time_csv_path": str(time_csv_path) if time_csv_path is not None else None,
     }
 
 
@@ -978,9 +1193,9 @@ def save_track_condition_comparison_report(
         resolved_class_order = [str(c) for c in class_order]
     else:
         resolved_class_order = sorted(df[class_col].dropna().unique().tolist(), key=_mixed_label_sort_key)
-        resolved_class_order = _apply_state_order(
-            resolved_class_order, _get_classification_state_order(adata_tracks, class_col)
-        )
+    resolved_class_order = _apply_state_order(
+        resolved_class_order, _get_classification_state_order(adata_tracks, class_col)
+    )
 
     proportions_by_sample, _, _ = _compute_grouped_class_proportions(
         df, group_cols=[sample_col], class_col=class_col, class_order=resolved_class_order,
@@ -1146,7 +1361,7 @@ def save_track_contact_group_analysis(
             group_x=group_x,
             group_y=group_y,
             group_cols=list(extra_group_cols),
-            class_order=class_order,
+            class_order=resolved_class_order,
             class_colors=class_colors,
             verbose=verbose,
             pdf_pages=pdf,
@@ -1219,6 +1434,18 @@ def generate_track_clustering_report_pdfs(
 
     if cluster_key not in adata_tracks.obs.columns:
         raise ValueError(f"Missing '{cluster_key}' in adata_tracks.obs.")
+
+    resolved_order = _apply_state_order(
+        sorted(adata_tracks.obs[cluster_key].astype(str).unique().tolist(), key=_mixed_label_sort_key),
+        _get_classification_state_order(adata_tracks, cluster_key),
+    )
+    adata_tracks.obs[cluster_key] = pd.Categorical(
+        adata_tracks.obs[cluster_key].astype(str), categories=resolved_order,
+    )
+    resolved_colors = _normalize_label_color_map(
+        resolved_order, colors=_get_classification_state_colors(adata_tracks, cluster_key),
+    )
+    adata_tracks.uns[f"{cluster_key}_colors"] = [resolved_colors[c] for c in resolved_order]
 
     if "X_umap" not in adata_tracks.obsm:
         sc.tl.umap(adata_tracks, random_state=0)
@@ -1304,7 +1531,12 @@ def generate_track_clustering_report_pdfs(
         pdf.savefig(fig, dpi=int(plot_dpi), bbox_inches="tight")
         plt.close(fig)
 
-        fig = _plot_cluster_rankings(adata_tracks=adata_tracks, cluster_key=cluster_key)
+        fig = _plot_cluster_rankings(
+            adata_tracks=adata_tracks,
+            cluster_key=cluster_key,
+            cluster_order=resolved_order,
+            cluster_colors=resolved_colors,
+        )
         _apply_best_pdf_orientation(fig, default_orientation="landscape")
         pdf.savefig(fig, dpi=int(plot_dpi), bbox_inches="tight")
         plt.close(fig)

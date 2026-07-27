@@ -316,7 +316,7 @@ def _make_chk_help_row(chk: QCheckBox, title: str, desc: str) -> QHBoxLayout:
 
 # ── Default selections (used when no prior config exists) ───────────────────
 _DEFAULT_TIMEPOINT_FEATURES = {"speed", "sphericity", "elongation", "extent", "solidity"}
-_DEFAULT_WINDOW_FEATURES    = {"net_displacement", "straightness"}
+_DEFAULT_WINDOW_FEATURES    = {"net_displacement"}
 _DEFAULT_LOG_SCALE_FEATURES = {"speed"}
 
 _TECHNICAL_OBS_COLS = {
@@ -406,6 +406,8 @@ class StateClassificationSubTab(QWidget):
         self.metadata_loader = metadata_loader
         self._get_cell_type = cell_type_getter
         self._model_adata = None
+        self._hmm_model = None
+        self._hmm_model_cell_type = None
         self._bg = BackgroundOperation(self)
         self._preload_bg = BackgroundOperation(self)
         self._last_features_key: tuple = ()
@@ -1799,6 +1801,7 @@ class StateClassificationSubTab(QWidget):
             from behav3d.analysis.behavior.state.classification import run_hmm_state_clustering
             res = run_hmm_state_clustering(**params, verbose=True, return_details=True)
             self._hmm_model = res["hmm_model"]
+            self._hmm_model_cell_type = ct
             return res["model_adata"]
 
         self._bg.run(
@@ -1920,6 +1923,7 @@ class StateClassificationSubTab(QWidget):
             from behav3d.analysis.behavior.state.classification import run_hmm_state_clustering
             res = run_hmm_state_clustering(**params, verbose=True, return_details=True)
             self._hmm_model = res["hmm_model"]
+            self._hmm_model_cell_type = ct
             return res["model_adata"]
 
         def _done(result):
@@ -2005,14 +2009,26 @@ class StateClassificationSubTab(QWidget):
             apply_hmm_deployment_artifact_to_full_dataset,
             _resolve_hmm_deployment_artifact_path,
         )
+        from behav3d.analysis.behavior.state.utils import (
+            _get_classification_state_colors,
+            _get_classification_state_order,
+            _set_classification_state_colors,
+            _set_classification_state_order,
+        )
 
         artifact_path = _resolve_hmm_deployment_artifact_path(output_dir=str(out), cell_type=ct)
 
-        hmm_model = self._hmm_model
+        hmm_model = (
+            getattr(self, "_hmm_model", None)
+            if getattr(self, "_hmm_model_cell_type", None) == ct
+            else None
+        )
         if hmm_model is None and artifact_path.exists():
             try:
                 _stored = load_hmm_deployment_artifact(str(artifact_path))
                 hmm_model = _stored.get("model")
+                self._hmm_model = hmm_model
+                self._hmm_model_cell_type = ct
             except Exception:
                 pass
 
@@ -2032,6 +2048,23 @@ class StateClassificationSubTab(QWidget):
             self._model_adata.obs[FULL_STATE_COL] = (
                 self._model_adata.obs["full_behavioral_cluster"].copy()
             )
+
+        # Sync saved colors/order too — the rename dialog saves them under the raw
+        # dialog obs-column names, not the classification-constant column names the
+        # deployment artifact/full-dataset pipeline looks them up under.
+        raw_intrinsic_colors = _get_classification_state_colors(self._model_adata, "intrinsic_behavioral_cluster")
+        raw_intrinsic_order = _get_classification_state_order(self._model_adata, "intrinsic_behavioral_cluster")
+        if raw_intrinsic_colors:
+            _set_classification_state_colors(self._model_adata, INTRINSIC_STATE_COL, raw_intrinsic_colors)
+        if raw_intrinsic_order:
+            _set_classification_state_order(self._model_adata, INTRINSIC_STATE_COL, raw_intrinsic_order)
+
+        raw_full_colors = _get_classification_state_colors(self._model_adata, "full_behavioral_cluster")
+        raw_full_order = _get_classification_state_order(self._model_adata, "full_behavioral_cluster")
+        if raw_full_colors:
+            _set_classification_state_colors(self._model_adata, FULL_STATE_COL, raw_full_colors)
+        if raw_full_order:
+            _set_classification_state_order(self._model_adata, FULL_STATE_COL, raw_full_order)
 
         try:
             save_hmm_deployment_artifact(
@@ -2126,7 +2159,10 @@ class StateClassificationSubTab(QWidget):
                             .fillna("(unknown)")
                         )
 
-            from behav3d.analysis.behavior.state.utils import _get_classification_state_colors
+            from behav3d.analysis.behavior.state.utils import (
+                _get_classification_state_colors,
+                _get_classification_state_order,
+            )
             composition_dir = _resolve_state_paths(out, ct).state_composition_outdir
             composition_dir.mkdir(parents=True, exist_ok=True)
             return save_state_composition_report(
@@ -2141,6 +2177,7 @@ class StateClassificationSubTab(QWidget):
                 group_x=group_x,
                 group_y=group_y,
                 state_colors=_get_classification_state_colors(adata, FULL_STATE_COL),
+                state_order=_get_classification_state_order(adata, FULL_STATE_COL),
                 verbose=True,
             )
 
@@ -2180,7 +2217,10 @@ class StateClassificationSubTab(QWidget):
             from behav3d.analysis.behavior.state.visualization.plots.state_transitions import (
                 save_state_transition_report,
             )
-            from behav3d.analysis.behavior.state.utils import _get_classification_state_colors
+            from behav3d.analysis.behavior.state.utils import (
+                _get_classification_state_colors,
+                _get_classification_state_order,
+            )
             adata = ad.read_h5ad(str(full_path))
             transition_dir = _resolve_state_paths(out, ct).state_transitions_outdir
             transition_dir.mkdir(parents=True, exist_ok=True)
@@ -2190,6 +2230,7 @@ class StateClassificationSubTab(QWidget):
                 state_col=FULL_STATE_COL,
                 time_col="position_t",
                 state_colors=_get_classification_state_colors(adata, FULL_STATE_COL),
+                state_order=_get_classification_state_order(adata, FULL_STATE_COL),
                 verbose=True,
             )
 
@@ -2235,6 +2276,7 @@ class StateClassificationSubTab(QWidget):
             from behav3d.analysis.behavior.state.utils import (
                 _resolve_state_paths,
                 _get_classification_state_colors,
+                _get_classification_state_order,
             )
             from behav3d.analysis.behavior.state.visualization.plots.state_composition import (
                 save_state_condition_comparison_report,
@@ -2256,6 +2298,7 @@ class StateClassificationSubTab(QWidget):
                 group_cols=group_cols or None,
                 group_x=group_x,
                 state_colors=_get_classification_state_colors(adata, FULL_STATE_COL),
+                state_order=_get_classification_state_order(adata, FULL_STATE_COL),
                 verbose=True,
             )
 
@@ -3017,6 +3060,23 @@ class TrackClassificationSubTab(QWidget):
         prop_row.addWidget(self.btn_view_track_proportions)
         g_prop.addLayout(prop_row)
 
+        self.grp_window_transitions = QGroupBox("Window Transitions")
+        g_wintrans = QVBoxLayout(self.grp_window_transitions)
+        g_wintrans.setSpacing(4)
+        g_wintrans.addWidget(_make_info_label(
+            "Sankey diagram of how each track's trajectory cluster changes from one "
+            "window to the next - reconnects the sub-tracks 'Divide long tracks' split "
+            "a track into, back through their shared parent TrackID. One diagram per "
+            "sample, plus a pooled page. Needs 'Divide long tracks' to have been used."
+        ))
+        wintrans_row = QHBoxLayout()
+        self.btn_window_transitions = QPushButton("▶ Create Window Transition Sankey")
+        _style_secondary(self.btn_window_transitions)
+        wintrans_row.addWidget(self.btn_window_transitions, stretch=1)
+        self.btn_view_window_transitions = _make_view_btn()
+        wintrans_row.addWidget(self.btn_view_window_transitions)
+        g_wintrans.addLayout(wintrans_row)
+
         self.grp_track_comparison = QGroupBox("Condition Comparison Report")
         g_track_comparison = QVBoxLayout(self.grp_track_comparison)
         g_track_comparison.setSpacing(4)
@@ -3091,6 +3151,40 @@ class TrackClassificationSubTab(QWidget):
         self.btn_view_contact_analysis = _make_view_btn()
         contact_row.addWidget(self.btn_view_contact_analysis)
         g_contact.addLayout(contact_row)
+
+        g_contact.addWidget(QLabel("State-shift analysis (behavioral state before → after contact):"))
+        shift_form = QFormLayout()
+        shift_form.setSpacing(3)
+        self.combo_contact_shift_window_mode = QComboBox()
+        self.combo_contact_shift_window_mode.addItems(["Fixed", "Full"])
+        shift_form.addRow("Window mode:", make_help_row(
+            self.combo_contact_shift_window_mode, "Before/after window mode",
+            "'Fixed': compare a fixed number of timepoints immediately before the contact bout "
+            "starts vs. immediately after it ends. 'Full': compare everything before the bout to "
+            "everything after it, within the track's classified window."
+        ))
+        self.spin_contact_shift_window_length = QSpinBox()
+        self.spin_contact_shift_window_length.setRange(1, 100000)
+        self.spin_contact_shift_window_length.setValue(10)
+        self.spin_contact_shift_window_length.setMaximumWidth(100)
+        shift_form.addRow("Fixed window length:", make_help_row(
+            self.spin_contact_shift_window_length, "Fixed window length (timepoints)",
+            "Only used in 'Fixed' window mode: number of timepoints immediately before the bout "
+            "start / after the bout end to compare."
+        ))
+        self.combo_contact_shift_state_col = QComboBox()
+        self.combo_contact_shift_state_col.addItems(
+            ["full_behavioral_cluster", "intrinsic_behavioral_cluster", "raw_hmm_state"]
+        )
+        shift_form.addRow("State column:", self.combo_contact_shift_state_col)
+        g_contact.addLayout(shift_form)
+        shift_row = QHBoxLayout()
+        self.btn_contact_state_shift = QPushButton("▶ Run State-Shift Analysis")
+        _style_secondary(self.btn_contact_state_shift)
+        shift_row.addWidget(self.btn_contact_state_shift, stretch=1)
+        self.btn_view_contact_state_shift = _make_view_btn()
+        shift_row.addWidget(self.btn_view_contact_state_shift)
+        g_contact.addLayout(shift_row)
 
         self.grp_exemplar = QGroupBox("Exemplar Tracks")
         g_exemplar = QVBoxLayout(self.grp_exemplar)
@@ -3184,6 +3278,7 @@ class TrackClassificationSubTab(QWidget):
         pipeline_content_lay.setSpacing(6)
         pipeline_content_lay.addWidget(self.grp_diag)
         pipeline_content_lay.addWidget(self.grp_track_proportions)
+        pipeline_content_lay.addWidget(self.grp_window_transitions)
         pipeline_content_lay.addWidget(self.grp_track_comparison)
         pipeline_content_lay.addWidget(self.grp_contact_analysis)
         pipeline_content_lay.addWidget(self.grp_exemplar)
@@ -3293,12 +3388,16 @@ class TrackClassificationSubTab(QWidget):
         self.btn_view_diagnostics.clicked.connect(lambda: self._on_view("track_diagnostics"))
         self.btn_track_proportions.clicked.connect(self._on_track_proportions)
         self.btn_view_track_proportions.clicked.connect(lambda: self._on_view("track_proportions"))
+        self.btn_window_transitions.clicked.connect(self._on_window_transitions)
+        self.btn_view_window_transitions.clicked.connect(lambda: self._on_view("window_transitions"))
         self.btn_track_condition_comparison.clicked.connect(self._on_track_condition_comparison)
         self.btn_view_track_condition_comparison.clicked.connect(
             lambda: self._on_view("track_condition_comparison")
         )
         self.btn_contact_analysis.clicked.connect(self._on_contact_analysis)
         self.btn_view_contact_analysis.clicked.connect(lambda: self._on_view("contact_analysis"))
+        self.btn_contact_state_shift.clicked.connect(self._on_contact_state_shift_analysis)
+        self.btn_view_contact_state_shift.clicked.connect(lambda: self._on_view("contact_state_shift"))
         self.btn_browse_pretrained_clf.clicked.connect(self._browse_pretrained_clf)
         self.btn_browse_pretrained_states.clicked.connect(self._browse_pretrained_states)
         self.btn_run_apply_pretrained.clicked.connect(self._on_apply_pretrained)
@@ -3416,6 +3515,7 @@ class TrackClassificationSubTab(QWidget):
     # ── Guided pipeline dispatch (Step 3 create plots) ───────────────────
     _TRACK_PIPELINE_RUN_BUTTONS = {
         "track_diagnostics": "btn_diagnostics",
+        "track_window_transitions": "btn_window_transitions",
     }
 
     def _on_pipeline_start(self, pipeline_id: str):
@@ -3437,12 +3537,13 @@ class TrackClassificationSubTab(QWidget):
         visible = {
             "track_diagnostics": {self.grp_diag},
             "track_proportions": {self.grp_track_proportions},
+            "track_window_transitions": {self.grp_window_transitions},
             "track_comparison": {self.grp_track_comparison},
             "track_contact": {self.grp_contact_analysis},
             "track_exemplars": {self.grp_exemplar},
         }.get(pipeline_id, set())
-        for group in (self.grp_diag, self.grp_track_proportions, self.grp_track_comparison,
-                      self.grp_contact_analysis, self.grp_exemplar):
+        for group in (self.grp_diag, self.grp_track_proportions, self.grp_window_transitions,
+                      self.grp_track_comparison, self.grp_contact_analysis, self.grp_exemplar):
             group.setVisible(group in visible)
         title = next(
             (s["title"] for s in TRACK_PLOT_PIPELINES if s["id"] == pipeline_id), ""
@@ -3933,6 +4034,11 @@ class TrackClassificationSubTab(QWidget):
         self.combo_contact_col.blockSignals(False)
         self.combo_contact_col.setEnabled(len(contact_cols) > 0)
         self.btn_contact_analysis.setEnabled(len(contact_cols) > 0 and self._track_adata is not None)
+        state_adata_path = self._state_adata_path(ct) if ct else None
+        has_states = bool(state_adata_path and state_adata_path.exists())
+        self.btn_contact_state_shift.setEnabled(
+            len(contact_cols) > 0 and self._track_adata is not None and has_states
+        )
 
     def _update_view_buttons(self):
         ct = self._cell_type()
@@ -3941,7 +4047,9 @@ class TrackClassificationSubTab(QWidget):
                 self.btn_view_track, self.btn_view_train_track,
                 self.btn_view_apply_track, self.btn_view_exemplars,
                 self.btn_view_diagnostics, self.btn_view_track_proportions,
+                self.btn_view_window_transitions,
                 self.btn_view_track_condition_comparison, self.btn_view_contact_analysis,
+                self.btn_view_contact_state_shift,
             ):
                 btn.setEnabled(False)
             return
@@ -3968,6 +4076,14 @@ class TrackClassificationSubTab(QWidget):
                 and any(proportions_dir.glob("*.pdf"))
             )
         )
+        window_transitions_dir = traj_dir / "window_transitions" if traj_dir else None
+        self.btn_view_window_transitions.setEnabled(
+            bool(
+                window_transitions_dir
+                and window_transitions_dir.exists()
+                and any(window_transitions_dir.glob("*.pdf"))
+            )
+        )
         comparisons_dir = traj_dir / "behavior_comparisons" if traj_dir else None
         self.btn_view_track_condition_comparison.setEnabled(
             bool(
@@ -3982,6 +4098,13 @@ class TrackClassificationSubTab(QWidget):
                 contact_dir
                 and contact_dir.exists()
                 and any(contact_dir.glob("*/*.pdf"))
+            )
+        )
+        self.btn_view_contact_state_shift.setEnabled(
+            bool(
+                contact_dir
+                and contact_dir.exists()
+                and any(contact_dir.glob("*/contact_state_shift.pdf"))
             )
         )
 
@@ -4207,8 +4330,11 @@ class TrackClassificationSubTab(QWidget):
         track_adata = self._track_adata
         method = (track_adata.uns.get("dtai_trajectory_clustering", {}) or {}).get("method")
         if method == "original_behav3d_feature_dtw":
-            # The old (feature-DTW) method has its own regenerate-after-rename path,
-            # driven by its dedicated rename UI (not this generic adata-based one).
+            # Known limitation: renaming feature-DTW clusters via this generic dialog updates
+            # adata.uns["classification"], but diagnostics for this method read colors/order from
+            # a separate YAML store (see `_save_feature_dtw_quality_control`) that isn't refreshed
+            # here, so its own reports can go stale after a rename. Regenerate manually via
+            # "Create diagnostics" if needed.
             return
 
         def _run(**kw):
@@ -4233,7 +4359,27 @@ class TrackClassificationSubTab(QWidget):
                 class_col=cluster_col,
                 verbose=True,
             )
-            return {"diagnostics": diag, "proportions": prop}
+            result = {"diagnostics": diag, "proportions": prop}
+            if "trajectory_window_id" in track_adata.obs.columns:
+                # Only meaningful when 'Divide long tracks' was used - most runs
+                # don't have this column, so skip silently rather than erroring
+                # the whole refresh for the common case. A real failure here is
+                # caught locally so it doesn't take down the reports above,
+                # which already succeeded by this point.
+                try:
+                    from behav3d.analysis.behavior.track.visualization.plots.window_transitions import (
+                        save_window_transition_report,
+                    )
+                    result["window_transitions"] = save_window_transition_report(
+                        track_adata,
+                        output_dir=str(out) if out else "",
+                        cell_type=ct,
+                        cluster_key=cluster_col,
+                        verbose=True,
+                    )
+                except Exception as exc:
+                    result["window_transitions_error"] = str(exc)
+            return result
 
         self._bg.run(
             fn=_run,
@@ -4578,6 +4724,9 @@ class TrackClassificationSubTab(QWidget):
             import matplotlib.pyplot as plt
             import anndata as _ad
             from behav3d.analysis.behavior.state.classification import FULL_STATE_COL
+            from behav3d.napari._rename_dialog import _track_cluster_col
+
+            cluster_col = _track_cluster_col(track_adata) or "ClusterID"
 
             if state_adata_path is None or not state_adata_path.exists():
                 raise FileNotFoundError(
@@ -4602,7 +4751,7 @@ class TrackClassificationSubTab(QWidget):
                     track_key="TrackID",
                     time_key="position_t",
                     state_key=FULL_STATE_COL,
-                    cluster_key="ClusterID",
+                    cluster_key=cluster_col,
                     tmin_key="position_t_min",
                     tmax_key="position_t_max",
                 )
@@ -4621,10 +4770,9 @@ class TrackClassificationSubTab(QWidget):
                     track_key="TrackID",
                     time_key="position_t",
                     state_key=FULL_STATE_COL,
-                    cluster_key="ClusterID",
+                    cluster_key=cluster_col,
                     tmin_key="position_t_min",
                     tmax_key="position_t_max",
-                    verbose=True,
                 )
                 results["statebar_pdfs"] = statebar_out
 
@@ -4640,7 +4788,7 @@ class TrackClassificationSubTab(QWidget):
                     track_key="TrackID",
                     time_key="position_t",
                     state_key=FULL_STATE_COL,
-                    cluster_key="ClusterID",
+                    cluster_key=cluster_col,
                     tmin_key="position_t_min",
                     tmax_key="position_t_max",
                     verbose=True,
@@ -4659,7 +4807,7 @@ class TrackClassificationSubTab(QWidget):
                     track_key="TrackID",
                     time_key="position_t",
                     state_key=FULL_STATE_COL,
-                    cluster_key="ClusterID",
+                    cluster_key=cluster_col,
                     tmin_key="position_t_min",
                     tmax_key="position_t_max",
                     verbose=True,
@@ -4812,6 +4960,56 @@ class TrackClassificationSubTab(QWidget):
             on_failed=lambda e: self._log(f"❌ Track proportion plots failed: {e}"),
         )
 
+    def _on_window_transitions(self):
+        ct = self._cell_type()
+        if not ct:
+            return
+        if self._track_adata is None:
+            QMessageBox.warning(self, "No data", "Run track clustering first.")
+            return
+        if "trajectory_window_id" not in self._track_adata.obs.columns:
+            QMessageBox.warning(
+                self, "No sub-track windows",
+                "This report needs tracks split into windows. Enable 'Divide long "
+                "tracks' in Step 1's Advanced Configuration and re-run track clustering.",
+            )
+            return
+        if self._bg.is_running():
+            QMessageBox.warning(self, "Busy", "Another operation is running.")
+            return
+        out = self._out_dir()
+        self._log(f"▶ Creating window transition Sankey for '{ct}'…")
+        track_adata = self._track_adata
+
+        def _run(**kw):
+            from behav3d.analysis.behavior.track.visualization.plots.window_transitions import (
+                save_window_transition_report,
+            )
+            from behav3d.napari._rename_dialog import _track_cluster_col
+            cluster_col = _track_cluster_col(track_adata) or "ClusterID"
+            return save_window_transition_report(
+                track_adata,
+                output_dir=str(out) if out else "",
+                cell_type=ct,
+                cluster_key=cluster_col,
+                verbose=True,
+            )
+
+        self._bg.run(
+            fn=_run,
+            desc=f"Window transition Sankey ({ct})…",
+            progress_row=self.progress_row,
+            buttons=[self.btn_window_transitions],
+            viewer=self.viewer,
+            inject_progress=False,
+            on_done=lambda r: (
+                self._log(f"✅ Window transition Sankey done for '{ct}'."),
+                self._update_view_buttons(),
+                self._notify_results(),
+            ),
+            on_failed=lambda e: self._log(f"❌ Window transition Sankey failed: {e}"),
+        )
+
     def _on_track_condition_comparison(self):
         ct = self._cell_type()
         if not ct:
@@ -4944,6 +5142,79 @@ class TrackClassificationSubTab(QWidget):
                 self._notify_results(),
             ),
             on_failed=lambda e: self._log(f"❌ Contact-vs-no-contact analysis failed: {e}"),
+        )
+
+    def _on_contact_state_shift_analysis(self):
+        ct = self._cell_type()
+        if not ct:
+            return
+        if self._track_adata is None:
+            QMessageBox.warning(self, "No data", "Run track clustering first.")
+            return
+        if self._bg.is_running():
+            QMessageBox.warning(self, "Busy", "Another operation is running.")
+            return
+        contact_col = self.combo_contact_col.currentText()
+        if not contact_col:
+            QMessageBox.warning(self, "Missing selection", "Select a contact column to analyze.")
+            return
+        state_adata_path = self._state_adata_path(ct)
+        if not state_adata_path or not state_adata_path.exists():
+            QMessageBox.warning(
+                self, "No data",
+                "Behavioral states h5ad not found. Run State Classification first.",
+            )
+            return
+        csv_path = self._track_features_csv_path(ct)
+        if not csv_path or not csv_path.exists():
+            QMessageBox.warning(self, "No data", "Track-features CSV not found. Run feature extraction first.")
+            return
+        min_bout_length = int(self.spin_contact_min_bout.value())
+        window_mode = self.combo_contact_shift_window_mode.currentText().lower()
+        fixed_window_length = int(self.spin_contact_shift_window_length.value())
+        state_col_choice = self.combo_contact_shift_state_col.currentText()
+        out = self._out_dir()
+        track_adata = self._track_adata
+        self._log(f"▶ Running contact state-shift analysis for '{ct}'…")
+
+        def _run(**kw):
+            import pandas as pd
+            import anndata as _ad
+            from behav3d.analysis.behavior.state.classification import FULL_STATE_COL
+            from behav3d.analysis.behavior.track.utils import _resolve_dtaidistance_paths
+            from behav3d.analysis.behavior.track.visualization.plots.contact_state_shift_report import (
+                save_track_contact_state_shift_report,
+            )
+            state_col = FULL_STATE_COL if state_col_choice == "full_behavioral_cluster" else state_col_choice
+            full_adata = _ad.read_h5ad(str(state_adata_path))
+            df_timepoints = pd.read_csv(csv_path)
+            contact_dir = _resolve_dtaidistance_paths(str(out) if out else "", ct)["outfolder"]
+            return save_track_contact_state_shift_report(
+                track_adata,
+                df_timepoints,
+                full_adata,
+                contact_dir,
+                contact_col=contact_col,
+                min_bout_length=min_bout_length,
+                state_col=state_col,
+                window_mode=window_mode,
+                fixed_window_length=fixed_window_length,
+                verbose=True,
+            )
+
+        self._bg.run(
+            fn=_run,
+            desc=f"Contact state-shift analysis ({ct})…",
+            progress_row=self.progress_row,
+            buttons=[self.btn_contact_state_shift],
+            viewer=self.viewer,
+            inject_progress=False,
+            on_done=lambda r: (
+                self._log(f"✅ Contact state-shift analysis done for '{ct}'."),
+                self._update_view_buttons(),
+                self._notify_results(),
+            ),
+            on_failed=lambda e: self._log(f"❌ Contact state-shift analysis failed: {e}"),
         )
 
     # ── Backprojection ───────────────────────────────────────────────────
@@ -5175,6 +5446,13 @@ class TrackClassificationSubTab(QWidget):
                 (f.stem, f)
                 for f in sorted(proportions_dir.glob("*.pdf"))
             ]
+        elif kind == "window_transitions" and traj_dir:
+            wt_dir = traj_dir / "window_transitions"
+            candidates = [(f.stem, f) for f in sorted(wt_dir.glob("*.pdf"))]
+            candidates += [
+                (f"per-sample/{f.stem}", f)
+                for f in sorted(wt_dir.glob("sankey_pdf_pages/*.pdf"))
+            ]
         elif kind == "track_condition_comparison" and traj_dir:
             comparisons_dir = traj_dir / "behavior_comparisons"
             candidates = [
@@ -5186,6 +5464,12 @@ class TrackClassificationSubTab(QWidget):
             candidates = [
                 (f"{f.parent.name}/{f.stem}", f)
                 for f in sorted(contact_dir.glob("*/*.pdf"))
+            ]
+        elif kind == "contact_state_shift" and traj_dir:
+            contact_dir = traj_dir / "contact_analysis"
+            candidates = [
+                (f.parent.name, f)
+                for f in sorted(contact_dir.glob("*/contact_state_shift.pdf"))
             ]
 
         existing = [(lbl, p) for lbl, p in candidates if p and p.exists()]
@@ -5279,6 +5563,17 @@ class SingleCellTab(QWidget):
         self.status_lbl.setStyleSheet("color: #888; font-size: 11px;")
         hdr_lay.addWidget(self.status_lbl)
         outer.addLayout(hdr_lay)
+
+        # ── Data-consistency warning (h5ad vs. filtered CSV track IDs) ────
+        self.data_consistency_warning_label = QLabel("")
+        self.data_consistency_warning_label.setWordWrap(True)
+        self.data_consistency_warning_label.setStyleSheet(
+            "QLabel { background: #3d2200; color: #ffaa44; border-radius: 4px; "
+            "padding: 6px 8px; font-size: 11px; }"
+        )
+        self.data_consistency_warning_label.hide()
+        outer.addWidget(self.data_consistency_warning_label)
+        self._consistency_bg = BackgroundOperation(self)
 
         # ── Guided overview + isolated settings pages ────────────────────
         from behav3d.napari._guided import GuidedPanel, make_back_header
@@ -5412,6 +5707,7 @@ class SingleCellTab(QWidget):
             combo.blockSignals(False)
 
         self._propagate_metadata_update()
+        self._refresh_data_consistency_warning()
 
     def _propagate_metadata_update(self):
         self.state_tab.on_metadata_updated()
@@ -5427,6 +5723,99 @@ class SingleCellTab(QWidget):
             params.setdefault("single_cell", {})["selected_cell_type"] = text
             _save_behav3d_params(self.metadata_loader, self._out_dir)
         self._propagate_metadata_update()
+        self._refresh_data_consistency_warning()
 
     def _current_cell_type(self) -> str:
         return self.cell_type_combo.currentText()
+
+    # ── Data-consistency warning ─────────────────────────────────────────
+
+    def showEvent(self, event):
+        """Fires whenever this tab becomes visible (initial show and every tab
+        switch back to it) — the natural "entering Single-Cell Analysis" hook,
+        so the warning reflects any h5ad/CSV drift since it was last shown."""
+        super().showEvent(event)
+        self._refresh_data_consistency_warning()
+
+    def _refresh_data_consistency_warning(self):
+        """Cheap background check: do the filtered track-features CSV and the
+        track/behavioral-states h5ad(s) for the current cell type still describe
+        the same tracks?
+
+        Only reads the two ID columns from the CSV (not the full file) and the
+        ``.obs`` table from each h5ad in ``backed="r"`` mode (not the full
+        AnnData, so no X matrix is loaded) — this is far cheaper than the
+        full contact/no-contact analysis pipeline and safe to run on every tab
+        entry. Runs off the Qt thread so it never blocks tab switching; if a
+        previous check is still in flight, this call is skipped (a subsequent
+        trigger — e.g. the next tab visit — will pick it up).
+        """
+        ct = self._current_cell_type()
+        out = self._out_dir()
+        self.data_consistency_warning_label.hide()
+        if not ct or not out:
+            return
+
+        csv_path = self.track_tab._track_features_csv_path(ct)
+        if not csv_path or not csv_path.exists():
+            return
+        h5ad_sources = [
+            ("track classification h5ad", self.track_tab._track_adata_path(ct)),
+            ("behavioral states h5ad", self.track_tab._state_adata_path(ct)),
+        ]
+        h5ad_sources = [(label, p) for label, p in h5ad_sources if p and p.exists()]
+        if not h5ad_sources:
+            return
+
+        if self._consistency_bg.is_running():
+            return
+
+        groupby_cols = ["sample_name", "TrackID"]
+
+        def _key_set(df):
+            from behav3d.analysis.behavior.track.contact_grouping import _normalize_id_column
+            d = df[groupby_cols].copy()
+            for col in groupby_cols:
+                d[col] = _normalize_id_column(d[col])
+            return set(map(tuple, d.drop_duplicates().to_numpy()))
+
+        def _check():
+            import pandas as pd
+            import anndata as ad
+
+            csv_keys = _key_set(pd.read_csv(csv_path, usecols=groupby_cols))
+            mismatches = []
+            for label, path in h5ad_sources:
+                adata = ad.read_h5ad(str(path), backed="r")
+                try:
+                    h5ad_keys = _key_set(adata.obs[groupby_cols])
+                finally:
+                    if getattr(adata, "isbacked", False):
+                        adata.file.close()
+                missing = h5ad_keys - csv_keys
+                if missing:
+                    mismatches.append((label, len(missing)))
+            return mismatches
+
+        def _on_done(mismatches):
+            if not mismatches:
+                self.data_consistency_warning_label.hide()
+                return
+            details = "; ".join(f"{n} track(s) missing from {label}" for label, n in mismatches)
+            self.data_consistency_warning_label.setText(
+                f"⚠ Filtered track data no longer matches the behavioral-analysis h5ad output "
+                f"for cell type '{ct}' ({details}). Re-run Track / State Classification to "
+                f"refresh the h5ad from the current filtered data."
+            )
+            self.data_consistency_warning_label.show()
+
+        def _on_failed(err):
+            print(f"[BEHAV3D] Data-consistency check failed: {err}")
+
+        self._consistency_bg.run(
+            fn=_check,
+            desc="Checking data consistency…",
+            inject_progress=False,
+            on_done=_on_done,
+            on_failed=_on_failed,
+        )

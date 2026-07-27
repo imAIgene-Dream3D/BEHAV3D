@@ -3,6 +3,28 @@ from pathlib import Path
 import re
 
 
+def resolve_metadata_csv_path(metadata_loader):
+    """Return the metadata CSV path for *metadata_loader*, whatever its type.
+
+    Callers historically assumed a public ``.metadata_csv_path`` attribute,
+    which holds for the notebook-era loaders in ``behav3d.widgets`` but not
+    for the napari plugin's ``DataPreparationTab``, which only tracks the
+    loaded CSV privately as ``._loaded_csv_path`` (with a
+    ``behav3d_parameters["paths"]["metadata_csv"]`` fallback). Checking all
+    three keeps ``*_and_sync_metadata`` helpers from crashing - after a
+    possibly hours-long segmentation run - on whichever loader happens to
+    call them.
+    """
+    path = getattr(metadata_loader, "metadata_csv_path", None)
+    if path:
+        return path
+    path = getattr(metadata_loader, "_loaded_csv_path", None)
+    if path:
+        return path
+    params = getattr(metadata_loader, "behav3d_parameters", None) or {}
+    return (params.get("paths") or {}).get("metadata_csv")
+
+
 def is_multicolor_celltype(cell_type_name: str) -> bool:
     """Return True if a cell type name matches the per-channel multicolor pattern.
 

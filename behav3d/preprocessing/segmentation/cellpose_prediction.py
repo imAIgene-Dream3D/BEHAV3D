@@ -37,6 +37,7 @@ from behav3d.core.metadata import (
     detect_immune_cell_types_from_metadata,
     detect_other_cell_types_from_metadata,
     has_dead_channel,
+    resolve_metadata_csv_path,
 )
 
 # Must match CELLPOSE_CHANNEL_UNUSED in behav3d.widgets.segmentation
@@ -483,8 +484,16 @@ def run_cellpose_and_sync_metadata(
     metadata_loader.metadata = updated_metadata
 
     # 3. Save
-    updated_metadata.to_csv(metadata_loader.metadata_csv_path, index=False)
-    
+    csv_path = resolve_metadata_csv_path(metadata_loader)
+    if not csv_path:
+        raise RuntimeError(
+            "Cellpose finished but could not find a metadata CSV path to save to "
+            "(no metadata_csv_path/_loaded_csv_path, and no paths.metadata_csv in "
+            "behav3d_parameters). The updated metadata is still in memory - save it "
+            "manually to avoid losing this run's results."
+        )
+    updated_metadata.to_csv(csv_path, index=False)
+
     return updated_metadata, summary
 
 
@@ -669,6 +678,14 @@ def run_otsu_and_sync_metadata(
     metadata_loader.metadata = updated_metadata
 
     # 3. Save
-    updated_metadata.to_csv(metadata_loader.metadata_csv_path, index=False)
-    
+    csv_path = resolve_metadata_csv_path(metadata_loader)
+    if not csv_path:
+        raise RuntimeError(
+            "Otsu thresholding finished but could not find a metadata CSV path to save "
+            "to (no metadata_csv_path/_loaded_csv_path, and no paths.metadata_csv in "
+            "behav3d_parameters). The updated metadata is still in memory - save it "
+            "manually to avoid losing this run's results."
+        )
+    updated_metadata.to_csv(csv_path, index=False)
+
     return updated_metadata, summary

@@ -1508,6 +1508,7 @@ def rename_track_clusters(
     mapping,
     cluster_col="ClusterID",
     keep_unmapped=True,
+    categories=None,
 ):
     """Relabel track clusters in-place."""
     relabel_cluster_ids(
@@ -1517,6 +1518,7 @@ def rename_track_clusters(
         new_key=cluster_col,
         keep_unmapped=keep_unmapped,
         overwrite_original=True,
+        categories=categories,
     )
     return adata
 

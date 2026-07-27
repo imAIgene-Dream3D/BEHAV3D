@@ -8,6 +8,7 @@ from matplotlib import colors as mcolors
 from matplotlib import pyplot as plt
 from behav3d.analysis.behavior.utils import (
     _mixed_label_sort_key,
+    _natural_sort_key,
     _resolve_output_dir,
     _save_adata_obs_csv,
     _sanitize_filename_token,
@@ -16,6 +17,9 @@ from behav3d.analysis.behavior.utils import (
     _vinfo,
     _vsave,
     _vstart,
+)
+from behav3d.analysis.behavior.general.visualization.plots.proportion_bars import (
+    hash_stable_label_color,
 )
 
 
@@ -44,16 +48,16 @@ def _coerce_hex_color(value, fallback="#808080"):
 
 
 def _default_label_color_map(labels, cmap_name="tab20"):
+    """Deterministic per-label default colors, independent of list order.
+
+    Uses the same hash-stable assignment as `hash_stable_label_color` so a label
+    gets the same default color everywhere it's seen, regardless of which report
+    (or which order of states) first generates it.
+    """
     labels = [] if labels is None else [str(x) for x in list(labels)]
     if len(labels) == 0:
         return {}
-    cmap = plt.get_cmap(cmap_name)
-    if len(labels) <= getattr(cmap, "N", 256):
-        color_values = [cmap(i / max(len(labels) - 1, 1)) for i in range(len(labels))]
-    else:
-        hsv = plt.get_cmap("hsv")
-        color_values = [hsv(i / len(labels)) for i in range(len(labels))]
-    return {label: _coerce_hex_color(color_values[i]) for i, label in enumerate(labels)}
+    return {label: _coerce_hex_color(hash_stable_label_color(label, cmap_name=cmap_name)) for label in labels}
 
 
 def _normalize_label_color_map(labels, colors=None, cmap_name="tab20"):
@@ -116,6 +120,8 @@ def _get_classification_state_order(adata, state_col):
     if not isinstance(state_order, dict):
         return []
     order = state_order.get(str(state_col), None)
+    if isinstance(order, np.ndarray):
+        order = order.tolist()
     if isinstance(order, (list, tuple)):
         return [str(x) for x in order]
     return []
@@ -665,6 +671,7 @@ def _rebuild_full_behavioral_cluster_from_intrinsic(
 
     _bcols = binary_cols_to_merge if binary_cols_to_merge is not None else []
     binary_cols = [str(c) for c in list(_bcols)]
+    missing_intrinsic_mask = pd.isna(adata.obs[intrinsic_col])
     adata.obs = _add_clean_binary_annotation_columns(adata.obs, binary_cols)
     adata.obs["behavioral_clusterid"] = adata.obs[intrinsic_col].astype(str)
     adata.obs["binary_group"] = _assign_binary_group_labels(
@@ -673,9 +680,10 @@ def _rebuild_full_behavioral_cluster_from_intrinsic(
         binary_group_constraints=binary_group_constraints,
         enforce_binary_group_constraints=bool(enforce_binary_group_constraints),
     ).astype("category")
-    adata.obs["full_behavioral_cluster"] = (
+    full_behavioral_cluster = (
         adata.obs["binary_group"].astype(str) + "_" + adata.obs["behavioral_clusterid"].astype(str)
-    ).astype("category")
+    ).where(~missing_intrinsic_mask, pd.NA)
+    adata.obs["full_behavioral_cluster"] = full_behavioral_cluster.astype("category")
     adata.obs["behavioral_clusterid"] = adata.obs["behavioral_clusterid"].astype("category")
     return adata
 

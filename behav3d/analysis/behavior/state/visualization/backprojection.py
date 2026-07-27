@@ -10,10 +10,12 @@ import zarr
 
 from behav3d.io.formats.zarr import append_to_zarr
 from behav3d.io.images import load_image
-from behav3d.analysis.behavior.utils import _mixed_label_sort_key
+from behav3d.analysis.behavior.utils import _natural_sort_key
 from behav3d.analysis.behavior.state.utils import (
+    _apply_state_order,
     _coerce_hex_color,
     _get_classification_state_colors,
+    _get_classification_state_order,
     _normalize_label_color_map,
 )
 
@@ -78,7 +80,7 @@ def _validate_required_obs_columns(obs, required_cols):
         )
 
 
-def _build_code_map(obs, state_col):
+def _build_code_map(obs, state_col, state_order=None):
     labels = (
         pd.Series(obs[state_col])
         .dropna()
@@ -86,7 +88,8 @@ def _build_code_map(obs, state_col):
         .str.strip()
     )
     labels = labels[labels != ""]
-    unique_labels = sorted(labels.unique().tolist(), key=_mixed_label_sort_key)
+    unique_labels = sorted(labels.unique().tolist(), key=_natural_sort_key)
+    unique_labels = _apply_state_order(unique_labels, state_order)
     return {str(label): int(idx + 1) for idx, label in enumerate(unique_labels)}
 
 
@@ -539,6 +542,7 @@ def export_behavioral_state_backprojection_zarrs(
     background_value=0,
     enforce_time_coverage=True,
     state_colors=None,
+    state_order=None,
     raise_on_error=True,
     require_all_rows_present=False,
     n_workers=1,
@@ -557,7 +561,9 @@ def export_behavioral_state_backprojection_zarrs(
     )
 
     output_dir = Path(output_dir)
-    code_map = _build_code_map(adata.obs, state_col=state_col)
+    if state_order is None:
+        state_order = _get_classification_state_order(adata, state_col)
+    code_map = _build_code_map(adata.obs, state_col=state_col, state_order=state_order)
     if len(code_map) == 0:
         raise ValueError(
             f"Cannot export behavioral states because '{state_col}' has no non-empty labels."
@@ -917,7 +923,11 @@ def _ensure_behavioral_state_backprojection_for_sample(
             f"'{sample_name}' is absent in '{h5ad_path}'."
         )
 
-    code_map = _build_code_map(adata_full.obs, state_col=resolved_state_col)
+    code_map = _build_code_map(
+        adata_full.obs,
+        state_col=resolved_state_col,
+        state_order=_get_classification_state_order(adata_full, resolved_state_col),
+    )
     if len(code_map) == 0:
         raise ValueError(
             f"Cannot lazily create behavioral-state backprojection because '{resolved_state_col}' has no labels."
