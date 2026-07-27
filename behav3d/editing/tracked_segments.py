@@ -209,13 +209,20 @@ def _seed_components_by_nearest(
     *no* overlapping marker; a plain watershed then leaves that whole
     (disconnected) blob as background, silently erasing the label.
 
-    This helper starts from the same overlap markers but additionally matches
-    any *orphan* connected component (one that received no overlap marker) to
-    the nearest previous sub-label by centroid distance, dropping a single seed
-    inside it.  Blobs that already carry a marker are left untouched, so the
+    This helper starts from the same overlap markers but additionally rescues
+    any sub-label that lost *all* overlap this frame, so it is not erased.  The
+    rescue is a strict **one-to-one** match: each lost sub-label is matched to a
+    distinct orphan blob (one that received no overlap marker) by nearest
+    centroid distance.  Doing it one-to-one is essential — matching each blob to
+    its nearest label independently can assign *both* blobs to the same label
+    and drop the other, which would delete one of the split IDs across time.
+
+    Blobs already carrying an overlap marker are left untouched, so the
     watershed still splits genuinely-connected regions along a ridge exactly as
-    before.  Only existing mask pixels are ever labelled — a cell that truly
-    left the frame has no blob and so is still (correctly) not propagated.
+    before.  Any leftover orphan blob (a stray same-label fragment, or more
+    blobs than labels) is attached to its nearest sub-label so its pixels are
+    not dropped.  Only existing mask pixels are ever labelled — a cell that
+    truly left the frame has no blob and so is still (correctly) not propagated.
     """
     from scipy.ndimage import label as _cc_label, center_of_mass
 
@@ -233,23 +240,61 @@ def _seed_components_by_nearest(
         return markers
 
     cc, n_cc = _cc_label(mask_t)
+    if n_cc == 0:
+        return markers
+
+    comp_centroids: Dict[int, np.ndarray] = {}
+    comp_has_marker: Dict[int, bool] = {}
     for comp in range(1, n_cc + 1):
         comp_mask = cc == comp
-        # Component already seeded by overlap — let watershed handle it.
-        if (markers[comp_mask] > 0).any():
-            continue
-        # Orphan blob: assign it to the nearest previous sub-label.
-        comp_centroid = np.array(center_of_mass(comp_mask))
-        nearest = min(
-            centroids,
-            key=lambda sid: float(np.linalg.norm(centroids[sid] - comp_centroid)),
-        )
-        cz, cy, cx = (int(round(v)) for v in comp_centroid)
+        comp_has_marker[comp] = bool((markers[comp_mask] > 0).any())
+        comp_centroids[comp] = np.array(center_of_mass(comp_mask))
+
+    def _seed_component(comp: int, sid: int) -> None:
+        comp_mask = cc == comp
+        cz, cy, cx = (int(round(v)) for v in comp_centroids[comp])
         if not comp_mask[cz, cy, cx]:
             # Centroid can fall outside a concave/annular blob; use any voxel.
             zs, ys, xs = np.nonzero(comp_mask)
             cz, cy, cx = int(zs[0]), int(ys[0]), int(xs[0])
-        markers[cz, cy, cx] = nearest
+        markers[cz, cy, cx] = sid
+
+    # Sub-labels already represented by an overlap marker somewhere this frame.
+    present = {int(v) for v in np.unique(markers) if v != 0}
+    # Sub-labels that lost all overlap this frame — at risk of being erased.
+    missing = [sid for sid in centroids if sid not in present]
+    # Components with no overlap marker — available to host a rescued label.
+    orphans = [c for c in range(1, n_cc + 1) if not comp_has_marker[c]]
+
+    # 1) Rescue each missing sub-label into a DISTINCT orphan blob, matched
+    #    one-to-one by ascending centroid distance (greedy global-nearest), so
+    #    two lost labels can never collapse onto the same blob.
+    pairs = [
+        (float(np.linalg.norm(centroids[sid] - comp_centroids[comp])), sid, comp)
+        for sid in missing
+        for comp in orphans
+    ]
+    pairs.sort(key=lambda p: p[0])
+    used_sid: set = set()
+    used_comp: set = set()
+    for _d, sid, comp in pairs:
+        if sid in used_sid or comp in used_comp:
+            continue
+        _seed_component(comp, sid)
+        used_sid.add(sid)
+        used_comp.add(comp)
+
+    # 2) Any orphan blob still unseeded (stray same-label fragment, or more
+    #    blobs than labels) → attach to its nearest sub-label so it is kept.
+    for comp in orphans:
+        if comp in used_comp:
+            continue
+        nearest = min(
+            centroids,
+            key=lambda sid: float(np.linalg.norm(centroids[sid] - comp_centroids[comp])),
+        )
+        _seed_component(comp, nearest)
+
     return markers
 
 
