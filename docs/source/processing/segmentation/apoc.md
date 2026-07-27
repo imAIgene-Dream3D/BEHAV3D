@@ -156,6 +156,11 @@ More checked channels → more feature columns and slower runs; keep the set tha
 
 After training, **Show classifier statistics** opens a table of **feature importance** (one row per filter×sigma×channel combination, e.g. `difference_of_gaussian_sigma2_channel0`). Higher importance means the forest relied on that column more when splitting.
 
+The Importance cells are color-coded from **green (more informative)** toward
+**red (less informative)**. Start with the proposed preset and, when object scale
+is uncertain, a broader candidate set; then use this table to remove consistently
+low-importance rows before retraining and checking the probability-map preview.
+
 - **One row dominates** (much higher than the rest). Often the classifier found one strong cue (e.g. a T-cell channel at σ `2`). It is a problem if preview looks **overfitted** to your painted labels, or if importance is high on a **noisy or artefact** channel you should disable.
 - **Many rows near zero** → safe to uncheck those filter×sigma boxes in *Tune Features* (or drop channels) and retrain for a faster, leaner model.
 - **Dominating filter** means a **specific row in the grid** (e.g. `DoG` at σ `1`). Fix by unchecking that row if it is redundant, or by fixing labels/channels if the model is latching onto the wrong cue.

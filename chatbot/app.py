@@ -995,15 +995,23 @@ def metadata_channel_mapping_guidance(
     return (
         "The **Metadata Builder does not map raw channel indices to cell types**. "
         "Its sample forms hold image/acquisition details plus each processing "
-        "population's **Line** and **Condition**. Channel-input or channel-label "
-        "controls belong to the selected segmentation method, so I should not "
-        "describe Cellpose controls as metadata fields.\n\n"
+        "population's **Line** and **Condition**. Channel inputs are configured in "
+        "Segmentation.\n\n"
         "For swapped-channel replicates, a valid metadata structure is to name two "
         "generic processing slots for the physical immune channels (for example, "
         "**blue** and **green**) and record the true identity, such as CD4 or CD8, "
-        "in each slot's **Line** field for every sample. Should those two processing "
-        "slots follow the physical channels, with Line carrying the biological "
-        "identity per sample?"
+        "in each slot's **Line** field for every sample. A slot must stay tied to "
+        "the same physical raw channel across all samples processed by that model; "
+        "the channel choice is not independent per sample.\n\n"
+        "The model scope also differs by method: **APOC** trains one binary model "
+        "per processing population and exposes channel inputs for each model; the "
+        "CPU **Pixel Classifier** also trains one classifier per population; "
+        "**ConvPaint** trains one shared multiclass model with one shared channel "
+        "set; and **Cellpose-SAM** exposes channel inputs per population. If the raw "
+        "channel order itself changes between samples, normalize the order first or "
+        "process those samples as separate model groups. Should the generic slots "
+        "follow fixed physical channels, with Line carrying the biological identity "
+        "per sample?"
     )
 
 
@@ -1231,8 +1239,12 @@ def apoc_feature_preset_action(
         "I am configuring the **Segmentation > APOC > Tune Features** controls, "
         f"not Feature Extraction or instance post-processing: {details}. Each preset "
         "selects Gaussian, DoG, LoG, and SoG at those scales and includes original "
-        "intensity. Retrain each classifier and inspect its probability-map preview "
-        "after applying the changes."
+        "intensity. Use this as a first pass, retrain, inspect the probability-map "
+        "preview, and open **Show classifier statistics**. In that table, greener "
+        "importance cells are more informative and redder cells are less informative. "
+        "Remove only consistently low-importance features, then retrain and preview "
+        "again; a broader custom scale set is useful when the first preset misses an "
+        "important object scale."
     )
     if not calls:
         text += " Those presets and Tune Features panels are already set, so no edit is needed."
@@ -1324,7 +1336,13 @@ def apoc_feature_grid_guidance(
         "rows at sigma **1, 2, 5**; Medium uses **1, 2, 5, 15**; Large uses "
         "**1, 2, 5, 10, 25**. All three presets include original intensity, which "
         "adds raw pixel values as a classifier feature. "
-        f"{availability}{scale_text}{recommendation} Changes here require retraining. "
+        f"{availability}{scale_text}{recommendation} Treat the preset as the first "
+        "pass rather than the final answer. If it misses relevant object scales, try "
+        "a broader candidate set, retrain, and inspect **Show classifier statistics**. "
+        "The importance table runs from greener, more informative cells toward redder, "
+        "less informative cells. Remove only features that remain uninformative, then "
+        "retrain and compare the probability-map preview again. Changes here require "
+        "retraining. "
         "These controls are separate from Minimum size, EDT, Mask threshold, Seed "
         "threshold, and the later Feature Extraction tab."
     )
@@ -1414,10 +1432,30 @@ def feature_threshold_guidance(
     if context.get("current_step") != "feature_extraction":
         return None
     latest = " ".join(_latest_user_message(messages).lower().split())
-    if "contact" not in latest or not any(term in latest for term in (
+    contact_request = "contact" in latest and any(term in latest for term in (
         "distance", "threshold", "set", "correct", "mean", "1.01", "touch",
-    )):
+    ))
+    death_request = any(term in latest for term in ("dead", "death")) and any(
+        term in latest for term in (
+            "threshold", "percentage", "percent", "set", "correct", "preview",
+            "first time", "calibrat",
+        )
+    )
+    if not contact_request and not death_request:
         return None
+
+    death_text = (
+        "Use **Preview Dead Threshold in Viewer** before relying on result PDFs or "
+        "choosing a number. Select the sample and population, open the preview, and "
+        "adjust the threshold above it: the overlay updates live; **green is below "
+        "the threshold (alive)** and **red is above it (dead)**; hovering an object shows "
+        "its measured dead-mask percentage. Calibrate against cells or organoids you "
+        "can confidently identify as alive or dead. The live context does not justify "
+        "a universal numeric range. Re-run Feature Extraction after choosing the "
+        "threshold."
+    )
+    if not contact_request:
+        return death_text
 
     controls = (context.get("ui_state", {}) or {}).get("controls", []) or []
     active = str(context.get("active_cell_type") or "")
@@ -1448,22 +1486,14 @@ def feature_threshold_guidance(
             "one-pixel XY gap, so it is close-proximity contact rather than strict "
             "mask touching."
         )
-    death_text = ""
-    if "dead" in latest or "death" in latest:
-        death_text = (
-            " For the dead-mask percentage, use the Feature Extraction preview: "
-            "green is below the threshold (alive), red is above it (dead), and hover "
-            "shows the measured percentage. Calibrate from cells you can confidently "
-            "classify as alive or dead; the live context does not justify a universal "
-            "numeric range."
-        )
+    appended_death = f" {death_text}" if death_request else ""
     return (
         "**Contact distance 0 µm means strict mask touching.** Any positive value "
         "permits that much physical separation between masks and therefore changes "
         "the biological definition from touching to proximity."
         + current_text + scale_text
         + " Re-run Feature Extraction after changing the contact distance."
-        + death_text
+        + appended_death
     )
 
 
@@ -1492,6 +1522,44 @@ def missing_log_error_question(context: dict, messages: list[dict]) -> str | Non
     )
 
 
+def result_opening_correction(
+    context: dict, messages: list[dict],
+) -> str | None:
+    """Stop repeated claims after the researcher reports that nothing opened."""
+    latest = " ".join(_latest_user_message(messages).lower().split())
+    correction = any(phrase in latest for phrase in (
+        "you cannot open", "you can not open", "you can't open",
+        "nothing opened", "it did not open", "it didn't open",
+        "not opening", "cannot open it", "can't open it",
+    ))
+    history = " ".join(
+        str(message.get("content") or "").lower()
+        for message in messages[:-1]
+        if message.get("role") == "assistant"
+    )
+    if not correction or not any(term in history for term in ("open", "opening")):
+        return None
+    preview = ""
+    prior_conversation = " ".join(
+        str(message.get("content") or "").lower()
+        for message in messages[:-1]
+    )
+    if context.get("current_step") == "feature_extraction" and any(
+        term in prior_conversation for term in ("dead", "death", "threshold")
+    ):
+        preview = (
+            " For death-threshold calibration, use **Preview Dead Threshold in "
+            "Viewer** in Feature Extraction; it provides the green alive/red dead "
+            "overlay and the measured percentage on hover."
+        )
+    return (
+        "**No result was opened.** A file being listed as viewable does not mean it "
+        "has opened. Open the exact item from the **Results** panel, or name the exact "
+        "result you want opened so it can be matched to a viewable result."
+        + preview
+    )
+
+
 def historical_reference_guidance(
     context: dict, messages: list[dict],
 ) -> dict | None:
@@ -1503,9 +1571,49 @@ def historical_reference_guidance(
         "historical setting", "reference profile", "reference configuration",
         "similar experiment", "similar dataset", "values used before",
         "what did you use", "used previously", "prior experiment",
-    ))
+    )) or (
+        any(term in latest for term in ("previous", "past", "prior", "historical"))
+        and "experiment" in latest
+    )
     if not historical_request:
         return None
+
+    if any(term in latest for term in (
+        "microglia", "macrophage", "exp91", "dmg", "dipg", "gd2",
+    )):
+        return {
+            "text": (
+                "**Historical example: Exp91 DMG organoid, macrophage/microglia, "
+                "and GD2 CAR-T co-culture.** The metadata CSV records eight wells, "
+                "1.77 µm isotropic sampling, 120-second frames, TCZYX order, and "
+                "five channels: brightfield 0, T cell 1, macrophage/microglia 2, "
+                "dead-cell dye 3, and organoid 4. The three organoid lines were kept "
+                "as one processing population because only one line occurred per "
+                "movie; line identity was retained for analysis. Macrophage/microglia "
+                "conditions were no added cells, M21, and M23. The historical CSV "
+                "uses the legacy value **None_None** for no added macrophages; track "
+                "paths in those wells contain segmentation noise and are not evidence "
+                "that macrophages were present.\n\n"
+                "The saved YAML uses APOC Probability Map + Watershed: organoid "
+                "channels 3 and 4 with mask/seed thresholds 0.5/0.8 and minimum size "
+                "1000 voxels; macrophage channel 2 and T-cell channel 1 with "
+                "0.5/0.6 and minimum sizes 100 and 30 voxels. Organoids and "
+                "macrophages used Propagation; T cells used btrack with maximum "
+                "search radius 150, optimizer distance 100, time threshold 5 frames, "
+                "and global optimization enabled. Active Killing was configured as "
+                "an absolute increase of 30 dead-mask pixels within 5 frames after "
+                "at least one contact frame.\n\n"
+                "Only T cells had behavioral classification: four HMM states and "
+                "50-timepoint trajectory windows. One source conflict must remain "
+                "visible: the saved YAML has HMM Start offset **0**, while the README "
+                "describes **1**. The design is also incomplete and unreplicated: "
+                "DIPG002ns has no M21 well, and each included combination has n=1, "
+                "so comparisons are descriptive or exploratory. These are sourced "
+                "historical values, not defaults, and I am not proposing form edits "
+                "from them."
+            ),
+            "calls": [],
+        }
 
     if (
         any(term in latest for term in ("calcium", "reporter", "islet"))
@@ -2893,7 +3001,9 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "You are the BEHAV3D Assistant for researchers analysing 3D fluorescence imaging. "
         "Answer the user's actual question first, then add only context that helps them decide "
         "or act. Use concise researcher-facing labels and never expose control IDs, variable "
-        "names, dotted configuration keys, JSON, or tool names in normal prose.\n\n"
+        "names, dotted configuration keys, JSON, or tool names in normal prose. Never narrate "
+        "internal rules, policies, prompting, capability checks, or reasoning with phrases such "
+        "as 'I should not' or 'my rules say'; give the resulting researcher-facing answer directly.\n\n"
         "TRUST AND SCOPE\n"
         "- The LIVE CONTEXT is authoritative. Read all loaded metadata records and current control "
         "values before asking for information. Never ask for a value already present.\n"
@@ -3001,6 +3111,12 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "- Never tell the user to click a field that you can edit with set_ui_value.\n"
         "- Do not claim an action succeeded in prose. State the intended change briefly; the client "
         "reports whether it was applied.\n"
+        "- Opening a result requires an open_result call with the exact id of a viewable item from "
+        "LIVE CONTEXT in the same response. Never say 'I will open', 'let me open', 'I am opening', "
+        "or 'try opening' without that call. A result merely listed as viewable has not been opened. "
+        "If no single exact result can be identified, say that it was not opened and direct the "
+        "researcher to the Results panel or the relevant built-in preview. Even when the call is "
+        "present, describe the intended opening rather than claiming it succeeded.\n"
         "- For EDT advice, use recommend_edt so the conversion comes from metadata. Use a 10 um cell "
         "diameter by default. For an organoid, first ask how many cell widths span its diameter. Treat "
         "the returned values as preview starting points, not ground truth.\n"
@@ -3351,6 +3467,7 @@ def deterministic_turn_response(
 
     preflight_question = (
         metadata_channel_mapping_guidance(context, messages)
+        or result_opening_correction(context, messages)
         or analysis_choice_summary(context, messages)
         or organoid_processing_question(context, messages)
         or metadata_identifier_confirmation_question(context, messages)

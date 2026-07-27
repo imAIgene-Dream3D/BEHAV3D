@@ -129,6 +129,72 @@ Use this profile to explain why intensity can be the primary behavioral signal
 when propagation makes movement and morphology nearly constant. Do not use its
 HMM feature set for motility experiments.
 
+## Exp91 DMG organoid, macrophage/microglia, and GD2 CAR-T co-culture
+
+**Evidence:** `README_BEHAV3D_BRIM_AW1_DMG_microglia_Exp91.md`,
+`metadata.csv`, and `behav3d_parameters.yml` supplied for Exp91.
+
+- Eight wells combine one DMG/DIPG organoid line per movie, optional
+  macrophage/microglia, and the same GD2 CAR-T product. Organoid lines are
+  `BT-093_WT` (DO7), its GD2-knockout control `BT-093_KO_WT` (DO7_KO), and
+  the independent patient line `DIPG002ns_WT`. Macrophage/microglia conditions
+  are no added cells, `M21_WT`, and `M23_WT`.
+- The matrix is intentionally incomplete: `DIPG002ns_WT` has no M21 condition.
+  Every included organoid-line by macrophage-condition combination has one well,
+  so biological comparisons are descriptive or exploratory rather than powered
+  replicate-level tests.
+- The CSV records 1.77 um isotropic sampling, 120 s frames, `TCZYX`, and five
+  raw channels: brightfield 0, T cell 1, macrophage/microglia 2, dead-cell dye 3,
+  and organoid 4. The README reports 437 timepoints.
+- One `organoid` processing type is used because only one organoid line occurs
+  in each movie. Organoid identity is stored as its per-sample line. Grouping by
+  organoid type therefore does not separate the three biological lines; exported
+  data must be subset by organoid line or the analysis run per line subset.
+- The historical CSV uses `None_None` for no macrophage/microglia added. In those
+  wells, macrophage segment and track paths still exist because the channel was
+  processed uniformly, but the README confirms that detections are noise. The
+  line value, not path presence, is authoritative. For newly built metadata, use
+  the current UI's `not added` representation rather than copying this legacy
+  sentinel.
+- The saved APOC strategy is Probability Map + Watershed. Organoid input uses
+  channels 3 and 4; macrophage uses 2; T cell uses 1; dead uses 3. Saved
+  mask/seed thresholds are 0.5/0.8 for organoids and 0.5/0.6 for macrophages and
+  T cells. Saved minimum sizes are 1000, 100, and 30 voxels respectively.
+- Organoid features use sigma 1, 2, 5, and 15; macrophage and T-cell features use
+  1, 2, and 5. A broader organoid candidate grid from 0.3 through 25 is also
+  saved. Treat those as candidate features: train, inspect Show classifier
+  statistics, remove consistently low-importance features, then retrain and
+  preview.
+- Organoids and macrophages use Propagation. The README explains that the
+  macrophages were mostly stationary/adherent and that changing protrusions
+  fragmented their masks, making propagation more reliable than centroid-based
+  identity assignment. T cells use btrack with maximum search radius 150,
+  global optimization, optimizer distance 100, time threshold 5 frames, and
+  step size 100.
+- Feature extraction uses direct contact at 0 um. Saved death thresholds are 3%
+  for organoids and 30% for macrophages and T cells. Both immune populations
+  include invasiveness. Organoid filtering uses minimum length 100 and initial
+  size 2000; macrophage filtering is effectively disabled; T cells use minimum
+  length 5 without maximum-length filtering or splitting.
+- Active Killing uses dead-mask pixel count in absolute mode: an increase of 30
+  pixels within 5 frames (10 min) after at least one contact frame. The saved
+  1.5 multiplier is inactive in absolute mode.
+- Only T cells have behavioral analysis configured: a four-state HMM using
+  morphology and motion, plus 5-frame net displacement and straightness. Binary
+  groups include death, active killing, and organoid contact; macrophage contact
+  is deliberately reserved for downstream contact analyses. Trajectory analysis
+  uses 50-timepoint windows, splitting at analysis time, nine requested clusters,
+  Average linkage, and the last-window trim mode.
+- Source conflict: the YAML saves HMM Start offset 0, while the README says Start
+  offset 1. Report both values and ask which source represents the finalized run;
+  do not silently reconcile them.
+
+Use this profile for macrophage/microglia effects on CAR-T behavior, antigen
+specificity using the GD2-knockout control, donor comparisons, invasiveness, and
+contact-associated killing. Keep the n=1 and incomplete-matrix caveats attached
+to every comparison, and never transfer its thresholds or tracking values to a
+new microglia experiment solely because the population names match.
+
 ## Method-level lessons from the integrated Methods description
 
 - Method choice follows signal quality, object morphology, compute, and whether
