@@ -352,6 +352,36 @@ TRACK_PROPORTIONS = {
     ),
 }
 
+TRACK_WINDOW_TRANSITIONS = {
+    "id": "track_window_transitions",
+    "title": "Window Transitions",
+    "subtitle": "Does a track's movement type change across its own sub-track windows?",
+    "color": "#c98a2c",
+    "what_does": (
+        "For tracks split into windows by 'Divide long tracks', reconnects each "
+        "track's sub-track windows back through their shared TrackID and shows, "
+        "as a Sankey diagram, how the trajectory cluster changes from one window "
+        "to the next - one diagram per sample, plus a pooled page."
+    ),
+    "concept": {
+        "term": "Window",
+        "text": (
+            "a fixed-length, non-overlapping chunk of one track's timepoints - a "
+            "track longer than the trajectory size gets split into several, each "
+            "clustered independently but still tied to the same original TrackID."
+        ),
+    },
+    "what_get": "A window-transition Sankey PDF per sample (+ pooled), and the underlying link-count CSVs.",
+    "decide": [],
+    "has_params": False,
+    "start_label": "Generate Window Transition Sankey  ▸",
+    "seed": (
+        "Explain the BEHAV3D Window Transitions Sankey: what a track window is, "
+        "and how to read a track moving from one trajectory cluster to another "
+        "across its own windows."
+    ),
+}
+
 TRACK_COMPARISON_REPORT = {
     "id": "track_comparison",
     "title": "Condition Comparison Report",
@@ -445,7 +475,7 @@ STATE_REPORT_PIPELINES = [
     STATE_COMPOSITION_REPORT, STATE_TRANSITION_REPORT, STATE_COMPARISON_REPORT,
 ]
 TRACK_PLOT_PIPELINES = [
-    TRACK_DIAGNOSTICS, TRACK_PROPORTIONS, TRACK_COMPARISON_REPORT,
+    TRACK_DIAGNOSTICS, TRACK_PROPORTIONS, TRACK_WINDOW_TRANSITIONS, TRACK_COMPARISON_REPORT,
     TRACK_CONTACT_GROUPING, TRACK_EXEMPLAR_TRACKS,
 ]
 
