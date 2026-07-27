@@ -19,13 +19,13 @@ from behav3d.napari._assistant_schema import (
 )
 from behav3d.napari._assistant_actions import (
     ProposedAction, get_by_dotted, set_by_dotted, validate_value, build_actions,
-    apply_action, apply_set_ui_value,
+    apply_action, apply_set_ui_value, normalize_metadata_line_value,
 )
 from behav3d.napari._assistant_context import (
     summarize_metadata, _diff_from_defaults, validate_metadata_records,
     _metadata_builder_state, _experiment_reference_context,
     _image_dimensions_state, _current_log_state, _segmentation_state,
-    _interface_capabilities, build_context,
+    _interface_capabilities, _feature_extraction_state, build_context,
 )
 from behav3d.napari._assistant_controls import (
     CONTROL_CONTRACT_VERSION, active_cell_type, control_registry,
@@ -33,7 +33,9 @@ from behav3d.napari._assistant_controls import (
 from behav3d.napari._assistant_recommendations import (
     calculate_edt_recommendations, format_edt_recommendations,
 )
-from behav3d.napari._assistant import researcher_facing_text
+from behav3d.napari._assistant import (
+    researcher_facing_text, streaming_transcript_block, transcript_block_role,
+)
 from behav3d.analysis.track_counts import (
     calculate_track_count_table, format_track_count_summary,
     generate_track_count_summary,
@@ -329,6 +331,13 @@ def test_backend_hides_bulk_metadata_tool_after_forms_exist():
     assert sanitized == {"samples": [{
         "pixel_distance_xy": 1.15, "pixel_distance_z": 4, "time_interval": 15,
     }]}
+    absent = app.sanitize_bulk_metadata_arguments({"samples": [{
+        "cell_types": {
+            "T cells": {"line": "GD2_CART"},
+            "Macrophages": {"line": None},
+        },
+    }]}, "T cells are GD2_CART and macrophages were not added")
+    assert absent["samples"][0]["cell_types"]["Macrophages"]["line"] == "not_added"
     recovered = app.recover_single_control_action(
         [],
         {"ui_state": {"controls": [{
@@ -501,7 +510,8 @@ def test_metadata_identifier_inferences_require_confirmation():
     assert "mandatory" in response
     assert "condition is optional" in response
     assert "M21/M23" in response
-    assert "None" in response
+    assert "not_added" in response
+    assert "not added" in response
     assert "confirm" in response
 
 
@@ -562,12 +572,33 @@ def test_analysis_choose_explains_and_named_view_opens_directly():
     import app
 
     summary = app.analysis_choice_summary(
-        {"assistant_session": {"intent": "choose_analysis"}},
-        [{"role": "user", "content": "Choose analysis"}],
+        {
+            "assistant_session": {"intent": "choose_analysis"},
+            "metadata": {
+                "n_samples": 8,
+                "cell_types": {
+                    "organoid": ["Organoids"],
+                    "immune": ["Macrophages", "T-cells"],
+                    "other": [],
+                },
+                "records": [{
+                    "or_Organoids_line_condition": "DO7",
+                    "im_T-cells_line_condition": "GD2_CART",
+                    "im_Macrophages_line_condition": "M21",
+                    "dead_channel": 3,
+                }],
+            },
+        },
+        [{"role": "user", "content": "Can you help me pick what analysis is nice?"}],
     )
-    assert "Death Dynamics" in summary
-    assert "Behavioral State" in summary
-    assert "State Trajectory" in summary
+    for name in (
+        "Death Dynamics", "Interaction Analysis", "Invasiveness Analysis",
+        "Active Killing", "Behavioral State", "State Trajectory", "Backprojection",
+    ):
+        assert name in summary
+    assert "8 samples" in summary
+    assert "DO7" in summary and "GD2_CART" in summary and "M21" in summary
+    assert "Questions suggested by your metadata" in summary
 
     action = app.analysis_navigation_action(
         {"current_step": "analysis", "analysis": {"view": "behavioral_state"}},
@@ -711,6 +742,7 @@ def test_active_killing_action_is_cadence_grounded_and_explicitly_proposed():
             "features.active_killing.observation_window",
             "features.active_killing.death_signal",
             "features.active_killing.use_absolute_threshold",
+            "features.active_killing.absolute_threshold",
         )
     ]
     result = app.active_killing_action(
@@ -723,7 +755,8 @@ def test_active_killing_action_is_cadence_grounded_and_explicitly_proposed():
         },
         [{"role": "user", "content": (
             "Configure active killing for tcell against organoid1 only. "
-            "I expect killing within 10 minutes."
+            "I expect killing within 10 minutes. "
+            "Use an absolute threshold of 30 dead pixels."
         )}],
     )
     values = {
@@ -734,8 +767,368 @@ def test_active_killing_action_is_cadence_grounded_and_explicitly_proposed():
     assert values["features.active_killing.observation_window"] == 5
     assert values["features.active_killing.death_signal"] == "Dead-mask pixel count"
     assert values["features.active_killing.use_absolute_threshold"] is True
+    assert values["features.active_killing.absolute_threshold"] == 30
     assert "proposing" in result["text"]
     assert "require your confirmation" in result["text"]
+
+
+def test_active_killing_action_refuses_incomplete_absolute_mode():
+    import app
+
+    result = app.active_killing_action(
+        {
+            "current_step": "feature_extraction",
+            "metadata": {"records": [{
+                "time_interval": 2, "time_unit": "min",
+            }]},
+            "ui_state": {"controls": []},
+        },
+        [{"role": "user", "content": (
+            "Configure active killing against 27t and mdo within 10 minutes."
+        )}],
+    )
+    assert result["calls"] == []
+    assert "positive minimum dead-mask pixel increase" in result["text"]
+    assert "remains 0" in result["text"]
+
+
+def test_active_killing_acceptance_proposes_every_agreed_field():
+    import app
+
+    controls = []
+    specs = {
+        "target_types": {
+            "value": ["27t", "mdo"], "choices": ["27t", "mdo"],
+        },
+        "observation_window": {"value": 5},
+        "death_signal": {
+            "value": "Dead-mask percentage",
+            "choices": [
+                "Dead-mask percentage", "Mean dead-dye intensity",
+                "Dead-mask pixel count",
+            ],
+        },
+        "use_absolute_threshold": {"value": False},
+        "absolute_threshold": {"value": 0.0, "active": False},
+        "minimum_contact_duration": {"value": 1},
+    }
+    for suffix, values in specs.items():
+        controls.append({
+            "id": f"features.active_killing.{suffix}",
+            "visible": True,
+            "enabled": True,
+            **values,
+        })
+    result = app.active_killing_confirmation_action(
+        {
+            "current_step": "feature_extraction",
+            "ui_state": {"controls": controls},
+        },
+        [
+            {"role": "assistant", "content": (
+                "Active Killing configuration for tcell against 27t and mdo: "
+                "Death signal: Dead-mask pixel count. Absolute threshold: "
+                "30 dead pixels. Observation window: 5 timepoints. "
+                "Minimum contact duration: 1 frame."
+            )},
+            {"role": "user", "content": "Ok, these settings seem ok"},
+        ],
+    )
+    values = {
+        call["arguments"]["control_id"]: call["arguments"]["value"]
+        for call in result["calls"]
+    }
+    assert values["features.active_killing.target_types"] == ["27t", "mdo"]
+    assert values["features.active_killing.death_signal"] == "Dead-mask pixel count"
+    assert values["features.active_killing.use_absolute_threshold"] is True
+    assert values["features.active_killing.absolute_threshold"] == 30
+    assert values["features.active_killing.observation_window"] == 5
+    assert values["features.active_killing.minimum_contact_duration"] == 1
+    assert "complete agreed Active Killing setup" in result["text"]
+    assert "independently" in result["text"]
+    assert "not ready until every action card" in result["text"]
+
+
+def test_active_killing_readiness_rejects_zero_absolute_threshold():
+    import app
+
+    summary = app.active_killing_readiness_summary(
+        {
+            "current_step": "feature_extraction",
+            "feature_extraction": {"active_killing": {
+                "setup_ready": False,
+                "setup_issues": [
+                    "Absolute signal-increase threshold must be greater than 0."
+                ],
+            }},
+        },
+        [
+            {"role": "assistant", "content": "Active Killing setup"},
+            {"role": "user", "content": "Is it ready?"},
+        ],
+    )
+    assert "not ready yet" in summary
+    assert "greater than 0" in summary
+
+
+def test_hmm_movement_guidance_lists_every_live_option_before_editing():
+    import app
+
+    prefix = "analysis.state_classification.tcell."
+    context = {
+        "current_step": "analysis",
+        "analysis": {
+            "view": "behavioral_state",
+            "selected_cell_type": "tcell",
+        },
+        "ui_state": {"controls": [
+            {
+                "id": prefix + "timepoint_features",
+                "visible": True,
+                "enabled": True,
+                "choices": [
+                    "speed", "displacement", "cumulative_displacement",
+                    "directional_persistence", "mean_dead_dye",
+                ],
+                "value": ["speed"],
+            },
+            {
+                "id": prefix + "window_features",
+                "visible": True,
+                "enabled": True,
+                "choices": [
+                    "net_displacement", "straightness",
+                    "mean_square_displacement",
+                ],
+                "value": ["net_displacement"],
+            },
+            {
+                "id": prefix + "binary_feature_groups",
+                "visible": True,
+                "enabled": True,
+                "choices": ["27t_contact", "mdo_contact"],
+                "value": ["27t_contact", "mdo_contact"],
+            },
+        ]},
+    }
+    text = app.hmm_movement_feature_guidance(
+        context,
+        [{"role": "user", "content": "Only movement features of relevance"}],
+    )
+    for label in (
+        "Speed", "Displacement", "Cumulative displacement",
+        "Directional persistence", "Net displacement", "Straightness",
+        "Mean square displacement",
+    ):
+        assert label in text
+    assert "Mean dead dye" not in text
+    assert "use all available movement features" in text
+    assert "applied after the HMM" in text
+
+
+def test_hmm_all_movement_choice_updates_both_feature_lists():
+    import app
+
+    prefix = "analysis.state_classification.tcell."
+    context = {
+        "current_step": "analysis",
+        "analysis": {
+            "view": "behavioral_state",
+            "selected_cell_type": "tcell",
+        },
+        "ui_state": {"controls": [
+            {
+                "id": prefix + "timepoint_features",
+                "visible": True,
+                "enabled": True,
+                "choices": [
+                    "speed", "displacement", "directional_persistence",
+                    "mean_dead_dye",
+                ],
+                "value": ["speed"],
+            },
+            {
+                "id": prefix + "window_features",
+                "visible": True,
+                "enabled": True,
+                "choices": ["net_displacement", "straightness"],
+                "value": ["net_displacement"],
+            },
+            {
+                "id": prefix + "binary_feature_groups",
+                "visible": True,
+                "enabled": True,
+                "choices": ["27t_contact", "mdo_contact"],
+                "value": ["27t_contact", "mdo_contact"],
+            },
+        ]},
+    }
+    result = app.hmm_movement_setup_action(
+        context,
+        [
+            {"role": "assistant", "content": (
+                "Choose names or say use all available movement features."
+            )},
+            {"role": "user", "content": "Use all available movement features"},
+        ],
+    )
+    values = {
+        call["arguments"]["control_id"]: call["arguments"]["value"]
+        for call in result["calls"]
+    }
+    assert values[prefix + "timepoint_features"] == [
+        "speed", "displacement", "directional_persistence",
+    ]
+    assert values[prefix + "window_features"] == [
+        "net_displacement", "straightness",
+    ]
+    assert "mean_dead_dye" not in str(values)
+
+
+def _tcell_hmm_context():
+    prefix = "analysis.state_classification.T-cells."
+    return {
+        "current_step": "analysis",
+        "active_cell_type": "T-cells",
+        "analysis": {
+            "view": "behavioral_state",
+            "selected_cell_type": "T-cells",
+        },
+        "ui_state": {"controls": [
+            {
+                "id": prefix + "timepoint_features",
+                "visible": True, "enabled": True,
+                "choices": ["speed", "elongation"],
+                "value": ["speed"],
+            },
+            {
+                "id": prefix + "window_features",
+                "visible": True, "enabled": True,
+                "choices": ["net_displacement", "straightness"],
+                "value": ["net_displacement"],
+            },
+            {
+                "id": prefix + "binary_feature_groups",
+                "visible": True, "enabled": True,
+                "choices": [
+                    "Organoid_contact", "Macrophages_contact", "dead",
+                ],
+                "value": [],
+            },
+            {
+                "id": prefix + "n_states",
+                "visible": True, "enabled": True, "value": 6,
+            },
+        ]},
+    }
+
+
+def test_hmm_guidance_uses_live_selected_cell_type():
+    import app
+
+    context = _tcell_hmm_context()
+    setup = app.hmm_setup_guidance(
+        context,
+        [{"role": "user", "content": (
+            "I want to do behavioral analysis, can you take me through the steps?"
+        )}],
+    )
+    assert "T-cells" in setup
+    assert "currently have" in setup
+    assert "rename" in setup.lower() and "merge" in setup.lower()
+
+    groups = app.hmm_binary_group_guidance(
+        context,
+        [{"role": "user", "content": (
+            "Would it be worth adding macrophage contact?"
+        )}],
+    )
+    assert "T-cells" in groups
+    assert "a cell from T-cells is directly touching Macrophages".lower() in groups.lower()
+    assert "not a different population" in groups
+
+
+def test_hmm_binary_group_edit_targets_selected_cell_control():
+    import app
+
+    context = _tcell_hmm_context()
+    result = app.hmm_binary_group_action(
+        context,
+        [{"role": "user", "content": "Add organoid contact and also add dead"}],
+    )
+    assert "T-cells" in result["text"]
+    assert result["calls"] == [{
+        "name": "set_ui_value",
+        "arguments": {
+            "control_id": (
+                "analysis.state_classification.T-cells.binary_feature_groups"
+            ),
+            "value": ["Organoid_contact", "dead"],
+        },
+    }]
+
+
+def test_hmm_states_can_be_merged_by_reusing_names():
+    import app
+
+    response = app.hmm_state_merge_guidance(
+        _tcell_hmm_context(),
+        [{"role": "user", "content": (
+            "If I have 6 states, can I select which ones to keep?"
+        )}],
+    )
+    assert "T-cells" in response
+    assert "same name" in response
+    assert "merge" in response
+    assert "Rename Primary Dynamic State Clusters" in response
+    assert "outside BEHAV3D" not in response
+
+
+def test_chat_transcript_shows_waiting_block_and_tracks_role_colors():
+    assert streaming_transcript_block(True, "") == (
+        "**BEHAV3D Assistant**\n\n*Preparing a response...*"
+    )
+    assert streaming_transcript_block(False, None) is None
+    role = transcript_block_role("You")
+    assert role == "user"
+    assert transcript_block_role("My question", role) == "user"
+    assert transcript_block_role("BEHAV3D Assistant", role) == "assistant"
+
+
+def test_metadata_absence_values_are_csv_safe():
+    import app
+
+    assert normalize_metadata_line_value(None) == "not_added"
+    assert normalize_metadata_line_value("None") == "not_added"
+    assert normalize_metadata_line_value("(not_added)") == "not_added"
+    assert normalize_metadata_line_value("M21") == "M21"
+    controls = [{
+        "id": "metadata.samples.0.cell_types.Macrophages.line",
+        "label": "Sample 1, Macrophages: line",
+        "value": "",
+        "visible": True,
+        "enabled": True,
+    }]
+    action = build_actions([{
+        "name": "set_ui_value",
+        "arguments": {
+            "control_id": "metadata.samples.0.cell_types.Macrophages.line",
+            "value": None,
+        },
+    }], [], {}, controls=controls)[0]
+    assert action.ok
+    assert action.data["value"] == "not_added"
+    result = app.metadata_absence_action(
+        {
+            "current_step": "data_preparation",
+            "ui_state": {"controls": controls},
+        },
+        [{"role": "user", "content": (
+            "Macrophages were not added in Sample 1; set that line."
+        )}],
+    )
+    assert "not added" in result["text"]
+    assert result["calls"][0]["arguments"]["value"] == "not_added"
 
 
 def test_equal_track_filter_review_explains_valid_fixed_length_workflow():
@@ -1213,6 +1606,7 @@ def test_safety_profile_summary_preserves_reference_without_claiming_execution()
     assert "tumor 27T and healthy MDO" in summary
     assert "5 frames (10 minutes)" in summary
     assert "not a completed analysis" in summary
+    assert "independent analysis for each target plus a combined analysis" in summary
     assert "configured" not in summary.lower()
 
 
@@ -1676,6 +2070,17 @@ def test_prompt_encodes_pi_feedback_scenarios():
     assert "does not mean APOC uses all channels" in sp
     assert "'Tune Features' means the classifier feature preset" in sp
     assert "ask them to copy and paste the latest error lines" in sp
+    assert "Intensity and Contact are required for every cell type" in sp
+    assert "never suggest dropping it from a T-cell population" in sp
+    assert "automatically produces an independent analysis" in sp
+    assert "Never apply only the mode checkbox" in sp
+    assert "setup_ready true" in sp
+    assert "enumerate all movement choices" in sp
+    assert "currently selected speed and net displacement" in sp
+    assert "read analysis.selected_cell_type" in sp
+    assert "assigning the same name to multiple primary clusters merges them" in sp
+    assert "Death Dynamics, Interaction Analysis, Invasiveness Analysis" in sp
+    assert "line to the literal CSV-safe value 'not_added'" in sp
 
 
 class _FakeSpin:
@@ -1693,10 +2098,12 @@ class _FakeSpin:
 
 
 class _FakeCheck:
-    def __init__(self, checked=False): self._checked = checked
+    def __init__(self, checked=False, enabled=True):
+        self._checked = checked
+        self._enabled = enabled
     def isChecked(self): return self._checked
     def setChecked(self, value): self._checked = bool(value)
-    def isEnabled(self): return True
+    def isEnabled(self): return self._enabled
     def isHidden(self): return False
 
 
@@ -1954,7 +2361,7 @@ def test_metadata_validation_matches_required_well_and_population_lines():
         "cell_types": {
             "organoid": {"line": "DO7", "condition": ""},
             "T-cells": {"line": "", "condition": ""},
-            "Macrophages": {"line": "None", "condition": ""},
+            "Macrophages": {"line": "not_added", "condition": ""},
         },
     }]
     issues = validate_metadata_records(records)
@@ -2122,7 +2529,7 @@ def test_live_registry_covers_filtering_and_hmm_controls():
     assert controls[states]["visible"] is True
 
 
-def test_active_killing_registry_targets_one_selected_type():
+def test_active_killing_registry_keeps_dependent_threshold_editable():
     from types import SimpleNamespace
     active = SimpleNamespace(
         immune_combo=_FakeCombo(["tcell"]),
@@ -2157,9 +2564,124 @@ def test_active_killing_registry_targets_one_selected_type():
     assert apply_set_ui_value(main, signal_id, "Dead-mask pixel count")
     assert active.death_signal_combo.currentText() == "nr_dead_mask_pixels"
     assert apply_set_ui_value(main, target_id, ["organoid2"])
-    assert controls["features.active_killing.absolute_threshold"]["visible"] is False
+    threshold = controls["features.active_killing.absolute_threshold"]
+    assert threshold["visible"] is True
+    assert threshold["enabled"] is True
+    assert threshold["active"] is False
+    assert apply_set_ui_value(
+        main, "features.active_killing.absolute_threshold", 30.0
+    )
+    assert active.spin_abs_threshold.value() == 30.0
     assert active_cell_type(main, "feature_extraction") == "tcell"
     assert [item.text() for item in active.target_list.selectedItems()] == ["organoid2"]
+
+
+def test_feature_context_reports_active_killing_setup_readiness():
+    from types import SimpleNamespace
+
+    active = SimpleNamespace(
+        immune_combo=_FakeCombo(["tcell"]),
+        target_list=_FakeList(["27t", "mdo"], selected=["27t", "mdo"]),
+        spin_obs_window=_FakeSpin(5),
+        death_signal_combo=_FakeCombo([
+            "percentage_dead_mask", "mean_dead_dye", "nr_dead_mask_pixels",
+        ], 2),
+        check_abs_threshold=_FakeCheck(True),
+        spin_threshold_mult=_FakeSpin(1.5),
+        spin_abs_threshold=_FakeSpin(0.0),
+        spin_min_contact=_FakeSpin(1),
+    )
+    main = SimpleNamespace(feature_extraction_tab=SimpleNamespace(
+        active_killing_panel=active,
+        _ak_toggle_btn=_FakeCheck(True),
+    ))
+    state = _feature_extraction_state(main)["active_killing"]
+    assert state["setup_ready"] is False
+    assert "greater than 0" in state["setup_issues"][0]
+    active.spin_abs_threshold.setValue(30.0)
+    state = _feature_extraction_state(main)["active_killing"]
+    assert state["setup_ready"] is True
+    assert state["setup_issues"] == []
+
+
+def test_feature_registry_marks_and_preserves_mandatory_groups():
+    from types import SimpleNamespace
+
+    checks = {
+        "movement": _FakeCheck(True, enabled=False),
+        "intensity": _FakeCheck(True, enabled=False),
+        "morphology": _FakeCheck(True),
+        "contact": _FakeCheck(True, enabled=False),
+        "invasiveness": _FakeCheck(True),
+        "death": _FakeCheck(True, enabled=False),
+    }
+    panel = SimpleNamespace(
+        feature_checks=checks,
+        contact_threshold=_FakeSpin(0.0),
+        spin_dead_threshold=_FakeSpin(5.0),
+        spin_workers=_FakeSpin(1),
+        _persist=lambda: None,
+    )
+    main = SimpleNamespace(feature_extraction_tab=SimpleNamespace(
+        panels={"tcell": panel},
+        active_killing_panel=None,
+    ))
+    control = next(
+        item for item in control_registry(main)
+        if item["id"] == "features.tcell.feature_groups"
+    )
+    assert control["required_choices"] == [
+        "movement", "intensity", "contact", "death",
+    ]
+    assert control["editable_choices"] == ["morphology", "invasiveness"]
+
+    action = build_actions(
+        [{
+            "name": "set_ui_value",
+            "arguments": {
+                "control_id": control["id"],
+                "value": ["movement", "contact", "death"],
+            },
+        }],
+        cards=[],
+        params={},
+        controls=[control],
+    )[0]
+    assert action.ok is False
+    assert "must keep:" in action.message
+    assert "intensity" in action.message
+
+
+def test_feature_group_guidance_keeps_intensity_for_dead_dye():
+    import app
+
+    text = app.feature_group_requirement_guidance(
+        {
+            "current_step": "feature_extraction",
+            "active_cell_type": "tcell",
+            "ui_state": {"controls": [{
+                "id": "features.tcell.feature_groups",
+                "visible": True,
+                "enabled": True,
+                "choices": [
+                    "movement", "intensity", "morphology", "contact",
+                    "invasiveness", "death",
+                ],
+                "required_choices": [
+                    "movement", "intensity", "contact", "death",
+                ],
+                "value": [
+                    "movement", "intensity", "morphology", "contact",
+                    "invasiveness", "death",
+                ],
+            }]},
+        },
+        [{"role": "user", "content": "Now adjust T cells"}],
+    )
+    assert "Intensity" in text
+    assert "mean dead-dye intensity" in text
+    assert "will not suggest removing" in text
+    assert "Morphology, Invasiveness" in text
 
 
 def test_analysis_registry_exposes_only_active_trajectory_controls():
@@ -2567,7 +3089,7 @@ def test_feedback_guidance_fixtures():
 
     fixture = Path(__file__).parent / "fixtures" / "assistant_feedback_transcripts.json"
     cases = json.loads(fixture.read_text(encoding="utf-8"))
-    assert KNOWLEDGE_VERSION == "2026.07.24.23"
+    assert KNOWLEDGE_VERSION == "2026.07.27.25"
     for case in cases:
         cards = select_guidance_cards(
             {"current_step": case["step"]}, case["user"], case.get("intent"))
@@ -2601,7 +3123,7 @@ def test_assistant_has_no_hidden_model_continuation():
     assert "def _auto_continue" not in source
     assert "_dispatch_proactive" not in source
     assert "Checking your setup" not in source
-    assert CONTROL_CONTRACT_VERSION == "3.1"
+    assert CONTROL_CONTRACT_VERSION == "3.2"
 
 
 # --------------------------------------------------------------------------

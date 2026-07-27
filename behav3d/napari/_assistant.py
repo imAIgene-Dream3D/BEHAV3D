@@ -46,6 +46,11 @@ _METADATA_FIELD_DEFAULTS = {
     "time_unit": "s",
 }
 
+_CHAT_ROLE_COLORS = {
+    "assistant": "#30363b",
+    "user": "#173847",
+}
+
 
 def _coerce_bool(value) -> bool:
     if isinstance(value, str):
@@ -235,6 +240,28 @@ def researcher_facing_text(text: str) -> str:
         result = result.replace(technical, label)
         result = result.replace(f"`{label}`", label)
     return result.replace("`", "")
+
+
+def streaming_transcript_block(request_active: bool, streaming_text: str | None) -> str | None:
+    """Return the visible assistant block while a request is in progress."""
+    if streaming_text is None:
+        return None
+    body = streaming_text or (
+        "*Preparing a response...*" if request_active else ""
+    )
+    if not body:
+        return None
+    return f"**BEHAV3D Assistant**\n\n{body}"
+
+
+def transcript_block_role(text: str, current_role: str | None = None) -> str | None:
+    """Track the speaker while walking blocks produced by ``setMarkdown``."""
+    label = str(text or "").strip()
+    if label == "You":
+        return "user"
+    if label == "BEHAV3D Assistant":
+        return "assistant"
+    return current_role
 
 
 class _ChatInput(QPlainTextEdit):
@@ -492,11 +519,13 @@ class AssistantDock(QWidget):
         # Any direct/full render supersedes a pending throttled one.
         self._render_timer.stop()
         blocks = list(self._md_log)
-        if self._streaming_text:
-            blocks.append(f"**BEHAV3D Assistant**\n\n{self._streaming_text}")
+        streaming = streaming_transcript_block(
+            self._request_active, self._streaming_text
+        )
+        if streaming:
+            blocks.append(streaming)
         try:
-            # A thin rule between turns gives clear visual separation.
-            self.transcript.setMarkdown("\n\n---\n\n".join(blocks))
+            self.transcript.setMarkdown("\n\n".join(blocks))
             if style:
                 self._style_blocks()
         except Exception:
@@ -520,22 +549,35 @@ class AssistantDock(QWidget):
         """setMarkdown renders paragraphs/lists very tightly. Walk the document
         and add line spacing + paragraph spacing so responses are readable."""
         try:
-            from qtpy.QtGui import QTextCursor, QTextBlockFormat
+            from qtpy.QtGui import (
+                QBrush, QColor, QTextCursor, QTextBlockFormat,
+            )
         except Exception:
             return
         doc = self.transcript.document()
         block = doc.begin()
+        role = None
         while block.isValid():
             cur = QTextCursor(block)
             bf = cur.blockFormat()
+            previous_role = role
+            role = transcript_block_role(block.text(), role)
+            is_role_label = role != previous_role
             bf.setLineHeight(140, QTextBlockFormat.ProportionalHeight)  # 1.4× line spacing
-            bf.setTopMargin(2.0)
-            bf.setBottomMargin(9.0)                                     # gap between paragraphs
+            bf.setTopMargin(8.0 if is_role_label else 2.0)
+            bf.setBottomMargin(5.0)
+            if role in _CHAT_ROLE_COLORS:
+                bf.setBackground(QBrush(QColor(_CHAT_ROLE_COLORS[role])))
+                bf.setLeftMargin(10.0)
+                bf.setRightMargin(10.0)
             cur.setBlockFormat(bf)
             block = block.next()
 
     def _append_md(self, markdown: str):
-        self._md_log.append(markdown)
+        content = str(markdown or "").lstrip()
+        if not content.startswith(("**You**", "**BEHAV3D Assistant**")):
+            content = f"**BEHAV3D Assistant**\n\n{content}"
+        self._md_log.append(content)
         self._render()
 
     def _append_user(self, text: str):

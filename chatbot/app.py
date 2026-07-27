@@ -46,7 +46,7 @@ _TOOL_NAMES = (
     "open_analysis_view",
 )
 _TOOL_NAME_PATTERN = "|".join(re.escape(name) for name in _TOOL_NAMES)
-CONTROL_CONTRACT_VERSION = "3.1"
+CONTROL_CONTRACT_VERSION = "3.2"
 _RESEARCHER_LABELS = {
     "pixel_distance_xy": "XY pixel size",
     "pixel_distance_z": "Z pixel size",
@@ -69,6 +69,20 @@ _RESEARCHER_LABELS = {
     "open_analysis_view": "open analysis view",
     "line_condition": "line and condition",
 }
+_MOVEMENT_FEATURE_NAMES = (
+    "displacement",
+    "cumulative_displacement",
+    "displacement_from_origin",
+    "mean_square_displacement",
+    "speed",
+    "mean_speed",
+    "summed_displacement",
+    "net_displacement",
+    "straightness",
+    "directional_persistence",
+    "median_turning_angle",
+    "fraction_reversed_movement",
+)
 
 
 def researcher_facing_text(text: str) -> str:
@@ -89,6 +103,26 @@ def split_researcher_stream_buffer(buffer: str, final: bool = False) -> tuple[st
         return "", buffer
     cutoff = whitespace[-1].end()
     return researcher_facing_text(buffer[:cutoff]), buffer[cutoff:]
+
+
+def _feature_label(value: str) -> str:
+    return str(value or "").replace("_", " ").strip().capitalize()
+
+
+def _previous_assistant_message(messages: list[dict]) -> str:
+    return next((
+        str(message.get("content") or "")
+        for message in reversed(messages[:-1])
+        if message.get("role") == "assistant"
+    ), "")
+
+
+def _visible_control_map(context: dict) -> dict[str, dict]:
+    return {
+        str(control.get("id") or ""): control
+        for control in ((context.get("ui_state", {}) or {}).get("controls", []) or [])
+        if control.get("id") and control.get("visible", True)
+    }
 
 
 def tools_for_context(tools: list[dict], context: dict) -> list[dict]:
@@ -197,8 +231,73 @@ def metadata_identifier_confirmation_question(
         "propose **1** for every sample. Before I fill the line fields, please confirm: "
         "should each line you gave apply to all relevant samples, should M21/M23 be "
         "inferred only where those suffixes appear in a filename, and should a sample "
-        "without a macrophage suffix use **None** to mean macrophages are absent?"
+        "without a macrophage suffix be described as **not added** and use the line "
+        "value **not_added**?"
     )
+
+
+def metadata_absence_action(context: dict, messages: list[dict]) -> dict | None:
+    """Write the CSV-safe line sentinel for an explicitly absent population."""
+    if context.get("current_step") != "data_preparation":
+        return None
+    latest = _latest_user_message(messages)
+    normalized = " ".join(re.sub(r"[^a-z0-9]+", " ", latest.lower()).split())
+    if not (
+        any(phrase in normalized for phrase in (
+            "not added", "was not added", "were not added", "is absent",
+            "are absent", "no macrophage", "no t cell", "use none",
+        ))
+        and re.search(r"\b(?:set|fill|mark|line|metadata|use|make)\b", normalized)
+    ):
+        return None
+    candidates = [
+        control
+        for control in _visible_control_map(context).values()
+        if str(control.get("id") or "").startswith("metadata.samples.")
+        and str(control.get("id") or "").endswith(".line")
+        and control.get("enabled", True)
+    ]
+    sample_match = re.search(r"\bsample\s*(\d+)\b", normalized)
+    if sample_match:
+        sample_index = int(sample_match.group(1)) - 1
+        candidates = [
+            control for control in candidates
+            if f"metadata.samples.{sample_index}." in str(control.get("id") or "")
+        ]
+    population_matches = []
+    for control in candidates:
+        control_id = str(control.get("id") or "")
+        match = re.search(r"\.cell_types\.(.+)\.line$", control_id)
+        cell_type = match.group(1) if match else str(control.get("cell_type") or "")
+        alias = " ".join(re.sub(
+            r"[^a-z0-9]+", " ", cell_type.lower()
+        ).split())
+        if alias and alias in normalized:
+            population_matches.append(control)
+    if population_matches:
+        candidates = population_matches
+    if len(candidates) != 1:
+        return None
+    control = candidates[0]
+    label = str(control.get("label") or "the selected population line")
+    if str(control.get("value") or "").strip().lower() == "not_added":
+        return {
+            "text": (
+                f"**{label}** already records that the population was **not added** "
+                "using the line value **not_added**."
+            ),
+            "calls": [],
+        }
+    return {
+        "text": (
+            f"I will record **{label}** as **not added** using the CSV-safe line "
+            "value **not_added**."
+        ),
+        "calls": [{
+            "name": "set_ui_value",
+            "arguments": {"control_id": control["id"], "value": "not_added"},
+        }],
+    }
 
 
 def metadata_completion_summary(context: dict, messages: list[dict]) -> str | None:
@@ -243,7 +342,8 @@ def metadata_completion_summary(context: dict, messages: list[dict]) -> str | No
             "Not yet. These mandatory metadata values are still missing:\n"
             f"{shown}{extra}\n\nPopulation **condition** fields are optional; "
             "population **line** fields are mandatory. A population confirmed absent "
-            "from a sample should use **None** for its line rather than remain blank."
+            "from a sample should be described as **not added** and use "
+            "**not_added** for its line rather than remain blank."
             f"{well_note}"
         )
     save_available = bool((builder.get("actions") or {}).get("save_available"))
@@ -259,21 +359,153 @@ def metadata_completion_summary(context: dict, messages: list[dict]) -> str | No
     )
 
 
+def _metadata_analysis_profile(context: dict) -> dict:
+    """Extract a compact experiment profile for analysis recommendations."""
+    metadata = context.get("metadata", {}) or {}
+    records = metadata.get("records", []) or []
+    configured = metadata.get("cell_types", {}) or {}
+    populations = {
+        category: [str(value) for value in (configured.get(category) or [])]
+        for category in ("organoid", "immune", "other")
+    }
+    line_values = []
+    dead_signal = False
+
+    def add_line(value) -> None:
+        text = str(value or "").strip()
+        if (
+            text
+            and text.lower() not in {
+                "nan", "none", "null", "not_added", "(not_added)",
+            }
+            and text not in line_values
+        ):
+            line_values.append(text)
+
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        for key, value in record.items():
+            key_text = str(key)
+            for prefix, category in (
+                ("or_", "organoid"), ("im_", "immune"), ("ot_", "other"),
+            ):
+                if key_text.startswith(prefix) and "_line_condition" in key_text:
+                    name = key_text[len(prefix):].split("_line_condition", 1)[0]
+                    if name and name not in populations[category]:
+                        populations[category].append(name)
+            if key_text.endswith("_line_condition"):
+                add_line(value)
+            if key_text in {"dead_channel", "dead_channel_number", "dead_mask_path"}:
+                dead_signal = dead_signal or (
+                    value is not None
+                    and str(value).strip().lower() not in {"", "nan", "none", "null"}
+                )
+        for _cell_type, fields in (record.get("cell_types") or {}).items():
+            if isinstance(fields, dict):
+                add_line(fields.get("line"))
+
+    return {
+        "n_samples": metadata.get("n_samples") or len(records),
+        "populations": populations,
+        "line_values": line_values,
+        "dead_signal": dead_signal,
+    }
+
+
 def analysis_choice_summary(context: dict, messages: list[dict]) -> str | None:
-    """Make the Choose analysis quick action explanatory rather than navigational."""
+    """List every analysis route and connect it to the live experiment design."""
     latest = " ".join(_latest_user_message(messages).lower().split())
     intent = str((context.get("assistant_session") or {}).get("intent") or "")
-    if intent != "choose_analysis" and latest not in {
-        "choose analysis", "which analysis", "help me choose an analysis",
-    }:
+    targeted_single_cell = any(phrase in latest for phrase in (
+        "classify behavioral tracks", "classify behavioural tracks",
+        "state trajectory", "track classification",
+    ))
+    asks_general = (
+        bool(re.search(
+            r"\b(?:what|which|choose|pick)\b.{0,28}\banalys(?:is|es)\b",
+            latest,
+        ))
+        or "analysis would be nice" in latest
+        or "analysis is possible" in latest
+        or "help me choose an analysis" in latest
+    )
+    if (intent != "choose_analysis" and not asks_general) or targeted_single_cell:
         return None
+
+    profile = _metadata_analysis_profile(context)
+    populations = profile["populations"]
+    all_populations = (
+        populations["organoid"] + populations["immune"] + populations["other"]
+    )
+    snapshot = ""
+    if profile["n_samples"] or all_populations:
+        sample_text = (
+            f"**{profile['n_samples']} samples**"
+            if profile["n_samples"] else "the loaded samples"
+        )
+        population_text = (
+            ", ".join(all_populations) if all_populations else "no populations detected"
+        )
+        lines = ", ".join(profile["line_values"][:8])
+        snapshot = (
+            f"From the live metadata I see {sample_text} with **{population_text}**."
+            + (f" Recorded lines/conditions include **{lines}**." if lines else "")
+            + "\n\n"
+        )
+
+    questions = []
+    if populations["organoid"]:
+        questions.append(
+            "Do target or organoid lines differ in death timing? Start with "
+            "**Death Dynamics**."
+        )
+    if populations["organoid"] and populations["immune"]:
+        questions.extend([
+            "Do immune contacts differ by target condition, and are they associated "
+            "with death? Use **Interaction Analysis**.",
+            "Do immune cells engage or enter targets to different degrees? Use "
+            "**Invasiveness Analysis**, if invasiveness features were extracted.",
+        ])
+    if populations["immune"]:
+        questions.append(
+            "Do immune populations occupy different dynamic states or complete "
+            "different behavioral programs? Use **Behavioral State**, then "
+            "**State Trajectory**."
+        )
+    if populations["organoid"] and populations["immune"] and profile["dead_signal"]:
+        questions.append(
+            "Which individual immune cells show contact-associated target killing? "
+            "Use **Active Killing** after feature extraction."
+        )
+    if not questions:
+        questions.append(
+            "Choose the route from the biological question and confirm its listed "
+            "prerequisites before running it."
+        )
+    question_text = "\n".join(f"- {question}" for question in questions)
     return (
-        "Choose the analysis from the biological question:\n"
-        "- **Death Dynamics**: quantify target or organoid death over time and inspect "
-        "death-related interaction summaries.\n"
-        "- **Behavioral State**: assign a recurring state to each cell at each timepoint.\n"
-        "- **State Trajectory**: group whole-cell state sequences across time.\n\n"
-        "What do you want to learn from the experiment?"
+        f"{snapshot}"
+        "BEHAV3D offers these analysis routes:\n"
+        "1. **Death Dynamics** - target survival, death timing, and disappearance.\n"
+        "2. **Interaction Analysis** - target-centered contact patterns and their "
+        "relationship to death.\n"
+        "3. **Invasiveness Analysis** - immune-cell engagement with targets over time "
+        "and per movie.\n"
+        "4. **Active Killing** - contact-associated target death attributed to "
+        "individual immune cells; configured under Feature Extraction.\n"
+        "5. **Behavioral State** - an HMM state for each selected-cell timepoint.\n"
+        "6. **State Trajectory** - clusters whole state sequences into behavioral "
+        "programs.\n"
+        "7. **Backprojection** - overlays state, trajectory, or killing results on the "
+        "images for visual validation.\n\n"
+        "**Questions suggested by your metadata**\n"
+        f"{question_text}\n\n"
+        "For an immune-cell behavior question, the usual sequence is **Behavioral "
+        "State -> rename or merge states -> State Trajectory -> Backprojection**. "
+        "For a target-killing question, start with **Death Dynamics**, then add "
+        "**Interaction/Invasiveness** and **Active Killing** where their prerequisites "
+        "are available."
     )
 
 
@@ -1558,6 +1790,621 @@ def segmentation_minimum_size_action(
     return {"text": text, "calls": calls}
 
 
+def feature_group_requirement_guidance(
+    context: dict, messages: list[dict],
+) -> str | None:
+    """Explain mandatory feature groups before the model suggests removing one."""
+    if context.get("current_step") != "feature_extraction":
+        return None
+    latest = _latest_user_message(messages).lower()
+    if not (
+        re.search(r"\badjust\s+(?:the\s+)?(?:t[\s-]?cells?|tcell)", latest)
+        or re.search(r"\b(?:drop|remove|disable)\s+intensity\b", latest)
+        or (
+            "feature group" in latest
+            and any(word in latest for word in ("adjust", "review", "which", "keep"))
+        )
+    ):
+        return None
+
+    cell_type = str(context.get("active_cell_type") or "")
+    controls = _visible_control_map(context)
+    control = next((
+        item for control_id, item in controls.items()
+        if control_id == f"features.{cell_type}.feature_groups"
+    ), None)
+    if control is None:
+        return None
+    required = list(control.get("required_choices") or [])
+    if not required:
+        return None
+    choices = list(control.get("choices") or [])
+    optional = [choice for choice in choices if choice not in required]
+    required_text = ", ".join(_feature_label(item) for item in required)
+    optional_text = ", ".join(_feature_label(item) for item in optional) or "none"
+    dead_context = (
+        " Because a dead channel is configured, Death is also required. "
+        "Intensity is kept because it calculates channel intensities, including "
+        "mean dead-dye intensity for this population."
+        if "death" in required else
+        " Intensity remains required because it provides the channel-intensity "
+        "measurements used downstream."
+    )
+    return (
+        f"For **{cell_type or 'the selected cell type'}**, the live panel marks "
+        f"**{required_text}** as required, so I will not suggest removing them."
+        f"{dead_context} The optional groups are **{optional_text}**. Tell me which "
+        "optional groups matter to your biological question and I can adjust those."
+    )
+
+
+def _hmm_feature_controls(context: dict) -> dict[str, dict]:
+    if context.get("current_step") != "analysis":
+        return {}
+    analysis = context.get("analysis", {}) or {}
+    if analysis.get("view") != "behavioral_state":
+        return {}
+    cell_type = str(
+        analysis.get("selected_cell_type")
+        or context.get("active_cell_type")
+        or ""
+    )
+    prefix = f"analysis.state_classification.{cell_type or 'selected'}."
+    controls = _visible_control_map(context)
+    return {
+        suffix: controls[control_id]
+        for suffix in (
+            "timepoint_features", "window_features", "binary_feature_groups",
+        )
+        if (control_id := prefix + suffix) in controls
+    }
+
+
+def _selected_hmm_cell_type(context: dict) -> str:
+    analysis = context.get("analysis", {}) or {}
+    return str(
+        analysis.get("selected_cell_type")
+        or context.get("active_cell_type")
+        or "the selected cell type"
+    )
+
+
+def _hmm_control_prefix(context: dict) -> str:
+    return f"analysis.state_classification.{_selected_hmm_cell_type(context)}."
+
+
+def hmm_setup_guidance(context: dict, messages: list[dict]) -> str | None:
+    """Guide Behavioral State from the controls for the currently selected cell type."""
+    controls = _hmm_feature_controls(context)
+    latest = _latest_user_message(messages).lower()
+    if not controls or not (
+        ("behavioral analysis" in latest or "behavioural analysis" in latest)
+        and any(word in latest for word in ("guide", "steps", "walk", "take me"))
+    ):
+        return None
+    cell_type = _selected_hmm_cell_type(context)
+    options = _movement_options(context)
+    timepoint = ", ".join(
+        _feature_label(value)
+        for value in controls.get("timepoint_features", {}).get("value", [])
+    ) or "none selected"
+    window = ", ".join(
+        _feature_label(value)
+        for value in controls.get("window_features", {}).get("value", [])
+    ) or "none selected"
+    binary = ", ".join(
+        _feature_label(value) for value in options["binary_selected"]
+    ) or "none selected"
+    live = _visible_control_map(context)
+    prefix = _hmm_control_prefix(context)
+    state_count = live.get(prefix + "n_states", {}).get("value")
+    state_text = (
+        f" The requested number of states is **{state_count}**."
+        if state_count is not None else ""
+    )
+    return (
+        f"You currently have **{cell_type}** selected, so this setup and every "
+        "recommendation below apply to that population.\n\n"
+        "1. Review the continuous HMM inputs. Current per-timepoint features: "
+        f"**{timepoint}**; current window features: **{window}**.\n"
+        "2. Keep binary groups separate from HMM training. Current binary groups: "
+        f"**{binary}**.{state_text}\n"
+        "3. Run State Classification and inspect the feature heatmap, per-state "
+        "distributions, and example state bars.\n"
+        "4. In Step 2, rename the primary states by biological meaning; reuse a name "
+        "to merge redundant states.\n"
+        "5. Review and rename the full behavioral clusters created by combining those "
+        "states with the binary groups.\n"
+        "6. Create reports and use Backprojection to verify the labels on the images.\n\n"
+        "Tell me whether your main question is movement, morphology, target contact, "
+        "or another behavior, and I can review the live feature choices for "
+        f"**{cell_type}**."
+    )
+
+
+def _binary_group_description(choice: str, selected_cell_type: str) -> str:
+    normalized = str(choice or "").strip()
+    lower = normalized.lower()
+    label = _feature_label(normalized)
+    selected = f"a cell from {selected_cell_type}"
+    if lower == "dead":
+        return f"{selected} is marked dead at that timepoint"
+    if "mean_dead_dye" in lower or "mean dead" in lower:
+        return f"{selected} is grouped by its dead-dye signal"
+    if lower == "interpolated":
+        return f"that {selected_cell_type} timepoint was gap-filled during tracking"
+    if lower == "border_touching_segment":
+        return f"the selected {selected_cell_type} segment touches the image border"
+    if "invasiveness" in lower:
+        target = normalized.split("_invasiveness", 1)[0].replace("_", " ")
+        return (
+            f"{selected} meets the invasiveness criterion for "
+            f"{target or 'a target'}"
+        )
+    if "contact_on_distance" in lower:
+        target = normalized.split("_contact_on_distance", 1)[0].replace("_", " ")
+        return (
+            f"{selected} is within the configured contact distance of "
+            f"{target or 'another population'}"
+        )
+    if lower.endswith("_contact"):
+        target = normalized[:-len("_contact")].replace("_", " ")
+        return (
+            f"{selected} is directly touching "
+            f"{target or 'another population'}"
+        )
+    return f"the live feature flag **{label}** is true for {selected}"
+
+
+def hmm_binary_group_action(
+    context: dict, messages: list[dict],
+) -> dict | None:
+    """Add explicitly requested binary groups for the selected HMM cell type."""
+    controls = _hmm_feature_controls(context)
+    control = controls.get("binary_feature_groups")
+    if control is None:
+        return None
+    latest = _latest_user_message(messages)
+    normalized = " ".join(re.sub(r"[^a-z0-9]+", " ", latest.lower()).split())
+    if not re.search(r"\b(?:add|include|select|set)\b", normalized):
+        return None
+    requested = []
+    for choice in control.get("choices") or []:
+        alias = " ".join(re.sub(
+            r"[^a-z0-9]+", " ", str(choice).lower()
+        ).split())
+        if alias and re.search(rf"\b{re.escape(alias)}\b", normalized):
+            requested.append(str(choice))
+    if not requested:
+        return None
+    current = [str(value) for value in (control.get("value") or [])]
+    proposed = current + [value for value in requested if value not in current]
+    cell_type = _selected_hmm_cell_type(context)
+    selected_text = ", ".join(_feature_label(value) for value in requested)
+    calls = []
+    if proposed != current:
+        calls.append({
+            "name": "set_ui_value",
+            "arguments": {"control_id": control["id"], "value": proposed},
+        })
+    return {
+        "text": (
+            f"For the currently selected cell type, **{cell_type}**, I am proposing "
+            f"the binary groups **{selected_text}**. These groups are applied after "
+            "the HMM and do not train the primary states."
+            if calls else
+            f"For **{cell_type}**, **{selected_text}** "
+            "is already selected; no change is needed."
+        ),
+        "calls": calls,
+    }
+
+
+def hmm_binary_group_guidance(
+    context: dict, messages: list[dict],
+) -> str | None:
+    """Explain live binary groups in terms of the selected cell population."""
+    controls = _hmm_feature_controls(context)
+    control = controls.get("binary_feature_groups")
+    if control is None:
+        return None
+    latest = _latest_user_message(messages).lower()
+    asks = (
+        "binary group" in latest
+        or (
+            "contact" in latest
+            and any(word in latest for word in ("important", "worth", "mean", "good"))
+        )
+    )
+    if not asks or re.search(r"\b(?:add|include|select|set)\b", latest):
+        return None
+    cell_type = _selected_hmm_cell_type(context)
+    choices = [str(value) for value in (control.get("choices") or [])]
+    if not choices:
+        return (
+            f"You currently have **{cell_type}** selected, but no binary groups are "
+            "available in its loaded feature file."
+        )
+    descriptions = "\n".join(
+        f"- **{_feature_label(choice)}**: "
+        f"{_binary_group_description(choice, cell_type)}."
+        for choice in choices
+    )
+    selected = ", ".join(
+        _feature_label(value) for value in (control.get("value") or [])
+    ) or "none"
+    contact_choices = [
+        _feature_label(choice) for choice in choices if "contact" in choice.lower()
+    ]
+    recommendation = (
+        " For target engagement, prioritize an organoid or target contact group; "
+        "a macrophage contact group can additionally test whether cells in the "
+        f"selected **{cell_type}** population behave differently while touching "
+        "macrophages."
+        if contact_choices else ""
+    )
+    return (
+        f"You currently have **{cell_type}** selected. Each binary group therefore "
+        f"describes the selected **{cell_type}** at each timepoint, not a different "
+        "population:\n"
+        f"{descriptions}\n\nCurrently selected: **{selected}**. Binary groups are "
+        f"post-HMM overlays; they do not define the primary states.{recommendation}"
+    )
+
+
+def hmm_state_merge_guidance(
+    context: dict, messages: list[dict],
+) -> str | None:
+    """Explain the supported rename-and-merge workflow for excess HMM states."""
+    if not _hmm_feature_controls(context):
+        return None
+    latest = _latest_user_message(messages).lower()
+    if not (
+        ("state" in latest or "cluster" in latest)
+        and any(phrase in latest for phrase in (
+            "which ones to keep", "select which", "too many", "merge",
+            "remove states", "drop states", "6 states", "six states",
+        ))
+    ):
+        return None
+    cell_type = _selected_hmm_cell_type(context)
+    return (
+        f"For **{cell_type}**, the HMM will first produce all requested primary "
+        "states. You do not need to rerun immediately just to discard redundant "
+        "ones. Inspect the feature heatmap, per-state distributions, and example "
+        "state bars, then use **Step 2 - Rename Primary Dynamic State Clusters**. "
+        "Give biologically equivalent clusters the **same name** to merge them into "
+        "one interpreted state.\n\nAfter that, review **Rename Full Behavioral "
+        "Clusters (Binary Groups)**. This second rename step lets you collapse the "
+        "state-plus-contact/death combinations into the final behavior labels you "
+        "want. Rerun with fewer requested states only if the primary separation "
+        "itself is unstable or uninterpretable."
+    )
+
+
+def _movement_options(context: dict) -> dict[str, list[str]]:
+    controls = _hmm_feature_controls(context)
+    timepoint = controls.get("timepoint_features", {})
+    window = controls.get("window_features", {})
+    movement = set(_MOVEMENT_FEATURE_NAMES)
+    return {
+        "timepoint": [
+            str(choice) for choice in (timepoint.get("choices") or [])
+            if str(choice) in movement
+        ],
+        "window": [
+            str(choice) for choice in (window.get("choices") or [])
+            if str(choice) in movement
+        ],
+        "selected_timepoint": [
+            str(value) for value in (timepoint.get("value") or [])
+            if str(value) in movement
+        ],
+        "selected_window": [
+            str(value) for value in (window.get("value") or [])
+            if str(value) in movement
+        ],
+        "binary_available": [
+            str(choice)
+            for choice in (
+                controls.get("binary_feature_groups", {}).get("choices") or []
+            )
+        ],
+        "binary_selected": [
+            str(value)
+            for value in (
+                controls.get("binary_feature_groups", {}).get("value") or []
+            )
+        ],
+    }
+
+
+def hmm_movement_setup_action(
+    context: dict, messages: list[dict],
+) -> dict | None:
+    """Apply an explicit movement-feature choice across both HMM feature lists."""
+    controls = _hmm_feature_controls(context)
+    if not controls:
+        return None
+    latest = _latest_user_message(messages)
+    previous = _previous_assistant_message(messages)
+    if "available movement" not in previous.lower():
+        return None
+
+    options = _movement_options(context)
+    normalized = " ".join(latest.lower().replace("_", " ").split())
+    choose_all = bool(re.search(
+        r"\b(?:all|every)\b.*\bmovement\b|\buse all\b", normalized
+    ))
+    selected_timepoint = []
+    selected_window = []
+    if choose_all:
+        selected_timepoint = options["timepoint"]
+        selected_window = options["window"]
+    else:
+        for value in options["timepoint"]:
+            label = " ".join(value.lower().replace("_", " ").split())
+            if re.search(rf"\b{re.escape(label)}\b", normalized):
+                selected_timepoint.append(value)
+        for value in options["window"]:
+            label = " ".join(value.lower().replace("_", " ").split())
+            if re.search(rf"\b{re.escape(label)}\b", normalized):
+                selected_window.append(value)
+        if not selected_timepoint and not selected_window:
+            return None
+
+    calls = []
+    for suffix, values in (
+        ("timepoint_features", selected_timepoint),
+        ("window_features", selected_window),
+    ):
+        control = controls.get(suffix)
+        if control is not None and list(control.get("value") or []) != values:
+            calls.append({
+                "name": "set_ui_value",
+                "arguments": {"control_id": control["id"], "value": values},
+            })
+    timepoint_text = ", ".join(
+        _feature_label(value) for value in selected_timepoint
+    ) or "none"
+    window_text = ", ".join(
+        _feature_label(value) for value in selected_window
+    ) or "none"
+    binary_text = ", ".join(
+        _feature_label(value) for value in options["binary_selected"]
+    ) or "none"
+    return {
+        "text": (
+            "I am proposing the complete movement-only selection: timepoint "
+            f"features **{timepoint_text}** and window features **{window_text}**. "
+            f"The currently selected binary comparison groups are **{binary_text}**; "
+            "they stratify results after the HMM and do not train the states. "
+            + (
+                "Apply the action cards before running the analysis."
+                if calls else
+                "Those movement selections are already present, so no change is needed."
+            )
+        ),
+        "calls": calls,
+    }
+
+
+def hmm_movement_feature_guidance(
+    context: dict, messages: list[dict],
+) -> str | None:
+    """List every movement input available in the loaded HMM feature file."""
+    controls = _hmm_feature_controls(context)
+    if not controls:
+        return None
+    latest = _latest_user_message(messages).lower()
+    asks_movement = (
+        "movement feature" in latest
+        or "movement-only" in latest
+        or "only movement" in latest
+    )
+    asks_behavior_setup = (
+        "behavior" in latest
+        and any(word in latest for word in ("interaction", "contact", "tumor"))
+        and any(word in latest for word in ("fill", "set", "configure", "select"))
+    )
+    asks_selection_review = (
+        "all the features" in latest
+        or ("is it ready" in latest and "feature" in latest)
+    )
+    if not (asks_movement or asks_behavior_setup or asks_selection_review):
+        return None
+
+    options = _movement_options(context)
+    timepoint = ", ".join(
+        _feature_label(value) for value in options["timepoint"]
+    ) or "none found in the loaded feature file"
+    window = ", ".join(
+        _feature_label(value) for value in options["window"]
+    ) or "none available"
+    current_tp = ", ".join(
+        _feature_label(value) for value in options["selected_timepoint"]
+    ) or "none"
+    current_window = ", ".join(
+        _feature_label(value) for value in options["selected_window"]
+    ) or "none"
+    binary = ", ".join(
+        _feature_label(value) for value in options["binary_available"]
+    ) or "none detected"
+    cell_type = _selected_hmm_cell_type(context)
+    return (
+        f"The loaded **{cell_type}** feature file offers these **movement inputs**:\n\n"
+        f"- Per-timepoint features: **{timepoint}**\n"
+        f"- Rolling/window features: **{window}**\n\n"
+        f"Currently selected: per-timepoint **{current_tp}**; window "
+        f"**{current_window}**. Available binary comparison groups are "
+        f"**{binary}**. Binary contact groups are applied after the HMM, so they "
+        "compare state frequencies without defining the states. Choose the feature "
+        "names you want, or say **use all available movement features**, and I will "
+        "propose both feature lists together."
+    )
+
+
+def _number_from_proposal(text: str, patterns: tuple[str, ...]) -> float | None:
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            try:
+                return float(match.group(1))
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def active_killing_confirmation_action(
+    context: dict, messages: list[dict],
+) -> dict | None:
+    """Turn acceptance of a multi-field Active Killing proposal into one batch."""
+    if context.get("current_step") != "feature_extraction":
+        return None
+    latest = " ".join(_latest_user_message(messages).lower().split())
+    if not any(phrase in latest for phrase in (
+        "settings seem ok", "settings seem okay", "looks good", "apply them",
+        "apply these", "use those settings", "use these settings",
+        "yes set it up", "yes, set it up",
+    )):
+        return None
+    previous = _previous_assistant_message(messages)
+    if "active killing" not in previous.lower():
+        return None
+
+    controls = _visible_control_map(context)
+    expected: dict[str, object] = {}
+    by_suffix = {
+        suffix: controls.get(f"features.active_killing.{suffix}")
+        for suffix in (
+            "target_types", "observation_window", "death_signal",
+            "use_absolute_threshold", "absolute_threshold",
+            "minimum_contact_duration",
+        )
+    }
+    previous_lower = previous.lower()
+    target_control = by_suffix["target_types"]
+    if target_control is not None:
+        selected_targets = [
+            str(choice) for choice in (target_control.get("choices") or [])
+            if re.search(
+                rf"\b{re.escape(str(choice).lower())}\b", previous_lower
+            )
+        ]
+        if selected_targets:
+            expected["target_types"] = selected_targets
+
+    for label in (
+        "Dead-mask pixel count", "Dead-mask percentage",
+        "Mean dead-dye intensity",
+    ):
+        if label.lower() in previous_lower:
+            expected["death_signal"] = label
+            break
+
+    absolute_mode = "absolute threshold" in previous_lower
+    if absolute_mode:
+        expected["use_absolute_threshold"] = True
+        absolute_value = _number_from_proposal(previous, (
+            r"absolute (?:signal-increase )?threshold[^\d]{0,50}"
+            r"(\d+(?:\.\d+)?)\s*(?:dead[- ]mask |dead )?(?:pixels|voxels)",
+            r"minimum rise[^\d]{0,30}(\d+(?:\.\d+)?)\s*"
+            r"(?:dead[- ]mask |dead )?(?:pixels|voxels)",
+            r"(\d+(?:\.\d+)?)\s*(?:dead[- ]mask |dead )?(?:pixels|voxels)"
+            r"[^\n.]{0,35}(?:minimum|threshold|rise)",
+        ))
+        if absolute_value is None or absolute_value <= 0:
+            return {
+                "text": (
+                    "I have not applied a partial Active Killing setup. The agreed "
+                    "absolute-threshold mode still needs a positive minimum "
+                    "dead-mask pixel increase. Tell me that value, then I can propose "
+                    "the threshold, signal, timing, contact duration, and targets "
+                    "together."
+                ),
+                "calls": [],
+            }
+        expected["absolute_threshold"] = absolute_value
+
+    observation = _number_from_proposal(previous, (
+        r"observation window[^\d]{0,45}(\d+(?:\.\d+)?)\s*"
+        r"(?:timepoints?|frames?|tp)\b",
+        r"currently[^\n.]{0,25}(\d+(?:\.\d+)?)\s*"
+        r"(?:timepoints?|frames?|tp)\b",
+    ))
+    if observation is not None:
+        expected["observation_window"] = int(round(observation))
+    minimum_contact = _number_from_proposal(previous, (
+        r"(?:minimum|min\.?) contact duration[^\d]{0,45}"
+        r"(\d+(?:\.\d+)?)\s*(?:timepoints?|frames?|tp)\b",
+    ))
+    if minimum_contact is not None:
+        expected["minimum_contact_duration"] = int(round(minimum_contact))
+
+    calls = []
+    for suffix, value in expected.items():
+        control = by_suffix.get(suffix)
+        if control is not None:
+            calls.append({
+                "name": "set_ui_value",
+                "arguments": {"control_id": control["id"], "value": value},
+            })
+    if not calls:
+        return None
+    targets = expected.get("target_types") or (
+        target_control.get("value") if target_control else []
+    )
+    target_text = ", ".join(str(value) for value in targets) or "the selected targets"
+    return {
+        "text": (
+            "I am proposing the complete agreed Active Killing setup in one batch, "
+            f"for effector cells against **{target_text}**. BEHAV3D will run each "
+            "selected target independently and also create a combined analysis when "
+            "more than one target is selected. The setup is not ready until every "
+            "action card below has been applied; after that the live readiness state "
+            "will confirm it."
+        ),
+        "calls": calls,
+    }
+
+
+def active_killing_readiness_summary(
+    context: dict, messages: list[dict],
+) -> str | None:
+    if context.get("current_step") != "feature_extraction":
+        return None
+    latest = _latest_user_message(messages).lower()
+    if "active killing" not in " ".join(
+        str(message.get("content") or "").lower() for message in messages
+    ):
+        return None
+    if not any(phrase in latest for phrase in (
+        "is it set", "is it ready", "ready now", "setup complete",
+    )):
+        return None
+    state = (
+        (context.get("feature_extraction", {}) or {}).get("active_killing", {})
+        or {}
+    )
+    issues = list(state.get("setup_issues") or [])
+    if issues:
+        return (
+            "Active Killing is **not ready yet**. "
+            + " ".join(issues)
+            + " I will not describe the setup as complete until the live controls "
+            "contain every required value."
+        )
+    targets = ", ".join(state.get("target_cell_types") or []) or "none"
+    return (
+        "Active Killing is **ready** in the live controls: effector "
+        f"**{state.get('effector_cell_type')}**, targets **{targets}**, observation "
+        f"window **{state.get('observation_window')} timepoints**, and minimum "
+        f"contact **{state.get('minimum_contact_duration')} timepoints**. "
+        "When multiple targets are selected, BEHAV3D produces independent target "
+        "analyses and a combined analysis."
+    )
+
+
 def active_killing_action(context: dict, messages: list[dict]) -> dict | None:
     """Build the standard Active Killing proposal from target and cadence."""
     if context.get("current_step") != "feature_extraction":
@@ -1570,11 +2417,14 @@ def active_killing_action(context: dict, messages: list[dict]) -> dict | None:
     text = latest.lower()
     if "configure active killing" not in text:
         return None
-    target_match = re.search(r"\bagainst\s+([a-z0-9_ -]+?)\s+only\b", text)
+    target_match = re.search(
+        r"\bagainst\s+([a-z0-9_ ,&/-]+?)(?:\s+only)?(?:[.;]|\s+within\b)",
+        text,
+    )
     window_match = re.search(r"\bwithin\s+(\d+(?:\.\d+)?)\s+minutes?\b", text)
     if target_match is None or window_match is None:
         return None
-    target = target_match.group(1).strip()
+    target_text = target_match.group(1).strip()
     duration_minutes = float(window_match.group(1))
 
     records = (context.get("metadata", {}) or {}).get("records", []) or []
@@ -1603,11 +2453,39 @@ def active_killing_action(context: dict, messages: list[dict]) -> dict | None:
         for control in controls
         if control.get("visible", True) and control.get("enabled", True)
     }
+    target_control = by_id.get("features.active_killing.target_types", {})
+    target_choices = [str(value) for value in (target_control.get("choices") or [])]
+    targets = [
+        choice for choice in target_choices
+        if re.search(rf"\b{re.escape(choice.lower())}\b", target_text)
+    ]
+    if not targets:
+        targets = [
+            value.strip()
+            for value in re.split(r"\s*(?:,|&|\band\b)\s*", target_text)
+            if value.strip()
+        ]
+    absolute_threshold = _number_from_proposal(latest, (
+        r"absolute (?:signal-increase )?threshold[^\d]{0,30}"
+        r"(\d+(?:\.\d+)?)\s*(?:dead[- ]mask |dead )?(?:pixels|voxels)",
+    ))
+    if absolute_threshold is None or absolute_threshold <= 0:
+        return {
+            "text": (
+                f"The timing converts to **{window} timepoints** at {interval:g} "
+                f"{record.get('time_unit') or ''} per frame. Before I propose the "
+                "complete Active Killing setup, I still need one value: the positive "
+                "minimum dead-mask pixel increase for the absolute threshold. I will "
+                "not enable absolute-threshold mode while that value remains 0."
+            ),
+            "calls": [],
+        }
     expected = {
-        "features.active_killing.target_types": [target],
+        "features.active_killing.target_types": targets,
         "features.active_killing.observation_window": window,
         "features.active_killing.death_signal": "Dead-mask pixel count",
         "features.active_killing.use_absolute_threshold": True,
+        "features.active_killing.absolute_threshold": absolute_threshold,
     }
     if not set(expected).issubset(by_id):
         return None
@@ -1615,9 +2493,11 @@ def active_killing_action(context: dict, messages: list[dict]) -> dict | None:
         "text": (
             f"Based on {duration_minutes:g} minutes at {interval:g} "
             f"{record.get('time_unit') or ''} per frame, I’m proposing an Observation "
-            f"window of {window} timepoints, target {target} only, Dead-mask pixel "
-            "count, and an absolute threshold. These changes still require your "
-            "confirmation in the action cards."
+            f"window of {window} timepoints, target{'s' if len(targets) != 1 else ''} "
+            f"{', '.join(targets)}, Dead-mask pixel count, and an absolute threshold "
+            f"of {absolute_threshold:g}. BEHAV3D runs every selected target "
+            "independently and adds a combined analysis when multiple targets are "
+            "selected. These changes still require your confirmation in the action cards."
         ),
         "calls": [
             {
@@ -1754,8 +2634,8 @@ def safety_profile_summary(context: dict, messages: list[dict]) -> str | None:
         "**Active Killing definition:** The experiment reference defines an event "
         "as a contact-associated relative rise in dead-mask percentage to at least "
         f"1.5× baseline within {window_text}, after at least one frame of contact. "
-        "If you run the module, analyse 27T and MDO separately because it accepts "
-        f"one target type per run. {result_note}"
+        "If you run the module, select both 27T and MDO: BEHAV3D creates an "
+        f"independent analysis for each target plus a combined analysis. {result_note}"
     )
 
 
@@ -1767,6 +2647,17 @@ def model_tool_policy(force_bulk: bool, has_tools: bool) -> tuple[object, dict |
         # field before it has proposed all known metadata values.
         return "required", {"thinking": {"type": "disabled"}}
     return ("auto" if has_tools else None), None
+
+
+def _normalize_absent_line_value(value):
+    if value is None:
+        return "not_added"
+    normalized = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in {
+        "none", "null", "n/a", "na", "absent", "not_added", "(not_added)",
+    }:
+        return "not_added"
+    return value
 
 
 def sanitize_bulk_metadata_arguments(arguments: dict, user_message: str) -> dict:
@@ -1794,12 +2685,36 @@ def sanitize_bulk_metadata_arguments(arguments: dict, user_message: str) -> dict
             sample.pop("time_unit", None)
         cell_types = sample.get("cell_types")
         if isinstance(cell_types, dict):
+            for values in cell_types.values():
+                if isinstance(values, dict) and "line" in values:
+                    values["line"] = _normalize_absent_line_value(values["line"])
             sample["cell_types"] = {
                 name: values for name, values in cell_types.items() if values
             }
             if not sample["cell_types"]:
                 sample.pop("cell_types", None)
     return cleaned
+
+
+def normalize_metadata_line_calls(calls: list[dict]) -> list[dict]:
+    """Prevent API responses from writing invalid None-like population lines."""
+    for call in calls or []:
+        name = call.get("name")
+        arguments = call.get("arguments", {}) or {}
+        if name == "set_ui_value":
+            control_id = str(arguments.get("control_id") or "")
+            if control_id.startswith("metadata.samples.") and control_id.endswith(".line"):
+                arguments["value"] = _normalize_absent_line_value(arguments.get("value"))
+        elif name == "fill_metadata_builder" and arguments.get("field") == "cell_line":
+            arguments["value"] = _normalize_absent_line_value(arguments.get("value"))
+        elif name == "bulk_fill_metadata":
+            for sample in arguments.get("samples") or []:
+                if not isinstance(sample, dict):
+                    continue
+                for values in (sample.get("cell_types") or {}).values():
+                    if isinstance(values, dict) and "line" in values:
+                        values["line"] = _normalize_absent_line_value(values["line"])
+    return calls
 
 
 def recover_single_control_action(
@@ -1957,7 +2872,8 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "deterministic shared value such as '1' and ask for confirmation. Before filling population "
         "lines, establish whether each line is shared across all samples. Filename suffixes are only "
         "proposed inferences. For a sample where a configured population is confirmed absent, set its "
-        "line to the literal value 'None'; never leave a mandatory line blank.\n"
+        "line to the literal CSV-safe value 'not_added' and describe it to the researcher as 'not "
+        "added'; never write None and never leave a mandatory line blank.\n"
         "- Use only controls matching the selected method and exact cell type. Do not apply a change to "
         "a broad cell category.\n"
         "- Navigation and read-only result/preview actions may happen immediately. Every assistant-proposed "
@@ -2059,16 +2975,28 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "lowering it to reduce RAM. When multiple organoid types exist, "
         "recommend tracking all organoid types together with Propagation.\n"
         "- In Feature Extraction, recommend Morphology only when shape is biologically relevant and Movement "
-        "for motility. Contact distance 0 means strict touching; larger values mean proximity, and any change "
+        "for motility. Read required_choices on every feature-group control before recommending a removal. "
+        "Intensity and Contact are required for every cell type, Movement is required for immune/other cells, "
+        "and Death is required when a dead channel is configured. Intensity includes mean dead-dye and other "
+        "channel-intensity measurements, so never suggest dropping it from a T-cell population with a dead "
+        "channel. Contact distance 0 means strict touching; larger values mean proximity, and any change "
         "requires feature extraction to be run again. A positive contact distance equal to the XY pixel "
         "size permits a one-XY-pixel gap; it is not strict touching and is not a voxel diagonal.\n"
-        "- In Active Killing, configure one target type per run. Derive Observation window and Minimum contact "
+        "- In Active Killing, the target selector may contain multiple target types. One run automatically "
+        "produces an independent analysis for each selected target and an additional combined analysis when "
+        "more than one is selected; never tell the user to configure separate UI runs. Derive Observation "
+        "window and Minimum contact "
         "duration from the biological timescale and metadata time interval. Prefer dead-mask pixel count with "
         "an absolute threshold by default; calibrate that threshold from cell size and XY pixel size. Do not "
         "reuse a 20-30 pixel example blindly. Use relative multipliers only in the limited baseline contexts "
         "described in the guidance. In study-design explanations, call the immune cell the effector and the "
         "organoid or cell being contacted the target; never describe an immune effector such as TEG as a "
         "target. With one immune type and two organoid types, say one effector type and two target types. "
+        "An accepted multi-parameter setup must propose every agreed value in the same response: targets, "
+        "death signal, threshold mode and value, observation window, and minimum contact duration. Never "
+        "apply only the mode checkbox while leaving an agreed absolute threshold at 0. The dependent "
+        "threshold controls remain editable when inactive; read their active flag rather than omitting them. "
+        "Do not say the setup is ready until the live Active Killing state reports setup_ready true. "
         "When an experiment reference defines Active Killing settings, say the reference 'defines' or "
         "'describes' them, never 'you have configured' or 'already configured' unless live controls/results "
         "prove that. Preserve a stated one-frame minimum exactly; do not replace it with a generic 1-3-frame "
@@ -2082,15 +3010,31 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "- For cell counts under minimum track-length filters or at a requested timepoint, always use "
         "summarize_track_counts. Never estimate counts or calculate them from prose.\n"
         "- Behavioral State and State Trajectory are different analysis views. For HMM state classification, "
+        "read analysis.selected_cell_type before every setup, feature, or binary-group answer, explicitly "
+        "tell the researcher which cell type is selected, and interpret every contact/death group from that "
+        "selected cell's perspective. A population named in a contact group is the population the selected "
+        "cell touches; it is not evidence that the named population is selected. "
         "use fixed state count, keep Start offset at 1, use Window size 5 by default or 1 for single-frame "
         "events, and usually match Smooth window to Window size. Log-scale only inspected skewed features, do "
-        "not routinely percentile-clip, and explain that binary groups are applied after the HMM.\n"
+        "not routinely percentile-clip, and explain that binary groups are applied after the HMM. When the "
+        "researcher asks for movement-only states or asks whether movement features are complete, enumerate "
+        "all movement choices from both the live Timepoint features and Additional window features controls. "
+        "Distinguish instantaneous/accumulated movement, directionality, and rolling trajectory summaries. "
+        "Do not present the currently selected speed and net displacement as the complete option set. Ask the "
+        "researcher to choose, then propose both feature lists together rather than partially setting one. "
+        "After classification, Step 2 supports renaming primary dynamic state clusters; assigning the same "
+        "name to multiple primary clusters merges them. The subsequent full behavioral-cluster rename can "
+        "collapse state-plus-binary combinations. Never claim individual states can only be ignored or "
+        "manually edited outside BEHAV3D.\n"
         "- For State Trajectory, Trajectory size cannot exceed the Filtering trim. Average linkage is the "
         "default, Complete is a reasonable comparison, and Single performs poorly. Original BEHAV3D mode is "
         "deprecated. Be transparent that contact-based comparison plots and exemplar-track exports are known "
         "to be unreliable in the current implementation.\n"
-        "- 'Choose analysis' is an explanation request: summarize Death Dynamics, Behavioral State, and "
-        "State Trajectory and ask which biological question the researcher has; do not navigate. When the "
+        "- A general analysis-choice request must enumerate all relevant routes: Death Dynamics, Interaction "
+        "Analysis, Invasiveness Analysis, Active Killing, Behavioral State, State Trajectory, and "
+        "Backprojection. Then use the loaded metadata populations, lines/conditions, and dead-signal "
+        "availability to propose concrete biological questions and a sensible sequence, while distinguishing "
+        "configured prerequisites from results that actually exist. Do not navigate for this overview. When the "
         "user names a specific view and asks to open it, use open_analysis_view. Never repeatedly navigate "
         "to the generic Analysis tab when it is already open.\n"
         "- Produce at most the actions needed for this one user turn. There is no hidden continuation turn."
@@ -2262,6 +3206,61 @@ def assemble_tool_calls(fragments: list[dict]) -> list[dict]:
     return calls
 
 
+def deterministic_turn_response(
+    context: dict, messages: list[dict], tools: list[dict],
+) -> dict | None:
+    """Resolve feedback-critical turns before invoking the language model."""
+    deterministic_action = (
+        metadata_absence_action(context, messages)
+        or metadata_persistence_action(context, messages)
+        or metadata_time_conversion_action(context, messages)
+        or metadata_pixel_size_action(context, messages)
+        or analysis_navigation_action(context, messages)
+        or historical_reference_guidance(context, messages)
+        or apoc_feature_preset_action(context, messages)
+        or segmentation_minimum_size_action(context, messages)
+        or tracking_radius_action(context, messages)
+        or btrack_step2_action(context, messages)
+        or hmm_binary_group_action(context, messages)
+        or hmm_movement_setup_action(context, messages)
+        or active_killing_confirmation_action(context, messages)
+        or active_killing_action(context, messages)
+    )
+    available_tool_names = {tool.get("name") for tool in tools}
+    if deterministic_action and all(
+        call.get("name") in available_tool_names
+        for call in deterministic_action.get("calls", [])
+    ):
+        return deterministic_action
+
+    preflight_question = (
+        metadata_channel_mapping_guidance(context, messages)
+        or organoid_processing_question(context, messages)
+        or metadata_identifier_confirmation_question(context, messages)
+        or metadata_completion_summary(context, messages)
+        or analysis_choice_summary(context, messages)
+        or safety_profile_summary(context, messages)
+        or active_killing_readiness_summary(context, messages)
+        or feature_group_requirement_guidance(context, messages)
+        or hmm_setup_guidance(context, messages)
+        or hmm_state_merge_guidance(context, messages)
+        or hmm_binary_group_guidance(context, messages)
+        or hmm_movement_feature_guidance(context, messages)
+        or apoc_channel_selection_guidance(context, messages)
+        or apoc_feature_grid_guidance(context, messages)
+        or edt_direction_guidance(context, messages)
+        or merged_probability_watershed_guidance(context, messages)
+        or feature_threshold_guidance(context, messages)
+        or equal_track_filter_summary(context, messages)
+        or missing_log_error_question(context, messages)
+        or segmentation_signal_question(context, messages)
+        or tracking_motion_question(context, messages)
+    )
+    if preflight_question:
+        return {"text": preflight_question, "calls": []}
+    return None
+
+
 # ===========================================================================
 # Modal app (imported lazily so the pure helpers import without modal installed)
 # ===========================================================================
@@ -2381,64 +3380,23 @@ if modal is not None:
             context = body.get("context", {})
             tools = tools_for_context(body.get("tools", []), context)
 
-            deterministic_action = (
-                metadata_persistence_action(context, messages)
-                or metadata_time_conversion_action(context, messages)
-                or metadata_pixel_size_action(context, messages)
-                or analysis_navigation_action(context, messages)
-                or historical_reference_guidance(context, messages)
-                or apoc_feature_preset_action(context, messages)
-                or segmentation_minimum_size_action(context, messages)
-                or tracking_radius_action(context, messages)
-                or btrack_step2_action(context, messages)
-                or active_killing_action(context, messages)
+            deterministic = deterministic_turn_response(
+                context, messages, tools
             )
-            available_tool_names = {tool.get("name") for tool in tools}
-            if deterministic_action and all(
-                call.get("name") in available_tool_names
-                for call in deterministic_action.get("calls", [])
-            ):
+            if deterministic:
                 def deterministic_action_stream():
                     yield "data: " + json.dumps({
-                        "type": "token", "text": deterministic_action["text"],
+                        "type": "token", "text": deterministic["text"],
                     }) + "\n\n"
-                    if deterministic_action.get("calls"):
+                    if deterministic.get("calls"):
                         yield "data: " + json.dumps({
                             "type": "tool_calls",
-                            "calls": deterministic_action["calls"],
+                            "calls": deterministic["calls"],
                         }) + "\n\n"
                     yield "data: " + json.dumps({"type": "done"}) + "\n\n"
 
                 return StreamingResponse(
                     deterministic_action_stream(), media_type="text/event-stream"
-                )
-
-            preflight_question = (
-                metadata_channel_mapping_guidance(context, messages)
-                or organoid_processing_question(context, messages)
-                or metadata_identifier_confirmation_question(context, messages)
-                or metadata_completion_summary(context, messages)
-                or analysis_choice_summary(context, messages)
-                or safety_profile_summary(context, messages)
-                or apoc_channel_selection_guidance(context, messages)
-                or apoc_feature_grid_guidance(context, messages)
-                or edt_direction_guidance(context, messages)
-                or merged_probability_watershed_guidance(context, messages)
-                or feature_threshold_guidance(context, messages)
-                or equal_track_filter_summary(context, messages)
-                or missing_log_error_question(context, messages)
-                or segmentation_signal_question(context, messages)
-                or tracking_motion_question(context, messages)
-            )
-            if preflight_question:
-                def preflight_question_stream():
-                    yield "data: " + json.dumps({
-                        "type": "token", "text": preflight_question,
-                    }) + "\n\n"
-                    yield "data: " + json.dumps({"type": "done"}) + "\n\n"
-
-                return StreamingResponse(
-                    preflight_question_stream(), media_type="text/event-stream"
                 )
 
             user_msg = next((m["content"] for m in reversed(messages)
@@ -2528,6 +3486,7 @@ if modal is not None:
                             call["arguments"] = sanitize_bulk_metadata_arguments(
                                 call.get("arguments", {}), user_msg
                             )
+                calls = normalize_metadata_line_calls(calls)
                 if calls:
                     yield sse({"type": "tool_calls", "calls": calls})
                 yield sse({"type": "done"})

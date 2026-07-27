@@ -35,8 +35,10 @@ def _control(
     unit: str | None = None,
     visible: bool = True,
     enabled: bool = True,
+    required_choices: list[str] | None = None,
+    active: bool | None = None,
 ) -> dict:
-    return {
+    control = {
         "id": control_id,
         "label": label,
         "value": value,
@@ -48,6 +50,11 @@ def _control(
         "cell_type": cell_type,
         "unit": unit,
     }
+    if required_choices is not None:
+        control["required_choices"] = required_choices
+    if active is not None:
+        control["active"] = active
+    return control
 
 
 def _metadata_records() -> list[dict]:
@@ -999,6 +1006,15 @@ def _active_killing_case() -> dict:
             method="Active Killing",
             cell_type="tcell",
         ),
+        _control(
+            "features.active_killing.absolute_threshold",
+            "Active Killing: Absolute signal-increase threshold",
+            0.0,
+            unit="pixels",
+            method="Active Killing",
+            cell_type="tcell",
+            active=False,
+        ),
     ]
     metadata = {
         "loaded": True,
@@ -1017,8 +1033,8 @@ def _active_killing_case() -> dict:
             "role": "user",
             "content": (
                 "Configure active killing for tcell against organoid1 only. I expect "
-                "killing within 10 minutes and images are every 2 minutes. Use the "
-                "generally recommended death signal and threshold mode."
+                "killing within 10 minutes and images are every 2 minutes. Use an "
+                "absolute threshold of 30 dead pixels."
             ),
         }],
         "context": _context(
@@ -1027,6 +1043,322 @@ def _active_killing_case() -> dict:
             feature_extraction={"active_killing_open": True},
         ),
         "check": _check_active_killing,
+    }
+
+
+def _feature_group_dead_dye_case() -> dict:
+    choices = [
+        "movement", "intensity", "morphology", "contact",
+        "invasiveness", "death",
+    ]
+    controls = [_control(
+        "features.tcell.feature_groups",
+        "tcell: feature groups",
+        choices,
+        choices=choices,
+        cell_type="tcell",
+        required_choices=["movement", "intensity", "contact", "death"],
+    )]
+    return {
+        "name": "tcell_features_keep_dead_dye_intensity",
+        "messages": [{
+            "role": "user",
+            "content": "Now adjust T cells. Should I drop intensity?",
+        }],
+        "context": _context(
+            "feature_extraction", controls, active_cell_type="tcell",
+        ),
+        "check": _check_feature_group_dead_dye,
+    }
+
+
+def _active_killing_complete_acceptance_case() -> dict:
+    controls = [
+        _control(
+            "features.active_killing.target_types",
+            "Active Killing: Target cell type",
+            ["27t", "mdo"],
+            choices=["27t", "mdo"],
+            method="Active Killing",
+            cell_type="tcell",
+        ),
+        _control(
+            "features.active_killing.observation_window",
+            "Active Killing: Observation window",
+            5,
+            unit="timepoints",
+            method="Active Killing",
+            cell_type="tcell",
+        ),
+        _control(
+            "features.active_killing.death_signal",
+            "Active Killing: Death or reporter signal",
+            "Dead-mask percentage",
+            choices=[
+                "Dead-mask percentage", "Mean dead-dye intensity",
+                "Dead-mask pixel count",
+            ],
+            method="Active Killing",
+            cell_type="tcell",
+        ),
+        _control(
+            "features.active_killing.use_absolute_threshold",
+            "Active Killing: Use an absolute signal-increase threshold",
+            False,
+            method="Active Killing",
+            cell_type="tcell",
+        ),
+        _control(
+            "features.active_killing.absolute_threshold",
+            "Active Killing: Absolute signal-increase threshold",
+            0.0,
+            unit="pixels",
+            method="Active Killing",
+            cell_type="tcell",
+            active=False,
+        ),
+        _control(
+            "features.active_killing.minimum_contact_duration",
+            "Active Killing: Minimum contact duration",
+            1,
+            unit="timepoints",
+            method="Active Killing",
+            cell_type="tcell",
+        ),
+    ]
+    return {
+        "name": "active_killing_accepts_complete_setup",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": (
+                    "Active Killing configuration for tcell against 27t and mdo: "
+                    "Death signal: Dead-mask pixel count. Absolute threshold: "
+                    "30 dead pixels. Observation window: 5 timepoints. "
+                    "Minimum contact duration: 1 frame."
+                ),
+            },
+            {"role": "user", "content": "Ok, these settings seem ok"},
+        ],
+        "context": _context(
+            "feature_extraction", controls, active_cell_type="tcell",
+            feature_extraction={
+                "active_killing_open": True,
+                "active_killing": {
+                    "setup_ready": True,
+                    "setup_issues": [],
+                },
+            },
+        ),
+        "check": _check_active_killing_complete_acceptance,
+    }
+
+
+def _hmm_movement_controls() -> list[dict]:
+    prefix = "analysis.state_classification.tcell."
+    return [
+        _control(
+            prefix + "timepoint_features",
+            "tcell: Timepoint features",
+            ["speed"],
+            choices=[
+                "speed", "displacement", "cumulative_displacement",
+                "displacement_from_origin", "directional_persistence",
+                "median_turning_angle", "mean_dead_dye",
+            ],
+            method="HMM",
+            cell_type="tcell",
+        ),
+        _control(
+            prefix + "window_features",
+            "tcell: Additional window features",
+            ["net_displacement"],
+            choices=[
+                "net_displacement", "straightness",
+                "mean_square_displacement",
+            ],
+            method="HMM",
+            cell_type="tcell",
+        ),
+        _control(
+            prefix + "binary_feature_groups",
+            "tcell: Binary feature groups",
+            ["27t_contact", "mdo_contact"],
+            choices=["27t_contact", "mdo_contact"],
+            method="HMM",
+            cell_type="tcell",
+        ),
+    ]
+
+
+def _hmm_movement_options_case() -> dict:
+    controls = _hmm_movement_controls()
+    return {
+        "name": "hmm_lists_all_movement_options",
+        "messages": [{
+            "role": "user",
+            "content": "Only movement features of relevance",
+        }],
+        "context": _context(
+            "analysis", controls, active_cell_type="tcell",
+            analysis={"view": "behavioral_state", "selected_cell_type": "tcell"},
+        ),
+        "check": _check_hmm_movement_options,
+    }
+
+
+def _hmm_apply_all_movement_case() -> dict:
+    return {
+        "name": "hmm_applies_all_offered_movement_features",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": (
+                    "Choose the feature names you want, or say use all available "
+                    "movement features."
+                ),
+            },
+            {"role": "user", "content": "Use all available movement features"},
+        ],
+        "context": _context(
+            "analysis", _hmm_movement_controls(), active_cell_type="tcell",
+            analysis={"view": "behavioral_state", "selected_cell_type": "tcell"},
+        ),
+        "check": _check_hmm_apply_all_movement,
+    }
+
+
+def _sam_hmm_controls() -> list[dict]:
+    prefix = "analysis.state_classification.T-cells."
+    return [
+        _control(
+            prefix + "timepoint_features",
+            "T-cells: Timepoint features",
+            ["speed"],
+            choices=["speed", "elongation"],
+            method="HMM",
+            cell_type="T-cells",
+        ),
+        _control(
+            prefix + "window_features",
+            "T-cells: Additional window features",
+            ["net_displacement"],
+            choices=["net_displacement", "straightness"],
+            method="HMM",
+            cell_type="T-cells",
+        ),
+        _control(
+            prefix + "binary_feature_groups",
+            "T-cells: Binary feature groups",
+            [],
+            choices=["Organoid_contact", "Macrophages_contact", "dead"],
+            method="HMM",
+            cell_type="T-cells",
+        ),
+        _control(
+            prefix + "n_states",
+            "T-cells: Number of states",
+            6,
+            method="HMM",
+            cell_type="T-cells",
+        ),
+    ]
+
+
+def _hmm_selected_cell_setup_case() -> dict:
+    return {
+        "name": "hmm_setup_uses_selected_tcells",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "I want to do behavioral analysis, can you take me through the steps?"
+            ),
+        }],
+        "context": _context(
+            "analysis", _sam_hmm_controls(), active_cell_type="T-cells",
+            analysis={
+                "view": "behavioral_state",
+                "selected_cell_type": "T-cells",
+            },
+        ),
+        "check": _check_hmm_selected_cell_setup,
+    }
+
+
+def _hmm_macrophage_contact_for_tcells_case() -> dict:
+    return {
+        "name": "hmm_contact_meaning_uses_selected_tcells",
+        "messages": [{
+            "role": "user",
+            "content": "Would it be worth adding macrophage contact?",
+        }],
+        "context": _context(
+            "analysis", _sam_hmm_controls(), active_cell_type="T-cells",
+            analysis={
+                "view": "behavioral_state",
+                "selected_cell_type": "T-cells",
+            },
+        ),
+        "check": _check_hmm_macrophage_contact_for_tcells,
+    }
+
+
+def _hmm_add_binary_groups_for_tcells_case() -> dict:
+    return {
+        "name": "hmm_adds_binary_groups_to_selected_tcells",
+        "messages": [{
+            "role": "user",
+            "content": "Add organoid contact and also add dead",
+        }],
+        "context": _context(
+            "analysis", _sam_hmm_controls(), active_cell_type="T-cells",
+            analysis={
+                "view": "behavioral_state",
+                "selected_cell_type": "T-cells",
+            },
+        ),
+        "check": _check_hmm_add_binary_groups_for_tcells,
+    }
+
+
+def _hmm_merge_states_case() -> dict:
+    return {
+        "name": "hmm_explains_supported_state_merging",
+        "messages": [{
+            "role": "user",
+            "content": "If I have 6 states, can I select which ones to keep?",
+        }],
+        "context": _context(
+            "analysis", _sam_hmm_controls(), active_cell_type="T-cells",
+            analysis={
+                "view": "behavioral_state",
+                "selected_cell_type": "T-cells",
+            },
+        ),
+        "check": _check_hmm_merge_states,
+    }
+
+
+def _active_killing_zero_threshold_readiness_case() -> dict:
+    return {
+        "name": "active_killing_zero_threshold_is_not_ready",
+        "messages": [
+            {"role": "assistant", "content": "Active Killing setup"},
+            {"role": "user", "content": "Is it ready?"},
+        ],
+        "context": _context(
+            "feature_extraction", [], active_cell_type="tcell",
+            feature_extraction={
+                "active_killing_open": True,
+                "active_killing": {
+                    "setup_ready": False,
+                    "setup_issues": [
+                        "Absolute signal-increase threshold must be greater than 0."
+                    ],
+                },
+            },
+        ),
+        "check": _check_active_killing_zero_threshold_readiness,
     }
 
 
@@ -1472,13 +1804,62 @@ def _metadata_save_case() -> dict:
 def _choose_analysis_case() -> dict:
     return {
         "name": "choose_analysis_explains_options",
-        "messages": [{"role": "user", "content": "Choose analysis"}],
+        "messages": [{
+            "role": "user",
+            "content": "Can you help me pick what analysis would be nice for my data?",
+        }],
         "context": _context(
             "analysis", [],
             assistant_session={"intent": "choose_analysis"},
             analysis={"view": "death_dynamics"},
+            metadata={
+                "loaded": True,
+                "n_samples": 8,
+                "cell_types": {
+                    "organoid": ["Organoids"],
+                    "immune": ["Macrophages", "T-cells"],
+                    "other": [],
+                },
+                "records": [{
+                    "sample_name": "Movie1",
+                    "or_Organoids_line_condition": "DO7",
+                    "im_Macrophages_line_condition": "M21",
+                    "im_T-cells_line_condition": "GD2_CART",
+                    "dead_channel": 3,
+                }],
+                "validation": [],
+            },
         ),
         "check": _check_choose_analysis,
+    }
+
+
+def _metadata_not_added_case() -> dict:
+    control_id = "metadata.samples.0.cell_types.Macrophages.line"
+    return {
+        "name": "metadata_absent_population_uses_not_added",
+        "messages": [{
+            "role": "user",
+            "content": "Macrophages were not added in Sample 1; set that line.",
+        }],
+        "context": _context(
+            "data_preparation", [
+                _control(
+                    control_id,
+                    "Sample 1, Macrophages: line",
+                    "",
+                    cell_type="Macrophages",
+                ),
+            ],
+            metadata={
+                "loaded": True,
+                "record_source": "metadata_builder_draft",
+                "records": [{"sample_name": "Sample1"}],
+                "validation": [],
+            },
+            metadata_builder={"open": True, "sample_forms_created": True},
+        ),
+        "check": _check_metadata_not_added,
     }
 
 
@@ -1516,7 +1897,10 @@ def _check_organoid_line_grouping(result: dict) -> list[str]:
 def _check_metadata_identifier_confirmation(result: dict) -> list[str]:
     text = result["text"].lower()
     errors = []
-    for phrase in ("well", "mandatory", "condition is optional", "m21/m23", "none"):
+    for phrase in (
+        "well", "mandatory", "condition is optional", "m21/m23",
+        "not added", "not_added",
+    ):
         if phrase not in text:
             errors.append(f"missing identifier guidance: {phrase}")
     if result["calls"]:
@@ -1544,7 +1928,7 @@ def _check_metadata_completion(result: dict) -> list[str]:
     errors = []
     for phrase in (
         "mandatory well", "mandatory t-cells line",
-        "mandatory macrophages line", "condition", "optional", "none",
+        "mandatory macrophages line", "condition", "optional", "not_added",
     ):
         if phrase not in text:
             errors.append(f"missing completeness detail: {phrase}")
@@ -1567,11 +1951,31 @@ def _check_metadata_save(result: dict) -> list[str]:
 def _check_choose_analysis(result: dict) -> list[str]:
     text = result["text"].lower()
     errors = []
-    for phrase in ("death dynamics", "behavioral state", "state trajectory"):
+    for phrase in (
+        "death dynamics", "interaction analysis", "invasiveness analysis",
+        "active killing", "behavioral state", "state trajectory", "backprojection",
+    ):
         if phrase not in text:
             errors.append(f"did not explain {phrase}")
+    for phrase in ("8 samples", "do7", "m21", "gd2_cart"):
+        if phrase not in text:
+            errors.append(f"did not ground the recommendation in metadata: {phrase}")
     if result["calls"]:
         errors.append("Choose analysis navigated instead of explaining options")
+    return errors
+
+
+def _check_metadata_not_added(result: dict) -> list[str]:
+    changed = _changed_values(result)
+    control_id = "metadata.samples.0.cell_types.Macrophages.line"
+    errors = []
+    if changed.get(control_id) != "not_added":
+        errors.append("did not write the CSV-safe not_added line value")
+    text = result["text"].lower()
+    if "not added" not in text or "not_added" not in text:
+        errors.append("did not explain the absent population in researcher-facing terms")
+    if re.search(r"\bline value\s+none\b", text):
+        errors.append("still recommended None as the line value")
     return errors
 
 
@@ -2140,6 +2544,7 @@ def _check_active_killing(result: dict) -> list[str]:
         "features.active_killing.observation_window": 5,
         "features.active_killing.death_signal": "Dead-mask pixel count",
         "features.active_killing.use_absolute_threshold": True,
+        "features.active_killing.absolute_threshold": 30,
     }
     errors = []
     for control_id, value in expected.items():
@@ -2156,6 +2561,158 @@ def _check_active_killing(result: dict) -> list[str]:
         "i've set", "i have set", "changes are applied", "changes were applied",
     )):
         errors.append("claimed proposed Active Killing changes were already applied")
+    return errors
+
+
+def _check_feature_group_dead_dye(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "required", "intensity", "mean dead-dye intensity",
+        "will not suggest removing",
+    ):
+        if phrase not in text:
+            errors.append(f"missing mandatory feature guidance: {phrase}")
+    if "drop intensity" in text or "remove intensity" in text:
+        errors.append("still suggested removing required T-cell intensity")
+    if result["calls"]:
+        errors.append("changed feature groups before the optional-group choice")
+    return errors
+
+
+def _check_active_killing_complete_acceptance(result: dict) -> list[str]:
+    changed = _changed_values(result)
+    expected = {
+        "features.active_killing.target_types": ["27t", "mdo"],
+        "features.active_killing.observation_window": 5,
+        "features.active_killing.death_signal": "Dead-mask pixel count",
+        "features.active_killing.use_absolute_threshold": True,
+        "features.active_killing.absolute_threshold": 30,
+        "features.active_killing.minimum_contact_duration": 1,
+    }
+    errors = []
+    for control_id, value in expected.items():
+        if changed.get(control_id) != value:
+            errors.append(
+                f"{control_id} was {changed.get(control_id)!r}, expected {value!r}"
+            )
+    text = result["text"].lower()
+    for phrase in (
+        "complete agreed active killing setup",
+        "independently",
+        "combined analysis",
+        "not ready until every action card",
+    ):
+        if phrase not in text:
+            errors.append(f"missing setup-completeness guidance: {phrase}")
+    return errors
+
+
+def _check_hmm_movement_options(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "speed", "displacement", "cumulative displacement",
+        "displacement from origin", "directional persistence",
+        "median turning angle", "net displacement", "straightness",
+        "mean square displacement", "use all available movement features",
+    ):
+        if phrase not in text:
+            errors.append(f"missing movement option: {phrase}")
+    if "mean dead dye" in text:
+        errors.append("included a non-movement intensity feature")
+    if result["calls"]:
+        errors.append("changed HMM inputs before the researcher chose features")
+    return errors
+
+
+def _check_hmm_apply_all_movement(result: dict) -> list[str]:
+    changed = _changed_values(result)
+    prefix = "analysis.state_classification.tcell."
+    errors = []
+    expected_timepoint = [
+        "speed", "displacement", "cumulative_displacement",
+        "displacement_from_origin", "directional_persistence",
+        "median_turning_angle",
+    ]
+    expected_window = [
+        "net_displacement", "straightness", "mean_square_displacement",
+    ]
+    if changed.get(prefix + "timepoint_features") != expected_timepoint:
+        errors.append("did not propose all offered timepoint movement features")
+    if changed.get(prefix + "window_features") != expected_window:
+        errors.append("did not propose all offered window movement features")
+    if "mean_dead_dye" in str(changed):
+        errors.append("included a non-movement intensity feature")
+    if "complete movement-only selection" not in result["text"].lower():
+        errors.append("did not describe the two-list selection as complete")
+    return errors
+
+
+def _check_hmm_selected_cell_setup(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    if "currently have **t-cells** selected" not in text:
+        errors.append("did not acknowledge the live T-cell selection")
+    for phrase in ("speed", "net displacement", "rename", "merge", "backprojection"):
+        if phrase not in text:
+            errors.append(f"missing selected-cell setup step: {phrase}")
+    if result["calls"]:
+        errors.append("changed HMM settings during an explanation-only request")
+    return errors
+
+
+def _check_hmm_macrophage_contact_for_tcells(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "currently have **t-cells** selected",
+        "a cell from t-cells is directly touching macrophages",
+        "not a different population",
+    ):
+        if phrase not in text:
+            errors.append(f"missing selected-cell contact meaning: {phrase}")
+    if result["calls"]:
+        errors.append("changed binary groups before the researcher requested an edit")
+    return errors
+
+
+def _check_hmm_add_binary_groups_for_tcells(result: dict) -> list[str]:
+    changed = _changed_values(result)
+    control_id = "analysis.state_classification.T-cells.binary_feature_groups"
+    errors = []
+    if changed.get(control_id) != ["Organoid_contact", "dead"]:
+        errors.append("did not update the selected T-cell binary-group control")
+    if "t-cells" not in result["text"].lower():
+        errors.append("did not identify the selected T-cell population")
+    return errors
+
+
+def _check_hmm_merge_states(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "rename primary dynamic state clusters", "same name", "merge",
+        "full behavioral clusters",
+    ):
+        if phrase not in text:
+            errors.append(f"missing supported state-merge guidance: {phrase}")
+    if any(phrase in text for phrase in (
+        "not a built-in feature", "outside behav3d", "ignore ones",
+    )):
+        errors.append("claimed BEHAV3D cannot merge states")
+    if result["calls"]:
+        errors.append("changed HMM settings during a workflow explanation")
+    return errors
+
+
+def _check_active_killing_zero_threshold_readiness(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    if "not ready yet" not in text or "greater than 0" not in text:
+        errors.append("did not report the zero absolute threshold as incomplete")
+    if result["calls"]:
+        errors.append("attempted another partial edit instead of reporting readiness")
     return errors
 
 
@@ -2302,6 +2859,7 @@ SCENARIOS = [
     _metadata_completion_case,
     _metadata_save_case,
     _choose_analysis_case,
+    _metadata_not_added_case,
     _open_death_dynamics_case,
     _metadata_setup_case,
     _pixel_fill_case,
@@ -2334,6 +2892,15 @@ SCENARIOS = [
     _filtering_case,
     _reporter_propagation_case,
     _active_killing_case,
+    _feature_group_dead_dye_case,
+    _active_killing_complete_acceptance_case,
+    _hmm_movement_options_case,
+    _hmm_apply_all_movement_case,
+    _hmm_selected_cell_setup_case,
+    _hmm_macrophage_contact_for_tcells_case,
+    _hmm_add_binary_groups_for_tcells_case,
+    _hmm_merge_states_case,
+    _active_killing_zero_threshold_readiness_case,
     _hmm_single_frame_case,
     _trajectory_linkage_case,
     _functional_experiment_context_case,
