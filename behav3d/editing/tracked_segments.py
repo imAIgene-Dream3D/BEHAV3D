@@ -196,6 +196,63 @@ def _pick_erosion_backend():
 _EROSION_FN = _pick_erosion_backend()
 
 
+def _seed_components_by_nearest(
+    mask_t: np.ndarray,
+    prev: np.ndarray,
+    seed_ids: Sequence[int],
+) -> np.ndarray:
+    """Build propagation markers so every mask blob keeps a sub-label.
+
+    The default seeding for split propagation keeps a previous sub-label only
+    where its pixels still overlap the current frame's mask.  For small,
+    spatially-separate cells that move between frames, a blob can end up with
+    *no* overlapping marker; a plain watershed then leaves that whole
+    (disconnected) blob as background, silently erasing the label.
+
+    This helper starts from the same overlap markers but additionally matches
+    any *orphan* connected component (one that received no overlap marker) to
+    the nearest previous sub-label by centroid distance, dropping a single seed
+    inside it.  Blobs that already carry a marker are left untouched, so the
+    watershed still splits genuinely-connected regions along a ridge exactly as
+    before.  Only existing mask pixels are ever labelled — a cell that truly
+    left the frame has no blob and so is still (correctly) not propagated.
+    """
+    from scipy.ndimage import label as _cc_label, center_of_mass
+
+    prev_seg = np.where(np.isin(prev, seed_ids), prev, 0).astype(prev.dtype)
+    markers = np.where(mask_t, prev_seg, 0).astype(prev.dtype)
+
+    # Previous-frame centroid of each sub-label, computed on the whole prev
+    # frame (not just the overlap) so a moved cell still has a reference point.
+    centroids: Dict[int, np.ndarray] = {}
+    for sid in seed_ids:
+        m = prev == sid
+        if m.any():
+            centroids[int(sid)] = np.array(center_of_mass(m))
+    if not centroids:
+        return markers
+
+    cc, n_cc = _cc_label(mask_t)
+    for comp in range(1, n_cc + 1):
+        comp_mask = cc == comp
+        # Component already seeded by overlap — let watershed handle it.
+        if (markers[comp_mask] > 0).any():
+            continue
+        # Orphan blob: assign it to the nearest previous sub-label.
+        comp_centroid = np.array(center_of_mass(comp_mask))
+        nearest = min(
+            centroids,
+            key=lambda sid: float(np.linalg.norm(centroids[sid] - comp_centroid)),
+        )
+        cz, cy, cx = (int(round(v)) for v in comp_centroid)
+        if not comp_mask[cz, cy, cx]:
+            # Centroid can fall outside a concave/annular blob; use any voxel.
+            zs, ys, xs = np.nonzero(comp_mask)
+            cz, cy, cx = int(zs[0]), int(ys[0]), int(xs[0])
+        markers[cz, cy, cx] = nearest
+    return markers
+
+
 def _ellipsoid_footprint(r_xy: int, r_z: int) -> np.ndarray:
     """Discrete (2*r_z+1, 2*r_xy+1, 2*r_xy+1) ellipsoid mask for 3D ops."""
     r_xy = max(0, int(r_xy))
@@ -331,16 +388,13 @@ def split_label(
             if not mask_t.any():
                 # Track has gaps — stop propagating in this direction.
                 break
-            # Restrict prev sub-labels to current mask (so they only seed
-            # pixels still inside the parent).
-            prev_seg = np.where(np.isin(prev, seed_ids), prev, 0).astype(prev.dtype)
-            prev_inside = np.where(mask_t, prev_seg, 0)
-            # Some labels from prev may not survive into this frame (cell
-            # disappears) — in that case, only the surviving children get
-            # propagated.  Watershed needs at least one marker.
+            # Seed the current mask from the previous frame's sub-labels.
+            # Overlapping pixels seed directly; any blob that would otherwise
+            # be left marker-less (e.g. a small, separate cell that moved) is
+            # matched to the nearest previous sub-label so it is not erased.
+            prev_inside = _seed_components_by_nearest(mask_t, prev, seed_ids)
+            # No sub-label survives anywhere in this frame's mask — stop.
             if not (prev_inside > 0).any():
-                # Fallback: use the previous frame's sub-label centroids
-                # projected back into the new mask.
                 break
             t_seg_label = mask_t.astype(prev.dtype)
             new_sub = _run_single_timepoint_propagation(
