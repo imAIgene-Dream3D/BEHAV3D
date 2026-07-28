@@ -22,6 +22,7 @@ from behav3d.features.state_descriptive_features import extract_descibing_track_
 from behav3d.analysis.behavior.track.dtw import (
     _add_cluster_medoids,
     _cluster_precomputed_distances,
+    _cluster_precomputed_distances_leiden,
     _ensure_dtaidistance_umap,
     _relabel_by_cluster_size,
     _validate_distance_matrix,
@@ -940,6 +941,9 @@ def run_categorical_dtaidistance_trajectory_clustering(
     psi=None,
     parallel=True,
     linkage="average",
+    clustering_method="agglomerative",
+    leiden_n_neighbors=15,
+    leiden_resolution=1.0,
     missing_policy="keep",
     cluster_key="ClusterID",
     save_outputs=True,
@@ -956,7 +960,14 @@ def run_categorical_dtaidistance_trajectory_clustering(
     random_state=123,
     verbose=True,
 ):
-    """Cluster categorical state trajectories with dtaidistance over one-hot encodings."""
+    """Cluster categorical state trajectories with dtaidistance over one-hot encodings.
+
+    clustering_method="agglomerative" (default) uses AgglomerativeClustering with a
+    fixed n_clusters/linkage. clustering_method="leiden" instead runs Leiden graph
+    clustering (leiden_n_neighbors/leiden_resolution) on the same precomputed distance
+    matrix that the QC UMAP embedding is built from, so the emergent number of clusters
+    tends to track the density blobs visible in that plot rather than a fixed split.
+    """
     started = time.perf_counter()
     if bool(clear_outputs):
         outfolder = Path(output_dir).expanduser() / "analysis" / str(cell_type) / str(output_subdir_name)
@@ -1039,13 +1050,31 @@ def run_categorical_dtaidistance_trajectory_clustering(
     )
     dtw_backend = "dtaidistance"
 
-    if bool(verbose):
-        _winfo("trajectory-dtai", f"clustering precomputed distances with n_clusters={int(n_clusters)}")
-    raw_labels, _ = _cluster_precomputed_distances(
-        distances,
-        n_clusters=int(n_clusters),
-        linkage=str(linkage),
-    )
+    clustering_method = str(clustering_method).strip().lower()
+    if clustering_method not in {"agglomerative", "leiden"}:
+        raise ValueError("clustering_method must be 'agglomerative' or 'leiden'.")
+
+    if clustering_method == "leiden":
+        if bool(verbose):
+            _winfo(
+                "trajectory-dtai",
+                "clustering precomputed distances with Leiden "
+                f"(n_neighbors={int(leiden_n_neighbors)}, resolution={leiden_resolution})",
+            )
+        raw_labels, _ = _cluster_precomputed_distances_leiden(
+            distances,
+            n_neighbors=int(leiden_n_neighbors),
+            resolution=leiden_resolution,
+            random_state=int(random_state),
+        )
+    else:
+        if bool(verbose):
+            _winfo("trajectory-dtai", f"clustering precomputed distances with n_clusters={int(n_clusters)}")
+        raw_labels, _ = _cluster_precomputed_distances(
+            distances,
+            n_clusters=int(n_clusters),
+            linkage=str(linkage),
+        )
     labels, size_mapping = _relabel_by_cluster_size(raw_labels)
     track_obs[cluster_key] = pd.Categorical(labels)
 
@@ -1065,7 +1094,8 @@ def run_categorical_dtaidistance_trajectory_clustering(
         silhouette = None
 
     adata_tracks.uns["dtai_trajectory_clustering"] = {
-        "method": "categorical_onehot_dtaidistance_agglomerative",
+        "method": f"categorical_onehot_dtaidistance_{clustering_method}",
+        "clustering_method": str(clustering_method),
         "dtw_backend": str(dtw_backend),
         "local_encoding": "one_hot",
         "inner_dist": "squared euclidean",
@@ -1081,14 +1111,17 @@ def run_categorical_dtaidistance_trajectory_clustering(
         "split_long_tracks": bool(split_long_tracks),
         "trajectory_window_col": str(trajectory_window_col),
         "max_tracks": None if max_tracks is None else int(max_tracks),
-        "n_clusters": int(n_clusters),
+        "n_clusters": int(n_clusters) if clustering_method == "agglomerative" else None,
+        "n_clusters_found": int(len(set(labels))),
         "window": None if window is None else int(window),
         "max_dist": None if max_dist is None else float(max_dist),
         "max_length_diff": None if max_length_diff is None else int(max_length_diff),
         "penalty": None if penalty is None else float(penalty),
         "psi": None if psi is None else int(psi),
         "parallel": bool(parallel),
-        "linkage": str(linkage),
+        "linkage": str(linkage) if clustering_method == "agglomerative" else None,
+        "leiden_n_neighbors": int(leiden_n_neighbors) if clustering_method == "leiden" else None,
+        "leiden_resolution": leiden_resolution if clustering_method == "leiden" else None,
         "missing_policy": str(missing_policy),
         "cluster_key": str(cluster_key),
         "raw_label_size_mapping": dict(size_mapping),

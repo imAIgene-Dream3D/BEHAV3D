@@ -1786,6 +1786,33 @@ class StateClassificationSubTab(QWidget):
         self.log_edit.append(formatted)
         print(formatted)
 
+    # ── Open-folder pop-up ─────────────────────────────────────────────
+    def _offer_open_results_folder(self, folder: Path, what: str = "State Classification"):
+        """Pop a dialog offering to open the results folder in the OS file manager.
+
+        Silently no-ops if ``folder`` does not exist (e.g. analysis failed).
+        """
+        try:
+            if not folder or not Path(folder).exists():
+                return
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Information)
+            box.setWindowTitle(f"{what} complete")
+            box.setText(f"{what} analysis is complete.")
+            box.setInformativeText(
+                f"Results have been saved to:\n{folder}\n\n"
+                "Would you like to open the results folder?"
+            )
+            btn_open = box.addButton("Open folder", QMessageBox.AcceptRole)
+            box.addButton("Close", QMessageBox.RejectRole)
+            box.setDefaultButton(btn_open)
+            box.exec_()
+            if box.clickedButton() is btn_open:
+                from qtpy.QtCore import QUrl
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+        except Exception as e:
+            self._log(f"Could not show results-folder dialog: {e}")
+
     def _on_run_state(self):
         ct = self._cell_type()
         if not ct:
@@ -1871,7 +1898,7 @@ class StateClassificationSubTab(QWidget):
         params.setdefault("state_classification", {})[ct] = collected
         _save_behav3d_params(self.metadata_loader, self._out_dir)
 
-    def _on_state_done(self, result):
+    def _on_state_done(self, result, interactive: bool = True):
         ct = self._cell_type()
         self._persist_state_cfg(ct)
         self._log(f"✅ State classification complete for '{ct}'.")
@@ -1900,6 +1927,16 @@ class StateClassificationSubTab(QWidget):
         self._update_bp_buttons()
         self._notify_results()
         QTimer.singleShot(0, lambda _ct=ct: self._apply_to_full_dataset_after_rename(_ct))
+        if interactive:
+            diagnostics_pdf = None
+            try:
+                diagnostics_pdf = result.uns.get("clustering", {}).get("diagnostics_pdf")
+            except Exception:
+                diagnostics_pdf = None
+            if diagnostics_pdf:
+                self._offer_open_results_folder(
+                    Path(diagnostics_pdf).parent, what="State Classification"
+                )
 
     def run_state_classification(self, interactive=True, extra_callbacks=None):
         """Called from queue runner (_queue.py)."""
@@ -1927,7 +1964,7 @@ class StateClassificationSubTab(QWidget):
             return res["model_adata"]
 
         def _done(result):
-            self._on_state_done(result)
+            self._on_state_done(result, interactive=interactive)
             if on_done_cb:
                 on_done_cb(result)
 
@@ -2758,13 +2795,26 @@ class TrackClassificationSubTab(QWidget):
         dtw_form = QFormLayout()
         dtw_form.setSpacing(3)
 
+        self.combo_clustering_method = QComboBox()
+        self.combo_clustering_method.addItems(["agglomerative", "leiden"])
+        self.combo_clustering_method.setMaximumWidth(130)
+        dtw_form.addRow("Method:", make_help_row(
+            self.combo_clustering_method, "Clustering method",
+            "Algorithm used to group track trajectories from the DTW distance matrix. "
+            "'agglomerative' uses a fixed cluster count (N clusters, Linkage below). "
+            "'leiden' finds density-based communities on the same distance matrix the "
+            "QC UMAP plot is built from, so the number of clusters is emergent (set via "
+            "Leiden resolution below) and tends to track the blobs visible in that plot "
+            "instead of a fixed split."
+        ))
+
         self.combo_linkage = QComboBox()
         self.combo_linkage.addItems(["average", "complete", "single"])
         self.combo_linkage.setMaximumWidth(130)
         dtw_form.addRow("Linkage:", make_help_row(
             self.combo_linkage, "Linkage",
             "Agglomerative clustering linkage method. 'average' is the most commonly used; "
-            "'complete' produces more compact clusters."
+            "'complete' produces more compact clusters. Only used when Method is 'agglomerative'."
         ))
 
         self.combo_trim = QComboBox()
@@ -2785,6 +2835,31 @@ class TrackClassificationSubTab(QWidget):
             "are preserved for backprojection."
         ))
         self.adv1.addLayout(dtw_form)
+
+        self._leiden_frame = QFrame()
+        leiden_form = QFormLayout(self._leiden_frame)
+        leiden_form.setSpacing(3)
+        self.spin_leiden_neighbors = QSpinBox()
+        self.spin_leiden_neighbors.setRange(2, 200)
+        self.spin_leiden_neighbors.setValue(15)
+        self.spin_leiden_neighbors.setMaximumWidth(90)
+        leiden_form.addRow("Leiden neighbors:", make_help_row(
+            self.spin_leiden_neighbors, "Leiden neighbors",
+            "Number of nearest neighbours used to build the graph Leiden clusters on. "
+            "Higher values smooth over noise but can merge distinct groups."
+        ))
+        self.spin_leiden_resolution = QDoubleSpinBox()
+        self.spin_leiden_resolution.setRange(0.01, 20.0)
+        self.spin_leiden_resolution.setSingleStep(0.1)
+        self.spin_leiden_resolution.setDecimals(2)
+        self.spin_leiden_resolution.setValue(1.0)
+        self.spin_leiden_resolution.setMaximumWidth(90)
+        leiden_form.addRow("Leiden resolution:", make_help_row(
+            self.spin_leiden_resolution, "Leiden resolution",
+            "Controls how many Leiden clusters are found: higher values produce more, "
+            "smaller clusters; lower values produce fewer, larger ones."
+        ))
+        self.adv1.addWidget(self._leiden_frame)
 
         self.chk_parallel = QCheckBox("Parallel computation")
         self.chk_parallel.setChecked(True)
@@ -3370,9 +3445,11 @@ class TrackClassificationSubTab(QWidget):
         lay.addStretch(1)
 
         self._setup_signals()
+        self._apply_clustering_method_mode(self.combo_clustering_method.currentText())
 
     def _setup_signals(self):
         self.chk_apply_pretrained.toggled.connect(self._toggle_pretrained_mode)
+        self.combo_clustering_method.currentTextChanged.connect(self._apply_clustering_method_mode)
         self.chk_use_original.toggled.connect(self._on_original_toggled_from_adv)
         self.chk_use_original_top.toggled.connect(self._on_original_toggled_from_top)
         self.btn_run_track.clicked.connect(self._on_run_cluster)
@@ -3595,6 +3672,12 @@ class TrackClassificationSubTab(QWidget):
         if checked:
             self._show_original_dtw_disclaimer()
 
+    def _apply_clustering_method_mode(self, method: str):
+        """Update visibility/enabled state of Linkage vs Leiden-specific controls."""
+        is_leiden = str(method) == "leiden"
+        self.combo_linkage.setEnabled(not is_leiden)
+        self._leiden_frame.setVisible(is_leiden)
+
     def _apply_original_mode(self, checked: bool):
         """Update visibility of UI sections for original vs dtaidistance mode."""
         self.chk_use_original_top.setVisible(checked)
@@ -3665,6 +3748,9 @@ class TrackClassificationSubTab(QWidget):
             "behavioral_trajectory_size": int(self.spin_traj_size.value()),
             "n_clusters":                 int(self.spin_n_clusters.value()),
             "linkage":                    self.combo_linkage.currentText(),
+            "clustering_method":          self.combo_clustering_method.currentText(),
+            "leiden_n_neighbors":         int(self.spin_leiden_neighbors.value()),
+            "leiden_resolution":          float(self.spin_leiden_resolution.value()),
             "trajectory_trim_mode":       self.combo_trim.currentText(),
             "split_long_tracks":          self.chk_split_long_tracks.isChecked(),
             "parallel":                   self.chk_parallel.isChecked(),
@@ -3699,6 +3785,13 @@ class TrackClassificationSubTab(QWidget):
             self.spin_n_clusters.setValue(int(cfg["n_clusters"]))
         if "linkage" in cfg:
             self.combo_linkage.setCurrentText(cfg["linkage"])
+        if "clustering_method" in cfg:
+            self.combo_clustering_method.setCurrentText(cfg["clustering_method"])
+        if "leiden_n_neighbors" in cfg:
+            self.spin_leiden_neighbors.setValue(int(cfg["leiden_n_neighbors"]))
+        if "leiden_resolution" in cfg:
+            self.spin_leiden_resolution.setValue(float(cfg["leiden_resolution"]))
+        self._apply_clustering_method_mode(self.combo_clustering_method.currentText())
         if "trajectory_trim_mode" in cfg:
             self.combo_trim.setCurrentText(cfg["trajectory_trim_mode"])
         if "split_long_tracks" in cfg:
@@ -4146,6 +4239,9 @@ class TrackClassificationSubTab(QWidget):
             "n_clusters": int(self.spin_n_clusters.value()),
             "random_state": int(self.spin_seed.value()),
             "linkage": self.combo_linkage.currentText(),
+            "clustering_method": self.combo_clustering_method.currentText(),
+            "leiden_n_neighbors": int(self.spin_leiden_neighbors.value()),
+            "leiden_resolution": float(self.spin_leiden_resolution.value()),
             "trajectory_trim_mode": self.combo_trim.currentText(),
             "split_long_tracks": self.chk_split_long_tracks.isChecked(),
             "parallel": self.chk_parallel.isChecked(),
