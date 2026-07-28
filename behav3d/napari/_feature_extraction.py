@@ -3267,14 +3267,16 @@ class ActiveKillingPanel(QWidget):
             self.log("\u26a0\ufe0f No immune type selected.")
             return
 
-        advanced_path = (
-            self._active_killing_dir(immune)
-            / f"BEHAV3D_{immune}_advanced_track_features.csv"
+        from behav3d.features.advanced_timepoint_features import (
+            find_advanced_features_csv,
         )
-        if not advanced_path.exists():
+        advanced_path = find_advanced_features_csv(
+            self.metadata_loader.output_dir, immune
+        )
+        if advanced_path is None or not Path(advanced_path).exists():
             self.log(
-                f"\u26a0\ufe0f Advanced features CSV not found at:\n  {advanced_path}\n"
-                "Run Active Killing Analysis first."
+                "\u26a0\ufe0f No active-killing results found \u2014 run Active "
+                "Killing Analysis first."
             )
             return
 
