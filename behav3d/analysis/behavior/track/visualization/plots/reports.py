@@ -105,6 +105,18 @@ from behav3d.analysis.behavior.track.contact_grouping import (
     _contact_mean_col_name,
     _contact_max_bout_col_name,
 )
+from behav3d.analysis.behavior.state.visualization.plots.state_composition import (
+    _compute_relative_matrices_by_sample,
+    _compute_overall_relative_composition_by_sample,
+    _compute_grouped_relative_matrices,
+    _plot_page_relative_stacked_grid,
+    _plot_page_grouped_2d_grid,
+    _plot_page_grouped_stacked_grid,
+    _build_relative_plot_data_table,
+    _build_overall_summary_plot_data_table,
+    _panels_per_a4_page,
+    _paginate_samples,
+)
 from behav3d.analysis.behavior.state.utils import (
     _apply_state_order,
     _get_classification_state_colors,
@@ -742,6 +754,36 @@ def _save_contact_cluster_stack_grid_page(
     return {"n_pages": n_pages, "csv_path": str(csv_path) if csv_path is not None else None}
 
 
+def _expand_track_windows_to_timepoints(df, *, time_col="position_t", tmin_col="position_t_min", tmax_col="position_t_max"):
+    """Expand one row per track (with an active [tmin, tmax] window) into one row
+    per (track, timepoint) for every integer timepoint in its window, repeating all
+    other columns unchanged.
+
+    Track-cluster labels are one label per whole track (or, when tracks are split
+    for clustering, per sub-track), not one label per timepoint - so unlike
+    per-timepoint behavioral states, they can't be fed directly into the existing
+    relative-composition-over-time machinery. Expanding each track's window into
+    per-timepoint rows first lets that same machinery be reused as-is: a track
+    counts toward every timepoint it was actually alive/tracked for, which is what's
+    needed since split tracks can start/end at different times per track.
+    """
+    columns = list(df.columns)
+    if len(df) == 0:
+        return df.copy().assign(**{time_col: pd.Series(dtype=float)})[columns + ([time_col] if time_col not in columns else [])]
+    tmin = np.floor(pd.to_numeric(df[tmin_col], errors="coerce").to_numpy(dtype=float)).astype("int64")
+    tmax = np.floor(pd.to_numeric(df[tmax_col], errors="coerce").to_numpy(dtype=float)).astype("int64")
+    lengths = np.clip(tmax - tmin + 1, 0, None)
+    total = int(lengths.sum())
+    out_cols = columns + ([time_col] if time_col not in columns else [])
+    if total == 0:
+        return df.iloc[0:0].copy().assign(**{time_col: pd.Series(dtype=float)})[out_cols]
+    repeat_idx = np.repeat(np.arange(len(df)), lengths)
+    expanded = df.iloc[repeat_idx].reset_index(drop=True)
+    offsets = np.concatenate([np.arange(int(n)) for n in lengths])
+    expanded[time_col] = (tmin[repeat_idx] + offsets).astype(float)
+    return expanded
+
+
 def save_track_class_proportions_by_sample_plot(
     adata_tracks,
     out_dir,
@@ -758,12 +800,23 @@ def save_track_class_proportions_by_sample_plot(
     class_colors=None,
     pdf_pages=None,
     csv_dir=None,
+    time_col="position_t",
+    tmin_col="position_t_min",
+    tmax_col="position_t_max",
 ):
     """
     Save one horizontal stacked bar per sample showing track-class proportions,
     plus optional grouped grid pages (1-2 effective group columns: true 2D grid;
     3+: flat grid). ``group_x``/``group_y`` explicitly pick the 2D grid's axes;
     ``group_cols`` is the "group per page" column list (unaffected in meaning).
+
+    If ``tmin_col``/``tmax_col`` (each track's active timepoint window) are present
+    in ``adata_tracks.obs``, this also adds track-class proportions *over time*:
+    at each timepoint, the proportion of currently-active tracks/sub-tracks in
+    each class, using the same sample/group breakdown as the static bars above -
+    a track counts toward every timepoint within its own window, so tracks split
+    into sub-tracks at different points in time are each counted only over their
+    own active span.
 
     If ``pdf_pages`` (an open ``PdfPages``) is given, pages are appended to it instead of a
     standalone PDF being created. ``csv_dir`` overrides where CSVs are written (defaults to
@@ -859,6 +912,7 @@ def save_track_class_proportions_by_sample_plot(
     colors = _normalize_label_color_map(class_order, colors=resolved_colors, cmap_name=cmap_name)
     grouped_csv_path = None
     n_grouped_pages = 0
+    time_csv_path = None
 
     with (nullcontext(pdf_pages) if pdf_pages is not None else PdfPages(pdf_path)) as pdf:
         rows_per_page = stacked_proportion_barh_rows_per_page()
@@ -927,6 +981,147 @@ def save_track_class_proportions_by_sample_plot(
             grouped_csv_path = csv_dir / f"track_class_proportions_by_group_{class_token}.csv"
             pd.DataFrame(grouped_long_rows).to_csv(grouped_csv_path, index=False)
 
+        # --- Track-class proportions OVER TIME ---
+        # Each track/sub-track contributes to every timepoint within its own
+        # [tmin_col, tmax_col] window, so tracks split at different points in
+        # time are each counted only over their own active span, not the whole
+        # original track's span.
+        has_time_cols = tmin_col in adata_tracks.obs.columns and tmax_col in adata_tracks.obs.columns
+        if has_time_cols:
+            time_plot_df = (
+                adata_tracks.obs[[sample_col, class_col, tmin_col, tmax_col] + valid_group_cols]
+                .dropna(subset=[tmin_col, tmax_col])
+                .copy()
+            )
+            time_plot_df[sample_col] = (
+                time_plot_df[sample_col].astype("string").fillna("unassigned").astype(str).str.strip().replace("", "unassigned")
+            )
+            time_plot_df[class_col] = (
+                time_plot_df[class_col].astype("string").fillna("unassigned").astype(str).str.strip().replace("", "unassigned")
+            )
+            for gc in valid_group_cols:
+                time_plot_df[gc] = time_plot_df[gc].astype("string").fillna("(unknown)").astype(str)
+
+            expanded_df = _expand_track_windows_to_timepoints(
+                time_plot_df, time_col=time_col, tmin_col=tmin_col, tmax_col=tmax_col,
+            )
+
+            if len(expanded_df) > 0:
+                panels_per_page, ncols_eff, max_rows = _panels_per_a4_page(grid_ncols)
+                time_tables = []
+
+                relative_by_sample_time, _ = _compute_relative_matrices_by_sample(
+                    expanded_df, time_col=time_col, state_col=class_col, sample_col=sample_col,
+                    state_order=class_order, sample_order=sample_order,
+                )
+                overall_by_sample_time = _compute_overall_relative_composition_by_sample(
+                    expanded_df, state_col=class_col, sample_col=sample_col,
+                    state_order=class_order, sample_order=sample_order,
+                )
+                for page_samples in _paginate_samples(sample_order, samples_per_page=panels_per_page):
+                    page_rel = {s: relative_by_sample_time[s] for s in page_samples if s in relative_by_sample_time}
+                    page_overall = {s: overall_by_sample_time[s] for s in page_samples if s in overall_by_sample_time}
+                    fig_t = _plot_page_relative_stacked_grid(
+                        page_rel,
+                        overall_by_sample=page_overall,
+                        state_order=class_order,
+                        time_col=time_col,
+                        sample_col=sample_col,
+                        grid_ncols=ncols_eff,
+                        figsize_per_panel=(4.0, 2.8),
+                        state_colors=colors,
+                    )
+                    pdf.savefig(fig_t, dpi=dpi)
+                    plt.close(fig_t)
+
+                time_tables.extend([
+                    _build_relative_plot_data_table(relative_by_sample_time, plot_view="stacked_by_sample").assign(
+                        plot_component="timecourse"
+                    ),
+                    _build_overall_summary_plot_data_table(overall_by_sample_time, plot_view="stacked_by_sample").assign(
+                        plot_component="overall_summary"
+                    ),
+                ])
+
+                if valid_group_cols:
+                    relative_by_group_time, overall_by_group_time = _compute_grouped_relative_matrices(
+                        expanded_df, group_cols=valid_group_cols, time_col=time_col,
+                        state_col=class_col, state_order=class_order,
+                    )
+                    time_group_label_title = ", ".join(valid_group_cols)
+                    time_unique_vals_per_col = {}
+                    if len(valid_group_cols) in (1, 2):
+                        for col in valid_group_cols:
+                            time_unique_vals_per_col[col] = sorted(
+                                expanded_df[col].astype(str).dropna().unique().tolist()
+                            )
+
+                    if len(valid_group_cols) in (1, 2):
+                        if len(valid_group_cols) == 2:
+                            row_col = axis_cols[0] if axis_cols is not None else max(
+                                valid_group_cols, key=lambda c: len(time_unique_vals_per_col[c])
+                            )
+                            col_y_vals = time_unique_vals_per_col[row_col]
+                        else:
+                            col_y_vals = time_unique_vals_per_col[valid_group_cols[0]]
+                        for row_start in range(0, max(1, len(col_y_vals)), max_rows):
+                            row_end = min(row_start + max_rows, len(col_y_vals))
+                            fig_gt = _plot_page_grouped_2d_grid(
+                                relative_by_group_time,
+                                overall_by_group=overall_by_group_time,
+                                group_cols=valid_group_cols,
+                                unique_vals_per_col=time_unique_vals_per_col,
+                                state_order=class_order,
+                                time_col=time_col,
+                                group_label_title=time_group_label_title,
+                                state_colors=colors,
+                                row_slice=(row_start, row_end),
+                                axis_cols=axis_cols,
+                            )
+                            pdf.savefig(fig_gt, dpi=dpi)
+                            plt.close(fig_gt)
+                    else:
+                        time_group_keys = list(relative_by_group_time.keys())
+                        for page_groups in _chunk_list(time_group_keys, panels_per_page):
+                            page_rel_g = {k: relative_by_group_time[k] for k in page_groups}
+                            page_overall_g = {k: overall_by_group_time[k] for k in page_groups}
+                            fig_gt = _plot_page_grouped_stacked_grid(
+                                page_rel_g,
+                                overall_by_group=page_overall_g,
+                                state_order=class_order,
+                                time_col=time_col,
+                                group_label_title=time_group_label_title,
+                                grid_ncols=ncols_eff,
+                                figsize_per_panel=(4.0, 2.8),
+                                state_colors=colors,
+                            )
+                            pdf.savefig(fig_gt, dpi=dpi)
+                            plt.close(fig_gt)
+
+                    time_group_label_lookup = (
+                        expanded_df.assign(_group_label=_make_group_label(expanded_df, valid_group_cols).values)
+                        .drop_duplicates(subset=["_group_label"])
+                        .set_index("_group_label")[valid_group_cols]
+                    )
+                    time_group_timecourse = _build_relative_plot_data_table(
+                        relative_by_group_time, plot_view="stacked_by_group", label_col_name="group_label"
+                    ).assign(plot_component="group_timecourse")
+                    time_group_overall = _build_overall_summary_plot_data_table(
+                        overall_by_group_time, plot_view="stacked_by_group", label_col_name="group_label"
+                    ).assign(plot_component="group_overall_summary")
+                    for gtable in (time_group_timecourse, time_group_overall):
+                        if len(gtable) > 0:
+                            for col in valid_group_cols:
+                                gtable[col] = gtable["group_label"].map(time_group_label_lookup[col])
+                    time_tables.extend([time_group_timecourse, time_group_overall])
+
+                time_csv_path = csv_dir / f"track_class_proportions_over_time_{class_token}.csv"
+                pd.concat(time_tables, ignore_index=True).to_csv(time_csv_path, index=False)
+            elif verbose:
+                print(f"  Note: no valid {tmin_col}/{tmax_col} rows — skipping proportions-over-time.")
+        elif verbose:
+            print(f"  Note: '{tmin_col}'/'{tmax_col}' not found in adata_tracks.obs — skipping proportions-over-time.")
+
     color_hex = {str(k): str(to_hex(v)) for k, v in colors.items()}
     return {
         "pdf_path": str(pdf_path),
@@ -937,6 +1132,7 @@ def save_track_class_proportions_by_sample_plot(
         "group_cols": valid_group_cols,
         "grouped_csv_path": str(grouped_csv_path) if grouped_csv_path is not None else None,
         "n_grouped_pages": n_grouped_pages,
+        "time_csv_path": str(time_csv_path) if time_csv_path is not None else None,
     }
 
 

@@ -440,7 +440,7 @@ def validate_metadata_records(records: list[dict]) -> list[dict]:
 
         # Draft builder records keep line and condition as separate nested
         # fields. A line is mandatory for every configured population; condition
-        # is optional. Use the literal value "None" for a confirmed absent
+        # is optional. Use the literal value "not_added" for a confirmed absent
         # population so absence is explicit rather than indistinguishable from an
         # unfinished row.
         for cell_type, fields in (record.get("cell_types") or {}).items():
@@ -534,7 +534,7 @@ _METADATA_FIELD_REQUIREMENTS = {
         "Dead-mask path",
     ],
     "absence_value": (
-        'Use "None" as the line only after the researcher confirms that a '
+        'Use "not_added" as the line only after the researcher confirms that a '
         "configured population is absent from that sample."
     ),
 }
@@ -1114,11 +1114,49 @@ def _feature_extraction_state(main_widget) -> dict:
             lambda: [str(item.text()) for item in target_list.selectedItems()],
             [],
         ) or []
+    use_absolute = bool(_widget_value(
+        getattr(active, "check_abs_threshold", None)
+    ))
+    absolute_threshold = _widget_value(
+        getattr(active, "spin_abs_threshold", None)
+    )
+    observation_window = _widget_value(
+        getattr(active, "spin_obs_window", None)
+    )
+    minimum_contact = _widget_value(
+        getattr(active, "spin_min_contact", None)
+    )
+    effector = _widget_value(getattr(active, "immune_combo", None))
+    issues = []
+    if not effector or str(effector).startswith("(no immune"):
+        issues.append("Select an immune effector cell type.")
+    if not targets:
+        issues.append("Select at least one target cell type.")
+    if use_absolute:
+        try:
+            if float(absolute_threshold) <= 0:
+                issues.append(
+                    "Absolute signal-increase threshold must be greater than 0."
+                )
+        except (TypeError, ValueError):
+            issues.append("Set a valid absolute signal-increase threshold.")
     return {
         "active_killing_open": expanded,
         "active_killing": {
-            "effector_cell_type": _widget_value(getattr(active, "immune_combo", None)),
+            "effector_cell_type": effector,
             "target_cell_types": targets,
+            "observation_window": observation_window,
+            "death_signal": _widget_value(
+                getattr(active, "death_signal_combo", None)
+            ),
+            "uses_absolute_threshold": use_absolute,
+            "absolute_threshold": absolute_threshold,
+            "threshold_multiplier": _widget_value(
+                getattr(active, "spin_threshold_mult", None)
+            ),
+            "minimum_contact_duration": minimum_contact,
+            "setup_ready": not issues,
+            "setup_issues": issues,
         },
     }
 

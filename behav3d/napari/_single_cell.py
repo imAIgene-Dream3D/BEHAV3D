@@ -3060,6 +3060,23 @@ class TrackClassificationSubTab(QWidget):
         prop_row.addWidget(self.btn_view_track_proportions)
         g_prop.addLayout(prop_row)
 
+        self.grp_window_transitions = QGroupBox("Window Transitions")
+        g_wintrans = QVBoxLayout(self.grp_window_transitions)
+        g_wintrans.setSpacing(4)
+        g_wintrans.addWidget(_make_info_label(
+            "Sankey diagram of how each track's trajectory cluster changes from one "
+            "window to the next - reconnects the sub-tracks 'Divide long tracks' split "
+            "a track into, back through their shared parent TrackID. One diagram per "
+            "sample, plus a pooled page. Needs 'Divide long tracks' to have been used."
+        ))
+        wintrans_row = QHBoxLayout()
+        self.btn_window_transitions = QPushButton("▶ Create Window Transition Sankey")
+        _style_secondary(self.btn_window_transitions)
+        wintrans_row.addWidget(self.btn_window_transitions, stretch=1)
+        self.btn_view_window_transitions = _make_view_btn()
+        wintrans_row.addWidget(self.btn_view_window_transitions)
+        g_wintrans.addLayout(wintrans_row)
+
         self.grp_track_comparison = QGroupBox("Condition Comparison Report")
         g_track_comparison = QVBoxLayout(self.grp_track_comparison)
         g_track_comparison.setSpacing(4)
@@ -3261,6 +3278,7 @@ class TrackClassificationSubTab(QWidget):
         pipeline_content_lay.setSpacing(6)
         pipeline_content_lay.addWidget(self.grp_diag)
         pipeline_content_lay.addWidget(self.grp_track_proportions)
+        pipeline_content_lay.addWidget(self.grp_window_transitions)
         pipeline_content_lay.addWidget(self.grp_track_comparison)
         pipeline_content_lay.addWidget(self.grp_contact_analysis)
         pipeline_content_lay.addWidget(self.grp_exemplar)
@@ -3370,6 +3388,8 @@ class TrackClassificationSubTab(QWidget):
         self.btn_view_diagnostics.clicked.connect(lambda: self._on_view("track_diagnostics"))
         self.btn_track_proportions.clicked.connect(self._on_track_proportions)
         self.btn_view_track_proportions.clicked.connect(lambda: self._on_view("track_proportions"))
+        self.btn_window_transitions.clicked.connect(self._on_window_transitions)
+        self.btn_view_window_transitions.clicked.connect(lambda: self._on_view("window_transitions"))
         self.btn_track_condition_comparison.clicked.connect(self._on_track_condition_comparison)
         self.btn_view_track_condition_comparison.clicked.connect(
             lambda: self._on_view("track_condition_comparison")
@@ -3495,6 +3515,7 @@ class TrackClassificationSubTab(QWidget):
     # ── Guided pipeline dispatch (Step 3 create plots) ───────────────────
     _TRACK_PIPELINE_RUN_BUTTONS = {
         "track_diagnostics": "btn_diagnostics",
+        "track_window_transitions": "btn_window_transitions",
     }
 
     def _on_pipeline_start(self, pipeline_id: str):
@@ -3516,12 +3537,13 @@ class TrackClassificationSubTab(QWidget):
         visible = {
             "track_diagnostics": {self.grp_diag},
             "track_proportions": {self.grp_track_proportions},
+            "track_window_transitions": {self.grp_window_transitions},
             "track_comparison": {self.grp_track_comparison},
             "track_contact": {self.grp_contact_analysis},
             "track_exemplars": {self.grp_exemplar},
         }.get(pipeline_id, set())
-        for group in (self.grp_diag, self.grp_track_proportions, self.grp_track_comparison,
-                      self.grp_contact_analysis, self.grp_exemplar):
+        for group in (self.grp_diag, self.grp_track_proportions, self.grp_window_transitions,
+                      self.grp_track_comparison, self.grp_contact_analysis, self.grp_exemplar):
             group.setVisible(group in visible)
         title = next(
             (s["title"] for s in TRACK_PLOT_PIPELINES if s["id"] == pipeline_id), ""
@@ -4025,6 +4047,7 @@ class TrackClassificationSubTab(QWidget):
                 self.btn_view_track, self.btn_view_train_track,
                 self.btn_view_apply_track, self.btn_view_exemplars,
                 self.btn_view_diagnostics, self.btn_view_track_proportions,
+                self.btn_view_window_transitions,
                 self.btn_view_track_condition_comparison, self.btn_view_contact_analysis,
                 self.btn_view_contact_state_shift,
             ):
@@ -4051,6 +4074,14 @@ class TrackClassificationSubTab(QWidget):
                 proportions_dir
                 and proportions_dir.exists()
                 and any(proportions_dir.glob("*.pdf"))
+            )
+        )
+        window_transitions_dir = traj_dir / "window_transitions" if traj_dir else None
+        self.btn_view_window_transitions.setEnabled(
+            bool(
+                window_transitions_dir
+                and window_transitions_dir.exists()
+                and any(window_transitions_dir.glob("*.pdf"))
             )
         )
         comparisons_dir = traj_dir / "behavior_comparisons" if traj_dir else None
@@ -4328,7 +4359,27 @@ class TrackClassificationSubTab(QWidget):
                 class_col=cluster_col,
                 verbose=True,
             )
-            return {"diagnostics": diag, "proportions": prop}
+            result = {"diagnostics": diag, "proportions": prop}
+            if "trajectory_window_id" in track_adata.obs.columns:
+                # Only meaningful when 'Divide long tracks' was used - most runs
+                # don't have this column, so skip silently rather than erroring
+                # the whole refresh for the common case. A real failure here is
+                # caught locally so it doesn't take down the reports above,
+                # which already succeeded by this point.
+                try:
+                    from behav3d.analysis.behavior.track.visualization.plots.window_transitions import (
+                        save_window_transition_report,
+                    )
+                    result["window_transitions"] = save_window_transition_report(
+                        track_adata,
+                        output_dir=str(out) if out else "",
+                        cell_type=ct,
+                        cluster_key=cluster_col,
+                        verbose=True,
+                    )
+                except Exception as exc:
+                    result["window_transitions_error"] = str(exc)
+            return result
 
         self._bg.run(
             fn=_run,
@@ -4909,6 +4960,56 @@ class TrackClassificationSubTab(QWidget):
             on_failed=lambda e: self._log(f"❌ Track proportion plots failed: {e}"),
         )
 
+    def _on_window_transitions(self):
+        ct = self._cell_type()
+        if not ct:
+            return
+        if self._track_adata is None:
+            QMessageBox.warning(self, "No data", "Run track clustering first.")
+            return
+        if "trajectory_window_id" not in self._track_adata.obs.columns:
+            QMessageBox.warning(
+                self, "No sub-track windows",
+                "This report needs tracks split into windows. Enable 'Divide long "
+                "tracks' in Step 1's Advanced Configuration and re-run track clustering.",
+            )
+            return
+        if self._bg.is_running():
+            QMessageBox.warning(self, "Busy", "Another operation is running.")
+            return
+        out = self._out_dir()
+        self._log(f"▶ Creating window transition Sankey for '{ct}'…")
+        track_adata = self._track_adata
+
+        def _run(**kw):
+            from behav3d.analysis.behavior.track.visualization.plots.window_transitions import (
+                save_window_transition_report,
+            )
+            from behav3d.napari._rename_dialog import _track_cluster_col
+            cluster_col = _track_cluster_col(track_adata) or "ClusterID"
+            return save_window_transition_report(
+                track_adata,
+                output_dir=str(out) if out else "",
+                cell_type=ct,
+                cluster_key=cluster_col,
+                verbose=True,
+            )
+
+        self._bg.run(
+            fn=_run,
+            desc=f"Window transition Sankey ({ct})…",
+            progress_row=self.progress_row,
+            buttons=[self.btn_window_transitions],
+            viewer=self.viewer,
+            inject_progress=False,
+            on_done=lambda r: (
+                self._log(f"✅ Window transition Sankey done for '{ct}'."),
+                self._update_view_buttons(),
+                self._notify_results(),
+            ),
+            on_failed=lambda e: self._log(f"❌ Window transition Sankey failed: {e}"),
+        )
+
     def _on_track_condition_comparison(self):
         ct = self._cell_type()
         if not ct:
@@ -5344,6 +5445,13 @@ class TrackClassificationSubTab(QWidget):
             candidates = [
                 (f.stem, f)
                 for f in sorted(proportions_dir.glob("*.pdf"))
+            ]
+        elif kind == "window_transitions" and traj_dir:
+            wt_dir = traj_dir / "window_transitions"
+            candidates = [(f.stem, f) for f in sorted(wt_dir.glob("*.pdf"))]
+            candidates += [
+                (f"per-sample/{f.stem}", f)
+                for f in sorted(wt_dir.glob("sankey_pdf_pages/*.pdf"))
             ]
         elif kind == "track_condition_comparison" and traj_dir:
             comparisons_dir = traj_dir / "behavior_comparisons"

@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 
-CONTROL_CONTRACT_VERSION = "3.1"
+CONTROL_CONTRACT_VERSION = "3.2"
 
 
 def _safe(fn: Callable, default=None):
@@ -153,6 +153,13 @@ def _checkset_binding(control_id, label, checks, **kwargs):
     item = _binding(control_id, label, first, getter=get, setter=set_, **kwargs)
     item["choices"] = list(checks)
     item["enabled"] = any(_is_enabled(check) for check in checks.values())
+    item["editable_choices"] = [
+        name for name, check in checks.items() if _is_enabled(check)
+    ]
+    item["required_choices"] = [
+        name for name, check in checks.items()
+        if not _is_enabled(check) and _safe(check.isChecked, False)
+    ]
     return item
 
 
@@ -870,9 +877,14 @@ def _feature_bindings(main_widget) -> list[dict]:
                     f"Active Killing: {label}", widget,
                     step="feature_extraction", unit=unit,
                     method="Active Killing", cell_type=immune,
-                    visible=expanded and relevant,
+                    visible=expanded,
                     **binding_kwargs,
                 )
+                if suffix in {"threshold_multiplier", "absolute_threshold"}:
+                    # Both alternatives must remain addressable in one assistant
+                    # proposal when the mode checkbox also changes.
+                    item["enabled"] = expanded
+                    item["active"] = relevant
                 if suffix == "death_signal":
                     item["choices"] = list(_ACTIVE_KILLING_SIGNAL_LABELS.values())
                 out.append(item)

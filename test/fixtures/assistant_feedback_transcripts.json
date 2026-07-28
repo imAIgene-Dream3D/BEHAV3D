@@ -107,16 +107,44 @@
     ]
   },
   {
+    "id": "feature_mandatory_dead_dye",
+    "step": "feature_extraction",
+    "user": "Can I drop intensity from the T-cell feature groups?",
+    "required": [
+      "intensity and contact mandatory",
+      "death mandatory when a dead channel is configured",
+      "mean dead-dye",
+      "never suggest dropping it"
+    ]
+  },
+  {
     "id": "active_killing_calibration",
     "step": "feature_extraction",
     "user": "How should I choose the active killing window and threshold?",
     "required": [
-      "one target type per run",
+      "multiple selected targets",
+      "runs each target independently",
+      "combined analysis",
       "metadata time interval",
       "dead-mask pixel count",
       "absolute increase threshold",
+      "incomplete while its value is 0",
       "do not reuse 20-30 pixels blindly",
       "minimum contact duration"
+    ]
+  },
+  {
+    "id": "hmm_movement_options",
+    "step": "analysis",
+    "user": "For Behavioral State, which movement features can I choose?",
+    "required": [
+      "enumerate all movement columns",
+      "timepoint features",
+      "additional window features",
+      "speed",
+      "directional persistence",
+      "straightness",
+      "never imply that the two currently selected features are the complete list"
     ]
   },
   {
@@ -175,8 +203,9 @@
       "complete is a reasonable comparison",
       "single linkage performs poorly",
       "original behav3d feature-based mode is deprecated",
-      "contact-based comparison plots",
-      "exemplar track"
+      "categorical dtw supports contact-based grouping",
+      "contact state-shift analysis",
+      "requires behavioral state results"
     ]
   },
   {
@@ -237,7 +266,7 @@
     "required": [
       "well and each configured population's line are mandatory",
       "condition is optional",
-      "line 'none'"
+      "line value 'not_added'"
     ]
   },
   {
@@ -245,10 +274,17 @@
     "step": "analysis",
     "user": "Choose analysis",
     "required": [
-      "choose analysis action explains",
-      "must not repeatedly navigate",
-      "open a named view directly"
-    ]
+      "death dynamics",
+      "interaction analysis",
+      "invasiveness analysis",
+      "active killing",
+      "behavioral state",
+      "state trajectory",
+      "contact-based grouping",
+      "contact state-shift analysis",
+      "backprojection"
+    ],
+    "forbidden": ["contact-based comparison plots are currently known to produce empty output"]
   },
   {
     "id": "metadata_does_not_own_channel_mapping",
@@ -336,6 +372,34 @@
       "start at 50%",
       "xy pixel size squared times z pixel size",
       "preview value"
+    ]
+  },
+  {
+    "id": "hmm_selected_cell_type_controls_contact_meaning",
+    "step": "analysis",
+    "user": "Would macrophage contact be useful as an HMM binary group while T-cells are selected?",
+    "required": [
+      "always read and state the live selected cell type",
+      "macrophages contact while t-cells are selected means a t-cell touching a macrophage"
+    ]
+  },
+  {
+    "id": "hmm_states_can_be_merged_in_step_two",
+    "step": "analysis",
+    "user": "If I have six HMM states, can I merge the ones I do not want?",
+    "required": [
+      "assigning the same biological name to multiple primary clusters merges them",
+      "full behavioral clusters"
+    ]
+  },
+  {
+    "id": "metadata_absence_uses_csv_safe_value",
+    "step": "data_preparation",
+    "user": "There were no macrophages in this sample.",
+    "required": [
+      "describe it as not added",
+      "line value 'not_added'",
+      "never use none"
     ]
   }
 ]

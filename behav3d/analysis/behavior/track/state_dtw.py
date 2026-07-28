@@ -673,6 +673,7 @@ def save_dtaidistance_exemplar_overview(
         tmin_key="position_t_min",
         tmax_key="position_t_max",
         seed=int(random_state),
+        window_key=str(meta.get("trajectory_window_col", "trajectory_window_id")),
     )
     overview_pdf = dest / "example_tracks_overview.pdf"
     with PdfPages(overview_pdf) as pdf:
@@ -780,6 +781,7 @@ def save_dtaidistance_exemplar_plots(
         tmin_key="position_t_min",
         tmax_key="position_t_max",
         seed=int(random_state),
+        window_key=str(meta.get("trajectory_window_col", "trajectory_window_id")),
     )
     exemplar_selection_csv = exemplar_root / (
         f"example_track_selection_cluster_{_sanitize_filename_token(resolved_cluster_key, fallback='cluster')}_"
@@ -804,6 +806,7 @@ def save_dtaidistance_exemplar_plots(
             tmin_key="position_t_min",
             tmax_key="position_t_max",
             seed=int(random_state),
+            window_key=str(meta.get("trajectory_window_col", "trajectory_window_id")),
         )
         overview_pdf = exemplar_root / "example_tracks_overview.pdf"
         with PdfPages(overview_pdf) as pdf:
