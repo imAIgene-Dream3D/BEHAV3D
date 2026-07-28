@@ -60,16 +60,20 @@ def detect_cell_type_columns(row: pd.Series) -> Dict[str, str]:
     return out
 
 
-def cell_types_with_tracked_segments(row: pd.Series) -> List[str]:
+def cell_types_with_tracked_segments(
+    row: pd.Series, include_multicolor: bool = False
+) -> List[str]:
     """Return cell-type names that have a non-empty ``*_tracks_image_path``.
 
-    Per-channel multicolor types (``*_N_multicolor``) are excluded because
-    only the merged/grouped output is editable.  The individual channel
-    segments should not be opened in the track editor.
+    Per-channel multicolor types (``*_N_multicolor``) are excluded by default
+    because the merged/grouped output is the usual edit target.  Pass
+    ``include_multicolor=True`` to also list the individual channels — used when
+    the user explicitly chooses to edit the independent tracks and rebuild the
+    merged output afterwards.
     """
     out: List[str] = []
     for ct_name, prefix in detect_cell_type_columns(row).items():
-        if is_multicolor_celltype(ct_name):
+        if is_multicolor_celltype(ct_name) and not include_multicolor:
             continue  # skip individual channels — only merged/grouped is editable
         col = f"{prefix}_{ct_name}_tracks_image_path" if prefix else f"{ct_name}_tracks_image_path"
         v = row.get(col)
@@ -226,7 +230,15 @@ def load_tracked_segments_into_viewer(
                 )
                 seg = np.asarray(seg)
             name = f"{sample_name} – {ct_name} tracked segments"
-            viewer.add_labels(seg, name=name, visible=not is_multicolor_celltype(ct_name))
+            # A multicolor channel is normally hidden, but when it is the
+            # explicitly requested layer (editing an independent channel) it
+            # must be visible.
+            explicit = only_cell_type is not None and ct_name == only_cell_type
+            viewer.add_labels(
+                seg,
+                name=name,
+                visible=explicit or not is_multicolor_celltype(ct_name),
+            )
             log(f"    + Tracked Labels layer: {name}")
             added.append(name)
         except Exception as exc:
