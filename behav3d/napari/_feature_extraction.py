@@ -2679,7 +2679,7 @@ class ActiveKillingPanel(QWidget):
         params_form.addRow("", self.abs_hint_label)
 
         self.spin_abs_threshold = QDoubleSpinBox()
-        self.spin_abs_threshold.setRange(0.0, 100.0)
+        self.spin_abs_threshold.setRange(0.0, 10000.0)
         self.spin_abs_threshold.setSingleStep(0.01)
         self.spin_abs_threshold.setDecimals(4)
         self.spin_abs_threshold.setValue(0.0)
