@@ -6,7 +6,7 @@ It works with pretty much any 3D microscopy data, for example 3D live co-culture
 
 <p align="center">
   <img src="docs/source/_static/icons/death_dynamics.jpg" width="200" alt="Death dynamics"/>
-  <img src="docs/source/_static/icons/invasion.jpg" width="200" alt="Invasion"/>
+  <img src="docs/source/_static/icons/invasion.jpg" width="100" alt="Invasion"/>
   <img src="docs/source/_static/icons/active_killing.jpg" width="200" alt="Active killing"/>
   <img src="docs/source/_static/icons/single_cell_analysis.jpg" width="200" alt="Single cell analysis"/>
 </p>
