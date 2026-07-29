@@ -102,6 +102,40 @@ def detect_binary_columns_from_csv(csv_path, cols, chunksize=50000):
     )
 
 
+def detect_non_numeric_columns_from_csv(csv_path, cols, chunksize=50000):
+    """Value-based detection of columns unsuitable as continuous HMM features.
+
+    A column is flagged if any non-NA value fails to parse as a finite float --
+    e.g. free-text/categorical labels ("um", "27t") or comma-separated contact-ID
+    lists ("45,46"). Such object-dtype columns silently poison the HMM
+    observation matrix's dtype when selected as a feature: pandas keeps the
+    column as ``object`` even after numeric coercion, so ``adata.X`` ends up
+    object-dtype and anndata's h5ad writer -- assuming an object array must be
+    strings -- crashes with "Can't implicitly convert non-string objects to
+    strings" the moment it hits the actual float values. These columns must be
+    excluded before they are ever offered as selectable timepoint features.
+    """
+    if csv_path is None or len(cols) == 0:
+        return []
+
+    invalid = {str(c): False for c in cols}
+    try:
+        for chunk in pd.read_csv(csv_path, usecols=cols, chunksize=chunksize, low_memory=False):
+            for col in cols:
+                key = str(col)
+                if invalid[key]:
+                    continue
+                series = chunk[col].dropna()
+                if len(series) == 0:
+                    continue
+                if pd.to_numeric(series, errors="coerce").isna().any():
+                    invalid[key] = True
+    except Exception:
+        return []
+
+    return sorted([c for c in cols if invalid[str(c)]])
+
+
 def _winfo(prefix, message):
     print(f"[{prefix}] INFO {message}")
 
@@ -902,19 +936,29 @@ class BaseStateClassificationPanel:
 
         excluded = self._excluded_non_behavior_columns(cols)
         usable_cols = [c for c in cols if c not in excluded]
+
+        # Columns that can't be parsed as continuous numbers (e.g. "touching_27ts"
+        # holding comma-separated contact-ID lists, or unit/label columns) must not
+        # be offered as selectable HMM features -- picking one silently breaks the
+        # .h5ad write later on. Binary detection below still runs over the full
+        # usable_cols so 0/1 and true/false columns keep working as before.
+        csv_path = self._resolve_track_features_csv()
+        non_numeric_cols = set(detect_non_numeric_columns_from_csv(csv_path, usable_cols))
+        feature_usable_cols = [c for c in usable_cols if c not in non_numeric_cols]
+
         base_groups = deepcopy(behav3d_calculated_features)
         matched = set()
         grouped = {}
         for group_name, patterns in base_groups.items():
             vals = []
             for pat in patterns:
-                vals.extend(expand_column_patterns(pat, usable_cols))
-            clean_vals = sorted({x for x in vals if x in usable_cols})
+                vals.extend(expand_column_patterns(pat, feature_usable_cols))
+            clean_vals = sorted({x for x in vals if x in feature_usable_cols})
             if len(clean_vals) > 0:
                 grouped[group_name] = clean_vals
                 matched.update(clean_vals)
 
-        other = sorted([c for c in usable_cols if c not in matched])
+        other = sorted([c for c in feature_usable_cols if c not in matched])
         if len(other) > 0:
             grouped["other"] = other
 
@@ -924,7 +968,7 @@ class BaseStateClassificationPanel:
         if len(preselected) == 0:
             # fallback to basic sensible defaults when present
             for f in ["speed", "elongation", "sphericity", "extent", "solidity"]:
-                if f in usable_cols:
+                if f in feature_usable_cols:
                     preselected.add(f)
 
         children = []
@@ -976,13 +1020,13 @@ class BaseStateClassificationPanel:
             for idx, title in enumerate(titles):
                 fg_acc.set_title(idx, title)
             self.feature_groups_status.value = (
-                f"<b>Available features:</b> {len(usable_cols)} usable columns "
-                f"(excluded metadata/technical: {len(excluded)})"
+                f"<b>Available features:</b> {len(feature_usable_cols)} usable columns "
+                f"(excluded metadata/technical: {len(excluded)}, "
+                f"non-numeric: {len(non_numeric_cols)})"
             )
             self.feature_groups_box.children = [fg_acc]
         self._update_selected_features_box()
 
-        csv_path = self._resolve_track_features_csv()
         binary_input_cols = [c for c in usable_cols if c not in {"interpolated"}]
         binary_candidates = self._detect_binary_columns_from_csv(
             csv_path=csv_path,

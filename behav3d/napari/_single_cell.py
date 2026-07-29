@@ -1517,10 +1517,19 @@ class StateClassificationSubTab(QWidget):
             # switching cell types could dump every feature into the binary list.
             from behav3d.widgets.base_state_classification import (
                 detect_binary_columns_from_csv,
+                detect_non_numeric_columns_from_csv,
             )
             bin_cols = detect_binary_columns_from_csv(Path(csv_path), usable_cols)
             bin_set = set(bin_cols)
-            feat_cols = [c for c in usable_cols if c not in bin_set]
+            # Columns that aren't binary and can't be parsed as continuous numbers
+            # (e.g. "touching_27ts" holding comma-separated contact-ID lists, or
+            # unit/label columns) must not be offered as selectable HMM features --
+            # picking one silently breaks the .h5ad write later on.
+            non_feature_candidates = [c for c in usable_cols if c not in bin_set]
+            non_numeric_cols = set(
+                detect_non_numeric_columns_from_csv(Path(csv_path), non_feature_candidates)
+            )
+            feat_cols = [c for c in non_feature_candidates if c not in non_numeric_cols]
             # Continuous features eligible for log scaling; reused by the
             # "Preview feature distributions" histogram button.
             self._logscale_candidate_cols = list(feat_cols)
