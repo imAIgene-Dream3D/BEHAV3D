@@ -1,6 +1,10 @@
 # ⚡ APOC (GPU)
 
-APOC ([Accelerated Pixel and Object Classifiers](https://github.com/haesleinhuepf/apoc)) is the **GPU pixel classifier** option in BEHAV3D EXPLORER — a project where, in its own words, *"clesperanto meets scikit-learn to classify pixels, objects and edges in images."* It computes image features on an OpenCL GPU, trains a Random Forest classifier on those features, and runs that classifier on the GPU to predict the class of every voxel.
+APOC ([Accelerated Pixel and Object Classifiers](https://github.com/haesleinhuepf/apoc)) is the **GPU pixel classifier** option in BEHAV3D EXPLORER. It computes image features on an OpenCL GPU, trains a Random Forest classifier on those features, and runs that classifier on the GPU to predict the class of every voxel.
+
+```{important}
+APOC trains a model for each defined cell type. If you set up N cell types in BEHAV3D, APOC trains N separate classifiers
+```
 
 APOC's own documentation does not give a formal reference for the feature and classifier parameters; the definitions on this page are the standard image-processing meanings of each filter plus the values BEHAV3D exposes. For method choice across all six segmentation options, see the [segmentation overview](./index.md#how-to-pick-a-method).
 
@@ -12,7 +16,7 @@ The strategy combo at the top of the training area controls how a trained classi
 
 | Strategy | What APOC outputs | How it becomes instance labels |
 |---|---|---|
-| **APOC (Direct Instance Segmentation)** | Already-labelled instances. | None, the output is used as-is. |
+| **APOC (Direct Instance Segmentation)** | Already-labelled instances. | Fully separated objects become instances |
 | **APOC Mask + EDT/Watershed Resegmentation** | Foreground vs. background mask. | Euclidean Distance Transform of the mask → threshold → watershed seeds → watershed → size filter. |
 | **APOC Probability Map + Watershed** | Per-voxel foreground probability. | A mask threshold defines foreground; a higher seed threshold defines watershed seeds; watershed splits touching objects on the probability map. |
 
