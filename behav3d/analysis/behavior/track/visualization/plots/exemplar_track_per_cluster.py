@@ -66,10 +66,20 @@ def select_exemplar_tracks_by_cluster(
     tmax_key="position_t_max",
     seed=0,
     query=None,
+    window_key="trajectory_window_id",
 ):
     """
     Select exemplar tracks per cluster and return:
       chosen_df, cluster_total_counts
+
+    When tracks were split into fixed-size windows for clustering
+    (``split_long_tracks=True``: each window is its own independent trajectory,
+    sharing the original TrackID), ``window_key`` must be included in the
+    grouping below. Otherwise distinct windows of the same track that land in
+    the same cluster get merged into a single row, and min/max-aggregating
+    ``tmin_key``/``tmax_key`` across them reconstructs a time span wider than
+    any single clustered window - e.g. the whole original track instead of one
+    32-timepoint window.
     """
     rng = np.random.default_rng(seed)
     needed = {sample_key, track_key, tmin_key, tmax_key, cluster_key}
@@ -77,9 +87,13 @@ def select_exemplar_tracks_by_cluster(
     if missing:
         raise ValueError(f"adata_tracks.obs missing required columns: {missing}")
 
-    full_tracks_df = adata_tracks.obs[[sample_key, track_key, tmin_key, tmax_key, cluster_key]].copy()
+    has_window_key = window_key in adata_tracks.obs.columns
+    group_cols = [cluster_key, sample_key, track_key] + ([window_key] if has_window_key else [])
+    select_cols = [sample_key, track_key, tmin_key, tmax_key, cluster_key] + ([window_key] if has_window_key else [])
+
+    full_tracks_df = adata_tracks.obs[select_cols].copy()
     grouped_full = (
-        full_tracks_df.groupby([cluster_key, sample_key, track_key], observed=True, as_index=False)
+        full_tracks_df.groupby(group_cols, observed=True, as_index=False)
         .agg(**{tmin_key: (tmin_key, "min"), tmax_key: (tmax_key, "max")})
     )
     if len(grouped_full) == 0:
@@ -90,13 +104,11 @@ def select_exemplar_tracks_by_cluster(
     if query is None:
         tracks_df = grouped_full
     else:
-        tracks_df = adata_tracks.obs.query(query)[
-            [sample_key, track_key, tmin_key, tmax_key, cluster_key]
-        ].copy()
+        tracks_df = adata_tracks.obs.query(query)[select_cols].copy()
         if len(tracks_df) == 0:
             raise ValueError("No tracks left after applying `query` (if any).")
         tracks_df = (
-            tracks_df.groupby([cluster_key, sample_key, track_key], observed=True, as_index=False)
+            tracks_df.groupby(group_cols, observed=True, as_index=False)
             .agg(**{tmin_key: (tmin_key, "min"), tmax_key: (tmax_key, "max")})
         )
 
@@ -128,21 +140,35 @@ def plot_tracks_bars_on_ax(
     title=None,
     x_mode="absolute",   # "absolute" or "relative"
     state_color_map=None,
+    window_key="trajectory_window_id",
 ):
     """
     If x_mode="relative": each track is mapped to [0, rel_max] where rel_max is auto-chosen:
       - default: 100
       - if timepoints look discrete and track is short: rel_max = (n_timepoints - 1)
-    """
-    key_cols = [sample_key, track_key]
 
-    obs = adata_full.obs[[sample_key, track_key, time_key, state_key]].copy()
+    ``window_key`` (when present on both ``chosen_df`` and ``adata_full.obs``) is
+    included in the track identity key so that, when tracks were split into
+    fixed-size windows for clustering, distinct windows of the same original
+    track are treated as separate rows here rather than merged back into one -
+    which would otherwise redraw the whole original track instead of just the
+    clustered window.
+    """
+    has_window_key = window_key in chosen_df.columns and window_key in adata_full.obs.columns
+    key_cols = [sample_key, track_key] + ([window_key] if has_window_key else [])
+
+    obs_cols = [sample_key, track_key, time_key, state_key] + ([window_key] if has_window_key else [])
+    obs = adata_full.obs[obs_cols].copy()
     obs[sample_key] = obs[sample_key].astype("string")
     obs[track_key] = obs[track_key].astype("string")
+    if has_window_key:
+        obs[window_key] = obs[window_key].astype("string")
 
     chosen_df = chosen_df.copy()
     chosen_df[sample_key] = chosen_df[sample_key].astype("string")
     chosen_df[track_key] = chosen_df[track_key].astype("string")
+    if has_window_key:
+        chosen_df[window_key] = chosen_df[window_key].astype("string")
 
     chosen_keys = chosen_df[key_cols].drop_duplicates()
     obs = obs.merge(chosen_keys, on=key_cols, how="inner")
@@ -167,7 +193,7 @@ def plot_tracks_bars_on_ax(
         # compute per-track relative x with per-track rel_max
         obs["_x"] = np.nan
 
-        for (s, t), df in obs.groupby(key_cols, observed=True, sort=False):
+        for _, df in obs.groupby(key_cols, observed=True, sort=False):
             tmin = float(df[tmin_key].iloc[0])
             tmax = float(df[tmax_key].iloc[0])
             denom = (tmax - tmin)
@@ -207,9 +233,10 @@ def plot_tracks_bars_on_ax(
     y_gap = 0.25
 
     for i, row in tracks.iterrows():
-        s = row[sample_key]
-        t = row[track_key]
-        df = obs[(obs[sample_key] == s) & (obs[track_key] == t)]
+        mask = (obs[sample_key] == row[sample_key]) & (obs[track_key] == row[track_key])
+        if has_window_key:
+            mask = mask & (obs[window_key] == row[window_key])
+        df = obs[mask]
         if df.empty:
             continue
 
@@ -270,6 +297,7 @@ def plot_exemplar_tracks_by_cluster(
     legend_loc="center left",
     legend_bbox_to_anchor=(0.98, 0.5),
     legend_ncol=1,
+    window_key="trajectory_window_id",
 ):
     chosen, cluster_total_counts = select_exemplar_tracks_by_cluster(
         adata_tracks=adata_tracks,
@@ -281,6 +309,7 @@ def plot_exemplar_tracks_by_cluster(
         tmax_key=tmax_key,
         seed=seed,
         query=query,
+        window_key=window_key,
     )
 
     clusters = list(chosen[cluster_key].dropna().unique())
@@ -316,13 +345,13 @@ def plot_exemplar_tracks_by_cluster(
             for v in state_values
         ]
 
+    df_cl_cols = [sample_key, track_key, tmin_key, tmax_key] + (
+        [window_key] if window_key in chosen.columns else []
+    )
     for i, cl in enumerate(clusters):
         r, c = divmod(i, ncols)
         ax = axes[r, c]
-        df_cl = chosen.loc[
-            chosen[cluster_key] == cl,
-            [sample_key, track_key, tmin_key, tmax_key],
-        ].copy()
+        df_cl = chosen.loc[chosen[cluster_key] == cl, df_cl_cols].copy()
 
         plot_tracks_bars_on_ax(
             adata_full=adata_full,
@@ -338,6 +367,7 @@ def plot_exemplar_tracks_by_cluster(
             title=f"{cluster_key} = {cl} (N_total={cluster_total_counts.get(cl, 0)})",
             x_mode=x_mode,
             state_color_map=state_color_map,
+            window_key=window_key,
         )
 
     for j in range(n_clusters, nrows * ncols):
@@ -613,6 +643,7 @@ def save_exemplar_statebar_track_pdf_per_cluster(
     cmap_name="tab20",
     layout_mode="per_cluster",
     num_example_ranks=5,
+    window_key="trajectory_window_id",
 ):
     mode = _normalize_layout_mode(layout_mode)
     if chosen_df is None:
@@ -627,6 +658,7 @@ def save_exemplar_statebar_track_pdf_per_cluster(
             tmin_key=tmin_key,
             tmax_key=tmax_key,
             seed=seed,
+            window_key=window_key,
         )
 
     chosen_df = chosen_df.copy().reset_index(drop=True)

@@ -674,14 +674,18 @@ def filter_tracks(
         df_track_counts=df_track_counts
         )
 
-    # Filter out tracks whose size at the first timepoint is below min_size
-    # Checks 'volume' first, falls back to 'nr_pixels'
+    # Filter out tracks whose size at the first timepoint is below min_size.
+    # min_size is always native voxels (see UnitGroupManager native_unit="pixel"
+    # in napari/_filtering.py), so it must be compared against 'nr_pixels'
+    # (also voxels) rather than 'volume', which is physical um^3 and not on the
+    # same scale. 'volume' is only used as a fallback for input CSVs that lack
+    # 'nr_pixels' (e.g. some advanced-features exports).
     size_col = None
     if min_size is not None:
-        if "volume" in df_all_tracks_filt.columns:
-            size_col = "volume"
-        elif "nr_pixels" in df_all_tracks_filt.columns:
+        if "nr_pixels" in df_all_tracks_filt.columns:
             size_col = "nr_pixels"
+        elif "volume" in df_all_tracks_filt.columns:
+            size_col = "volume"
 
     if min_size is not None and size_col is not None:
         first_tp = df_all_tracks_filt[df_all_tracks_filt["relative_time"] == 1]

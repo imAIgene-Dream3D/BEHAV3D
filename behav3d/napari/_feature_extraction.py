@@ -2679,7 +2679,7 @@ class ActiveKillingPanel(QWidget):
         params_form.addRow("", self.abs_hint_label)
 
         self.spin_abs_threshold = QDoubleSpinBox()
-        self.spin_abs_threshold.setRange(0.0, 100.0)
+        self.spin_abs_threshold.setRange(0.0, 10000.0)
         self.spin_abs_threshold.setSingleStep(0.01)
         self.spin_abs_threshold.setDecimals(4)
         self.spin_abs_threshold.setValue(0.0)
@@ -2974,24 +2974,29 @@ class ActiveKillingPanel(QWidget):
                     output_subfolder=subfolder
                 )
 
+            plot_jobs = []
             df_killing, df_summary, stats = None, None, None
             for t in targets:
                 self.log(f"--- Running independent analysis for target: {t} ---")
                 df_killing, df_summary, stats = run_for_targets([t], t)
+                plot_jobs.append((t, df_killing))
 
             if len(targets) > 1:
                 self.log("--- Running combined analysis for all selected targets ---")
                 combined_subfolder = "combined"
                 df_killing, df_summary, stats = run_for_targets(targets, combined_subfolder)
+                plot_jobs.append((combined_subfolder, df_killing))
             else:
                 combined_subfolder = targets[0]
 
-            return (df_killing, df_summary, stats, combined_subfolder)
+            return (plot_jobs, stats, combined_subfolder)
 
         def _on_done(result):
-            df_killing, _df_summary, stats, subfolder = result
+            plot_jobs, stats, subfolder = result
+            for job_subfolder, job_df_killing in plot_jobs:
+                job_results_dir = self._active_killing_dir(immune) / job_subfolder
+                self._save_plots(job_df_killing, immune, job_results_dir)
             results_dir = self._active_killing_dir(immune) / subfolder
-            self._save_plots(df_killing, immune, results_dir)
             n_active = int(stats.get("total_active_killing_timepoints", 0))
             rate = stats.get("overall_killing_rate", 0.0)
             self.log(
@@ -3194,16 +3199,17 @@ class ActiveKillingPanel(QWidget):
             for t in targets:
                 self.log(f"--- Running independent analysis for target: {t} ---")
                 df_killing, df_summary, stats = run_for_targets([t], t)
+                self._save_plots(df_killing, immune, self._active_killing_dir(immune) / t)
 
             if len(targets) > 1:
                 self.log("--- Running combined analysis for all selected targets ---")
                 combined_subfolder = "combined"
                 df_killing, df_summary, stats = run_for_targets(targets, combined_subfolder)
+                self._save_plots(df_killing, immune, self._active_killing_dir(immune) / combined_subfolder)
             else:
                 combined_subfolder = targets[0]
-            
+
             results_dir = self._active_killing_dir(immune) / combined_subfolder
-            self._save_plots(df_killing, immune, results_dir)
             n_active = int(stats.get("total_active_killing_timepoints", 0))
             rate = stats.get("overall_killing_rate", 0.0)
             self.log(

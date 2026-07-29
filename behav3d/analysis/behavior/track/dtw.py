@@ -268,6 +268,47 @@ def _cluster_precomputed_distances(distances, *, n_clusters=6, linkage="average"
     return raw_labels, model
 
 
+def _cluster_precomputed_distances_leiden(
+    distances,
+    *,
+    n_neighbors=15,
+    resolution=1.0,
+    random_state=123,
+):
+    """Cluster a precomputed DTW distance matrix with Leiden graph clustering.
+
+    Unlike agglomerative clustering with a fixed n_clusters, Leiden finds
+    community structure on the same k-NN graph that the QC UMAP embedding
+    (`_ensure_dtaidistance_umap`) is built from, so partitions tend to track
+    the visual blobs in that plot rather than cutting through them.
+    """
+    from behav3d.analysis.behavior.general.leiden import run_leiden_clustering
+
+    distances = np.asarray(distances, dtype=float)
+    n_obs = int(distances.shape[0])
+    if n_obs < 3:
+        raise ValueError("At least three tracks are required for Leiden clustering.")
+    resolved_n_neighbors = max(2, min(int(n_neighbors), n_obs - 1))
+    raw_labels = np.asarray(
+        run_leiden_clustering(
+            distances,
+            n_neighbors=resolved_n_neighbors,
+            metric="precomputed",
+            method="umap",
+            use_rep="X",
+            resolution=resolution,
+            random_state=int(random_state),
+            key_added="leiden_cluster",
+        )
+    )
+    if len(set(raw_labels.tolist())) < 2:
+        raise ValueError(
+            f"Leiden clustering collapsed to a single cluster at resolution={resolution}; "
+            "try a higher resolution."
+        )
+    return raw_labels, None
+
+
 def _ensure_dtaidistance_umap(adata_tracks, distances, *, random_state=123, n_neighbors=15, min_dist=0.1):
     """Compute (or reuse) the 2D UMAP embedding for a dtaidistance track adata.
 

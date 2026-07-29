@@ -72,11 +72,7 @@ This is needed for track-level analyses that require uniform-length inputs. The 
 
 > ☑ **Filter by minimal size at first timepoint** — *Min size:* `1000`
 
-Drops whole tracks whose mask **volume** at their first appearance (`relative_time = 1`) is smaller than the threshold. If the feature table doesn't have a `volume` column, the voxel count (`nr_pixels`) is used instead.
-
-```{note}
-The spinner label says *"Min size (px)"* but the value is actually compared to `volume` (in voxels) when available — so for most datasets you're filtering on voxel count of the cell mask at its first detected frame.
-```
+Drops whole tracks whose voxel count (`nr_pixels`) at their first appearance (`relative_time = 1`) is smaller than the threshold. If the feature table doesn't have an `nr_pixels` column, the physical **volume** (µm³) is used instead — in that fallback case, toggle the units switch to µm³ so the threshold you enter matches what's being compared.
 
 Common use: removing dust, debris, or over-segmented fragments that briefly look like cells.
 
