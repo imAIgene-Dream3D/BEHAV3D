@@ -473,7 +473,8 @@ class AssistantDock(QWidget):
         self._append_md(
             f"**BEHAV3D Assistant**{mode}\n\nAsk me which method or parameter "
             "values suit your data. I can also fill the forms in for you "
-            "(you confirm first). Try *“Explain this screen”* to start."
+            "(you confirm first). Try *“Explain this screen”* to start, or ask "
+            "*“Is all ready?”* before running the steps."
         )
 
     def _reset_conversation(self):
