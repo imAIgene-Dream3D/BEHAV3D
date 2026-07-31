@@ -1878,7 +1878,8 @@ class MulticolorTrackingPanel(QWidget):
 
     def __init__(self, base_name: str, channel_types: list, category: str,
                  metadata_loader, log_callback=None, viewer=None, parent=None,
-                 tab_progress_row=None, switch_to_data_prep_edit_callback=None):
+                 tab_progress_row=None, switch_to_data_prep_edit_callback=None,
+                 on_tracking_complete_callback=None):
         super().__init__(parent)
         self.base_name = base_name
         self.channel_types = sorted(channel_types)
@@ -1887,6 +1888,10 @@ class MulticolorTrackingPanel(QWidget):
         self.log = log_callback or print
         self.viewer = viewer
         self.tab_progress_row = tab_progress_row
+        self.on_tracking_complete = on_tracking_complete_callback
+        # Each panel owns its own BackgroundOperation so the "Run all
+        # channels" button can run off the Qt thread independently.
+        self._bg = BackgroundOperation(self)
 
         # Inner panel drives the shared parameter UI; keyed to first channel
         # so saved config is stored/loaded under that channel name.
@@ -1941,6 +1946,113 @@ class MulticolorTrackingPanel(QWidget):
 
         # ── Shared parameters (inner CellTypeTrackingPanel) ───────────
         layout.addWidget(self._inner_panel)
+
+        # The inner panel exposes a single-channel run button ("Run
+        # <first channel> Tracking") which would only track the first
+        # channel — misleading for a multicolor group.  Hide it (kept
+        # alive because the inner panel's own method-dropdown handler
+        # still calls btn_run.setEnabled/setToolTip) and drop the
+        # group-level button into the same slot so it appears exactly
+        # where the old one was.
+        self._inner_panel.btn_run.setVisible(False)
+
+        # ── Run All Channels + Merge button ───────────────────────────
+        merged_name = f"{self.base_name}_merged"
+        self.btn_run_all = QPushButton(
+            f"▶  Run All Channels + Merge  "
+            f"({', '.join(self.channel_types)} → {merged_name})"
+        )
+        self.btn_run_all.setStyleSheet(
+            "background-color: #28a745; color: white; font-weight: bold; "
+            "border-radius: 4px; padding: 8px; font-size: 13px;"
+        )
+        self.btn_run_all.setToolTip(
+            "Track every channel of this multicolor group using the shared "
+            "parameters above, then automatically merge the outputs into "
+            f"{merged_name}."
+        )
+        self.btn_run_all.clicked.connect(self._on_run_all_clicked)
+
+        # Insert into the inner panel's own layout, right after the
+        # (now hidden) single-channel button, so the group button takes
+        # its exact position instead of appearing below the whole panel.
+        inner_layout = self._inner_panel.layout()
+        run_idx = inner_layout.indexOf(self._inner_panel.btn_run)
+        inner_layout.insertWidget(run_idx + 1, self.btn_run_all)
+
+    # ------------------------------------------------------------------
+    def _on_run_all_clicked(self):
+        """Track every channel of this group + merge, in the background.
+
+        Mirrors :meth:`CellTypeTrackingPanel._on_run_clicked` but drives
+        this panel's :meth:`run_tracking` (all channels → merge) instead
+        of a single cell type.  The batch "Run All" flow in
+        :class:`TrackingTab` is unaffected and still calls
+        :meth:`run_tracking` directly.
+        """
+        if self._bg.is_running():
+            self.log("⚠️ A tracking run is already in progress for this panel.")
+            return
+
+        self._persist()
+        merged_name = f"{self.base_name}_merged"
+        self.log(
+            f"Running multicolor tracking for {self.base_name} "
+            f"({', '.join(self.channel_types)}) → {merged_name}"
+        )
+
+        # Check for existing tracking data across *all* channels.
+        existing = self._inner_panel._check_existing_tracking(self.channel_types)
+        if existing:
+            from behav3d.napari._overwrite_prompt import prompt_overwrite_single
+            choice = prompt_overwrite_single(
+                self,
+                "Overwrite Existing Tracking?",
+                existing,
+            )
+            if choice != "overwrite":
+                self.log(f"Multicolor tracking for {self.base_name} cancelled.")
+                return
+        overwrite = True
+
+        # Snapshot all Qt widget values now — the worker must not touch them.
+        params = self._inner_panel.collect_runtime_params()
+
+        def _do_tracking(progress_cb=None):
+            return self.run_tracking(
+                overwrite=overwrite, params=params, progress_cb=progress_cb,
+            )
+
+        def _on_done(new_md):
+            self.log(
+                f"✅ {self.base_name} multicolor tracking finished "
+                f"→ {merged_name}."
+            )
+            res = QMessageBox.question(
+                self, "Tracking Finished",
+                f"Multicolor tracking for {self.base_name} finished!\n\n"
+                f"All channels ({', '.join(self.channel_types)}) were tracked "
+                f"and merged into {merged_name}.\n\n"
+                "Do you want to switch to the Visualization Tab and see the tracks?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if res == QMessageBox.Yes:
+                self._inner_panel._switch_to_viz_and_show_tracks()
+            if self.on_tracking_complete is not None:
+                self.on_tracking_complete()
+
+        def _on_failed(err: str):
+            self.log(f"Error during multicolor tracking: {err}")
+
+        self._bg.run(
+            fn=_do_tracking,
+            desc=f"Multicolor tracking {self.base_name}…",
+            progress_row=self.tab_progress_row,
+            buttons=[self.btn_run_all],
+            viewer=self.viewer,
+            on_done=_on_done,
+            on_failed=_on_failed,
+        )
 
     # ------------------------------------------------------------------
     def _persist(self):
@@ -2293,6 +2405,7 @@ class TrackingTab(QWidget):
                 log_callback=self._log, viewer=self.viewer,
                 tab_progress_row=self.progress_row,
                 switch_to_data_prep_edit_callback=self._switch_to_data_prep_edit,
+                on_tracking_complete_callback=self.tracking_completed.emit,
             )
             self._multicolor_panels[base] = panel
             self.cell_tabs.addTab(panel, f"🟣 {base.capitalize()} (multicolor)")
@@ -2320,6 +2433,7 @@ class TrackingTab(QWidget):
                 log_callback=self._log, viewer=self.viewer,
                 tab_progress_row=self.progress_row,
                 switch_to_data_prep_edit_callback=self._switch_to_data_prep_edit,
+                on_tracking_complete_callback=self.tracking_completed.emit,
             )
             self._multicolor_panels[base] = panel
             self.cell_tabs.addTab(panel, f"🔵 {base.capitalize()} (multicolor)")
@@ -2347,6 +2461,7 @@ class TrackingTab(QWidget):
                 log_callback=self._log, viewer=self.viewer,
                 tab_progress_row=self.progress_row,
                 switch_to_data_prep_edit_callback=self._switch_to_data_prep_edit,
+                on_tracking_complete_callback=self.tracking_completed.emit,
             )
             self._multicolor_panels[base] = panel
             self.cell_tabs.addTab(panel, f"🟡 {base.capitalize()} (multicolor)")
