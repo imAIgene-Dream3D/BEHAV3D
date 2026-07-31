@@ -469,12 +469,12 @@ behav3d_calculated_features = {
     "morphology": [
         "nr_pixels", "volume", "bbox_volume", "extent", "solidity",
         "equivalent_diameter", "major_axis_length", "minor_axis_length",
-        "axis1_length", "axis2_length", "axis3_length",
-        "elongation", "surface_area", "sphericity", "convex_volume", "surface_to_volume_ratio",
+        "elongation", "oblateness", "prolateness",
+        "surface_area", "sphericity", "convex_volume", "surface_to_volume_ratio",
     ],
     "movement": [
         "displacement", "cumulative_displacement", "displacement_from_origin",
-        "mean_square_displacement", "speed", "mean_speed", "summed_displacement",
+        "mean_square_displacement", "speed", "summed_displacement",
         "net_displacement", "straightness", "directional_persistence",
         "median_turning_angle", "fraction_reversed_movement",
     ],
@@ -485,15 +485,80 @@ behav3d_calculated_features = {
         "percentage_dead_mask", "nr_dead_mask_pixels", "increase_dead_mask", "dead",
     ],
     "contact": [
-        "*_contact", "*_contact_on_distance", "*_contact_pixels", "active_*_contact",
+        "*_contact", "*_contact_on_distance", "active_*_contact",
     ],
     "invasiveness": [
         "*_invasiveness", "*_invasiveness_perc", "any_org_invasiveness", "any_org_invasiveness_perc",
     ],
     "active_killing": [
-        "is_active_killing", "killing_efficiency",
+        "is_active_killing", "killing_efficiency", "death_signal_increase_*tp",
     ],
 }
+
+
+def excluded_non_behavior_columns(cols, metadata=None):
+    """
+    Columns that are IDs, metadata, technical/QC bookkeeping, or otherwise not
+    usable as numeric HMM state-classification inputs, even though they may
+    appear in a track-features CSV. Shared by the Jupyter and napari
+    state-classification panels so both present the same candidate list.
+    """
+    col_set = {str(c) for c in cols}
+    excluded = {
+        "sample_name",
+        "TrackID",
+        "sub_TrackID",
+        "position_t",
+        "position_x",
+        "position_y",
+        "position_z",
+        "segment_id",
+        "lineage_id",
+        "frame",
+        "t",
+        "interpolated",
+        "exp_nr",
+        "well",
+        "origin_cell_type",
+        "origin_TrackID",
+        "orientation_vector",
+        "border_touching_segment",
+        "targeted_track_id",
+        "contact_event_id",
+        "killing_threshold_used",
+        "observation_complete",
+    }
+
+    if metadata is not None:
+        try:
+            excluded.update({str(c) for c in metadata.columns})
+        except AttributeError:
+            pass
+
+    for c in col_set:
+        lc = str(c).lower()
+        if lc.endswith("_line_condition"):
+            excluded.add(c)
+        if lc.endswith("_tracks_csv_path"):
+            excluded.add(c)
+        if lc.endswith("_segments_image_path"):
+            excluded.add(c)
+        if lc.endswith("_tracks_image_path"):
+            excluded.add(c)
+        if lc.endswith("_raw_image_path"):
+            excluded.add(c)
+        if lc.endswith("_dead_mask_path"):
+            excluded.add(c)
+        if lc.startswith("channel_") and lc.endswith("_label"):
+            excluded.add(c)
+        if lc.startswith("touching_") and lc.endswith("s"):
+            excluded.add(c)
+        if lc.startswith("pix_distance_"):
+            excluded.add(c)
+        if lc.startswith("pix_") and lc.endswith("_contact"):
+            excluded.add(c)
+
+    return excluded.intersection(col_set)
 
 spinning_loader = (
     '<div style="display:flex;align-items:center;gap:6px;">'

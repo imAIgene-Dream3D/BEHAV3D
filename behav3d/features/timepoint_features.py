@@ -807,6 +807,21 @@ def run_feature_extraction(
     feature_outdir.mkdir(parents=True, exist_ok=True)
     all_tracks_out_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features.csv")
     df_all_tracks.to_csv(all_tracks_out_path, index=False)
+
+    stale_steps = []
+    filtered_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features_filtered.csv")
+    if filtered_path.exists():
+        stale_steps.append("Filtering")
+    active_killing_dir = Path(analysis_outdir, "active_killing")
+    if active_killing_dir.exists() and any(active_killing_dir.rglob(f"BEHAV3D_{cell_type}_advanced_track_features.csv")):
+        stale_steps.append("Active Killing")
+    if stale_steps:
+        print(
+            f"{get_current_time()} - WARNING: Feature Extraction for '{cell_type}' was just rerun. "
+            f"Existing {' and '.join(stale_steps)} results for this cell type were computed from the "
+            f"previous track features and are now stale. Re-run {' and then '.join(stale_steps)} to refresh them."
+        )
+
     if progress_cb is not None:
         try:
             progress_cb(_total_samples, _total_samples, f"{cell_type} done")

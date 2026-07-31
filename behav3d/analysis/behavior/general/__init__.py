@@ -21,14 +21,17 @@ def relabel_cluster_ids(
     if (original_key in adata.obs.columns) and (not overwrite_original):
         raise ValueError(f"{original_key} already exists")
 
-    adata.obs[original_key] = adata.obs[cluster_key].astype(str).copy()
+    is_missing = pd.isna(adata.obs[cluster_key])
     current = adata.obs[cluster_key].astype(str)
+    adata.obs[original_key] = current.where(~is_missing, pd.NA).copy()
 
     if isinstance(mapping, dict):
         map_dict = {str(k): v for k, v in mapping.items()}
         mapped = current.map(map_dict)
     else:
-        uniq = np.array(sorted(current.unique(), key=lambda x: (int(x) if x.isdigit() else x)))
+        uniq = np.array(
+            sorted(current[~is_missing].unique(), key=lambda x: (int(x) if x.isdigit() else x))
+        )
         labels = list(mapping)
         if len(labels) < len(uniq):
             raise ValueError("Not enough labels for number of clusters")
@@ -39,6 +42,7 @@ def relabel_cluster_ids(
         out = mapped.where(mapped.notna(), current)
     else:
         out = mapped.fillna(unmapped_label)
+    out = out.where(~is_missing, pd.NA)
 
     out_col = new_key if new_key is not None else cluster_key
     present = sorted({str(x) for x in out.dropna().unique()}, key=_mixed_label_sort_key)

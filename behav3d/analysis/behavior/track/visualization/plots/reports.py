@@ -101,9 +101,17 @@ from behav3d.analysis.behavior.general.visualization.plots.feature_violin import
 from behav3d.analysis.behavior.track.contact_grouping import (
     compute_track_contact_features,
     merge_track_contact_features_into_obs,
+    compute_track_contact_target_class_features,
+    merge_track_target_class_group_into_obs,
+    contact_col_target_cell_type,
     _contact_group_col_name,
     _contact_mean_col_name,
     _contact_max_bout_col_name,
+    _contact_class_mean_col_name,
+    _contact_class_max_bout_col_name,
+    _contact_target_class_group_col_name,
+    _NO_CONTACT_LABEL,
+    _MULTIPLE_CLASSES_LABEL,
 )
 from behav3d.analysis.behavior.state.utils import (
     _apply_state_order,
@@ -625,12 +633,16 @@ def _save_contact_cluster_stack_grid_page(
     group_y,
     class_order,
     csv_dir,
+    stack_order=None,
+    stack_colors=None,
+    title_prefix="Contact-Group Composition",
     dpi=300,
     verbose=False,
 ):
-    """Add the `class_col`-on-x-axis contact/no_contact stacked-bar grid page(s) to `pdf`,
-    faceted by `group_x`/`group_y` as a true 2D grid; `extra_group_cols` ("group per page")
-    paginate into separate grid pages instead of adding a third grid dimension.
+    """Add the `class_col`-on-x-axis stacked-bar grid page(s) to `pdf` — stacked by `group_col`'s
+    levels (`stack_order`/`stack_colors`, defaulting to the binary contact/no_contact convention
+    when not given) — faceted by `group_x`/`group_y` as a true 2D grid; `extra_group_cols` ("group
+    per page") paginate into separate grid pages instead of adding a third grid dimension.
 
     Skipped entirely (returns ``n_pages=0``) when none of `group_x`/`group_y`/`extra_group_cols`
     are set, matching the plain per-sample contact-rate page which is always produced separately.
@@ -644,8 +656,13 @@ def _save_contact_cluster_stack_grid_page(
             print("  Note: no group_x/group_y/extra_group_cols set — skipping cluster-stack grid page.")
         return {"n_pages": 0, "csv_path": None}
 
-    stack_order = list(_CONTACT_STACK_ORDER)
-    stack_colors = _normalize_label_color_map(stack_order, colors=_CONTACT_STACK_COLORS, cmap_name="tab10")
+    if stack_order is None:
+        stack_order = list(_CONTACT_STACK_ORDER)
+        default_stack_colors = _CONTACT_STACK_COLORS
+    else:
+        stack_order = [str(s) for s in stack_order]
+        default_stack_colors = stack_colors
+    stack_colors = _normalize_label_color_map(stack_order, colors=default_stack_colors, cmap_name="tab10")
 
     needed_cols = [class_col, group_col] + list(dict.fromkeys(grid_axis_cols + extra_group_cols))
     plot_df = adata_tracks.obs[needed_cols].copy()
@@ -697,7 +714,7 @@ def _save_contact_cluster_stack_grid_page(
                 if (group_x and group_y and group_x in grid_axis_cols and group_y in grid_axis_cols)
                 else None
             )
-            title = f"Contact-Group Composition by {class_col}"
+            title = f"{title_prefix} by {class_col}"
             if extra_group_cols:
                 title = f"{title} — {', '.join(extra_group_cols)}: {page_key}"
             fig = _plot_page_class_stack_grid(
@@ -722,7 +739,7 @@ def _save_contact_cluster_stack_grid_page(
                     row[f"{group_col}={stack_val}"] = float(props.loc[cls, stack_val]) if cls in props.index else 0.0
                 long_rows.append(row)
 
-            title = f"Contact-Group Composition by {class_col}"
+            title = f"{title_prefix} by {class_col}"
             if extra_group_cols:
                 title = f"{title} — {', '.join(extra_group_cols)}: {page_key}"
             fig = _plot_single_class_stack_panel(
@@ -736,7 +753,8 @@ def _save_contact_cluster_stack_grid_page(
     csv_path = None
     if long_rows:
         class_token = _sanitize_filename_token(class_col, fallback="ClusterID")
-        csv_path = Path(csv_dir) / f"contact_cluster_stack_grid_{class_token}.csv"
+        group_token = _sanitize_filename_token(group_col, fallback="group")
+        csv_path = Path(csv_dir) / f"contact_cluster_stack_grid_{class_token}_by_{group_token}.csv"
         pd.DataFrame(long_rows).to_csv(csv_path, index=False)
 
     return {"n_pages": n_pages, "csv_path": str(csv_path) if csv_path is not None else None}
@@ -1085,6 +1103,12 @@ def save_track_contact_group_analysis(
     extra_group_cols=None,
     group_x=None,
     group_y=None,
+    target_class_lookup=None,
+    touching_col=None,
+    time_varying=True,
+    target_class_order=None,
+    target_class_colors=None,
+    target_cell_type_label=None,
     verbose=False,
 ):
     """Group classified tracks by whether they had a sufficiently long contiguous bout of
@@ -1099,6 +1123,25 @@ def save_track_contact_group_analysis(
        `group_x` × `group_y` 2D grid (since the comparison is always binary, both axes are free
        to be real grid axes); `extra_group_cols` paginate into separate grid pages.
     4. Violin plots of mean contact fraction and max contact-bout length per cluster.
+
+    All 4 sections above are always produced, unchanged, regardless of the options below.
+
+    If ``target_class_lookup`` is given (a "touched target TrackID -> class" lookup from
+    ``contact_grouping.build_target_class_lookup_from_state_adata`` /
+    ``build_target_class_lookup_from_track_adata`` — pass the matching ``touching_col`` name, i.e.
+    ``contact_grouping.touching_column_name(target_cell_type)``, and set ``time_varying=True`` for
+    a state-classification lookup or ``False`` for a track-classification one), three more pages
+    are appended after the four above:
+
+    5. Violin plots of per-target-class mean contact fraction and max sustained contact-bout
+       length (one row per ``(track, target_class)`` actually touched — a track touching 2 classes
+       contributes to both).
+    6. A `class_col`-on-x-axis composition grid, stacked by target-class group (``no_contact`` /
+       each touched target class / ``"Multiple classes"`` for tracks that touched >= 2 distinct
+       target classes).
+    7. A condition-comparison report (Welch's t-test, pairwise across all target-class-group
+       levels) analogous to section 3, but keyed on the target-class-group instead of plain
+       contact/no_contact.
 
     Returns a dict of all output artifact paths.
     """
@@ -1124,6 +1167,44 @@ def save_track_contact_group_analysis(
         n_contact = int((adata_tracks.obs[group_col] == "contact").sum())
         n_total = len(adata_tracks.obs)
         print(f"Contact grouping on '{contact_col}' (min_bout_length={min_bout_length}): {n_contact}/{n_total} tracks labeled 'contact'.")
+
+    use_target_class = target_class_lookup is not None
+    target_group_col = None
+    target_class_mean_col = None
+    target_class_max_bout_col = None
+    resolved_target_class_order = []
+    long_target_df = None
+    if use_target_class:
+        if touching_col is None:
+            raise ValueError("touching_col is required when target_class_lookup is given.")
+        long_target_df, target_group_df = compute_track_contact_target_class_features(
+            df_timepoints,
+            adata_tracks,
+            target_class_lookup,
+            contact_col=contact_col,
+            touching_col=touching_col,
+            time_varying=bool(time_varying),
+            contact_group_col=group_col,
+            verbose=verbose,
+        )
+        merge_track_target_class_group_into_obs(adata_tracks, target_group_df, contact_col=contact_col)
+        target_group_col = _contact_target_class_group_col_name(contact_col)
+        target_class_mean_col = _contact_class_mean_col_name(contact_col)
+        target_class_max_bout_col = _contact_class_max_bout_col_name(contact_col)
+        target_cell_type_label = target_cell_type_label or contact_col_target_cell_type(contact_col)
+
+        touched_classes = sorted(
+            long_target_df["target_class"].dropna().astype(str).unique().tolist(), key=_mixed_label_sort_key,
+        )
+        resolved_target_class_order = (
+            [str(c) for c in target_class_order] if target_class_order is not None else touched_classes
+        )
+        if bool(verbose):
+            n_multi = int((target_group_df[target_group_col] == _MULTIPLE_CLASSES_LABEL).sum())
+            print(
+                f"Target-class attribution on '{contact_col}': {len(resolved_target_class_order)} touched "
+                f"class(es), {n_multi} track(s) bucketed as '{_MULTIPLE_CLASSES_LABEL}'."
+            )
 
     # Own subfolder, named after the raw contact column (e.g. "macrophage_contact"), holding a
     # single combined report PDF and a "csv" subfolder for all underlying CSVs.
@@ -1201,16 +1282,85 @@ def save_track_contact_group_analysis(
         pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
 
+        target_class_composition_grid = {"n_pages": 0, "csv_path": None}
+        target_class_comparison = None
+        if use_target_class:
+            resolved_target_class_colors = _normalize_label_color_map(
+                resolved_target_class_order, colors=target_class_colors, cmap_name="tab20",
+            )
+            target_stack_order = [_NO_CONTACT_LABEL] + resolved_target_class_order + [_MULTIPLE_CLASSES_LABEL]
+            target_stack_colors = {_NO_CONTACT_LABEL: _CONTACT_STACK_COLORS[_NO_CONTACT_LABEL]}
+            target_stack_colors.update(resolved_target_class_colors)
+            target_stack_colors[_MULTIPLE_CLASSES_LABEL] = "#4C4C4C"
+
+            long_flat = long_target_df.reset_index()
+            fig = plot_feature_violin_by_group(
+                long_flat, target_class_mean_col, "target_class",
+                group_order=resolved_target_class_order, colors=resolved_target_class_colors,
+                ylabel=f"Mean fraction of timepoints in contact ({contact_col})",
+                title=f"Mean contact fraction by {target_cell_type_label} class",
+            )
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+
+            fig = plot_feature_violin_by_group(
+                long_flat, target_class_max_bout_col, "target_class",
+                group_order=resolved_target_class_order, colors=resolved_target_class_colors,
+                ylabel=f"Longest sustained contact bout, timepoints ({contact_col})",
+                title=f"Max sustained contact-bout length by {target_cell_type_label} class",
+            )
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+
+            target_class_composition_grid = _save_contact_cluster_stack_grid_page(
+                pdf,
+                adata_tracks,
+                class_col=class_col,
+                group_col=target_group_col,
+                extra_group_cols=extra_group_cols,
+                group_x=group_x,
+                group_y=group_y,
+                class_order=resolved_class_order,
+                csv_dir=csv_dir,
+                stack_order=target_stack_order,
+                stack_colors=target_stack_colors,
+                title_prefix=f"{target_cell_type_label}-Class Composition",
+                verbose=verbose,
+            )
+
+            target_class_comparison = save_track_condition_comparison_report(
+                adata_tracks,
+                out_dir,
+                sample_col=sample_col,
+                class_col=class_col,
+                condition_col=target_group_col,
+                group_x=group_x,
+                group_y=group_y,
+                group_cols=list(extra_group_cols),
+                class_order=resolved_class_order,
+                class_colors=class_colors,
+                verbose=verbose,
+                pdf_pages=pdf,
+                csv_dir=csv_dir,
+            )
+            target_class_comparison["pdf_path"] = str(pdf_path)
+
     # The per-plot helpers above report their own nominal (standalone) pdf paths; since they all
     # actually wrote into the single combined `pdf_path` here, point their "pdf_path" entries at
     # that combined file instead so downstream consumers reference something that exists on disk.
     contact_rate_by_cluster["pdf_path"] = str(pdf_path)
     condition_comparison["pdf_path"] = str(pdf_path)
 
+    target_class_long_features_csv = None
+    if use_target_class:
+        contact_token = _sanitize_filename_token(contact_col, fallback="contact")
+        target_class_long_features_csv = csv_dir / f"target_class_features_{contact_token}.csv"
+        long_target_df.reset_index().to_csv(target_class_long_features_csv, index=False)
+
     if bool(verbose):
         print(f"Saved contact-group analysis bundle for '{contact_col}' to: {pdf_path}")
 
-    return {
+    result = {
         "contact_col": str(contact_col),
         "min_bout_length": int(min_bout_length),
         "group_col": group_col,
@@ -1222,7 +1372,17 @@ def save_track_contact_group_analysis(
         "condition_comparison": condition_comparison,
         "mean_fraction_violin_pdf": str(pdf_path),
         "max_bout_length_violin_pdf": str(pdf_path),
+        "use_target_class": use_target_class,
     }
+    if use_target_class:
+        result["target_class_analysis"] = {
+            "target_class_group_col": target_group_col,
+            "touched_classes": resolved_target_class_order,
+            "long_features_csv": str(target_class_long_features_csv),
+            "composition_grid": target_class_composition_grid,
+            "comparison": target_class_comparison,
+        }
+    return result
 
 
 def generate_track_clustering_report_pdfs(
