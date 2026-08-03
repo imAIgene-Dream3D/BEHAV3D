@@ -104,21 +104,27 @@ The client sends:
 `POST /chat` returns an SSE stream containing newline-delimited JSON events:
 
 ```text
+{"type":"status","stage":"retrieval","component":"retrieval","message":"...","request_id":"..."}
+{"type":"status","stage":"provider","component":"deepseek","message":"...","request_id":"..."}
 {"type":"token","text":"..."}
 {"type":"tool_calls","calls":[{"name":"set_ui_value","arguments":{...}}]}
 {"type":"done"}
 ```
 
 Failures use `{"type":"error","message":"..."}` followed by `done`.
-`GET /health` reports the active model, RAG chunk count, control contract
-version, and knowledge version.
+All events include a short `request_id` and elapsed server time. `GET /health`
+is a cheap Modal and RAG check that reports the active model, chunk count,
+control contract version, and knowledge version. `GET
+/health?probe_provider=true` also sends a one-token request to DeepSeek and
+returns its status and latency. Use the provider probe interactively or during
+diagnosis, not as a high-frequency monitor.
 
 ## Component map
 
 | File | Responsibility | Change it when |
 |---|---|---|
 | `behav3d/napari/_assistant.py` | Chat UI, quick buttons, local metadata wizard, history, streaming, action cards, no-op handling, and apply/confirm policy. | Changing the chat experience or how validated actions are presented/applied. |
-| `behav3d/napari/_assistant_client.py` | Endpoint configuration, background HTTP/SSE worker, and offline fallback. | Changing transport, timeouts, authentication, or degraded behavior. |
+| `behav3d/napari/_assistant_client.py` | Endpoint configuration, background HTTP/SSE and health workers, classified failures, automatic retry, and offline fallback. | Changing transport, timeouts, health checks, authentication, or degraded behavior. |
 | `behav3d/napari/_assistant_context.py` | Defensive serialization of live BEHAV3D state and experiment references. | The assistant needs to read a new piece of UI, metadata, log, result, or experiment state. |
 | `behav3d/napari/_assistant_controls.py` | Live editable-control registry, getters, setters, units, choices, visibility, and persistence callbacks. | The assistant should be able to inspect or edit a real UI control. |
 | `behav3d/napari/_assistant_actions.py` | Tool schemas, tool-call validation, `ProposedAction`, and action application. | Adding a new action or changing how an action is validated/applied. |
@@ -356,6 +362,43 @@ The client reads `napari/assistant_config.json`, which is gitignored. Start from
 
 `BEHAV3D_ASSISTANT_ENDPOINT` overrides the file. The timeout is split into a
 10-second connection timeout and the configured read timeout.
+
+## Runtime status and recovery
+
+The chat dock keeps a persistent service-status row above the transcript. It
+shows the current stage and elapsed time instead of a generic loading state:
+
+| UI status | What has been confirmed |
+|---|---|
+| `Connecting to Modal` | The client is opening the HTTP connection; Modal has not replied yet. |
+| `Checking BEHAV3D guidance` | Modal is online and the server is retrieving local documentation. |
+| `Waiting for DeepSeek` | Modal and retrieval are complete; the external model has not started returning data. |
+| `Receiving the response` | DeepSeek is streaming text or proposed actions. |
+| `Retrying automatically` | A transient failure occurred before any output; one safe retry is in progress. |
+| `Offline` / `Issue` | The tooltip and transcript identify Modal, DeepSeek, configuration, or the response stream as the failing component. |
+
+The **Check status** button calls the provider-probing health route and reports
+Modal, the RAG index, DeepSeek, model name, latency, and any request ID in the
+status tooltip. At startup, the client performs only the lightweight health
+check. After an outage it repeats health checks every 15 seconds and returns to
+`Online` automatically. A chat request is retried once after two seconds only
+when the failure is transient and no text or tool action has arrived; partial
+responses are never replayed, avoiding duplicate form changes.
+
+For command-line diagnosis:
+
+```bash
+# Modal and RAG only
+curl -s <url>/health
+
+# Modal, RAG, and a live DeepSeek request
+curl -s '<url>/health?probe_provider=true'
+
+# Observe request stages and retain request_id for server-log correlation
+curl -N -X POST <url>/chat \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Explain this screen"}],"context":{"current_step":"tracking"},"tools":[]}'
+```
 
 Run a hot-reloading Modal endpoint:
 
