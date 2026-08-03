@@ -181,6 +181,7 @@ class BaseStateClassificationPanel:
         self._full_name_boxes = {}
         self._full_select_boxes = {}
         self._binary_detection_cache = None
+        self._cfg_loaded_cell_type = None
 
         self._descriptive_feature_options = (
             "mean",
@@ -1206,7 +1207,10 @@ class BaseStateClassificationPanel:
             self.cell_type_dd.value = self.cell_type_dd.options[0]
 
         self._refresh_apply_default_paths()
-        self._apply_cfg_defaults()
+        current_cell_type = self._current_cell_type()
+        if current_cell_type != self._cfg_loaded_cell_type:
+            self._apply_cfg_defaults()
+            self._cfg_loaded_cell_type = current_cell_type
         self._load_columns()
         self._build_feature_groups()
         self._load_existing_model_if_available()

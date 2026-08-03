@@ -2416,7 +2416,7 @@ class StateClassificationSubTab(QWidget):
                 output_dir=out_dir,
                 cell_type=ct,
                 state_col=state_col,
-                enforce_time_coverage=True,
+                enforce_time_coverage=False,
                 n_workers=1,
                 verbose=False,
             )
@@ -2525,7 +2525,7 @@ class StateClassificationSubTab(QWidget):
                 output_dir=out,
                 cell_type=ct,
                 state_col=state_col,
-                enforce_time_coverage=True,
+                enforce_time_coverage=False,
                 n_workers=1,
                 verbose=True,
             )
