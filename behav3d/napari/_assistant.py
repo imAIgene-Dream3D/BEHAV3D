@@ -579,8 +579,16 @@ class AssistantDock(QWidget):
         info = self._status_info or {}
         level = info.get("level", "working")
         message = info.get("message") or "Assistant status unavailable."
+        if level == "online":
+            fully_checked = (
+                info.get("deepseek") == "online"
+                or info.get("stage") == "complete"
+            )
+            self.status_label.setText(
+                "Online · All systems working" if fully_checked else "Online"
+            )
+            return
         prefixes = {
-            "online": "Online",
             "degraded": "Limited",
             "offline": "Offline",
             "error": "Issue",
