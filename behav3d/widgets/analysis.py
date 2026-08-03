@@ -34,7 +34,7 @@ from behav3d.core.utils import expand_column_patterns
 from behav3d.io.formats.zarr import load_zarr
 from behav3d.io.images import load_image
 from behav3d.features.timepoint_features import run_feature_extraction
-from behav3d.analysis.backprojection import backproject_columns, view_napari
+from behav3d.analysis.backprojection import backproject_columns, view_napari, backproject_feature_at_timepoint
 from behav3d.analysis.behavior.track.feature_dtw import run_tcell_analysis
 from behav3d.analysis.behavior.track.visualization.plots.feature_dtw import (
     plot_cluster_percentage_bars,
@@ -118,6 +118,51 @@ def _sample_voxel_size(metadata, sample_name):
 
 def _feature_output_csv_path(output_dir, cell_type):
     return Path(output_dir, "analysis", cell_type, "track_features", f"BEHAV3D_{cell_type}_combined_track_features.csv")
+
+
+def _filtered_feature_output_csv_path(output_dir, cell_type):
+    return Path(
+        output_dir, "analysis", cell_type, "track_features",
+        f"BEHAV3D_{cell_type}_combined_track_features_filtered.csv",
+    )
+
+
+def _preferred_feature_csv_path(output_dir, cell_type):
+    """Filtered combined-features CSV if it exists, else the unfiltered one.
+
+    Preferring the filtered CSV (when present) means ``original_TrackID``
+    handling in ``backproject_feature_at_timepoint`` is meaningful: that
+    column is only added by filtering (to snapshot pre-split TrackIDs), so
+    always reading the unfiltered CSV would make that preference dead code.
+    """
+    filtered_path = _filtered_feature_output_csv_path(output_dir, cell_type)
+    if filtered_path.exists():
+        return filtered_path
+    return _feature_output_csv_path(output_dir, cell_type)
+
+
+def _percentile_contrast_limits(img, mask=None):
+    """1st/99th percentile contrast limits over ``img[mask]`` (or ``img > 0`` if mask is None)."""
+    vals = img[mask] if mask is not None else img[img > 0]
+    if vals.size == 0:
+        return 0, max(1, float(img.max()) if img.size else 1)
+    vmin, vmax = float(np.percentile(vals, 1)), float(np.percentile(vals, 99))
+    if vmin == vmax:
+        vmax = vmin + 1e-6
+    return vmin, vmax
+
+
+def _shared_zarr_time_max(*arrays):
+    lengths = [int(a.shape[0]) for a in arrays if a is not None and hasattr(a, "shape") and len(a.shape) > 0]
+    return max(0, min(lengths) - 1) if lengths else 0
+
+
+def _project_label_frame(label_vol):
+    """Collapse a (Z,Y,X) label volume to 2D via first-nonzero-along-Z; passthrough if already 2D."""
+    if label_vol.ndim == 3:
+        first_nz_idx = np.argmax(label_vol > 0, axis=0)
+        return np.take_along_axis(label_vol, first_nz_idx[np.newaxis], axis=0)[0]
+    return label_vol
 
 
 def _csv_has_columns(csv_path, required_columns):
@@ -1997,17 +2042,11 @@ class DeathThresholdPreview:
 
     @staticmethod
     def _contrast_limits(img):
-        pos = img[img > 0]
-        if pos.size == 0:
-            return 0, max(1, img.max())
-        return float(np.percentile(pos, 1)), float(np.percentile(pos, 99))
+        return _percentile_contrast_limits(img)
 
     @staticmethod
     def _shared_time_max(*arrays):
-        lengths = [int(arr.shape[0]) for arr in arrays if arr is not None and hasattr(arr, "shape") and len(arr.shape) > 0]
-        if not lengths:
-            return 0
-        return max(0, min(lengths) - 1)
+        return _shared_zarr_time_max(*arrays)
 
     def _update(self, _):
         sample = self.sample_name
@@ -2065,11 +2104,7 @@ class DeathThresholdPreview:
                     dead_raw = raw_img
 
                 label_vol = np.asarray(label_zarr[t])
-                if label_vol.ndim == 3:
-                    first_nz_idx = np.argmax(label_vol > 0, axis=0)
-                    label_img = np.take_along_axis(label_vol, first_nz_idx[np.newaxis], axis=0)[0]
-                else:
-                    label_img = label_vol
+                label_img = _project_label_frame(label_vol)
 
                 # No label restriction: preview always uses all segments.
                 label_view = label_img
@@ -2150,6 +2185,286 @@ class DeathThresholdPreview:
                 display(widgets.HTML(legend_html))
                 if df_tracks is None:
                     print("Preview CSV is missing. Use the preview button in Feature Extraction to prepare intensity/death features first.")
+            except Exception as e:
+                traceback.print_exc()
+                print(f"Preview unavailable: {e}")
+
+
+_FEATURE_BP_EXCLUDED_COLUMNS = {
+    "TrackID", "original_TrackID", "sample_name", "position_t",
+    "position_x", "position_y", "position_z", "ClusterID", "UMAP1", "UMAP2",
+}
+
+
+class FeatureBackprojectionPreviewPanel:
+    """
+    Quick, current-timepoint-only preview: pick a cell type + numeric
+    feature, backproject it onto the segmentation labels for the
+    currently viewed timepoint. Mirrors ``DeathThresholdPreview``'s lazy
+    single-frame zarr reads (fast, low memory — no full-experiment zarr
+    is written, no napari viewer opened).
+    """
+
+    def __init__(self, metadata_loader):
+        self.metadata_loader = metadata_loader
+        self.output_dir = Path(self.metadata_loader.output_dir).expanduser()
+        self._tracks_cache = {}
+        self._preview_block_reason = None
+        self.raw_path = None
+        self.label_path = None
+
+        md = self.metadata_loader.metadata
+        organoid_types, immune_types, other_types = _detect_downstream_cell_types(md)
+        self.cell_types = organoid_types + immune_types + other_types
+        sample_list = sorted(map(str, md["sample_name"].unique().tolist())) if md is not None else []
+
+        self.cell_type_dd = widgets.Dropdown(
+            options=self.cell_types or ["(none)"],
+            value=(self.cell_types[0] if self.cell_types else "(none)"),
+            description="Cell type:", layout=widgets.Layout(width="220px"),
+        )
+        self.sample_dd = widgets.Dropdown(
+            options=sample_list or ["(none)"],
+            value=(sample_list[0] if sample_list else "(none)"),
+            description="Sample:", layout=widgets.Layout(width="260px"),
+        )
+        self.feature_dd = widgets.Dropdown(
+            options=["(none)"], value="(none)",
+            description="Feature:", layout=widgets.Layout(width="260px"),
+        )
+        self.org_ch_input = widgets.IntText(
+            value=0, description="Cell Channel:",
+            style={'description_width': 'initial'}, layout={'width': '190px'},
+        )
+        self.time_slider = widgets.IntSlider(
+            description="Time:", continuous_update=False, layout={'width': '400px'},
+        )
+        self.out = widgets.Output(layout={'overflow': 'visible', 'height': 'auto'})
+
+        self._channel_debouncer = Debouncer(self._update, wait=THRESHOLD_DEBOUNCE_SECONDS)
+
+        self.cell_type_dd.observe(self._on_context_change, names='value')
+        self.sample_dd.observe(self._on_context_change, names='value')
+        self.feature_dd.observe(self._update, names='value')
+        self.time_slider.observe(self._update, names='value')
+        self.org_ch_input.observe(self._channel_debouncer, names='value')
+
+        self.ui = widgets.VBox([
+            widgets.HTML("<b>Feature Backprojection Preview</b> <i>(current timepoint only)</i>"),
+            widgets.HBox([self.cell_type_dd, self.sample_dd, self.feature_dd],
+                         layout=widgets.Layout(align_items="center", gap="10px")),
+            widgets.HBox([self.org_ch_input, widgets.HTML("<i>(Index starting at 0)</i>")]),
+            self.time_slider,
+            self.out,
+        ])
+
+        if self.cell_types and sample_list:
+            self._on_context_change(None)
+
+    # --- path / CSV resolution -------------------------------------------------
+    def _resolve_label_path(self, row, cell_type):
+        for prefix in ['or', 'im', 'ot']:
+            col = f"{prefix}_{cell_type}_tracks_image_path"
+            if col in row and pd.notna(row[col]) and str(row[col]).strip():
+                p = Path(row[col])
+                return p if p.exists() else None
+        return None
+
+    def _tracks_dataframe(self, cell_type):
+        if cell_type in self._tracks_cache:
+            return self._tracks_cache[cell_type]
+        csv_path = _preferred_feature_csv_path(self.output_dir, cell_type)
+        if not csv_path.exists():
+            self._tracks_cache[cell_type] = (None, csv_path)
+            return None, csv_path
+        try:
+            df = pd.read_csv(csv_path, low_memory=False)
+        except Exception:
+            df = None
+        self._tracks_cache[cell_type] = (df, csv_path)
+        return df, csv_path
+
+    # --- context / options -------------------------------------------------
+    def _update_feature_options(self, cell_type):
+        df, _csv_path = self._tracks_dataframe(cell_type)
+        if df is None or df.empty:
+            self.feature_dd.options = ["(none)"]
+            self.feature_dd.value = "(none)"
+            return
+        numeric_cols = [
+            c for c in df.columns
+            if c not in _FEATURE_BP_EXCLUDED_COLUMNS and pd.api.types.is_numeric_dtype(df[c])
+        ]
+        options = ["(none)"] + sorted(numeric_cols)
+        self.feature_dd.options = options
+        self.feature_dd.value = options[1] if len(options) > 1 else "(none)"
+
+    def _on_context_change(self, _):
+        cell_type = self.cell_type_dd.value
+        sample = self.sample_dd.value
+        self._preview_block_reason = None
+        self.raw_path = None
+        self.label_path = None
+
+        if cell_type in (None, "(none)") or sample in (None, "(none)"):
+            return
+
+        self._update_feature_options(cell_type)
+
+        md = self.metadata_loader.metadata
+        md_match = md[md['sample_name'].astype(str) == str(sample)]
+        if md_match.empty:
+            self._preview_block_reason = f"Sample {sample} not found in metadata."
+            return
+        row = md_match.iloc[0]
+
+        if 'raw_image_path' in row and pd.notna(row['raw_image_path']) and str(row['raw_image_path']).strip():
+            p = Path(row['raw_image_path'])
+            self.raw_path = p if p.exists() else None
+            if self.raw_path is None:
+                self._preview_block_reason = f"raw_image_path file not found on disk: {p}"
+        else:
+            self._preview_block_reason = "raw_image_path is missing in metadata."
+
+        self.label_path = self._resolve_label_path(row, cell_type)
+        if self.label_path is None and self._preview_block_reason is None:
+            self._preview_block_reason = (
+                f"{cell_type} channel is empty for sample {sample} "
+                "(no valid tracks image path in metadata or file missing on disk)."
+            )
+
+        guessed_channel = _guess_channel_index(self.metadata_loader, sample, cell_type)
+        if guessed_channel is not None:
+            self.org_ch_input.value = int(guessed_channel)
+
+        if self.raw_path is not None and self.label_path is not None:
+            try:
+                raw_zarr = load_zarr(self.raw_path)
+                label_zarr = load_zarr(self.label_path)
+                shared_max = _shared_zarr_time_max(raw_zarr, label_zarr)
+                self.time_slider.max = shared_max
+                if self.time_slider.value > shared_max:
+                    self.time_slider.value = shared_max
+                elif self.time_slider.value == 0 and shared_max > 0:
+                    self.time_slider.value = shared_max // 2
+            except Exception:
+                pass
+
+        self._update(None)
+
+    # --- render -------------------------------------------------
+    def _update(self, _):
+        cell_type = self.cell_type_dd.value
+        sample = self.sample_dd.value
+        feature_col = self.feature_dd.value
+        t = self.time_slider.value
+
+        self.out.clear_output(wait=False)
+        with self.out:
+            try:
+                if cell_type in (None, "(none)") or sample in (None, "(none)"):
+                    print("Select a cell type and sample to preview.")
+                    return
+                if self._preview_block_reason:
+                    print(self._preview_block_reason)
+                    return
+                if self.raw_path is None or self.label_path is None:
+                    print("Preview data not available yet.")
+                    return
+                if feature_col in (None, "(none)"):
+                    print("Select a feature to backproject.")
+                    return
+
+                df_tracks, csv_path = self._tracks_dataframe(cell_type)
+                if df_tracks is None:
+                    print(
+                        f"No track-features CSV found for {cell_type} "
+                        f"(expected at {csv_path}). Run Feature Extraction first."
+                    )
+                    return
+                if feature_col not in df_tracks.columns:
+                    print(f"Feature '{feature_col}' not found in {csv_path.name}.")
+                    return
+
+                org_ch = int(self.org_ch_input.value)
+                raw_zarr = load_zarr(self.raw_path)
+                label_zarr = load_zarr(self.label_path)
+                shared_max = _shared_zarr_time_max(raw_zarr, label_zarr)
+                if t > shared_max:
+                    print(f"Timepoint {t} outside shared range (0-{shared_max}).")
+                    if self.time_slider.value != shared_max:
+                        self.time_slider.value = shared_max
+                    return
+
+                has_channels = (raw_zarr.ndim == 5)
+                if has_channels:
+                    n_channels = raw_zarr.shape[1]
+                    if org_ch >= n_channels:
+                        print(f"Channel {org_ch} out of range (0-{n_channels - 1}).")
+                        return
+                    raw_img = np.asarray(raw_zarr[t, org_ch]).max(axis=0)
+                else:
+                    raw_img = np.asarray(raw_zarr[t]).max(axis=0)
+
+                label_vol = np.asarray(label_zarr[t])
+                label_img = _project_label_frame(label_vol)
+
+                pos_mask = pd.to_numeric(df_tracks['position_t'], errors='coerce').fillna(-1).astype(int) == int(t)
+                sample_mask = df_tracks['sample_name'].astype(str) == str(sample)
+                df_t = df_tracks[sample_mask & pos_mask]
+
+                if df_t.empty:
+                    print(f"No feature rows for sample {sample} at timepoint {t}.")
+                    mapped = np.zeros_like(label_img)
+                    ids_with_value = np.array([], dtype=np.int64)
+                else:
+                    try:
+                        mapped, ids_with_value = backproject_feature_at_timepoint(
+                            labels_frame=label_img,
+                            df_features=df_t,
+                            feature_col=feature_col,
+                            track_col="TrackID",
+                            background_value=0,
+                        )
+                    except ValueError as e:
+                        print(f"Cannot backproject '{feature_col}': {e}")
+                        return
+
+                present_mask = (label_img > 0) & np.isin(label_img, ids_with_value)
+                missing_mask = (label_img > 0) & ~present_mask
+
+                vmin_r, vmax_r = _percentile_contrast_limits(raw_img)
+                vmin_f, vmax_f = _percentile_contrast_limits(mapped.astype(float), mask=present_mask)
+
+                seg_display = np.ma.masked_where(label_img == 0, label_img)
+                feature_display = np.ma.masked_where(~present_mask, mapped.astype(float))
+
+                cmap = plt.get_cmap('inferno').copy()
+                cmap.set_bad(color='#2a2a2a')
+
+                fig, axes = plt.subplots(1, 3, figsize=(18, 6), dpi=150)
+                axes[0].imshow(raw_img, cmap='gray', vmin=vmin_r, vmax=vmax_r)
+                axes[0].set_title(f"Raw {cell_type} (Ch {org_ch})")
+                axes[1].imshow(np.zeros_like(label_img), cmap='gray', vmin=0, vmax=1)
+                axes[1].imshow(seg_display, cmap='nipy_spectral', interpolation='nearest')
+                axes[1].set_title(f"Segments ({Path(self.label_path).stem})")
+                im3 = axes[2].imshow(feature_display, cmap=cmap, vmin=vmin_f, vmax=vmax_f)
+                if missing_mask.any():
+                    hatch_overlay = np.ma.masked_where(~missing_mask, missing_mask)
+                    axes[2].imshow(hatch_overlay, cmap=ListedColormap(['#888888']), alpha=0.6)
+                axes[2].set_title(f"{feature_col} (t={t})")
+                fig.colorbar(im3, ax=axes[2], fraction=0.046, pad=0.04)
+                for ax in axes:
+                    ax.axis('off')
+                plt.tight_layout()
+                plt.show()
+
+                if missing_mask.any():
+                    display(widgets.HTML(
+                        "<div style='padding:5px;border:1px solid #ccc;background:#f9f9f9;font-size:12px;'>"
+                        "<span style='color:#888;'>&#9632;</span> Gray = segment present but no matching "
+                        f"'{feature_col}' row in {csv_path.name} at this timepoint.</div>"
+                    ))
             except Exception as e:
                 traceback.print_exc()
                 print(f"Preview unavailable: {e}")
