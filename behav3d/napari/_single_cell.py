@@ -1515,10 +1515,19 @@ class StateClassificationSubTab(QWidget):
             # switching cell types could dump every feature into the binary list.
             from behav3d.widgets.base_state_classification import (
                 detect_binary_columns_from_csv,
+                detect_non_numeric_columns_from_csv,
             )
             bin_cols = detect_binary_columns_from_csv(Path(csv_path), usable_cols)
             bin_set = set(bin_cols)
-            feat_cols = [c for c in usable_cols if c not in bin_set]
+            # Columns that aren't binary and can't be parsed as continuous numbers
+            # (e.g. "touching_27ts" holding comma-separated contact-ID lists, or
+            # unit/label columns) must not be offered as selectable HMM features --
+            # picking one silently breaks the .h5ad write later on.
+            non_feature_candidates = [c for c in usable_cols if c not in bin_set]
+            non_numeric_cols = set(
+                detect_non_numeric_columns_from_csv(Path(csv_path), non_feature_candidates)
+            )
+            feat_cols = [c for c in non_feature_candidates if c not in non_numeric_cols]
             # Continuous features eligible for log scaling; reused by the
             # "Preview feature distributions" histogram button.
             self._logscale_candidate_cols = list(feat_cols)
@@ -1784,6 +1793,33 @@ class StateClassificationSubTab(QWidget):
         self.log_edit.append(formatted)
         print(formatted)
 
+    # ── Open-folder pop-up ─────────────────────────────────────────────
+    def _offer_open_results_folder(self, folder: Path, what: str = "State Classification"):
+        """Pop a dialog offering to open the results folder in the OS file manager.
+
+        Silently no-ops if ``folder`` does not exist (e.g. analysis failed).
+        """
+        try:
+            if not folder or not Path(folder).exists():
+                return
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Information)
+            box.setWindowTitle(f"{what} complete")
+            box.setText(f"{what} analysis is complete.")
+            box.setInformativeText(
+                f"Results have been saved to:\n{folder}\n\n"
+                "Would you like to open the results folder?"
+            )
+            btn_open = box.addButton("Open folder", QMessageBox.AcceptRole)
+            box.addButton("Close", QMessageBox.RejectRole)
+            box.setDefaultButton(btn_open)
+            box.exec_()
+            if box.clickedButton() is btn_open:
+                from qtpy.QtCore import QUrl
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+        except Exception as e:
+            self._log(f"Could not show results-folder dialog: {e}")
+
     def _on_run_state(self):
         ct = self._cell_type()
         if not ct:
@@ -1869,7 +1905,7 @@ class StateClassificationSubTab(QWidget):
         params.setdefault("state_classification", {})[ct] = collected
         _save_behav3d_params(self.metadata_loader, self._out_dir)
 
-    def _on_state_done(self, result):
+    def _on_state_done(self, result, interactive: bool = True):
         ct = self._cell_type()
         self._persist_state_cfg(ct)
         self._log(f"✅ State classification complete for '{ct}'.")
@@ -1898,6 +1934,16 @@ class StateClassificationSubTab(QWidget):
         self._update_bp_buttons()
         self._notify_results()
         QTimer.singleShot(0, lambda _ct=ct: self._apply_to_full_dataset_after_rename(_ct))
+        if interactive:
+            diagnostics_pdf = None
+            try:
+                diagnostics_pdf = result.uns.get("clustering", {}).get("diagnostics_pdf")
+            except Exception:
+                diagnostics_pdf = None
+            if diagnostics_pdf:
+                self._offer_open_results_folder(
+                    Path(diagnostics_pdf).parent, what="State Classification"
+                )
 
     def run_state_classification(self, interactive=True, extra_callbacks=None):
         """Called from queue runner (_queue.py)."""
@@ -1925,7 +1971,7 @@ class StateClassificationSubTab(QWidget):
             return res["model_adata"]
 
         def _done(result):
-            self._on_state_done(result)
+            self._on_state_done(result, interactive=interactive)
             if on_done_cb:
                 on_done_cb(result)
 
@@ -2756,13 +2802,26 @@ class TrackClassificationSubTab(QWidget):
         dtw_form = QFormLayout()
         dtw_form.setSpacing(3)
 
+        self.combo_clustering_method = QComboBox()
+        self.combo_clustering_method.addItems(["agglomerative", "leiden"])
+        self.combo_clustering_method.setMaximumWidth(130)
+        dtw_form.addRow("Method:", make_help_row(
+            self.combo_clustering_method, "Clustering method",
+            "Algorithm used to group track trajectories from the DTW distance matrix. "
+            "'agglomerative' uses a fixed cluster count (N clusters, Linkage below). "
+            "'leiden' finds density-based communities on the same distance matrix the "
+            "QC UMAP plot is built from, so the number of clusters is emergent (set via "
+            "Leiden resolution below) and tends to track the blobs visible in that plot "
+            "instead of a fixed split."
+        ))
+
         self.combo_linkage = QComboBox()
         self.combo_linkage.addItems(["average", "complete", "single"])
         self.combo_linkage.setMaximumWidth(130)
         dtw_form.addRow("Linkage:", make_help_row(
             self.combo_linkage, "Linkage",
             "Agglomerative clustering linkage method. 'average' is the most commonly used; "
-            "'complete' produces more compact clusters."
+            "'complete' produces more compact clusters. Only used when Method is 'agglomerative'."
         ))
 
         self.combo_trim = QComboBox()
@@ -2783,6 +2842,31 @@ class TrackClassificationSubTab(QWidget):
             "are preserved for backprojection."
         ))
         self.adv1.addLayout(dtw_form)
+
+        self._leiden_frame = QFrame()
+        leiden_form = QFormLayout(self._leiden_frame)
+        leiden_form.setSpacing(3)
+        self.spin_leiden_neighbors = QSpinBox()
+        self.spin_leiden_neighbors.setRange(2, 200)
+        self.spin_leiden_neighbors.setValue(15)
+        self.spin_leiden_neighbors.setMaximumWidth(90)
+        leiden_form.addRow("Leiden neighbors:", make_help_row(
+            self.spin_leiden_neighbors, "Leiden neighbors",
+            "Number of nearest neighbours used to build the graph Leiden clusters on. "
+            "Higher values smooth over noise but can merge distinct groups."
+        ))
+        self.spin_leiden_resolution = QDoubleSpinBox()
+        self.spin_leiden_resolution.setRange(0.01, 20.0)
+        self.spin_leiden_resolution.setSingleStep(0.1)
+        self.spin_leiden_resolution.setDecimals(2)
+        self.spin_leiden_resolution.setValue(1.0)
+        self.spin_leiden_resolution.setMaximumWidth(90)
+        leiden_form.addRow("Leiden resolution:", make_help_row(
+            self.spin_leiden_resolution, "Leiden resolution",
+            "Controls how many Leiden clusters are found: higher values produce more, "
+            "smaller clusters; lower values produce fewer, larger ones."
+        ))
+        self.adv1.addWidget(self._leiden_frame)
 
         self.chk_parallel = QCheckBox("Parallel computation")
         self.chk_parallel.setChecked(True)
@@ -3058,6 +3142,23 @@ class TrackClassificationSubTab(QWidget):
         prop_row.addWidget(self.btn_view_track_proportions)
         g_prop.addLayout(prop_row)
 
+        self.grp_window_transitions = QGroupBox("Window Transitions")
+        g_wintrans = QVBoxLayout(self.grp_window_transitions)
+        g_wintrans.setSpacing(4)
+        g_wintrans.addWidget(_make_info_label(
+            "Sankey diagram of how each track's trajectory cluster changes from one "
+            "window to the next - reconnects the sub-tracks 'Divide long tracks' split "
+            "a track into, back through their shared parent TrackID. One diagram per "
+            "sample, plus a pooled page. Needs 'Divide long tracks' to have been used."
+        ))
+        wintrans_row = QHBoxLayout()
+        self.btn_window_transitions = QPushButton("▶ Create Window Transition Sankey")
+        _style_secondary(self.btn_window_transitions)
+        wintrans_row.addWidget(self.btn_window_transitions, stretch=1)
+        self.btn_view_window_transitions = _make_view_btn()
+        wintrans_row.addWidget(self.btn_view_window_transitions)
+        g_wintrans.addLayout(wintrans_row)
+
         self.grp_track_comparison = QGroupBox("Condition Comparison Report")
         g_track_comparison = QVBoxLayout(self.grp_track_comparison)
         g_track_comparison.setSpacing(4)
@@ -3298,6 +3399,7 @@ class TrackClassificationSubTab(QWidget):
         pipeline_content_lay.setSpacing(6)
         pipeline_content_lay.addWidget(self.grp_diag)
         pipeline_content_lay.addWidget(self.grp_track_proportions)
+        pipeline_content_lay.addWidget(self.grp_window_transitions)
         pipeline_content_lay.addWidget(self.grp_track_comparison)
         pipeline_content_lay.addWidget(self.grp_contact_analysis)
         pipeline_content_lay.addWidget(self.grp_exemplar)
@@ -3389,9 +3491,11 @@ class TrackClassificationSubTab(QWidget):
         lay.addStretch(1)
 
         self._setup_signals()
+        self._apply_clustering_method_mode(self.combo_clustering_method.currentText())
 
     def _setup_signals(self):
         self.chk_apply_pretrained.toggled.connect(self._toggle_pretrained_mode)
+        self.combo_clustering_method.currentTextChanged.connect(self._apply_clustering_method_mode)
         self.chk_use_original.toggled.connect(self._on_original_toggled_from_adv)
         self.chk_use_original_top.toggled.connect(self._on_original_toggled_from_top)
         self.btn_run_track.clicked.connect(self._on_run_cluster)
@@ -3407,6 +3511,8 @@ class TrackClassificationSubTab(QWidget):
         self.btn_view_diagnostics.clicked.connect(lambda: self._on_view("track_diagnostics"))
         self.btn_track_proportions.clicked.connect(self._on_track_proportions)
         self.btn_view_track_proportions.clicked.connect(lambda: self._on_view("track_proportions"))
+        self.btn_window_transitions.clicked.connect(self._on_window_transitions)
+        self.btn_view_window_transitions.clicked.connect(lambda: self._on_view("window_transitions"))
         self.btn_track_condition_comparison.clicked.connect(self._on_track_condition_comparison)
         self.btn_view_track_condition_comparison.clicked.connect(
             lambda: self._on_view("track_condition_comparison")
@@ -3537,6 +3643,7 @@ class TrackClassificationSubTab(QWidget):
     # ── Guided pipeline dispatch (Step 3 create plots) ───────────────────
     _TRACK_PIPELINE_RUN_BUTTONS = {
         "track_diagnostics": "btn_diagnostics",
+        "track_window_transitions": "btn_window_transitions",
     }
 
     def _on_pipeline_start(self, pipeline_id: str):
@@ -3558,12 +3665,13 @@ class TrackClassificationSubTab(QWidget):
         visible = {
             "track_diagnostics": {self.grp_diag},
             "track_proportions": {self.grp_track_proportions},
+            "track_window_transitions": {self.grp_window_transitions},
             "track_comparison": {self.grp_track_comparison},
             "track_contact": {self.grp_contact_analysis},
             "track_exemplars": {self.grp_exemplar},
         }.get(pipeline_id, set())
-        for group in (self.grp_diag, self.grp_track_proportions, self.grp_track_comparison,
-                      self.grp_contact_analysis, self.grp_exemplar):
+        for group in (self.grp_diag, self.grp_track_proportions, self.grp_window_transitions,
+                      self.grp_track_comparison, self.grp_contact_analysis, self.grp_exemplar):
             group.setVisible(group in visible)
         title = next(
             (s["title"] for s in TRACK_PLOT_PIPELINES if s["id"] == pipeline_id), ""
@@ -3614,6 +3722,12 @@ class TrackClassificationSubTab(QWidget):
         self._apply_original_mode(checked)
         if checked:
             self._show_original_dtw_disclaimer()
+
+    def _apply_clustering_method_mode(self, method: str):
+        """Update visibility/enabled state of Linkage vs Leiden-specific controls."""
+        is_leiden = str(method) == "leiden"
+        self.combo_linkage.setEnabled(not is_leiden)
+        self._leiden_frame.setVisible(is_leiden)
 
     def _apply_original_mode(self, checked: bool):
         """Update visibility of UI sections for original vs dtaidistance mode."""
@@ -3685,6 +3799,9 @@ class TrackClassificationSubTab(QWidget):
             "behavioral_trajectory_size": int(self.spin_traj_size.value()),
             "n_clusters":                 int(self.spin_n_clusters.value()),
             "linkage":                    self.combo_linkage.currentText(),
+            "clustering_method":          self.combo_clustering_method.currentText(),
+            "leiden_n_neighbors":         int(self.spin_leiden_neighbors.value()),
+            "leiden_resolution":          float(self.spin_leiden_resolution.value()),
             "trajectory_trim_mode":       self.combo_trim.currentText(),
             "split_long_tracks":          self.chk_split_long_tracks.isChecked(),
             "parallel":                   self.chk_parallel.isChecked(),
@@ -3719,6 +3836,13 @@ class TrackClassificationSubTab(QWidget):
             self.spin_n_clusters.setValue(int(cfg["n_clusters"]))
         if "linkage" in cfg:
             self.combo_linkage.setCurrentText(cfg["linkage"])
+        if "clustering_method" in cfg:
+            self.combo_clustering_method.setCurrentText(cfg["clustering_method"])
+        if "leiden_n_neighbors" in cfg:
+            self.spin_leiden_neighbors.setValue(int(cfg["leiden_n_neighbors"]))
+        if "leiden_resolution" in cfg:
+            self.spin_leiden_resolution.setValue(float(cfg["leiden_resolution"]))
+        self._apply_clustering_method_mode(self.combo_clustering_method.currentText())
         if "trajectory_trim_mode" in cfg:
             self.combo_trim.setCurrentText(cfg["trajectory_trim_mode"])
         if "split_long_tracks" in cfg:
@@ -4142,6 +4266,7 @@ class TrackClassificationSubTab(QWidget):
                 self.btn_view_track, self.btn_view_train_track,
                 self.btn_view_apply_track, self.btn_view_exemplars,
                 self.btn_view_diagnostics, self.btn_view_track_proportions,
+                self.btn_view_window_transitions,
                 self.btn_view_track_condition_comparison, self.btn_view_contact_analysis,
                 self.btn_view_contact_state_shift, self.btn_view_track_contact_overview,
             ):
@@ -4168,6 +4293,14 @@ class TrackClassificationSubTab(QWidget):
                 proportions_dir
                 and proportions_dir.exists()
                 and any(proportions_dir.glob("*.pdf"))
+            )
+        )
+        window_transitions_dir = traj_dir / "window_transitions" if traj_dir else None
+        self.btn_view_window_transitions.setEnabled(
+            bool(
+                window_transitions_dir
+                and window_transitions_dir.exists()
+                and any(window_transitions_dir.glob("*.pdf"))
             )
         )
         comparisons_dir = traj_dir / "behavior_comparisons" if traj_dir else None
@@ -4239,6 +4372,9 @@ class TrackClassificationSubTab(QWidget):
             "n_clusters": int(self.spin_n_clusters.value()),
             "random_state": int(self.spin_seed.value()),
             "linkage": self.combo_linkage.currentText(),
+            "clustering_method": self.combo_clustering_method.currentText(),
+            "leiden_n_neighbors": int(self.spin_leiden_neighbors.value()),
+            "leiden_resolution": float(self.spin_leiden_resolution.value()),
             "trajectory_trim_mode": self.combo_trim.currentText(),
             "split_long_tracks": self.chk_split_long_tracks.isChecked(),
             "parallel": self.chk_parallel.isChecked(),
@@ -4452,7 +4588,27 @@ class TrackClassificationSubTab(QWidget):
                 class_col=cluster_col,
                 verbose=True,
             )
-            return {"diagnostics": diag, "proportions": prop}
+            result = {"diagnostics": diag, "proportions": prop}
+            if "trajectory_window_id" in track_adata.obs.columns:
+                # Only meaningful when 'Divide long tracks' was used - most runs
+                # don't have this column, so skip silently rather than erroring
+                # the whole refresh for the common case. A real failure here is
+                # caught locally so it doesn't take down the reports above,
+                # which already succeeded by this point.
+                try:
+                    from behav3d.analysis.behavior.track.visualization.plots.window_transitions import (
+                        save_window_transition_report,
+                    )
+                    result["window_transitions"] = save_window_transition_report(
+                        track_adata,
+                        output_dir=str(out) if out else "",
+                        cell_type=ct,
+                        cluster_key=cluster_col,
+                        verbose=True,
+                    )
+                except Exception as exc:
+                    result["window_transitions_error"] = str(exc)
+            return result
 
         self._bg.run(
             fn=_run,
@@ -5033,6 +5189,56 @@ class TrackClassificationSubTab(QWidget):
             on_failed=lambda e: self._log(f"❌ Track proportion plots failed: {e}"),
         )
 
+    def _on_window_transitions(self):
+        ct = self._cell_type()
+        if not ct:
+            return
+        if self._track_adata is None:
+            QMessageBox.warning(self, "No data", "Run track clustering first.")
+            return
+        if "trajectory_window_id" not in self._track_adata.obs.columns:
+            QMessageBox.warning(
+                self, "No sub-track windows",
+                "This report needs tracks split into windows. Enable 'Divide long "
+                "tracks' in Step 1's Advanced Configuration and re-run track clustering.",
+            )
+            return
+        if self._bg.is_running():
+            QMessageBox.warning(self, "Busy", "Another operation is running.")
+            return
+        out = self._out_dir()
+        self._log(f"▶ Creating window transition Sankey for '{ct}'…")
+        track_adata = self._track_adata
+
+        def _run(**kw):
+            from behav3d.analysis.behavior.track.visualization.plots.window_transitions import (
+                save_window_transition_report,
+            )
+            from behav3d.napari._rename_dialog import _track_cluster_col
+            cluster_col = _track_cluster_col(track_adata) or "ClusterID"
+            return save_window_transition_report(
+                track_adata,
+                output_dir=str(out) if out else "",
+                cell_type=ct,
+                cluster_key=cluster_col,
+                verbose=True,
+            )
+
+        self._bg.run(
+            fn=_run,
+            desc=f"Window transition Sankey ({ct})…",
+            progress_row=self.progress_row,
+            buttons=[self.btn_window_transitions],
+            viewer=self.viewer,
+            inject_progress=False,
+            on_done=lambda r: (
+                self._log(f"✅ Window transition Sankey done for '{ct}'."),
+                self._update_view_buttons(),
+                self._notify_results(),
+            ),
+            on_failed=lambda e: self._log(f"❌ Window transition Sankey failed: {e}"),
+        )
+
     def _on_track_condition_comparison(self):
         ct = self._cell_type()
         if not ct:
@@ -5581,6 +5787,13 @@ class TrackClassificationSubTab(QWidget):
             candidates = [
                 (f.stem, f)
                 for f in sorted(proportions_dir.glob("*.pdf"))
+            ]
+        elif kind == "window_transitions" and traj_dir:
+            wt_dir = traj_dir / "window_transitions"
+            candidates = [(f.stem, f) for f in sorted(wt_dir.glob("*.pdf"))]
+            candidates += [
+                (f"per-sample/{f.stem}", f)
+                for f in sorted(wt_dir.glob("sankey_pdf_pages/*.pdf"))
             ]
         elif kind == "track_condition_comparison" and traj_dir:
             comparisons_dir = traj_dir / "behavior_comparisons"

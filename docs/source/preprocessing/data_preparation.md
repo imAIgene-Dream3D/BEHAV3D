@@ -138,7 +138,7 @@ Use multicolor when the **same biological cell type appears in more than one flu
 **How to declare it in the Metadata Builder:**
 
 1. In the cell-type naming section, tick **Multicolor** next to the immune name.
-2. Set `N` = number of fluorescent channels for that cell type (typically 2 or 3).
+2. Set `N` = number of colors (or color combinations) used for that cell type (typically 2 or 3).
 3. Click *Configure Cell Types*. The Builder now creates **`N` separate cell-type entries** in the metadata, named `{base}_1_multicolor`, `{base}_2_multicolor`, …, `{base}_N_multicolor`. Each one gets its own per-cell-type columns (`im_{base}_n_multicolor_line_condition`, `…_segments_image_path`, `…_tracks_image_path`, `…_tracks_csv_path`).
 4. In each sample form, fill in **Line** and **Condition** for every multicolor channel, they can be the same (just different colours of the same biology) or different (genuinely different sub-populations).
 

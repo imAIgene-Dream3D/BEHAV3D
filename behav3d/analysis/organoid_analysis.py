@@ -50,6 +50,89 @@ def resolve_organoid_seg_path(sample_metadata, org_type, img_outdir, sample_name
     return Path(img_outdir, f"{sample_name}_{org_type}_tracked.zarr")
 
 
+def _compute_general_death_dynamics(df_tracks):
+    """Per-sample, per-timepoint organoid counts and cumulative fractions.
+
+    Single source of truth shared by per-target Death Dynamics
+    (``run_organoid_analysis``) and the cross-target comparison
+    (``plot_multi_organoid_death_dynamics``) so the two can never diverge.
+
+    ``df_tracks`` must carry ``sample_name``, ``TrackID``, ``position_t`` and a
+    ``dead`` column (bool, or whatever feature extraction wrote it as). The
+    ``dead`` column is normalised to boolean on a copy, so the caller's frame
+    is left untouched and raw values are accepted.
+
+    Returns ``(df_general, grid, dead_at_t)`` where ``df_general`` has one row
+    per (``sample_name``, ``position_t``) with ``nr_alive`` / ``nr_dead`` /
+    ``nr_disappeared`` / ``nr_organoids_t0`` and the matching ``percentage_*``
+    columns. ``grid`` and ``dead_at_t`` are the per-track intermediates (grid
+    carries ``TrackID``) reused by the per-target grouped plots; combined
+    callers can ignore them.
+    """
+    df = df_tracks.copy()
+
+    if pd.api.types.is_bool_dtype(df["dead"]):
+        df["dead"] = df["dead"].fillna(False)
+    else:
+        df["dead"] = (
+            df["dead"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .isin({"true", "1", "1.0", "yes"})
+        )
+
+    # Summarize tracks to their time of death
+    summ = (
+        df
+        .groupby(["sample_name", "TrackID"])
+        .agg(
+            t_first=("position_t", "min"),
+            t_last=("position_t", "max"),
+            # first time it is ever dead (NaN if never dead)
+            t_dead=("position_t", lambda s: s[df.loc[s.index, "dead"]].min()
+                    if (df.loc[s.index, "dead"]).any() else np.nan),
+        )
+        .reset_index()
+    )
+
+    timeline = df[["sample_name", "position_t"]].drop_duplicates()
+
+    grid = timeline.merge(summ, on="sample_name", how="left")
+    t = grid["position_t"]
+
+    dead_at_t = grid["t_dead"].notna() & (t >= grid["t_dead"])
+    seen_at_t = (t >= grid["t_first"]) & (t <= grid["t_last"])
+    never_dead = grid["t_dead"].isna()
+    disappeared_by_t = (t > grid["t_last"]) & never_dead
+    alive_at_t = seen_at_t & (~dead_at_t)
+
+    counts = (
+        grid.assign(alive=alive_at_t, dead=dead_at_t, disappeared=disappeared_by_t)
+            .groupby(["sample_name", "position_t"])
+            .agg(
+                nr_alive=("alive", "sum"),
+                nr_dead=("dead", "sum"),
+                nr_disappeared=("disappeared", "sum"),
+            )
+            .reset_index()
+    )
+
+    df_t0 = (
+        df[df["position_t"] == 0]
+        .groupby("sample_name")
+        .agg(nr_organoids_t0=("TrackID", "nunique"))
+        .reset_index()
+    )
+
+    df_general = counts.merge(df_t0, on="sample_name", how="left")
+    df_general["percentage_dead"]        = df_general["nr_dead"]        / df_general["nr_organoids_t0"]
+    df_general["percentage_alive"]       = df_general["nr_alive"]       / df_general["nr_organoids_t0"]
+    df_general["percentage_disappeared"] = df_general["nr_disappeared"] / df_general["nr_organoids_t0"]
+
+    return df_general, grid, dead_at_t
+
+
 def run_organoid_analysis(
     dead_perc_threshold=None,
     config=None,
@@ -154,54 +237,13 @@ def run_organoid_analysis(
     else:
         df_tracks["smoothed_mean_dead_dye"] = np.nan
 
-    # Summarize tracks to their time of death
-    summ = (
-        df_tracks
-        .groupby(["sample_name","TrackID"])
-        .agg(
-            t_first=("position_t","min"),
-            t_last =("position_t","max"),
-            # first time it is ever dead (NaN if never dead)
-            t_dead =("position_t", lambda s: s[df_tracks.loc[s.index, "dead"]].min()
-                    if (df_tracks.loc[s.index,"dead"]).any() else np.nan)
-        )
-        .reset_index()
-    )
+    # Per-sample cumulative dead/alive/disappeared dynamics. Computed by the
+    # shared helper so this per-target output stays identical to what the
+    # cross-target comparison recomputes from the same filtered tracks.
+    # `grid` (carries TrackID) and `dead_at_t` are reused by the grouped
+    # condition plot below.
+    df_general, grid, dead_at_t = _compute_general_death_dynamics(df_tracks)
 
-    timeline = df_tracks[["sample_name", "position_t"]].drop_duplicates()
-    
-    grid = timeline.merge(summ, on="sample_name", how="left")
-    t = grid["position_t"]
-
-    dead_at_t = grid["t_dead"].notna() & (t >= grid["t_dead"])
-    seen_at_t = (t >= grid["t_first"]) & (t <= grid["t_last"])
-    never_dead = grid["t_dead"].isna()
-    disappeared_by_t = (t > grid["t_last"]) & never_dead
-    alive_at_t = seen_at_t & (~dead_at_t)
-    
-    counts = (
-        grid.assign(alive=alive_at_t, dead=dead_at_t, disappeared=disappeared_by_t)
-            .groupby(["sample_name","position_t"])
-            .agg(
-                nr_alive=("alive","sum"),
-                nr_dead=("dead","sum"),
-                nr_disappeared=("disappeared","sum"),
-            )
-            .reset_index()
-    )
-
-    df_t0 = (
-        df_tracks[df_tracks["position_t"]==0]
-        .groupby("sample_name")
-        .agg(nr_organoids_t0=("TrackID","nunique"))
-        .reset_index()
-    )
-
-    df_general = counts.merge(df_t0, on="sample_name", how="left")
-    df_general["percentage_dead"]        = df_general["nr_dead"]        / df_general["nr_organoids_t0"]
-    df_general["percentage_alive"]       = df_general["nr_alive"]       / df_general["nr_organoids_t0"]
-    df_general["percentage_disappeared"] = df_general["nr_disappeared"] / df_general["nr_organoids_t0"]
-    
     df_general_outpath = Path(results_outdir, f"combined_general_{org_type}_dynamics_analysis.csv")
     df_general.to_csv(
         df_general_outpath,
@@ -1663,29 +1705,44 @@ def plot_multi_organoid_death_dynamics(
                 parts = [f"{k}={cleaned_thr[k]:.4g}" for k in sorted(cleaned_thr.keys())]
                 threshold_annotation = "Dead threshold (% mask): " + "; ".join(parts)
     
-    # Check which organoid types have death dynamics data available
+    # Check which organoid types have death dynamics data available. Use each
+    # target's *filtered* track features as the source, so this comparison
+    # always reflects the current filtering — rather than a cached
+    # combined_general_*.csv that only refreshes when per-target Death Dynamics
+    # is re-run.
+    dead_columns = ["nr_dead_mask_pixels", "percentage_dead_mask", "dead"]
     available_data = {}
     for org_type in organoid_types:
-        csv_path = Path(output_dir, "analysis", org_type, "results", f"combined_general_{org_type}_dynamics_analysis.csv")
+        csv_path = Path(output_dir, "analysis", org_type, "track_features", f"BEHAV3D_{org_type}_combined_track_features_filtered.csv")
         if csv_path.exists():
             available_data[org_type] = csv_path
             print(f"Found data for {org_type}")
         else:
             print(f"Missing data for {org_type}: {csv_path}")
-    
+
     if len(available_data) < 1:
-        print(f"\nNeed at least 1 organoid type with death dynamics data.")
+        print(f"\nNeed at least 1 organoid type with filtered track features.")
         print(f"   Available: {list(available_data.keys())}")
-        print(f"   Run death dynamics analysis for each organoid type first.")
+        print(f"   Run track filtering for each organoid type first.")
         return None
-    
-    # Load and combine data from all organoid types
+
+    # Recompute per-sample cumulative dynamics from the filtered tracks
+    # (same helper the per-target step uses) and combine across targets.
     all_data = []
     for org_type, csv_path in available_data.items():
-        df = pd.read_csv(csv_path)
+        df_src = pd.read_csv(csv_path)
+        if not all(col in df_src.columns for col in dead_columns):
+            print(f"Skipping {org_type}: filtered track features missing dead columns "
+                  f"({[c for c in dead_columns if c not in df_src.columns]}).")
+            continue
+        df, _, _ = _compute_general_death_dynamics(df_src)
         df["organoid_type"] = org_type
         all_data.append(df)
-    
+
+    if not all_data:
+        print(f"\nNo organoid types with usable dead data for the combined comparison.")
+        return None
+
     df_combined = pd.concat(all_data, ignore_index=True)
     
     # Combined label for each sample + organoid_type combination

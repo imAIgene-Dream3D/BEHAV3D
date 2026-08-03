@@ -305,8 +305,9 @@ class CellTypeFilterPanel(QWidget):
             "Filter By Minimal Size At T1",
             "When enabled, a track is removed entirely if the cell's size "
             "at its first timepoint (relative_time == 1) is below 'Min "
-            "size'. Size is read from the 'volume' column when available, "
-            "otherwise from 'nr_pixels'.\n\n"
+            "size'. 'Min size' is a voxel count, so it is compared against "
+            "the 'nr_pixels' column when available, otherwise 'volume' "
+            "(physical um³) is used as a fallback.\n\n"
             "Runs after the 'Max timepoints' trim but before the 'Min "
             "length' and 'Max length' filters, so it removes small/spurious "
             "objects (e.g. segmentation fragments) before track-length "

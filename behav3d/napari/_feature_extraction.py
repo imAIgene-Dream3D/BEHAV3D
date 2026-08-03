@@ -2268,6 +2268,212 @@ class CellTypeFeaturePanel(QWidget):
 # ═══════════════════════════════════════════════════════════════════════════
 # ActiveKillingPanel — Extended analysis for immune cells
 # ═══════════════════════════════════════════════════════════════════════════
+def _render_killing_event_gifs(
+    metadata,
+    output_dir,
+    immune_type,
+    target_types,
+    observation_window,
+    df_killing,
+    n_top=5,
+    log_fn=None,
+):
+    """Render the top-N active-killing events as animated GIFs.
+
+    Ported from the notebook gallery (``behav3d/widgets/analysis.py``). For each
+    of the top-N immune cells (ranked by number of active-killing timepoints) a
+    cropped maximum-intensity-projection movie is built around the killing event
+    — grayscale raw signal, with the dead mask overlaid in red and the active
+    immune cell in purple, one frame per timepoint — and written to
+    ``analysis/<immune>/active_killing/<subfolder>/gallery/<sample>/``.
+
+    Reads the canonical output zarrs (raw ``<sample>.zarr``, tracked immune
+    ``<sample>_<immune>_tracked.zarr`` and ``<sample>_mask_dead.zarr``), the same
+    path scheme every napari tab uses.  Returns the list of written GIF paths.
+    """
+    from PIL import Image as PILImage, ImageDraw
+    from behav3d.io.images import load_image
+
+    def _log(msg):
+        if log_fn is not None:
+            log_fn(msg)
+
+    output_dir = Path(output_dir)
+    df = df_killing.copy()
+    if "TrackID" in df.columns and "immune_track_id" not in df.columns:
+        df["immune_track_id"] = df["TrackID"]
+    for _old, _new in (
+        ("centroid-0", "position_z"),
+        ("centroid-1", "position_y"),
+        ("centroid-2", "position_x"),
+    ):
+        if _old in df.columns and _new not in df.columns:
+            df[_new] = df[_old]
+
+    if "is_active_killing" not in df.columns:
+        return []
+    df_active = df[df["is_active_killing"] == True].copy()
+    if df_active.empty:
+        return []
+
+    subfolder = (
+        "combined" if len(target_types) > 1
+        else (target_types[0] if target_types else immune_type)
+    )
+
+    # Top-N killers *per sample* (matches the notebook gallery, which shows the
+    # top-N most active immune cells for each sample rather than an overall
+    # top-N across all samples pooled together).
+    top_killers = (
+        df_active.groupby(["sample_name", "immune_track_id"])
+        .size()
+        .groupby(level="sample_name", group_keys=False)
+        .nlargest(int(n_top))
+    )
+
+    def _mat(a):
+        if a is None:
+            return None
+        if hasattr(a, "compute"):
+            a = a.compute()
+        return np.asarray(a)
+
+    written = []
+    for (sample_name, track_id), _count in top_killers.items():
+        try:
+            rows = df_active[
+                (df_active["sample_name"] == sample_name)
+                & (df_active["immune_track_id"] == track_id)
+            ]
+            if rows.empty:
+                continue
+            # Feature the killer's *best* event by killing_efficiency (matches
+            # the notebook gallery); fall back to earliest timepoint if the
+            # efficiency column is unavailable.
+            if "killing_efficiency" in rows.columns:
+                event_row = rows.sort_values(
+                    "killing_efficiency", ascending=False
+                ).iloc[0]
+            else:
+                event_row = rows.sort_values("position_t").iloc[0]
+            t_id = int(track_id)
+            t_start = int(event_row["position_t"])
+            t_end = t_start + (2 * int(observation_window))
+
+            md_match = metadata[metadata["sample_name"] == sample_name]
+            if md_match.empty:
+                continue
+            md_row = md_match.iloc[0]
+            res_xy = float(md_row.get("pixel_distance_xy", 1.0))
+            res_z = float(md_row.get("pixel_distance_z", 1.0))
+
+            img_dir = Path(output_dir, "images", sample_name)
+            raw_path = img_dir / f"{sample_name}.zarr"
+            immune_path = img_dir / f"{sample_name}_{immune_type}_tracked.zarr"
+            dead_path = img_dir / f"{sample_name}_mask_dead.zarr"
+
+            cz = int(event_row["position_z"] / res_z)
+            cy = int(event_row["position_y"] / res_xy)
+            cx = int(event_row["position_x"] / res_xy)
+            win = 60
+
+            def _load_tp(path, tp):
+                if not Path(path).exists():
+                    return None
+                try:
+                    img = load_image(path)
+                    if tp >= img.shape[0]:
+                        return None
+                    return img[tp]
+                except Exception:
+                    return None
+
+            def _crop(img):
+                if img is None:
+                    return None
+                try:
+                    y, x = img.shape[-2], img.shape[-1]
+                    y1, y2 = max(0, cy - win), min(y, cy + win)
+                    x1, x2 = max(0, cx - win), min(x, cx + win)
+                    return img[..., y1:y2, x1:x2]
+                except Exception:
+                    return None
+
+            def _mip(t):
+                c_raw = _mat(_crop(_load_tp(raw_path, t)))
+                if c_raw is None:
+                    return None
+                c_mt = _mat(_crop(_load_tp(immune_path, t)))
+                c_md = _mat(_crop(_load_tp(dead_path, t)))
+
+                if c_raw.ndim == 4:            # (C, Z, Y, X)
+                    mip_gray = np.max(np.max(c_raw, axis=0), axis=0).astype(np.float32)
+                else:                          # (Z, Y, X)
+                    mip_gray = np.max(c_raw, axis=0).astype(np.float32)
+                p1, p99 = np.percentile(mip_gray, [1, 99])
+                mip_gray = np.clip((mip_gray - p1) / (p99 - p1 + 1e-10), 0, 1)
+
+                mip_dead = (
+                    np.max(c_md > 0, axis=0) if c_md is not None
+                    else np.zeros_like(mip_gray)
+                )
+                mip_active = (
+                    np.max(c_mt == t_id, axis=0) if c_mt is not None
+                    else np.zeros_like(mip_gray)
+                )
+
+                rgb = np.stack([mip_gray, mip_gray, mip_gray], axis=-1)
+                a_red, a_pur = 0.3, 0.5
+                rgb[mip_dead > 0, 0] = rgb[mip_dead > 0, 0] * (1 - a_red) + a_red
+                rgb[mip_dead > 0, 1] = rgb[mip_dead > 0, 1] * (1 - a_red)
+                rgb[mip_dead > 0, 2] = rgb[mip_dead > 0, 2] * (1 - a_red)
+                rgb[mip_active > 0, 0] = rgb[mip_active > 0, 0] * (1 - a_pur) + a_pur
+                rgb[mip_active > 0, 1] = rgb[mip_active > 0, 1] * (1 - a_pur)
+                rgb[mip_active > 0, 2] = rgb[mip_active > 0, 2] * (1 - a_pur) + a_pur
+                return np.clip(rgb * 255, 0, 255).astype(np.uint8)
+
+            max_t = t_end
+            try:
+                max_t = int(
+                    df_killing[df_killing["sample_name"] == sample_name]["position_t"].max()
+                )
+            except Exception:
+                pass
+
+            frames = []
+            for t in range(t_start, min(t_end, max_t) + 1):
+                arr = _mip(t)
+                if arr is None:
+                    continue
+                pil = PILImage.fromarray(arr)
+                draw = ImageDraw.Draw(pil)
+                w = pil.size[0]
+                draw.text((w - 49, 6), f"T={t}", fill="black")
+                draw.text((w - 50, 5), f"T={t}", fill="white")
+                frames.append(pil)
+
+            if not frames:
+                continue
+
+            gallery_dir = Path(
+                output_dir, "analysis", immune_type, "active_killing",
+                subfolder, "gallery", sample_name,
+            )
+            gallery_dir.mkdir(parents=True, exist_ok=True)
+            gif_path = gallery_dir / f"killing_event_{sample_name}_T{t_id}_start{t_start}.gif"
+            frames[0].save(
+                gif_path, save_all=True, append_images=frames[1:],
+                duration=200, loop=0,
+            )
+            written.append(gif_path)
+            _log(f"  ✓ {gif_path.name}")
+        except Exception as _e:  # pragma: no cover - defensive, per-event
+            _log(f"  ⚠️ Skipped a killing event ({sample_name} #{track_id}): {_e}")
+            continue
+
+    return written
+
+
 class ActiveKillingPanel(QWidget):
     """
     Extended analysis: Active Killing Analysis for immune cell types only.
@@ -2324,9 +2530,9 @@ class ActiveKillingPanel(QWidget):
         layout.setSpacing(6)
 
         desc = QLabel(
-            "Detects functional killing events by analysing how much the death "
-            "signal in target (organoid) cells increases after immune cell contact, "
-            "relative to the per-sample background death rate.\n"
+            "Detects functional killing events: for each immune\u2013target contact, "
+            "checks whether that target organoid's OWN death signal rises enough "
+            "after contact (vs its signal at contact start) to count as a kill.\n"
             "\u26a0\ufe0f  Run baseline feature extraction for the immune type FIRST."
         )
         desc.setWordWrap(True)
@@ -2386,16 +2592,12 @@ class ActiveKillingPanel(QWidget):
             make_help_row(
                 self.spin_obs_window,
                 "Observation Window",
-                "Number of timepoints after a contact's start timepoint over which\n"
-                "each touched target's death-signal change is measured (signal at\n"
-                "contact_start+window minus signal at contact_start), evaluated\n"
-                "independently per touched target organoid.\n\n"
-                "A contact event is 'active killing' when the best-touched target's\n"
-                "increase exceeds its own killing threshold:\n"
-                "  killing_threshold = signal_at_contact_start x (threshold_multiplier - 1)\n"
-                "  (or the fixed Absolute Threshold, if 'Use absolute threshold' is checked)\n\n"
-                "If the window runs past the end of a timelapse, the last available\n"
-                "frame is used instead of extrapolating.",
+                "How many timepoints after contact starts to measure the touched\n"
+                "target's death-signal rise: its signal at (contact start + window)\n"
+                "minus its signal at contact start. Measured separately for each\n"
+                "touched target organoid.\n\n"
+                "If the window runs past the end of the timelapse, the last\n"
+                "available frame is used (no extrapolation).",
             ),
         )
 
@@ -2411,15 +2613,13 @@ class ActiveKillingPanel(QWidget):
             make_help_row(
                 self.death_signal_combo,
                 "Death Signal Column",
-                "Target-cell column used to measure death-signal increase for the\n"
-                "per-contact killing check.\n\n"
-                "  percentage_dead_mask  - fraction of dead-mask pixels in the segment\n"
+                "Which target-cell column is read as the death signal:\n\n"
+                "  percentage_dead_mask  - % of dead-mask pixels in the segment\n"
                 "  mean_dead_dye         - mean dead-dye channel intensity\n"
                 "  nr_dead_mask_pixels   - raw count of dead-mask pixels\n\n"
-                "Changing this changes the units of the Absolute Threshold below, so\n"
-                "re-check that value if you switch. When using an absolute threshold,\n"
-                "nr_dead_mask_pixels is recommended - a flat pixel-count cutoff is\n"
-                "easier to reason about than one on a fraction or intensity scale.",
+                "Switching this changes the units of the Absolute Threshold below,\n"
+                "so re-check that value. For an absolute threshold, nr_dead_mask_pixels\n"
+                "is recommended - a flat pixel count is easiest to reason about.",
             ),
         )
 
@@ -2434,16 +2634,14 @@ class ActiveKillingPanel(QWidget):
             make_help_row(
                 self.spin_threshold_mult,
                 "Killing Threshold Multiplier",
-                "Multiplier applied to a touched target organoid's OWN death signal\n"
-                "at the moment contact starts (no sample-wide or cross-organoid\n"
-                "averaging is involved).\n\n"
-                "A contact event is classified as 'active killing' for a target when:\n"
-                "  signal_at_contact_start+window >= signal_at_contact_start x multiplier\n\n"
-                "Default: 1.5  (signal must at least reach 150% of its value at the\n"
-                "moment of contact, by the end of the observation window).\n\n"
-                "If the signal is exactly 0 at contact start, 0.1 is substituted so the\n"
-                "threshold isn't trivially 0 (which would flag any nonzero signal as\n"
-                "active killing).\n\n"
+                "Sets the kill threshold as a multiple of each touched target's OWN\n"
+                "death signal at contact start (no sample-wide or cross-organoid\n"
+                "averaging).\n\n"
+                "Active killing when, by the end of the observation window, the\n"
+                "target's signal exceeds  signal_at_contact_start x multiplier.\n\n"
+                "Default 1.5  ->  signal must grow past 150% of its value at contact.\n\n"
+                "If the signal is exactly 0 at contact start, 0.1 is used in its place\n"
+                "so the threshold isn't trivially 0 (which would flag any rise).\n\n"
                 "Ignored when 'Use absolute threshold' is checked.",
             ),
         )
@@ -2454,14 +2652,14 @@ class ActiveKillingPanel(QWidget):
         abs_threshold_row.addWidget(self.check_abs_threshold)
         abs_threshold_row.addWidget(HelpButton(
             "Use Absolute Threshold",
-            "When checked, active killing is decided using the fixed 'Absolute "
-            "threshold' value below instead of the multiplier-based threshold\n"
-            "(signal_at_contact_start x multiplier).\n\n"
-            "Useful when touched organoids tend to start near-zero death signal, "
-            "which makes the multiplier-based threshold overly sensitive to small "
-            "absolute changes.\n\n"
-            "When unchecked, the 'Absolute threshold' field is disabled and the "
-            "Killing Threshold Multiplier is used instead.",
+            "Decide killing with the fixed 'Absolute threshold' below instead of "
+            "the multiplier (signal_at_contact_start x multiplier).\n\n"
+            "Best when targets tend to start near-zero death signal, where the "
+            "multiplier becomes over-sensitive to tiny changes.\n\n"
+            "Generally recommended with 2 or more target lines that have different "
+            "baseline death rates - there the multiplier's fold-change is unfair.\n\n"
+            "Unchecked = the Killing Threshold Multiplier is used and this field "
+            "is disabled.",
         ))
         abs_threshold_row.addStretch()
         params_form.addRow("", abs_threshold_row)
@@ -2484,16 +2682,13 @@ class ActiveKillingPanel(QWidget):
             make_help_row(
                 self.spin_abs_threshold,
                 "Absolute Killing Threshold",
-                "Fixed minimum death-signal increase (in the units of the Death\n"
-                "Signal Column, from contact start to the end of the Observation\n"
-                "Window) required to classify a contact event as active killing.\n\n"
-                "Only used when 'Use absolute threshold' is checked; it then\n"
-                "replaces the multiplier-based threshold entirely.\n\n"
-                "Useful when touched organoids tend to start near-zero death "
-                "signal, which makes the multiplier-based threshold unreliable.\n\n"
-                "Recommended: use this together with the nr_dead_mask_pixels death "
-                "signal column - a flat pixel-count cutoff is easier to reason "
-                "about than one on a fraction or intensity scale.",
+                "Fixed minimum death-signal rise (in the Death Signal Column's\n"
+                "units, from contact start to the end of the observation window)\n"
+                "needed to count as a kill.\n\n"
+                "Only used when 'Use absolute threshold' is checked; it then fully\n"
+                "replaces the multiplier.\n\n"
+                "Best for targets that start near-zero death signal. Tip: pair with\n"
+                "nr_dead_mask_pixels - a flat pixel count is easiest to set.",
             ),
         )
 
@@ -2547,6 +2742,22 @@ class ActiveKillingPanel(QWidget):
         )
         self.btn_load_viewer.clicked.connect(self._on_load_viewer_clicked)
         viewer_form.addRow("", self.btn_load_viewer)
+
+        self.btn_export_gifs = QPushButton("\U0001f39e  Export Killing GIFs")
+        self.btn_export_gifs.setStyleSheet(
+            "QPushButton { background: #37474F; color: white; padding: 5px 10px; "
+            "border-radius: 3px; font-size: 11px; } "
+            "QPushButton:hover { background: #546E7A; }"
+        )
+        self.btn_export_gifs.setToolTip(
+            "Render the top-N active-killing events as animated GIFs (cropped 3D\n"
+            "max-projection movies: raw signal, dead mask in red, active immune\n"
+            "cell in purple).\n\n"
+            "Saved to analysis/<immune>/active_killing/<target>/gallery/<sample>/.\n"
+            "Requires Active Killing Analysis to have been run at least once."
+        )
+        self.btn_export_gifs.clicked.connect(self._on_export_gifs_clicked)
+        viewer_form.addRow("", self.btn_export_gifs)
         layout.addWidget(viewer_group)
 
         # ── Run button ─────────────────────────────────────────────────────
@@ -2774,24 +2985,29 @@ class ActiveKillingPanel(QWidget):
                     output_subfolder=subfolder
                 )
 
+            plot_jobs = []
             df_killing, df_summary, stats = None, None, None
             for t in targets:
                 self.log(f"--- Running independent analysis for target: {t} ---")
                 df_killing, df_summary, stats = run_for_targets([t], t)
+                plot_jobs.append((t, df_killing))
 
             if len(targets) > 1:
                 self.log("--- Running combined analysis for all selected targets ---")
                 combined_subfolder = "combined"
                 df_killing, df_summary, stats = run_for_targets(targets, combined_subfolder)
+                plot_jobs.append((combined_subfolder, df_killing))
             else:
                 combined_subfolder = targets[0]
 
-            return (df_killing, df_summary, stats, combined_subfolder)
+            return (plot_jobs, stats, combined_subfolder)
 
         def _on_done(result):
-            df_killing, _df_summary, stats, subfolder = result
+            plot_jobs, stats, subfolder = result
+            for job_subfolder, job_df_killing in plot_jobs:
+                job_results_dir = self._active_killing_dir(immune) / job_subfolder
+                self._save_plots(job_df_killing, immune, job_results_dir)
             results_dir = self._active_killing_dir(immune) / subfolder
-            self._save_plots(df_killing, immune, results_dir)
             n_active = int(stats.get("total_active_killing_timepoints", 0))
             rate = stats.get("overall_killing_rate", 0.0)
             self.log(
@@ -2994,16 +3210,17 @@ class ActiveKillingPanel(QWidget):
             for t in targets:
                 self.log(f"--- Running independent analysis for target: {t} ---")
                 df_killing, df_summary, stats = run_for_targets([t], t)
+                self._save_plots(df_killing, immune, self._active_killing_dir(immune) / t)
 
             if len(targets) > 1:
                 self.log("--- Running combined analysis for all selected targets ---")
                 combined_subfolder = "combined"
                 df_killing, df_summary, stats = run_for_targets(targets, combined_subfolder)
+                self._save_plots(df_killing, immune, self._active_killing_dir(immune) / combined_subfolder)
             else:
                 combined_subfolder = targets[0]
-            
+
             results_dir = self._active_killing_dir(immune) / combined_subfolder
-            self._save_plots(df_killing, immune, results_dir)
             n_active = int(stats.get("total_active_killing_timepoints", 0))
             rate = stats.get("overall_killing_rate", 0.0)
             self.log(
@@ -3067,14 +3284,16 @@ class ActiveKillingPanel(QWidget):
             self.log("\u26a0\ufe0f No immune type selected.")
             return
 
-        advanced_path = (
-            self._active_killing_dir(immune)
-            / f"BEHAV3D_{immune}_advanced_track_features.csv"
+        from behav3d.features.advanced_timepoint_features import (
+            find_advanced_features_csv,
         )
-        if not advanced_path.exists():
+        advanced_path = find_advanced_features_csv(
+            self.metadata_loader.output_dir, immune
+        )
+        if advanced_path is None or not Path(advanced_path).exists():
             self.log(
-                f"\u26a0\ufe0f Advanced features CSV not found at:\n  {advanced_path}\n"
-                "Run Active Killing Analysis first."
+                "\u26a0\ufe0f No active-killing results found \u2014 run Active "
+                "Killing Analysis first."
             )
             return
 
@@ -3174,6 +3393,84 @@ class ActiveKillingPanel(QWidget):
             import traceback as _tb
             _tb.print_exc()
             self.log(f"\u274c Error loading top killers in viewer: {e}")
+
+    def _on_export_gifs_clicked(self):
+        """Render the top-N active-killing events as animated GIFs (background)."""
+        if self._bg.is_running():
+            self.log("\u26a0\ufe0f An operation is already in progress.")
+            return
+        immune = self._get_immune_type()
+        if not immune or "(no immune" in immune:
+            self.log("\u26a0\ufe0f No immune type selected.")
+            return
+
+        from behav3d.features.advanced_timepoint_features import (
+            find_advanced_features_csv,
+        )
+        advanced_path = find_advanced_features_csv(
+            self.metadata_loader.output_dir, immune
+        )
+        if advanced_path is None or not Path(advanced_path).exists():
+            self.log(
+                "\u26a0\ufe0f No active-killing results found \u2014 run Active "
+                "Killing Analysis first."
+            )
+            return
+        try:
+            df_killing = pd.read_csv(advanced_path)
+        except Exception as e:
+            self.log(f"\u274c Could not read active-killing results: {e}")
+            return
+
+        metadata = self.metadata_loader.metadata
+        output_dir = self.metadata_loader.output_dir
+        targets = self._get_selected_targets()
+        obs_window = int(self.spin_obs_window.value())
+        n_top = int(self.spin_top_n.value())
+
+        def _do_export(progress_cb=None):
+            return _render_killing_event_gifs(
+                metadata=metadata,
+                output_dir=output_dir,
+                immune_type=immune,
+                target_types=targets,
+                observation_window=obs_window,
+                df_killing=df_killing,
+                n_top=n_top,
+                log_fn=self.log,
+            )
+
+        def _on_done(paths):
+            self.btn_export_gifs.setText("\U0001f39e  Export Killing GIFs")
+            if paths:
+                self.log(
+                    f"\u2705 Wrote {len(paths)} killing GIF(s) to the gallery folder."
+                )
+                try:
+                    self._offer_open_folder(Path(paths[0]).parent.parent)
+                except Exception:
+                    pass
+            else:
+                self.log(
+                    "\u2139\ufe0f No killing GIFs produced (no active-killing "
+                    "events, or the required images are missing)."
+                )
+
+        def _on_failed(err):
+            self.btn_export_gifs.setText("\U0001f39e  Export Killing GIFs")
+            self.log(f"\u274c Killing GIF export error: {err}")
+
+        self._bg.run(
+            fn=_do_export,
+            desc=f"Killing GIFs \u2014 {immune}\u2026",
+            progress_row=self.tab_progress_row,
+            buttons=[self.btn_export_gifs],
+            viewer=self.viewer,
+            on_done=_on_done,
+            on_failed=_on_failed,
+            inject_progress=False,
+            indeterminate=True,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════

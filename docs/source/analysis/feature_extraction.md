@@ -149,7 +149,7 @@ D_{\text{start}} \times (m - 1) & \text{(multiplier mode)}
 \end{cases}
 $$
 
-Multiplier mode is therefore equivalent to requiring $D_{\text{end}} \ge D_{\text{start}} \times m$ — the signal must grow to at least $m\times$ its value at contact start. A baseline of exactly $D_{\text{start}} = 0$ is replaced by $0.1$ so the threshold isn't trivially zero. The organoid is flagged as killed when
+Multiplier mode is therefore equivalent to requiring $D_{\text{end}} > D_{\text{start}} \times m$ — the signal must grow past $m\times$ its value at contact start. A baseline of exactly $D_{\text{start}} = 0$ is replaced by $0.1$ so the threshold isn't trivially zero. The organoid is flagged as killed when
 
 $$
 \Delta D > \theta
@@ -168,7 +168,7 @@ Every touched organoid is scored this way, and the one with the **highest** `kil
 | **Death signal column** | `percentage_dead_mask` | dropdown of `percentage_dead_mask`, `mean_dead_dye`, `nr_dead_mask_pixels` | Which organoid column is read as the "death signal". |
 | **Killing threshold multiplier** | 1.5 | 0.1 – 20.0 | If absolute mode is off: an organoid's death signal must reach at least `signal_at_contact_start × multiplier` by the end of the window to count as killing. Scales with each organoid's own starting signal (a signal of exactly 0 is treated as 0.1 to avoid a trivial threshold). |
 | **Use absolute threshold instead of multiplier** | OFF | checkbox | When on, the multiplier is replaced by a fixed value (next field). Recommended together with `nr_dead_mask_pixels`, since a flat pixel-count cutoff is easier to reason about than one on a fraction/intensity scale. |
-| **Absolute threshold** | 0.0 | 0.0 – 100.0 | Fixed minimum death-signal increase (only used when "Use absolute threshold" is on). |
+| **Absolute threshold** | 0.0 | 0.0 – 10000.0 | Fixed minimum death-signal increase (only used when "Use absolute threshold" is on). |
 | **Min contact duration** | 1 | 1 – 50 timepoints | Minimum consecutive timepoints an immune cell must be in contact with the same target before a killing event can be counted. |
 | **Top-N killers to display** | 5 | 1 – 50 | Used by the preview button below. |
 

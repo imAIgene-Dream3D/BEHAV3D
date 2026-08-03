@@ -39,7 +39,7 @@ The widget has seven tabs, stacked top to bottom inside the right-hand dock:
 | 1 | 📋 **Data Preparation** | Build / load `metadata.csv`, pick the output directory, set dimension orders, convert raw images to Zarr. | [Data Preparation](preprocessing/data_preparation) |
 | 2 | 👁 **Visualization** | Open any sample (raw channels, segments, tracks) in napari layers, used at every step. | [Visualization](plugin_essentials/visualization) |
 | 3 | 🦠 **Segmentation** | Six methods: APOC, ConvPaint, Pixel Classifier, Cellpose, Cellpose-SAM (zero-shot), Import existing. | [Segmentation](processing/segmentation/index) |
-| 4 | 📍 **Tracking** | Per cell-type subtabs: Propagation (organoids), Reporter Propagation, btrack (motile cells), or Import existing. Manual editing of tracked segments lives in the Visualization tab. | [Tracking](processing/tracking/index) |
+| 4 | 📍 **Tracking** | Per cell-type subtabs: btrack (motile cells), Propagation (organoids), Reporter Propagation, LAP, TrackPy, or Import existing. Manual editing of tracked segments lives in the Visualization tab. | [Tracking](processing/tracking/index) |
 | 5 | 🧪 **Feature Extraction** | Movement, intensity, morphology, contact and death features per track. Extended analysis: active killing. | [Feature Extraction](analysis/feature_extraction) |
 | 6 | 🧹 **Filtering** | Track-length, experiment-duration, dead-at-t0 and minimal size filters. | [Filtering](analysis/filtering) |
 | 7 | 📊 **Analysis** | Death Dynamics & Interaction Analysis, plus Single Cell behavioural-state and trajectory (track) classification — each ending in a Backprojection step that paints the labels back onto the raw images. | [Analysis](analysis/index) |

@@ -152,6 +152,26 @@ class TrackClassificationPanel:
             layout=widgets.Layout(width="170px"),
             style={"description_width": "80px"},
         )
+        self.clustering_method = widgets.Dropdown(
+            description="Method",
+            options=[("Agglomerative", "agglomerative"), ("Leiden", "leiden")],
+            value="agglomerative",
+            layout=widgets.Layout(width="200px"),
+            style={"description_width": "70px"},
+        )
+        self.clustering_method.observe(self._on_clustering_method_changed, names="value")
+        self.leiden_n_neighbors = widgets.IntText(
+            description="Leiden neighbors",
+            value=15,
+            layout=widgets.Layout(width="220px"),
+            style={"description_width": "120px"},
+        )
+        self.leiden_resolution = widgets.FloatText(
+            description="Leiden resolution",
+            value=1.0,
+            layout=widgets.Layout(width="220px"),
+            style={"description_width": "130px"},
+        )
         self.n_per_cluster = widgets.IntText(
             description="Exemplars/cluster",
             value=10,
@@ -330,7 +350,10 @@ class TrackClassificationPanel:
         self.advanced_row_2 = widgets.HBox(
             [
                 self.trajectory_trim_mode,
+                self.clustering_method,
                 self.linkage,
+                self.leiden_n_neighbors,
+                self.leiden_resolution,
                 self.parallel,
                 self.save_distance_matrix,
                 self.use_original_behav3d,
@@ -908,6 +931,7 @@ class TrackClassificationPanel:
         self.btn_apply_classifier.on_click(self._on_apply_classifier_clicked)
         self._refresh_context()
         self._sync_advanced_visibility()
+        self._sync_clustering_method_visibility()
         self._sync_mode()
 
     def _detect_cell_types(self):
@@ -1012,6 +1036,9 @@ class TrackClassificationPanel:
         self.trajectory_trim_mode.value = str(cfg.get("trajectory_trim_mode", self.trajectory_trim_mode.value))
         self.split_long_tracks.value = bool(cfg.get("split_long_tracks", self.split_long_tracks.value))
         self.linkage.value = str(cfg.get("linkage", self.linkage.value))
+        self.clustering_method.value = str(cfg.get("clustering_method", self.clustering_method.value))
+        self.leiden_n_neighbors.value = int(cfg.get("leiden_n_neighbors", self.leiden_n_neighbors.value))
+        self.leiden_resolution.value = float(cfg.get("leiden_resolution", self.leiden_resolution.value))
         self.missing_policy.value = str(cfg.get("missing_policy", self.missing_policy.value))
         self.parallel.value = bool(cfg.get("parallel", self.parallel.value))
         self.save_distance_matrix.value = bool(cfg.get("save_distance_matrix", self.save_distance_matrix.value))
@@ -1035,6 +1062,7 @@ class TrackClassificationPanel:
         if saved_artifact and not str(self.classifier_artifact_path.value).strip():
             self.classifier_artifact_path.value = saved_artifact
         self._sync_trim_mode_visibility()
+        self._sync_clustering_method_visibility()
 
     def _persist_current_settings(self):
         cfg = self._panel_cfg()
@@ -1048,6 +1076,9 @@ class TrackClassificationPanel:
             "trajectory_trim_mode": str(self.trajectory_trim_mode.value),
             "split_long_tracks": bool(self.split_long_tracks.value),
             "linkage": str(self.linkage.value),
+            "clustering_method": str(self.clustering_method.value),
+            "leiden_n_neighbors": int(self.leiden_n_neighbors.value),
+            "leiden_resolution": float(self.leiden_resolution.value),
             "missing_policy": str(self.missing_policy.value),
             "parallel": bool(self.parallel.value),
             "save_distance_matrix": bool(self.save_distance_matrix.value),
@@ -1242,6 +1273,16 @@ class TrackClassificationPanel:
     def _on_advanced_changed(self, _):
         self._sync_advanced_visibility()
 
+    def _sync_clustering_method_visibility(self):
+        is_leiden = str(self.clustering_method.value) == "leiden"
+        self.n_clusters.disabled = is_leiden
+        self.linkage.disabled = is_leiden
+        self.leiden_n_neighbors.disabled = not is_leiden
+        self.leiden_resolution.disabled = not is_leiden
+
+    def _on_clustering_method_changed(self, _):
+        self._sync_clustering_method_visibility()
+
     def _on_classifier_advanced_changed(self, _):
         display = None if bool(self.classifier_advanced.value) else "none"
         self.classifier_advanced_row.layout.display = display
@@ -1303,7 +1344,10 @@ class TrackClassificationPanel:
             self.advanced_row_2.children = [
                 self.trajectory_trim_mode,
                 self.split_long_tracks,
+                self.clustering_method,
                 self.linkage,
+                self.leiden_n_neighbors,
+                self.leiden_resolution,
                 self.parallel,
                 self.save_distance_matrix,
                 self.use_original_behav3d,
@@ -1909,6 +1953,9 @@ class TrackClassificationPanel:
                     psi=None,
                     parallel=bool(self.parallel.value),
                     linkage=str(self.linkage.value),
+                    clustering_method=str(self.clustering_method.value),
+                    leiden_n_neighbors=int(self.leiden_n_neighbors.value),
+                    leiden_resolution=float(self.leiden_resolution.value),
                     missing_policy="keep",
                     save_distance_matrix=bool(self.save_distance_matrix.value),
                     plot_results=True,

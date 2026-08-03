@@ -34,6 +34,8 @@ Each cell type is tracked with one of the following methods, picked from the met
 
 | Method | What it does |
 |---|---|
+| **LAP (laptrack)** | Linear Assignment Problem tracking: links detections frame-to-frame by solving a global optimization on the centroid-distance cost matrix, with gap closing and optional merge/split events. See [LAP](lap). |
+| **TrackPy** | Crocker-Grier style nearest-neighbour linker with adaptive search radius and memory-based gap recovery. Simpler/faster alternative to LAP for sparser data. See [TrackPy](trackpy). |
 | **Propagation** | Propagates the previous timepoint's labels onto the current timepoint's mask by spatial overlap (watershed-based, not centroid distance). No tunable parameters. |
 | **Reporter Propagation** | Pools all segments across the whole movie, groups spatially-overlapping ones regardless of time, and stamps each group's single largest detection onto every timepoint. For near-static objects whose segmentation flickers on and off. See [Reporter Propagation](reporter_propagation). |
 | **btrack (Bayesian)** | Bayesian tracker with a Kalman-filter motion model, optionally followed by a global hypothesis optimiser. See [btrack](btrack). |
@@ -116,6 +118,8 @@ Full step-by-step instructions, all six tools, and tips: **[Manual editing of tr
 :hidden:
 :maxdepth: 1
 
+lap
+trackpy
 propagation
 reporter_propagation
 btrack

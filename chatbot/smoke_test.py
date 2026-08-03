@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -32,19 +33,28 @@ def _control(
     strategy: str | None = None,
     cell_type: str | None = None,
     unit: str | None = None,
+    visible: bool = True,
+    enabled: bool = True,
+    required_choices: list[str] | None = None,
+    active: bool | None = None,
 ) -> dict:
-    return {
+    control = {
         "id": control_id,
         "label": label,
         "value": value,
         "choices": choices,
-        "visible": True,
-        "enabled": True,
+        "visible": visible,
+        "enabled": enabled,
         "method": method,
         "strategy": strategy,
         "cell_type": cell_type,
         "unit": unit,
     }
+    if required_choices is not None:
+        control["required_choices"] = required_choices
+    if active is not None:
+        control["active"] = active
+    return control
 
 
 def _metadata_records() -> list[dict]:
@@ -157,6 +167,741 @@ def _segmentation_case() -> dict:
             },
         ),
         "check": _check_segmentation,
+    }
+
+
+def _method_requires_signal_context_case() -> dict:
+    metadata = {
+        "loaded": True,
+        "records": [{
+            "sample_name": "Movie1",
+            "pixel_distance_xy": 0.5,
+            "pixel_distance_z": 2.0,
+            "time_interval": 2,
+            "time_unit": "min",
+        }],
+        "image_dimensions": [{
+            "sample_name": "Movie1",
+            "shape": "(50, 4, 20, 512, 512)",
+            "dimension_order": "TCZYX",
+            "channel_count": 4,
+            "timepoint_count": 50,
+        }],
+        "validation": [],
+    }
+    return {
+        "name": "segmentation_method_asks_about_signal",
+        "messages": [{
+            "role": "user",
+            "content": "Choose the best segmentation method for this experiment.",
+        }],
+        "context": _context(
+            "segmentation", [], metadata=metadata,
+            segmentation={"method": "APOC (GPU)", "method_index": 0},
+        ),
+        "check": _check_method_requires_signal_context,
+    }
+
+
+def _cellpose_requires_bleed_confirmation_case() -> dict:
+    return {
+        "name": "cellpose_sam_requires_bleed_confirmation",
+        "messages": [{
+            "role": "user",
+            "content": "Would Cellpose-SAM work for my data?",
+        }],
+        "context": _context(
+            "segmentation", [],
+            segmentation={"method": "APOC (GPU)", "method_index": 0},
+        ),
+        "check": _check_method_requires_signal_context,
+    }
+
+
+def _confirmed_bleed_through_case() -> dict:
+    return {
+        "name": "confirmed_bleed_through_prefers_apoc",
+        "messages": [
+            {
+                "role": "user",
+                "content": "Would Cellpose-SAM work for my data?",
+            },
+            {
+                "role": "assistant",
+                "content": (
+                    "Is each target isolated in a clean channel, or is signal from "
+                    "other cell types visible in the same channel?"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "There is signal bleed-through: some channels contain signal "
+                    "from more than one cell type."
+                ),
+            },
+        ],
+        "context": _context(
+            "segmentation", [],
+            segmentation={"method": "APOC (GPU)", "method_index": 0},
+        ),
+        "check": _check_confirmed_bleed_through,
+    }
+
+
+def _apoc_channel_map_case() -> dict:
+    choices = ["Channel 0", "Channel 1", "Channel 2", "Channel 3"]
+    controls = [
+        _control(
+            f"segmentation.apoc.{cell_type}.input_channels",
+            f"{cell_type}: APOC image channel inputs",
+            list(choices),
+            choices=choices,
+            method="APOC",
+            cell_type=cell_type,
+        )
+        for cell_type in ("27t", "mdo", "tcell", "dead")
+    ]
+    apoc_cells = {
+        cell_type: {
+            "available_input_channels": choices,
+            "selected_input_channels": choices,
+            "channel_controls_ready": True,
+            "trained_classifier_found": False,
+        }
+        for cell_type in ("27t", "mdo", "tcell", "dead")
+    }
+    return {
+        "name": "apoc_applies_channel_map",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "Here is the channel map: Channel 0 shows tcell; Channel 1 shows "
+                "27t; Channel 2 shows both 27t and mdo; Channel 3 is the dead "
+                "signal. For this experiment use Channels 1 and 2 for both 27t "
+                "and mdo, Channel 0 for tcell, and Channel 3 for dead. Please set "
+                "the APOC image channel inputs."
+            ),
+        }],
+        "context": _context(
+            "segmentation", controls, active_cell_type="27t",
+            segmentation={
+                "method": "APOC (GPU)",
+                "apoc": {
+                    "training_data_loaded": True,
+                    "cell_types": apoc_cells,
+                },
+            },
+        ),
+        "check": _check_apoc_channel_map,
+    }
+
+
+def _apoc_channels_wait_for_training_data_case() -> dict:
+    return {
+        "name": "apoc_channels_wait_for_training_data",
+        "messages": [{
+            "role": "user",
+            "content": "How do I choose the APOC image channel inputs?",
+        }],
+        "context": _context(
+            "segmentation", [], active_cell_type="27t",
+            segmentation={
+                "method": "APOC (GPU)",
+                "apoc": {
+                    "training_data_loaded": False,
+                    "cell_types": {
+                        "27t": {
+                            "available_input_channels": [],
+                            "selected_input_channels": [],
+                            "channel_controls_ready": False,
+                            "trained_classifier_found": False,
+                        },
+                    },
+                },
+            },
+            current_log={
+                "source": "segmentation",
+                "recent_lines": [
+                    "APOC training controls locked. Load training data to enable classifier training.",
+                ],
+                "errors": [],
+                "has_explicit_error": False,
+            },
+        ),
+        "check": _check_apoc_channels_wait_for_training_data,
+    }
+
+
+def _apoc_feature_preset_case() -> dict:
+    controls = [_control(
+        "segmentation.apoc.tcell.feature_preset",
+        "tcell: APOC feature scale preset",
+        "Large structures",
+        choices=[
+            "Small structures", "Medium structures",
+            "Large structures", "Custom feature selection",
+        ],
+        method="APOC",
+        cell_type="tcell",
+    )]
+    return {
+        "name": "apoc_tunes_classifier_features",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "These are individual T cells. Please tune the APOC features using "
+                "the normal preset for small structures. Do not change minimum size "
+                "or the segmentation thresholds."
+            ),
+        }],
+        "context": _context(
+            "segmentation", controls, active_cell_type="tcell",
+            segmentation={
+                "method": "APOC (GPU)",
+                "apoc": {
+                    "training_data_loaded": True,
+                    "cell_types": {
+                        "tcell": {
+                            "feature_preset": "large_preset",
+                            "channel_controls_ready": True,
+                            "trained_classifier_found": False,
+                        },
+                    },
+                },
+            },
+        ),
+        "check": _check_apoc_feature_preset,
+    }
+
+
+def _swapped_channel_metadata_case() -> dict:
+    return {
+        "name": "swapped_channels_stay_out_of_metadata",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "I have an experiment where two replicates have the immune channels "
+                "swapped. Walk me through where I name them and set the channels."
+            ),
+        }],
+        "context": _context(
+            "data_preparation", [],
+            metadata_builder={"open": True, "sample_forms_created": True},
+        ),
+        "check": _check_swapped_channel_metadata,
+    }
+
+
+def _apoc_invalid_channel_index_case() -> dict:
+    metadata = {
+        "loaded": True,
+        "records": _metadata_records(),
+        "image_dimensions": [{
+            "sample_name": "Movie1",
+            "shape": "(50, 4, 20, 512, 512)",
+            "dimension_order": "TCZYX",
+            "channel_count": 4,
+            "timepoint_count": 50,
+        }],
+        "validation": [],
+    }
+    return {
+        "name": "apoc_rejects_invalid_channel_index",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "13T is ch1, blue ch0, green ch4. "
+                "Which channels do I pick for APOC?"
+            ),
+        }],
+        "context": _context(
+            "segmentation", [], metadata=metadata,
+            segmentation={"method": "APOC (GPU)"},
+        ),
+        "check": _check_apoc_invalid_channel_index,
+    }
+
+
+def _apoc_dead_channel_case() -> dict:
+    return {
+        "name": "apoc_does_not_use_dead_as_negative_class",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "13T is ch1, blue ch0, green ch3, dead ch2. "
+                "Which channels do I pick for APOC?"
+            ),
+        }],
+        "context": _context(
+            "segmentation", [],
+            segmentation={"method": "APOC (GPU)"},
+        ),
+        "check": _check_apoc_dead_channel,
+    }
+
+
+def _apoc_feature_grid_case() -> dict:
+    controls = [
+        _control(
+            "segmentation.apoc.tcell.feature_scales",
+            "tcell: APOC custom feature scales",
+            "1, 2, 5, 10",
+            method="APOC", cell_type="tcell", unit="pixels",
+        ),
+        _control(
+            "segmentation.apoc.tcell.feature_filters",
+            "tcell: APOC custom feature filters",
+            ["Gaussian blur at sigma 1 px"],
+            choices=[
+                "Gaussian blur at sigma 1 px",
+                "Difference of Gaussians at sigma 2 px",
+                "Laplacian of Gaussian at sigma 2 px",
+                "Sobel edge at sigma 2 px",
+            ],
+            method="APOC", cell_type="tcell",
+        ),
+    ]
+    return {
+        "name": "apoc_feature_grid_is_exposed",
+        "messages": [{
+            "role": "user",
+            "content": "Can I tune the actual APOC feature values and filter sigmas?",
+        }],
+        "context": _context(
+            "segmentation", controls, active_cell_type="tcell",
+            segmentation={"method": "APOC (GPU)"},
+        ),
+        "check": _check_apoc_feature_grid,
+    }
+
+
+def _apoc_tune_features_explanation_case() -> dict:
+    controls = [
+        _control(
+            "segmentation.apoc.27t.feature_scales",
+            "27t: APOC custom feature scales",
+            "0.3, 0.5, 1, 2, 3, 4, 5, 10, 15, 25",
+            method="APOC", cell_type="27t", unit="pixels",
+        ),
+        _control(
+            "segmentation.apoc.27t.feature_filters",
+            "27t: APOC custom feature filters",
+            ["Gaussian blur at sigma 1 px"],
+            method="APOC", cell_type="27t",
+        ),
+    ]
+    return {
+        "name": "apoc_tune_features_stays_in_segmentation",
+        "messages": [{
+            "role": "user",
+            "content": "Explain to me how to tune the features.",
+        }],
+        "context": _context(
+            "segmentation", controls, active_cell_type="27t",
+            segmentation={"method": "APOC (GPU)"},
+        ),
+        "check": _check_apoc_tune_features_explanation,
+    }
+
+
+def _apoc_mdo_feature_recommendation_case() -> dict:
+    controls = [
+        _control(
+            "segmentation.apoc.mdo.feature_preset",
+            "mdo: APOC feature scale preset",
+            "Medium structures",
+            method="APOC", cell_type="mdo",
+        ),
+        _control(
+            "segmentation.apoc.mdo.feature_scales",
+            "mdo: APOC custom feature scales",
+            "0.3, 0.5, 1, 2, 3, 4, 5, 10, 15, 25",
+            method="APOC", cell_type="mdo", unit="pixels",
+        ),
+        _control(
+            "segmentation.apoc.mdo.feature_filters",
+            "mdo: APOC custom feature filters",
+            [],
+            method="APOC", cell_type="mdo",
+        ),
+    ]
+    metadata = {
+        "loaded": True,
+        "records": _metadata_records(),
+        "cell_types": {"organoid": ["27t", "mdo"], "immune": ["tcell"]},
+        "validation": [],
+    }
+    return {
+        "name": "apoc_recommends_tune_panel_for_mdo",
+        "messages": [
+            {
+                "role": "user",
+                "content": "Explain how to tune the APOC features.",
+            },
+            {
+                "role": "assistant",
+                "content": "The Tune Features panel controls classifier filters.",
+            },
+            {
+                "role": "user",
+                "content": "What do you recommend for the mdo?",
+            },
+        ],
+        "context": _context(
+            "segmentation", controls, metadata=metadata, active_cell_type="mdo",
+            segmentation={"method": "APOC (GPU)"},
+        ),
+        "check": _check_apoc_mdo_feature_recommendation,
+    }
+
+
+def _apoc_fill_organoid_features_case() -> dict:
+    controls = []
+    for cell_type in ("27t", "mdo"):
+        controls.extend([
+            _control(
+                f"segmentation.apoc.{cell_type}.feature_preset",
+                f"{cell_type}: APOC feature scale preset",
+                "Medium structures",
+                choices=[
+                    "Small structures", "Medium structures",
+                    "Large structures", "Custom feature selection",
+                ],
+                method="APOC", cell_type=cell_type,
+            ),
+            _control(
+                f"segmentation.apoc.{cell_type}.show_feature_tuning",
+                f"{cell_type}: show APOC custom feature tuning",
+                False,
+                method="APOC", cell_type=cell_type,
+            ),
+        ])
+    metadata = {
+        "loaded": True,
+        "records": _metadata_records(),
+        "cell_types": {"organoid": ["27t", "mdo"], "immune": ["tcell"]},
+        "validation": [],
+    }
+    return {
+        "name": "apoc_fills_organoid_tune_features",
+        "messages": [{
+            "role": "user",
+            "content": "Fill in the correct features for the MDO and the 27T for me.",
+        }],
+        "context": _context(
+            "segmentation", controls, metadata=metadata, active_cell_type="mdo",
+            segmentation={"method": "APOC (GPU)"},
+        ),
+        "check": _check_apoc_fill_organoid_features,
+    }
+
+
+def _tracking_which_method_case() -> dict:
+    return {
+        "name": "tracking_which_method_stays_on_tab",
+        "messages": [{"role": "user", "content": "Which method?"}],
+        "context": _context(
+            "tracking", [], active_cell_type="tcell",
+        ),
+        "check": _check_tracking_which_method,
+    }
+
+
+def _btrack_step2_enable_case() -> dict:
+    controls = [
+        _control(
+            "tracking.tcell.btrack.use_global_optimization",
+            "tcell: Enable global track optimization",
+            False, method="btrack", cell_type="tcell",
+        ),
+        _control(
+            "tracking.tcell.btrack.distance_threshold",
+            "tcell: btrack optimizer distance threshold",
+            60, method="btrack", cell_type="tcell", unit="um",
+            visible=False, enabled=False,
+        ),
+        _control(
+            "tracking.tcell.btrack.time_threshold",
+            "tcell: btrack optimizer time threshold",
+            3, method="btrack", cell_type="tcell", unit="frames",
+            visible=False, enabled=False,
+        ),
+    ]
+    return {
+        "name": "btrack_step2_is_enabled_after_step1",
+        "messages": [
+            {"role": "user", "content": "Set up tracking for the T cells."},
+            {"role": "assistant", "content": "The Step 1 search radius is set."},
+            {"role": "user", "content": "I mean the Step 2 of tracking."},
+        ],
+        "context": _context(
+            "tracking", controls, active_cell_type="tcell",
+        ),
+        "check": _check_btrack_step2_enable,
+    }
+
+
+def _btrack_step2_tune_case() -> dict:
+    controls = [
+        _control(
+            "tracking.tcell.btrack.use_global_optimization",
+            "tcell: Enable global track optimization",
+            True, method="btrack", cell_type="tcell",
+        ),
+        _control(
+            "tracking.tcell.btrack.distance_threshold",
+            "tcell: btrack optimizer distance threshold",
+            60, method="btrack", cell_type="tcell", unit="um",
+        ),
+        _control(
+            "tracking.tcell.btrack.time_threshold",
+            "tcell: btrack optimizer time threshold",
+            3, method="btrack", cell_type="tcell", unit="frames",
+        ),
+        _control(
+            "tracking.tcell.btrack.hypotheses",
+            "tcell: btrack optimization hypotheses",
+            ["P_FP", "P_init", "P_term", "P_link"],
+            choices=[
+                "P_FP", "P_init", "P_term", "P_link",
+                "P_branch", "P_dead", "P_merge",
+            ],
+            method="btrack", cell_type="tcell",
+        ),
+    ]
+    return {
+        "name": "btrack_step2_uses_measured_gap",
+        "messages": [{
+            "role": "user",
+            "content": "For Step 2, bridge gaps up to 4 frames and 40 um.",
+        }],
+        "context": _context(
+            "tracking", controls, active_cell_type="tcell",
+        ),
+        "check": _check_btrack_step2_tune,
+    }
+
+
+def _segmentation_minimum_size_case() -> dict:
+    controls = [_control(
+        "segmentation.apoc.tcell.minimum_size",
+        "tcell: APOC minimum object size",
+        10,
+        method="APOC", cell_type="tcell", unit="voxels",
+    )]
+    metadata = {
+        "loaded": True,
+        "records": [{
+            "sample_name": "Movie1",
+            "pixel_distance_xy": 1.0,
+            "pixel_distance_z": 2.0,
+            "distance_unit": "um",
+            "time_interval": 2,
+            "time_unit": "min",
+        }],
+        "cell_types": {"organoid": [], "immune": ["tcell"]},
+        "validation": [],
+    }
+    return {
+        "name": "segmentation_minimum_size_uses_cell_volume",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "My T cells are approximately 10 um across. "
+                "Set the segmentation Minimum size."
+            ),
+        }],
+        "context": _context(
+            "segmentation", controls, metadata=metadata,
+            active_cell_type="tcell",
+            segmentation={"method": "APOC (GPU)"},
+        ),
+        "check": _check_segmentation_minimum_size,
+    }
+
+
+def _mask_edt_direction_case() -> dict:
+    strategy = "APOC Mask + EDT/Watershed Resegmentation"
+    return {
+        "name": "mask_edt_direction_and_fallback",
+        "messages": [
+            {
+                "role": "user",
+                "content": "I used EDT 50 for organoids before.",
+            },
+            {
+                "role": "assistant",
+                "content": "A higher EDT makes splitting harder.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    "That contradicts the implementation. Explain the EDT direction "
+                    "properly."
+                ),
+            },
+        ],
+        "context": _context(
+            "segmentation", [], active_cell_type="13T",
+            segmentation={
+                "method": "APOC (GPU)",
+                "apoc": {"cell_type_strategies": {"13T": strategy}},
+            },
+        ),
+        "check": _check_mask_edt_direction,
+    }
+
+
+def _contact_and_dead_threshold_case() -> dict:
+    controls = [_control(
+        "features.tcell.contact_distance",
+        "tcell: contact distance",
+        1.01,
+        cell_type="tcell", unit="um",
+    )]
+    metadata = {
+        "loaded": True,
+        "records": [{
+            "sample_name": "Movie1",
+            "pixel_distance_xy": 1.01,
+            "pixel_distance_z": 1.05,
+            "time_interval": 2,
+            "time_unit": "min",
+        }],
+        "validation": [],
+    }
+    return {
+        "name": "contact_distance_uses_xy_pixel_scale",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "How can I set the contact and dead-mask percentage threshold "
+                "correctly? Is 1.01 um strict touching?"
+            ),
+        }],
+        "context": _context(
+            "feature_extraction", controls, metadata=metadata,
+            active_cell_type="tcell",
+        ),
+        "check": _check_contact_and_dead_threshold,
+    }
+
+
+def _first_dead_threshold_preview_case() -> dict:
+    return {
+        "name": "dead_threshold_uses_viewer_preview_first",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "In Feature Extraction, how should I set the correct dead-mask "
+                "percentage threshold for the first time?"
+            ),
+        }],
+        "context": _context(
+            "feature_extraction", [], active_cell_type="tcell",
+            results=[{
+                "id": "analysis/tcell/BEHAV3D_dead_dye_distribution.pdf",
+                "label": "Dead dye distribution",
+                "description": "Distribution used to tune the dead-dye threshold.",
+                "kind": "pdf",
+                "category": "filtering",
+                "cell_type": "tcell",
+                "viewable": True,
+            }],
+        ),
+        "check": _check_first_dead_threshold_preview,
+    }
+
+
+def _failed_result_opening_correction_case() -> dict:
+    return {
+        "name": "failed_result_opening_does_not_loop",
+        "messages": [
+            {
+                "role": "user",
+                "content": "How should I set the dead-mask percentage threshold?",
+            },
+            {
+                "role": "assistant",
+                "content": "The result is listed as viewable. Let me open it.",
+            },
+            {"role": "user", "content": "I think you cannot open it."},
+        ],
+        "context": _context(
+            "feature_extraction", [], active_cell_type="tcell",
+            results=[{
+                "id": "analysis/tcell/BEHAV3D_dead_dye_distribution.pdf",
+                "label": "Dead dye distribution",
+                "viewable": True,
+            }],
+        ),
+        "check": _check_failed_result_opening_correction,
+    }
+
+
+def _loaded_metadata_not_unsaved_case() -> dict:
+    return {
+        "name": "loaded_metadata_is_not_called_unsaved",
+        "messages": [{
+            "role": "user",
+            "content": "The metadata is loaded. Let's do the segmentation.",
+        }],
+        "context": _context(
+            "segmentation", [],
+            metadata_builder={
+                "open": True,
+                "record_source": "loaded_metadata_copy",
+                "save_required": False,
+            },
+            segmentation={"method": "APOC (GPU)", "method_index": 0},
+        ),
+        "check": _check_loaded_metadata_not_unsaved,
+    }
+
+
+def _external_zarr_reload_case() -> dict:
+    return {
+        "name": "external_zarr_requires_metadata_reload",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "I converted the images to Zarr and updated the metadata file "
+                "outside BEHAV3D. Load Dataset still shows nothing. What should I do?"
+            ),
+        }],
+        "context": _context("visualization", []),
+        "check": _check_external_zarr_reload,
+    }
+
+
+def _missing_log_error_case() -> dict:
+    return {
+        "name": "failed_load_requests_log_error",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "I clicked Generate Training Data but nothing appeared. What is wrong?"
+            ),
+        }],
+        "context": _context(
+            "segmentation", [],
+            segmentation={
+                "method": "APOC (GPU)",
+                "apoc": {"training_data_loaded": False},
+            },
+            current_log={
+                "source": "segmentation",
+                "recent_lines": [
+                    "APOC training pipeline using GPU device: NVIDIA GPU",
+                    "Loading training data...",
+                    "Running _load_training_images...",
+                ],
+                "errors": [],
+                "has_explicit_error": False,
+            },
+        ),
+        "check": _check_missing_log_error,
     }
 
 
@@ -298,9 +1043,10 @@ def _active_killing_case() -> dict:
         _control(
             "features.active_killing.death_signal",
             "Active Killing: Death or reporter signal",
-            "percentage_dead_mask",
+            "Dead-mask percentage",
             choices=[
-                "percentage_dead_mask", "mean_dead_dye", "nr_dead_mask_pixels",
+                "Dead-mask percentage", "Mean dead-dye intensity",
+                "Dead-mask pixel count",
             ],
             method="Active Killing",
             cell_type="tcell",
@@ -311,6 +1057,15 @@ def _active_killing_case() -> dict:
             False,
             method="Active Killing",
             cell_type="tcell",
+        ),
+        _control(
+            "features.active_killing.absolute_threshold",
+            "Active Killing: Absolute signal-increase threshold",
+            0.0,
+            unit="pixels",
+            method="Active Killing",
+            cell_type="tcell",
+            active=False,
         ),
     ]
     metadata = {
@@ -330,8 +1085,8 @@ def _active_killing_case() -> dict:
             "role": "user",
             "content": (
                 "Configure active killing for tcell against organoid1 only. I expect "
-                "killing within 10 minutes and images are every 2 minutes. Use the "
-                "generally recommended death signal and threshold mode."
+                "killing within 10 minutes and images are every 2 minutes. Use an "
+                "absolute threshold of 30 dead pixels."
             ),
         }],
         "context": _context(
@@ -340,6 +1095,322 @@ def _active_killing_case() -> dict:
             feature_extraction={"active_killing_open": True},
         ),
         "check": _check_active_killing,
+    }
+
+
+def _feature_group_dead_dye_case() -> dict:
+    choices = [
+        "movement", "intensity", "morphology", "contact",
+        "invasiveness", "death",
+    ]
+    controls = [_control(
+        "features.tcell.feature_groups",
+        "tcell: feature groups",
+        choices,
+        choices=choices,
+        cell_type="tcell",
+        required_choices=["movement", "intensity", "contact", "death"],
+    )]
+    return {
+        "name": "tcell_features_keep_dead_dye_intensity",
+        "messages": [{
+            "role": "user",
+            "content": "Now adjust T cells. Should I drop intensity?",
+        }],
+        "context": _context(
+            "feature_extraction", controls, active_cell_type="tcell",
+        ),
+        "check": _check_feature_group_dead_dye,
+    }
+
+
+def _active_killing_complete_acceptance_case() -> dict:
+    controls = [
+        _control(
+            "features.active_killing.target_types",
+            "Active Killing: Target cell type",
+            ["27t", "mdo"],
+            choices=["27t", "mdo"],
+            method="Active Killing",
+            cell_type="tcell",
+        ),
+        _control(
+            "features.active_killing.observation_window",
+            "Active Killing: Observation window",
+            5,
+            unit="timepoints",
+            method="Active Killing",
+            cell_type="tcell",
+        ),
+        _control(
+            "features.active_killing.death_signal",
+            "Active Killing: Death or reporter signal",
+            "Dead-mask percentage",
+            choices=[
+                "Dead-mask percentage", "Mean dead-dye intensity",
+                "Dead-mask pixel count",
+            ],
+            method="Active Killing",
+            cell_type="tcell",
+        ),
+        _control(
+            "features.active_killing.use_absolute_threshold",
+            "Active Killing: Use an absolute signal-increase threshold",
+            False,
+            method="Active Killing",
+            cell_type="tcell",
+        ),
+        _control(
+            "features.active_killing.absolute_threshold",
+            "Active Killing: Absolute signal-increase threshold",
+            0.0,
+            unit="pixels",
+            method="Active Killing",
+            cell_type="tcell",
+            active=False,
+        ),
+        _control(
+            "features.active_killing.minimum_contact_duration",
+            "Active Killing: Minimum contact duration",
+            1,
+            unit="timepoints",
+            method="Active Killing",
+            cell_type="tcell",
+        ),
+    ]
+    return {
+        "name": "active_killing_accepts_complete_setup",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": (
+                    "Active Killing configuration for tcell against 27t and mdo: "
+                    "Death signal: Dead-mask pixel count. Absolute threshold: "
+                    "30 dead pixels. Observation window: 5 timepoints. "
+                    "Minimum contact duration: 1 frame."
+                ),
+            },
+            {"role": "user", "content": "Ok, these settings seem ok"},
+        ],
+        "context": _context(
+            "feature_extraction", controls, active_cell_type="tcell",
+            feature_extraction={
+                "active_killing_open": True,
+                "active_killing": {
+                    "setup_ready": True,
+                    "setup_issues": [],
+                },
+            },
+        ),
+        "check": _check_active_killing_complete_acceptance,
+    }
+
+
+def _hmm_movement_controls() -> list[dict]:
+    prefix = "analysis.state_classification.tcell."
+    return [
+        _control(
+            prefix + "timepoint_features",
+            "tcell: Timepoint features",
+            ["speed"],
+            choices=[
+                "speed", "displacement", "cumulative_displacement",
+                "displacement_from_origin", "directional_persistence",
+                "median_turning_angle", "mean_dead_dye",
+            ],
+            method="HMM",
+            cell_type="tcell",
+        ),
+        _control(
+            prefix + "window_features",
+            "tcell: Additional window features",
+            ["net_displacement"],
+            choices=[
+                "net_displacement", "straightness",
+                "mean_square_displacement",
+            ],
+            method="HMM",
+            cell_type="tcell",
+        ),
+        _control(
+            prefix + "binary_feature_groups",
+            "tcell: Binary feature groups",
+            ["27t_contact", "mdo_contact"],
+            choices=["27t_contact", "mdo_contact"],
+            method="HMM",
+            cell_type="tcell",
+        ),
+    ]
+
+
+def _hmm_movement_options_case() -> dict:
+    controls = _hmm_movement_controls()
+    return {
+        "name": "hmm_lists_all_movement_options",
+        "messages": [{
+            "role": "user",
+            "content": "Only movement features of relevance",
+        }],
+        "context": _context(
+            "analysis", controls, active_cell_type="tcell",
+            analysis={"view": "behavioral_state", "selected_cell_type": "tcell"},
+        ),
+        "check": _check_hmm_movement_options,
+    }
+
+
+def _hmm_apply_all_movement_case() -> dict:
+    return {
+        "name": "hmm_applies_all_offered_movement_features",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": (
+                    "Choose the feature names you want, or say use all available "
+                    "movement features."
+                ),
+            },
+            {"role": "user", "content": "Use all available movement features"},
+        ],
+        "context": _context(
+            "analysis", _hmm_movement_controls(), active_cell_type="tcell",
+            analysis={"view": "behavioral_state", "selected_cell_type": "tcell"},
+        ),
+        "check": _check_hmm_apply_all_movement,
+    }
+
+
+def _sam_hmm_controls() -> list[dict]:
+    prefix = "analysis.state_classification.T-cells."
+    return [
+        _control(
+            prefix + "timepoint_features",
+            "T-cells: Timepoint features",
+            ["speed"],
+            choices=["speed", "elongation"],
+            method="HMM",
+            cell_type="T-cells",
+        ),
+        _control(
+            prefix + "window_features",
+            "T-cells: Additional window features",
+            ["net_displacement"],
+            choices=["net_displacement", "straightness"],
+            method="HMM",
+            cell_type="T-cells",
+        ),
+        _control(
+            prefix + "binary_feature_groups",
+            "T-cells: Binary feature groups",
+            [],
+            choices=["Organoid_contact", "Macrophages_contact", "dead"],
+            method="HMM",
+            cell_type="T-cells",
+        ),
+        _control(
+            prefix + "n_states",
+            "T-cells: Number of states",
+            6,
+            method="HMM",
+            cell_type="T-cells",
+        ),
+    ]
+
+
+def _hmm_selected_cell_setup_case() -> dict:
+    return {
+        "name": "hmm_setup_uses_selected_tcells",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "I want to do behavioral analysis, can you take me through the steps?"
+            ),
+        }],
+        "context": _context(
+            "analysis", _sam_hmm_controls(), active_cell_type="T-cells",
+            analysis={
+                "view": "behavioral_state",
+                "selected_cell_type": "T-cells",
+            },
+        ),
+        "check": _check_hmm_selected_cell_setup,
+    }
+
+
+def _hmm_macrophage_contact_for_tcells_case() -> dict:
+    return {
+        "name": "hmm_contact_meaning_uses_selected_tcells",
+        "messages": [{
+            "role": "user",
+            "content": "Would it be worth adding macrophage contact?",
+        }],
+        "context": _context(
+            "analysis", _sam_hmm_controls(), active_cell_type="T-cells",
+            analysis={
+                "view": "behavioral_state",
+                "selected_cell_type": "T-cells",
+            },
+        ),
+        "check": _check_hmm_macrophage_contact_for_tcells,
+    }
+
+
+def _hmm_add_binary_groups_for_tcells_case() -> dict:
+    return {
+        "name": "hmm_adds_binary_groups_to_selected_tcells",
+        "messages": [{
+            "role": "user",
+            "content": "Add organoid contact and also add dead",
+        }],
+        "context": _context(
+            "analysis", _sam_hmm_controls(), active_cell_type="T-cells",
+            analysis={
+                "view": "behavioral_state",
+                "selected_cell_type": "T-cells",
+            },
+        ),
+        "check": _check_hmm_add_binary_groups_for_tcells,
+    }
+
+
+def _hmm_merge_states_case() -> dict:
+    return {
+        "name": "hmm_explains_supported_state_merging",
+        "messages": [{
+            "role": "user",
+            "content": "If I have 6 states, can I select which ones to keep?",
+        }],
+        "context": _context(
+            "analysis", _sam_hmm_controls(), active_cell_type="T-cells",
+            analysis={
+                "view": "behavioral_state",
+                "selected_cell_type": "T-cells",
+            },
+        ),
+        "check": _check_hmm_merge_states,
+    }
+
+
+def _active_killing_zero_threshold_readiness_case() -> dict:
+    return {
+        "name": "active_killing_zero_threshold_is_not_ready",
+        "messages": [
+            {"role": "assistant", "content": "Active Killing setup"},
+            {"role": "user", "content": "Is it ready?"},
+        ],
+        "context": _context(
+            "feature_extraction", [], active_cell_type="tcell",
+            feature_extraction={
+                "active_killing_open": True,
+                "active_killing": {
+                    "setup_ready": False,
+                    "setup_issues": [
+                        "Absolute signal-increase threshold must be greater than 0."
+                    ],
+                },
+            },
+        ),
+        "check": _check_active_killing_zero_threshold_readiness,
     }
 
 
@@ -485,14 +1556,559 @@ def _safety_profiling_context_case() -> dict:
             ),
         }],
         "context": _context(
-            "analysis", [], experiment_reference=reference, results=[],
+            "analysis", [],
+            metadata={
+                "loaded": True,
+                "records": [{
+                    "sample_name": "Exp010",
+                    "pixel_distance_xy": 0.5,
+                    "pixel_distance_z": 2.0,
+                    "time_interval": 2,
+                    "time_unit": "min",
+                }],
+                "validation": [],
+            },
+            experiment_reference=reference, results=[],
         ),
         "check": _check_safety_profiling_context,
     }
 
 
+def _historical_btrack_examples_case() -> dict:
+    controls = [
+        _control(
+            "tracking.tcell.btrack.maximum_search_radius",
+            "tcell: Maximum search radius", 25,
+            method="btrack", cell_type="tcell", unit="um",
+        ),
+        _control(
+            "tracking.tcell.btrack.distance_threshold",
+            "tcell: Distance threshold", 30,
+            method="btrack", cell_type="tcell", unit="um",
+        ),
+        _control(
+            "tracking.tcell.btrack.time_threshold",
+            "tcell: Time threshold", 2,
+            method="btrack", cell_type="tcell", unit="frames",
+        ),
+    ]
+    return {
+        "name": "historical_btrack_values_are_examples_only",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "Do you have example values from a previous experiment for btrack "
+                "on T cells? Can I copy them into this experiment?"
+            ),
+        }],
+        "context": _context(
+            "tracking", controls, active_cell_type="tcell",
+            metadata={
+                "loaded": True,
+                "records": [{
+                    "sample_name": "Current01",
+                    "pixel_distance_xy": 0.6,
+                    "pixel_distance_z": 2.0,
+                    "time_interval": 30,
+                    "time_unit": "s",
+                }],
+                "cell_types": {"immune": ["tcell"]},
+                "validation": [],
+            },
+            tracking={"method": "btrack"},
+        ),
+        "check": _check_historical_btrack_examples,
+    }
+
+
+def _historical_calcium_example_case() -> dict:
+    return {
+        "name": "historical_calcium_profile_explains_reporter_propagation",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "Was there a previous experiment with near-static calcium reporter "
+                "cells? What method and example values did it use?"
+            ),
+        }],
+        "context": _context(
+            "tracking", [], active_cell_type="islets",
+            metadata={
+                "loaded": True,
+                "records": [{
+                    "sample_name": "NewCalcium",
+                    "pixel_distance_xy": 0.5,
+                    "pixel_distance_z": 2.5,
+                    "time_interval": 10,
+                    "time_unit": "s",
+                }],
+                "cell_types": {"other": ["islets"]},
+                "validation": [],
+            },
+        ),
+        "check": _check_historical_calcium_example,
+    }
+
+
+def _historical_microglia_example_case() -> dict:
+    return {
+        "name": "historical_microglia_exp91_preserves_sources_and_caveats",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "What design and settings were used in the previous microglia "
+                "Exp91 experiment?"
+            ),
+        }],
+        "context": _context(
+            "analysis", [], active_cell_type="tcell",
+            metadata={
+                "loaded": True,
+                "records": [{
+                    "sample_name": "CurrentMicroglia",
+                    "pixel_distance_xy": 0.8,
+                    "pixel_distance_z": 2.0,
+                    "time_interval": 3,
+                    "time_unit": "min",
+                }],
+                "cell_types": {
+                    "organoid": ["organoid"],
+                    "immune": ["microglia", "tcell"],
+                },
+                "validation": [],
+            },
+        ),
+        "check": _check_historical_microglia_example,
+    }
+
+
+def _experiment_reference_metadata_conflict_case() -> dict:
+    reference = {
+        "notes": [{
+            "source": "README_BEHAV3D_IVM_HIV.md",
+            "text": "The CS002 frame interval was 10 seconds.",
+        }],
+        "source_policy": (
+            "Use live metadata for acquisition facts. State discrepancies."
+        ),
+    }
+    return {
+        "name": "live_metadata_wins_reference_cadence_conflict",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "The experiment README says CS002 used 10-second frames. What does "
+                "the currently loaded metadata say, and which value should I use?"
+            ),
+        }],
+        "context": _context(
+            "data_preparation", [],
+            metadata={
+                "loaded": True,
+                "records": [{
+                    "sample_name": "CS002",
+                    "pixel_distance_xy": 1.15,
+                    "pixel_distance_z": 4.0,
+                    "time_interval": 15,
+                    "time_unit": "s",
+                }],
+                "validation": [],
+            },
+            experiment_reference=reference,
+        ),
+        "check": _check_experiment_reference_metadata_conflict,
+    }
+
+
+def _organoid_line_grouping_case() -> dict:
+    return {
+        "name": "organoid_lines_require_processing_choice",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "I co-culture T cells and macrophages with three different organoid "
+                "lines. Can you help me set up the metadata?"
+            ),
+        }],
+        "context": _context(
+            "data_preparation", [],
+            metadata={"loaded": False, "records": [], "validation": []},
+            metadata_builder={"open": False, "sample_forms_created": False},
+        ),
+        "check": _check_organoid_line_grouping,
+    }
+
+
+def _metadata_identifier_confirmation_case() -> dict:
+    return {
+        "name": "metadata_identifiers_require_confirmation",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "No well identifier. M21 and M23 are macrophage lines, and "
+                "T-cells are GD2_CART."
+            ),
+        }],
+        "context": _context(
+            "data_preparation", [],
+            metadata={
+                "loaded": True,
+                "record_source": "metadata_builder_draft",
+                "records": [{"sample_name": "Img001_DO7_GD2"}],
+                "validation": [],
+                "save_required": True,
+            },
+            metadata_builder={
+                "open": True,
+                "sample_forms_created": True,
+                "actions": {"save_available": False, "load_available": False},
+            },
+        ),
+        "check": _check_metadata_identifier_confirmation,
+    }
+
+
+def _metadata_time_conversion_case() -> dict:
+    controls = []
+    records = []
+    for index in range(8):
+        records.append({
+            "sample_name": f"Img{index + 1:03d}",
+            "time_interval": 2,
+            "time_unit": "s",
+        })
+        controls.extend([
+            _control(
+                f"metadata.samples.{index}.time_interval",
+                f"Sample {index + 1}: Time interval", 2.0,
+            ),
+            _control(
+                f"metadata.samples.{index}.time_unit",
+                f"Sample {index + 1}: Time unit", "s",
+                choices=["s", "min", "h"],
+            ),
+        ])
+    return {
+        "name": "metadata_minutes_are_converted_for_all_samples",
+        "messages": [{
+            "role": "user",
+            "content": "The time unit is s while I set 2 minutes.",
+        }],
+        "context": _context(
+            "data_preparation", controls,
+            metadata={
+                "loaded": True,
+                "record_source": "metadata_builder_draft",
+                "records": records,
+                "validation": [],
+                "save_required": True,
+            },
+            metadata_builder={
+                "open": True,
+                "sample_forms_created": True,
+                "actions": {"save_available": False, "load_available": False},
+            },
+        ),
+        "check": _check_metadata_time_conversion,
+    }
+
+
+def _metadata_completion_case() -> dict:
+    validation = [
+        {
+            "severity": "error",
+            "field": "well",
+            "message": "Img001: mandatory well is missing.",
+        },
+        {
+            "severity": "error",
+            "field": "T-cells.line",
+            "message": "Img001: mandatory T-cells line is missing.",
+        },
+        {
+            "severity": "error",
+            "field": "Macrophages.line",
+            "message": "Img001: mandatory Macrophages line is missing.",
+        },
+    ]
+    return {
+        "name": "metadata_completion_reports_real_mandatory_fields",
+        "messages": [{
+            "role": "user",
+            "content": "Is this all that is needed?",
+        }],
+        "context": _context(
+            "data_preparation", [],
+            metadata={
+                "loaded": True,
+                "record_source": "metadata_builder_draft",
+                "records": [{"sample_name": "Img001"}],
+                "validation": validation,
+                "save_required": True,
+            },
+            metadata_builder={
+                "open": True,
+                "sample_forms_created": True,
+                "draft_validation": validation,
+                "actions": {"save_available": False, "load_available": False},
+            },
+        ),
+        "check": _check_metadata_completion,
+    }
+
+
+def _metadata_save_case() -> dict:
+    return {
+        "name": "metadata_save_uses_real_action",
+        "messages": [{"role": "user", "content": "Yeah save it please"}],
+        "context": _context(
+            "data_preparation", [],
+            metadata={
+                "loaded": True,
+                "record_source": "metadata_builder_draft",
+                "records": [{"sample_name": "Img001"}],
+                "validation": [],
+                "save_required": True,
+            },
+            metadata_builder={
+                "open": True,
+                "sample_forms_created": True,
+                "draft_validation": [],
+                "actions": {
+                    "save_available": True,
+                    "save_also_loads": True,
+                    "load_available": False,
+                },
+            },
+        ),
+        "check": _check_metadata_save,
+    }
+
+
+def _choose_analysis_case() -> dict:
+    return {
+        "name": "choose_analysis_explains_options",
+        "messages": [{
+            "role": "user",
+            "content": "Can you help me pick what analysis would be nice for my data?",
+        }],
+        "context": _context(
+            "analysis", [],
+            assistant_session={"intent": "choose_analysis"},
+            analysis={"view": "death_dynamics"},
+            metadata={
+                "loaded": True,
+                "n_samples": 8,
+                "cell_types": {
+                    "organoid": ["Organoids"],
+                    "immune": ["Macrophages", "T-cells"],
+                    "other": [],
+                },
+                "records": [{
+                    "sample_name": "Movie1",
+                    "or_Organoids_line_condition": "DO7",
+                    "im_Macrophages_line_condition": "M21",
+                    "im_T-cells_line_condition": "GD2_CART",
+                    "dead_channel": 3,
+                }],
+                "validation": [],
+            },
+        ),
+        "check": _check_choose_analysis,
+    }
+
+
+def _analysis_question_on_metadata_tab_case() -> dict:
+    return {
+        "name": "analysis_question_is_not_hijacked_by_metadata_clarification",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "I have an experiment with T cells, Macrophages and Organoids of "
+                "different lines. What analysis would be possible for this data?"
+            ),
+        }],
+        "context": _context(
+            "data_preparation", [],
+            metadata={"loaded": False, "records": [], "validation": []},
+            metadata_builder={"open": False, "sample_forms_created": False},
+        ),
+        "check": _check_analysis_question_on_metadata_tab,
+    }
+
+
+def _metadata_not_added_case() -> dict:
+    control_id = "metadata.samples.0.cell_types.Macrophages.line"
+    return {
+        "name": "metadata_absent_population_uses_not_added",
+        "messages": [{
+            "role": "user",
+            "content": "Macrophages were not added in Sample 1; set that line.",
+        }],
+        "context": _context(
+            "data_preparation", [
+                _control(
+                    control_id,
+                    "Sample 1, Macrophages: line",
+                    "",
+                    cell_type="Macrophages",
+                ),
+            ],
+            metadata={
+                "loaded": True,
+                "record_source": "metadata_builder_draft",
+                "records": [{"sample_name": "Sample1"}],
+                "validation": [],
+            },
+            metadata_builder={"open": True, "sample_forms_created": True},
+        ),
+        "check": _check_metadata_not_added,
+    }
+
+
+def _open_death_dynamics_case() -> dict:
+    return {
+        "name": "death_dynamics_opens_specific_view",
+        "messages": [{
+            "role": "user",
+            "content": "Can you take me to Death Dynamics?",
+        }],
+        "context": _context(
+            "analysis", [],
+            analysis={"view": "behavioral_state"},
+        ),
+        "check": _check_open_death_dynamics,
+    }
+
+
 def _tool_calls(result: dict, name: str) -> list[dict]:
     return [call.get("arguments", {}) for call in result["calls"] if call.get("name") == name]
+
+
+def _check_organoid_line_grouping(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    if "separate organoid types" not in text or "one organoid type" not in text:
+        errors.append("did not ask how organoid lines should map to processing types")
+    if "same movie" not in text or "segmented or tracked separately" not in text:
+        errors.append("did not explain when separate organoid types are appropriate")
+    if result["calls"]:
+        errors.append("attempted metadata edits before the grouping choice was confirmed")
+    return errors
+
+
+def _check_metadata_identifier_confirmation(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "well", "mandatory", "condition is optional", "filenames", "not_added",
+    ):
+        if phrase not in text:
+            errors.append(f"missing identifier guidance: {phrase}")
+    for experiment_value in ("m21", "m23", "gd2_cart"):
+        if experiment_value in text:
+            errors.append(f"embedded experiment-specific identifier: {experiment_value}")
+    if result["calls"]:
+        errors.append("filled filename-derived values before confirmation")
+    return errors
+
+
+def _check_metadata_time_conversion(result: dict) -> list[str]:
+    calls = _tool_calls(result, "set_ui_value")
+    changed = {call.get("control_id"): call.get("value") for call in calls}
+    errors = []
+    if "120 seconds" not in result["text"].lower():
+        errors.append("did not explain the 2 minute to 120 second conversion")
+    for index in range(8):
+        control_id = f"metadata.samples.{index}.time_interval"
+        if changed.get(control_id) != 120:
+            errors.append(f"missing {control_id} -> 120")
+    if any(str(call.get("control_id", "")).startswith("data.output") for call in calls):
+        errors.append("emitted an unrelated output-directory action")
+    return errors
+
+
+def _check_metadata_completion(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "mandatory well", "mandatory t-cells line",
+        "mandatory macrophages line", "condition", "optional", "not_added",
+    ):
+        if phrase not in text:
+            errors.append(f"missing completeness detail: {phrase}")
+    if _tool_calls(result, "save_metadata"):
+        errors.append("offered save despite mandatory validation errors")
+    return errors
+
+
+def _check_metadata_save(result: dict) -> list[str]:
+    errors = []
+    if _tool_calls(result, "save_metadata") != [{}]:
+        errors.append("did not call the real save metadata action")
+    if _tool_calls(result, "load_metadata"):
+        errors.append("offered a redundant load after save")
+    if "confirm" not in result["text"].lower():
+        errors.append("did not tell the user that the write requires confirmation")
+    return errors
+
+
+def _check_choose_analysis(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "death dynamics", "interaction analysis", "invasiveness analysis",
+        "active killing", "behavioral state", "state trajectory",
+        "contact-based grouping", "contact state-shift analysis", "backprojection",
+    ):
+        if phrase not in text:
+            errors.append(f"did not explain {phrase}")
+    for phrase in ("8 samples", "do7", "m21", "gd2_cart"):
+        if phrase not in text:
+            errors.append(f"did not ground the recommendation in metadata: {phrase}")
+    if result["calls"]:
+        errors.append("Choose analysis navigated instead of explaining options")
+    return errors
+
+
+def _check_analysis_question_on_metadata_tab(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "no metadata is loaded", "interaction analysis", "invasiveness analysis",
+        "contact-based grouping", "contact state-shift analysis",
+    ):
+        if phrase not in text:
+            errors.append(f"missing analysis overview detail: {phrase}")
+    for hijack in ("before i build the metadata", "separate organoid types"):
+        if hijack in text:
+            errors.append(f"analysis question was hijacked by metadata prompt: {hijack}")
+    if result["calls"]:
+        errors.append("analysis overview attempted an action")
+    return errors
+
+
+def _check_metadata_not_added(result: dict) -> list[str]:
+    changed = _changed_values(result)
+    control_id = "metadata.samples.0.cell_types.Macrophages.line"
+    errors = []
+    if changed.get(control_id) != "not_added":
+        errors.append("did not write the CSV-safe not_added line value")
+    text = result["text"].lower()
+    if "not added" not in text or "not_added" not in text:
+        errors.append("did not explain the absent population in researcher-facing terms")
+    if re.search(r"\bline value\s+none\b", text):
+        errors.append("still recommended None as the line value")
+    return errors
+
+
+def _check_open_death_dynamics(result: dict) -> list[str]:
+    calls = _tool_calls(result, "open_analysis_view")
+    if calls != [{"view": "death_dynamics"}]:
+        return [f"expected Death Dynamics subview action, got {result['calls']!r}"]
+    if _tool_calls(result, "navigate_to_step"):
+        return ["used generic Analysis navigation instead of the named subview"]
+    return []
 
 
 def _check_metadata_setup(result: dict) -> list[str]:
@@ -560,6 +2176,8 @@ def _check_segmentation(result: dict) -> list[str]:
     )
     if any(phrase in text for phrase in bad_directions):
         errors.append("response still recommends lowering Mask or Seed threshold")
+    if "requiring less confidence" in text:
+        errors.append("incorrectly described a higher Seed threshold as requiring less confidence")
     calls = _tool_calls(result, "set_ui_value")
     values = {call.get("control_id"): call.get("value") for call in calls}
     mask = values.get("segmentation.apoc.Tcell_cmtrm.mask_threshold")
@@ -573,6 +2191,436 @@ def _check_segmentation(result: dict) -> list[str]:
     return errors
 
 
+def _check_method_requires_signal_context(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    if not (
+        ("bleed" in text or "same channel" in text)
+        and ("clean" in text or "isolated" in text)
+        and "?" in result["text"]
+    ):
+        errors.append(
+            "did not ask whether the target is isolated/clean or has bleed-through"
+        )
+    if result["calls"]:
+        errors.append("changed a method before the signal context was known")
+    if "gfp" in text or "rfp" in text:
+        errors.append("asked for irrelevant fluorophore labels instead of visible cell signals")
+    if any(phrase in text for phrase in (
+        "solid default", "good default", "recommend apoc",
+        "best choice is apoc", "apoc is the practical",
+    )):
+        errors.append("characterized APOC as preferred before signal context was known")
+    if any(phrase in text for phrase in (
+        "yes, very likely", "best choice is cellpose",
+        "recommend cellpose-sam", "my recommendation is cellpose",
+    )):
+        errors.append("recommended Cellpose-SAM before bleed-through was confirmed")
+    return errors
+
+
+def _check_confirmed_bleed_through(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    if "apoc" not in text:
+        errors.append("did not recommend APOC after bleed-through was confirmed")
+    if any(phrase in text for phrase in (
+        "recommend cellpose-sam", "cellpose-sam is the best",
+        "cellpose-sam is a good fit", "cellpose-sam is the right choice",
+    )):
+        errors.append("still recommended Cellpose-SAM despite bleed-through")
+    return errors
+
+
+def _check_apoc_channel_map(result: dict) -> list[str]:
+    changed = _changed_values(result)
+    expected = {
+        "segmentation.apoc.27t.input_channels": ["Channel 1", "Channel 2"],
+        "segmentation.apoc.mdo.input_channels": ["Channel 1", "Channel 2"],
+        "segmentation.apoc.tcell.input_channels": ["Channel 0"],
+        "segmentation.apoc.dead.input_channels": ["Channel 3"],
+    }
+    errors = []
+    for control_id, value in expected.items():
+        if changed.get(control_id) != value:
+            errors.append(
+                f"{control_id} was {changed.get(control_id)!r}, expected {value!r}"
+            )
+    text = result["text"].lower()
+    if "apoc does not have" in text or "uses all" in text:
+        errors.append("incorrectly denied APOC per-model channel selection")
+    return errors
+
+
+def _check_apoc_channels_wait_for_training_data(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    if "generate training data" not in text:
+        errors.append("did not explain that Generate Training Data unlocks channels")
+    if any(phrase in text for phrase in (
+        "apoc does not have", "no channel selection", "always uses all",
+        "switch to cellpose", "need to switch to cellpose",
+    )):
+        errors.append("misrepresented unavailable pre-load APOC channel controls")
+    if result["calls"]:
+        errors.append("attempted to set channel controls before they existed")
+    return errors
+
+
+def _check_apoc_feature_preset(result: dict) -> list[str]:
+    changed = _changed_values(result)
+    errors = []
+    expected_id = "segmentation.apoc.tcell.feature_preset"
+    if changed.get(expected_id) != "Small structures":
+        errors.append(
+            f"feature preset was {changed.get(expected_id)!r}, expected Small structures"
+        )
+    forbidden = (
+        "minimum_size", "minimum size", "mask_threshold", "mask threshold",
+        "seed_threshold", "seed threshold",
+    )
+    for call in _tool_calls(result, "set_ui_value"):
+        control_id = str(call.get("control_id") or "").lower()
+        if any(token.replace(" ", "_") in control_id for token in forbidden):
+            errors.append(f"changed post-processing instead of features: {control_id}")
+    return errors
+
+
+def _check_swapped_channel_metadata(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "metadata builder does not map raw channel indices",
+        "line", "processing slots", "segmentation",
+        "not independent per sample", "shared multiclass model",
+    ):
+        if phrase not in text:
+            errors.append(f"missing swapped-channel boundary guidance: {phrase}")
+    if any(phrase in text for phrase in (
+        "each sample form has a channel", "per-sample dropdown",
+        "choose different channel numbers for the same processing slot",
+        "i should not", "my rules say",
+    )):
+        errors.append("invented per-sample channel mapping or exposed internal rules")
+    if result["calls"]:
+        errors.append("attempted edits before the slot workflow was confirmed")
+    return errors
+
+
+def _check_apoc_invalid_channel_index(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    if "indexed 0-3" not in text or "conflicts with the data" not in text:
+        errors.append("did not catch Channel 4 against a four-channel image")
+    if any(phrase in text for phrase in (
+        "channel 4 for green", "add the dead", "dead channel helps",
+    )):
+        errors.append("continued with channel advice despite the index conflict")
+    if result["calls"]:
+        errors.append("attempted channel edits before resolving the conflict")
+    return errors
+
+
+def _check_apoc_dead_channel(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "13t -> channel 1", "blue -> channel 0", "green -> channel 3",
+        "do not automatically add", "negative/background class",
+        "dead cell is still",
+    ):
+        if phrase not in text:
+            errors.append(f"missing APOC channel guidance: {phrase}")
+    if any(phrase in text for phrase in (
+        "dead channel helps", "separate class", "exclude dead",
+    )):
+        errors.append("recommended the dead signal as an APOC negative class")
+    if result["calls"]:
+        errors.append("attempted channel edits for an advice-only question")
+    return errors
+
+
+def _check_apoc_feature_grid(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "feature scales in pixels", "gaussian blur", "difference of gaussians",
+        "laplacian of gaussian", "sobel-of-gaussian",
+        "not a structure tensor", "current live apoc controls",
+        "show classifier statistics", "greener", "redder",
+    ):
+        if phrase not in text:
+            errors.append(f"missing APOC feature-grid detail: {phrase}")
+    positive_switch = any(phrase in text for phrase in (
+        "need to switch to pixel classifier",
+        "should switch to pixel classifier",
+        "recommend switching to pixel classifier",
+    )) and "no need to switch to pixel classifier" not in text
+    if (
+        "apoc does not expose" in text
+        or "handled internally" in text
+        or positive_switch
+    ):
+        errors.append("denied the APOC feature grid or suggested the wrong method")
+    if result["calls"]:
+        errors.append("attempted a feature edit without requested values")
+    return errors
+
+
+def _check_apoc_tune_features_explanation(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "segmentation > apoc > tune features",
+        "gaussian blur", "difference of gaussians",
+        "laplacian of gaussian", "sobel-of-gaussian",
+        "small structures", "medium", "large",
+        "original intensity", "changes here require retraining",
+        "show classifier statistics", "greener", "redder",
+    ):
+        if phrase not in text:
+            errors.append(f"missing Tune Features explanation: {phrase}")
+    if any(phrase in text for phrase in (
+        "feature groups", "contact distance", "dead-pixel threshold",
+        "raise the seed threshold",
+    )):
+        errors.append("drifted from APOC Tune Features into another control group")
+    if result["calls"]:
+        errors.append("attempted edits for an explanation-only request")
+    return errors
+
+
+def _check_apoc_mdo_feature_recommendation(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "mdo", "organoid", "large structures", "1, 2, 5, 10, and 25 pixels",
+        "probability-map preview", "show classifier statistics", "greener", "redder",
+    ):
+        if phrase not in text:
+            errors.append(f"missing MDO Tune Features recommendation: {phrase}")
+    if any(phrase in text for phrase in (
+        "raise the seed threshold", "set minimum size", "feature extraction settings",
+    )):
+        errors.append("answered with post-processing or Feature Extraction")
+    if result["calls"]:
+        errors.append("attempted an edit for a recommendation-only request")
+    return errors
+
+
+def _check_apoc_fill_organoid_features(result: dict) -> list[str]:
+    changed = _changed_values(result)
+    expected = {
+        "segmentation.apoc.27t.feature_preset": "Large structures",
+        "segmentation.apoc.mdo.feature_preset": "Large structures",
+        "segmentation.apoc.27t.show_feature_tuning": True,
+        "segmentation.apoc.mdo.show_feature_tuning": True,
+    }
+    errors = []
+    for control_id, value in expected.items():
+        if changed.get(control_id) != value:
+            errors.append(
+                f"{control_id} was {changed.get(control_id)!r}, expected {value!r}"
+            )
+    text = result["text"].lower()
+    if "segmentation > apoc > tune features" not in text:
+        errors.append("did not identify the requested Segmentation panel")
+    if any(str(control_id).startswith("features.") for control_id in changed):
+        errors.append("changed Feature Extraction instead of APOC classifier features")
+    if any(term in str(control_id) for control_id in changed for term in (
+        "minimum_size", "seed_threshold", "mask_threshold",
+    )):
+        errors.append("changed post-processing instead of the Tune Features panel")
+    return errors
+
+
+def _check_tracking_which_method(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    if "consecutive frames" not in text or "tcell" not in text:
+        errors.append("did not ask for movement for the active tracking cell type")
+    if any(term in text for term in (
+        "segmentation", "cellpose", "apoc", "pixel classifier",
+    )):
+        errors.append("answered a Tracking question with segmentation methods")
+    if result["calls"]:
+        errors.append("changed tracking method before motion was known")
+    return errors
+
+
+def _check_btrack_step2_enable(result: dict) -> list[str]:
+    changed = _changed_values(result)
+    errors = []
+    expected = "tracking.tcell.btrack.use_global_optimization"
+    if changed.get(expected) is not True:
+        errors.append("did not propose enabling btrack global optimization")
+    text = result["text"].lower()
+    for phrase in (
+        "global hypothesis optimizer", "not the organoid propagation",
+        "step 1", "false positive", "initialization", "termination", "linking",
+        "largest missing-frame gap",
+    ):
+        if phrase not in text:
+            errors.append(f"missing btrack Step 2 guidance: {phrase}")
+    if any(term in text for term in ("segmentation", "cellpose", "apoc")):
+        errors.append("left the Tracking module while explaining Step 2")
+    return errors
+
+
+def _check_btrack_step2_tune(result: dict) -> list[str]:
+    changed = _changed_values(result)
+    expected = {
+        "tracking.tcell.btrack.distance_threshold": 40,
+        "tracking.tcell.btrack.time_threshold": 4,
+    }
+    errors = []
+    for control_id, value in expected.items():
+        if changed.get(control_id) != value:
+            errors.append(
+                f"{control_id} was {changed.get(control_id)!r}, expected {value!r}"
+            )
+    text = result["text"].lower()
+    if "p_fp, p_init, p_term, p_link" not in text:
+        errors.append("did not preserve the normal Step 2 hypotheses")
+    if "branching, death, or merging" not in text:
+        errors.append("did not scope optional biological hypotheses")
+    return errors
+
+
+def _check_segmentation_minimum_size(result: dict) -> list[str]:
+    changed = _changed_values(result)
+    errors = []
+    if changed.get("segmentation.apoc.tcell.minimum_size") != 131:
+        errors.append("did not set the half-volume starting point to 131 voxels")
+    text = result["text"].lower()
+    for phrase in (
+        "10 µm diameter", "524 µm³", "50%", "131 voxels",
+        "post-processing exclusion cutoff", "preview",
+    ):
+        if phrase not in text:
+            errors.append(f"missing Minimum size calculation detail: {phrase}")
+    if any(phrase in text for phrase in (
+        "standard default", "typical minimum", "feature extraction",
+    )):
+        errors.append("used an ungrounded default or wrong module")
+    return errors
+
+
+def _check_mask_edt_direction(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "higher edt generally means more splitting",
+        "raise for more splitting, lower for less",
+        "falls back to the original unsplit component",
+    ):
+        if phrase not in text:
+            errors.append(f"missing Mask + EDT direction detail: {phrase}")
+    if any(phrase in text for phrase in (
+        "higher edt means less splitting", "lower it for more splitting",
+        "50 is more conservative", "harder to split",
+    )):
+        errors.append("repeated the reversed Mask + EDT direction")
+    if result["calls"]:
+        errors.append("attempted an EDT change during an explanation request")
+    return errors
+
+
+def _check_contact_and_dead_threshold(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "0 µm means strict mask touching", "one xy pixel",
+        "not a voxel diagonal", "one-pixel xy gap",
+        "green is below", "red is above", "universal numeric range",
+    ):
+        if phrase not in text:
+            errors.append(f"missing feature-threshold guidance: {phrase}")
+    if "1.01 µm is strict" in text or "one voxel diagonal" in text:
+        errors.append("misstated the 1.01 µm contact scale")
+    if result["calls"]:
+        errors.append("attempted a threshold edit without a requested value")
+    return errors
+
+
+def _check_first_dead_threshold_preview(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "preview dead threshold in viewer", "select the sample and population",
+        "green is below the threshold", "red is above it", "hovering",
+        "universal numeric range", "re-run feature extraction",
+    ):
+        if phrase not in text:
+            errors.append(f"missing first-time death-threshold workflow: {phrase}")
+    if any(phrase in text for phrase in (
+        "let me open", "i'll open", "i will open", "try opening",
+        "30% is fine", "start at 2%",
+    )):
+        errors.append("claimed an unsupported result opening or invented a threshold")
+    if result["calls"]:
+        errors.append("attempted to open a result or change a threshold")
+    return errors
+
+
+def _check_failed_result_opening_correction(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "no result was opened", "listed as viewable does not mean it has opened",
+        "results", "preview dead threshold in viewer",
+    ):
+        if phrase not in text:
+            errors.append(f"missing failed-opening correction: {phrase}")
+    if any(phrase in text for phrase in (
+        "let me open", "try opening", "i'll open", "i will open",
+    )):
+        errors.append("repeated the unsupported result-opening claim")
+    if result["calls"]:
+        errors.append("retried a result action after the user reported failure")
+    return errors
+
+
+def _check_loaded_metadata_not_unsaved(result: dict) -> list[str]:
+    text = result["text"].lower()
+    if any(phrase in text for phrase in (
+        "save metadata", "not yet saved", "metadata draft", "save the metadata",
+    )):
+        return ["incorrectly described loaded metadata as an unsaved draft"]
+    return []
+
+
+def _check_external_zarr_reload(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    if "load metadata" not in text:
+        errors.append("did not tell the user to reload externally updated metadata")
+    if "dimension order" in text and "also" not in text:
+        errors.append("treated dimension order as the sole cause after external conversion")
+    return errors
+
+
+def _check_missing_log_error(result: dict) -> list[str]:
+    text = result["text"].lower()
+    asks_for_log = (
+        ("copy" in text or "paste" in text)
+        and "log" in text
+        and "error" in text
+    )
+    errors = []
+    if not asks_for_log:
+        errors.append("did not request the exact log error before diagnosing")
+    if any(phrase in text for phrase in (
+        "the reason is", "this is because", "dimension order is blank",
+    )):
+        errors.append("claimed an unsupported cause without a log error")
+    if any(phrase in text for phrase in (
+        "file path", "dimension order", "gpu memory", "insufficient memory",
+    )):
+        errors.append("speculated about possible causes before reading the error")
+    return errors
+
+
 def _check_tracking_guide(result: dict) -> list[str]:
     text = result["text"].lower()
     asks_motion = any(word in text for word in ("move", "motion", "displacement", "overlap"))
@@ -582,6 +2630,10 @@ def _check_tracking_guide(result: dict) -> list[str]:
         errors.append("did not ask about frame-to-frame motion before choosing methods")
     if result["calls"]:
         errors.append("changed tracking settings before learning how structures move")
+    if any(name in text for name in (
+        "btrack", "propagation", "trackpy", "laptrack",
+    )):
+        errors.append("discussed named tracking methods before learning how the structure moves")
     if any(token in text for token in ("um/min", "µm/min", "micrometres per minute")):
         errors.append("invented a numeric example speed before the user quantified movement")
     return errors
@@ -619,16 +2671,21 @@ def _check_tracking_radius(result: dict) -> list[str]:
 
 def _check_filtering(result: dict) -> list[str]:
     text = result["text"].lower()
+    errors = []
     if any(phrase in text for phrase in (
         "are contradictory", "is contradictory", "settings conflict",
         "are conflicting", "is incompatible",
     )):
-        return ["described equal minimum and maximum track lengths as a conflict"]
-    if not any(word in text for word in ("same length", "equal length", "common length", "comparable")):
-        return ["did not explain the fixed-length comparison workflow"]
+        errors.append("described equal minimum and maximum track lengths as a conflict")
+    if not any(word in text for word in (
+        "same length", "equal length", "common length", "comparable", "uniform length",
+    )):
+        errors.append("did not explain the fixed-length comparison workflow")
     if "reasonable threshold" in text or "reasonable minimum" in text:
-        return ["endorsed the minimum before reading the track-length distribution"]
-    return []
+        errors.append("endorsed the minimum before reading the track-length distribution")
+    if "summarize_track_counts" in text:
+        errors.append("exposed the internal track-count tool name")
+    return errors
 
 
 def _changed_values(result: dict) -> dict:
@@ -651,8 +2708,9 @@ def _check_active_killing(result: dict) -> list[str]:
     expected = {
         "features.active_killing.target_types": ["organoid1"],
         "features.active_killing.observation_window": 5,
-        "features.active_killing.death_signal": "nr_dead_mask_pixels",
+        "features.active_killing.death_signal": "Dead-mask pixel count",
         "features.active_killing.use_absolute_threshold": True,
+        "features.active_killing.absolute_threshold": 30,
     }
     errors = []
     for control_id, value in expected.items():
@@ -660,6 +2718,167 @@ def _check_active_killing(result: dict) -> list[str]:
             errors.append(
                 f"{control_id} was {changed.get(control_id)!r}, expected {value!r}"
             )
+    text = result["text"].lower()
+    if any(name in text for name in (
+        "nr_dead_mask_pixels", "percentage_dead_mask", "mean_dead_dye",
+    )):
+        errors.append("exposed an internal Active Killing column name")
+    if any(phrase in text for phrase in (
+        "i've set", "i have set", "changes are applied", "changes were applied",
+    )):
+        errors.append("claimed proposed Active Killing changes were already applied")
+    return errors
+
+
+def _check_feature_group_dead_dye(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "required", "intensity", "mean dead-dye intensity",
+        "will not suggest removing",
+    ):
+        if phrase not in text:
+            errors.append(f"missing mandatory feature guidance: {phrase}")
+    if "drop intensity" in text or "remove intensity" in text:
+        errors.append("still suggested removing required T-cell intensity")
+    if result["calls"]:
+        errors.append("changed feature groups before the optional-group choice")
+    return errors
+
+
+def _check_active_killing_complete_acceptance(result: dict) -> list[str]:
+    changed = _changed_values(result)
+    expected = {
+        "features.active_killing.target_types": ["27t", "mdo"],
+        "features.active_killing.observation_window": 5,
+        "features.active_killing.death_signal": "Dead-mask pixel count",
+        "features.active_killing.use_absolute_threshold": True,
+        "features.active_killing.absolute_threshold": 30,
+        "features.active_killing.minimum_contact_duration": 1,
+    }
+    errors = []
+    for control_id, value in expected.items():
+        if changed.get(control_id) != value:
+            errors.append(
+                f"{control_id} was {changed.get(control_id)!r}, expected {value!r}"
+            )
+    text = result["text"].lower()
+    for phrase in (
+        "complete agreed active killing setup",
+        "independently",
+        "combined analysis",
+        "not ready until every action card",
+    ):
+        if phrase not in text:
+            errors.append(f"missing setup-completeness guidance: {phrase}")
+    return errors
+
+
+def _check_hmm_movement_options(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "speed", "displacement", "cumulative displacement",
+        "displacement from origin", "directional persistence",
+        "median turning angle", "net displacement", "straightness",
+        "mean square displacement", "use all available movement features",
+    ):
+        if phrase not in text:
+            errors.append(f"missing movement option: {phrase}")
+    if "mean dead dye" in text:
+        errors.append("included a non-movement intensity feature")
+    if result["calls"]:
+        errors.append("changed HMM inputs before the researcher chose features")
+    return errors
+
+
+def _check_hmm_apply_all_movement(result: dict) -> list[str]:
+    changed = _changed_values(result)
+    prefix = "analysis.state_classification.tcell."
+    errors = []
+    expected_timepoint = [
+        "speed", "displacement", "cumulative_displacement",
+        "displacement_from_origin", "directional_persistence",
+        "median_turning_angle",
+    ]
+    expected_window = [
+        "net_displacement", "straightness", "mean_square_displacement",
+    ]
+    if changed.get(prefix + "timepoint_features") != expected_timepoint:
+        errors.append("did not propose all offered timepoint movement features")
+    if changed.get(prefix + "window_features") != expected_window:
+        errors.append("did not propose all offered window movement features")
+    if "mean_dead_dye" in str(changed):
+        errors.append("included a non-movement intensity feature")
+    if "complete movement-only selection" not in result["text"].lower():
+        errors.append("did not describe the two-list selection as complete")
+    return errors
+
+
+def _check_hmm_selected_cell_setup(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    if "currently have **t-cells** selected" not in text:
+        errors.append("did not acknowledge the live T-cell selection")
+    for phrase in ("speed", "net displacement", "rename", "merge", "backprojection"):
+        if phrase not in text:
+            errors.append(f"missing selected-cell setup step: {phrase}")
+    if result["calls"]:
+        errors.append("changed HMM settings during an explanation-only request")
+    return errors
+
+
+def _check_hmm_macrophage_contact_for_tcells(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "currently have **t-cells** selected",
+        "a cell from t-cells is directly touching macrophages",
+        "not a different population",
+    ):
+        if phrase not in text:
+            errors.append(f"missing selected-cell contact meaning: {phrase}")
+    if result["calls"]:
+        errors.append("changed binary groups before the researcher requested an edit")
+    return errors
+
+
+def _check_hmm_add_binary_groups_for_tcells(result: dict) -> list[str]:
+    changed = _changed_values(result)
+    control_id = "analysis.state_classification.T-cells.binary_feature_groups"
+    errors = []
+    if changed.get(control_id) != ["Organoid_contact", "dead"]:
+        errors.append("did not update the selected T-cell binary-group control")
+    if "t-cells" not in result["text"].lower():
+        errors.append("did not identify the selected T-cell population")
+    return errors
+
+
+def _check_hmm_merge_states(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "rename primary dynamic state clusters", "same name", "merge",
+        "full behavioral clusters",
+    ):
+        if phrase not in text:
+            errors.append(f"missing supported state-merge guidance: {phrase}")
+    if any(phrase in text for phrase in (
+        "not a built-in feature", "outside behav3d", "ignore ones",
+    )):
+        errors.append("claimed BEHAV3D cannot merge states")
+    if result["calls"]:
+        errors.append("changed HMM settings during a workflow explanation")
+    return errors
+
+
+def _check_active_killing_zero_threshold_readiness(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    if "not ready yet" not in text or "greater than 0" not in text:
+        errors.append("did not report the zero absolute threshold as incomplete")
+    if result["calls"]:
+        errors.append("attempted another partial edit instead of reporting readiness")
     return errors
 
 
@@ -699,11 +2918,16 @@ def _check_functional_experiment_context(result: dict) -> list[str]:
         errors.append("did not state that invasiveness is unavailable")
     if result["calls"]:
         errors.append("attempted a UI action for an interpretation-only question")
+    if any(name in text for name in (
+        "{target}_invasiveness_perc", "is_active_killing",
+    )):
+        errors.append("exposed an internal analysis column name")
     return errors
 
 
 def _check_safety_profiling_context(result: dict) -> list[str]:
     text = result["text"].lower()
+    plain = text.replace("*", "").replace("`", "")
     errors = []
     if not all(token in text for token in ("27t", "mdo", "1.5")):
         errors.append("lost the tumor/healthy identities or 1.5x definition")
@@ -714,25 +2938,166 @@ def _check_safety_profiling_context(result: dict) -> list[str]:
         errors.append("lost the 5-frame / 10-minute observation window")
     if not any(word in text for word in ("exploratory", "descriptive", "small")):
         errors.append("omitted the small-sample interpretation caveat")
+    if any(name in text for name in (
+        "percentage_dead_mask", "killing_efficiency", "is_active_killing",
+    )):
+        errors.append("exposed an internal analysis column name")
+    if re.search(r"(?:one\s+)?target type\s*(?:is|=|:|\()\s*teg\b", plain):
+        errors.append("misidentified the TEG effector as a target type")
+    if any(phrase in plain for phrase in (
+        "you've configured", "you have configured", "already configured",
+        "configured this using", "your setting",
+    )):
+        errors.append("presented a reference definition as an applied configuration")
+    if any(phrase in plain for phrase in (
+        "1-3 frame", "1–3 frame", "one to three frame",
+    )):
+        errors.append("replaced the stated one-frame minimum with a generic range")
     if result["calls"]:
         errors.append("attempted a UI action for an interpretation-only question")
     return errors
 
 
+def _check_historical_btrack_examples(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in ("ivm", "cd4", "12", "10", "100"):
+        if phrase not in text:
+            errors.append(f"missing historical btrack context: {phrase}")
+    if not any(phrase in text for phrase in (
+        "not a default", "not defaults", "do not copy", "shouldn't copy",
+        "cannot copy", "historical example",
+    )):
+        errors.append("presented historical btrack values as reusable defaults")
+    if not (
+        any(term in text for term in ("per-frame", "per frame", "displacement"))
+        and any(term in text for term in ("gap", "preview", "measure"))
+    ):
+        errors.append("did not explain how to calibrate the current experiment")
+    if result["calls"]:
+        errors.append("attempted to apply historical btrack values")
+    return errors
+
+
+def _check_historical_calcium_example(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "reporter propagation", "0.33", "2", "5", "32", "100", "10%",
+    ):
+        if phrase not in text:
+            errors.append(f"missing calcium reference detail: {phrase}")
+    if not all(term in text for term in ("cellpose", "import")):
+        errors.append("omitted the external Cellpose-SAM import workflow")
+    if not any(term in text for term in (
+        "historical", "example", "not a default", "not universal",
+    )):
+        errors.append("did not label calcium settings as historical examples")
+    if result["calls"]:
+        errors.append("attempted to apply the calcium reference settings")
+    return errors
+
+
+def _check_historical_microglia_example(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "exp91", "eight wells", "1.77 µm", "120-second", "none_none",
+        "apoc probability map + watershed", "maximum search radius 150",
+        "absolute increase of 30", "start offset", "yaml", "readme", "n=1",
+        "historical values, not defaults",
+    ):
+        if phrase not in text:
+            errors.append(f"missing Exp91 reference detail: {phrase}")
+    if not all(value in text for value in ("0", "1")):
+        errors.append("did not preserve both sides of the Start offset conflict")
+    if not any(term in text for term in ("descriptive", "exploratory")):
+        errors.append("omitted the unreplicated-design interpretation caveat")
+    if result["calls"]:
+        errors.append("attempted to apply historical Exp91 values")
+    return errors
+
+
+def _check_experiment_reference_metadata_conflict(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    if "15" not in text or "10" not in text:
+        errors.append("did not report both sides of the cadence discrepancy")
+    if not any(term in text for term in (
+        "metadata", "currently loaded", "live",
+    )):
+        errors.append("did not identify live metadata as the current source")
+    if not any(term in text for term in (
+        "conflict", "disagree", "discrep", "unless", "confirm",
+    )):
+        errors.append("silently reconciled conflicting reference sources")
+    if any(term in text for term in ("time_interval", "time_unit")):
+        errors.append("exposed internal metadata field names")
+    if result["calls"]:
+        errors.append("attempted to edit metadata during a source comparison")
+    return errors
+
+
 SCENARIOS = [
+    _organoid_line_grouping_case,
+    _metadata_identifier_confirmation_case,
+    _metadata_time_conversion_case,
+    _metadata_completion_case,
+    _metadata_save_case,
+    _choose_analysis_case,
+    _analysis_question_on_metadata_tab_case,
+    _metadata_not_added_case,
+    _open_death_dynamics_case,
     _metadata_setup_case,
     _pixel_fill_case,
     _segmentation_case,
+    _method_requires_signal_context_case,
+    _cellpose_requires_bleed_confirmation_case,
+    _confirmed_bleed_through_case,
+    _apoc_channel_map_case,
+    _apoc_channels_wait_for_training_data_case,
+    _apoc_feature_preset_case,
+    _swapped_channel_metadata_case,
+    _apoc_invalid_channel_index_case,
+    _apoc_dead_channel_case,
+    _apoc_feature_grid_case,
+    _apoc_tune_features_explanation_case,
+    _apoc_mdo_feature_recommendation_case,
+    _apoc_fill_organoid_features_case,
+    _tracking_which_method_case,
+    _btrack_step2_enable_case,
+    _btrack_step2_tune_case,
+    _segmentation_minimum_size_case,
+    _mask_edt_direction_case,
+    _contact_and_dead_threshold_case,
+    _first_dead_threshold_preview_case,
+    _failed_result_opening_correction_case,
+    _loaded_metadata_not_unsaved_case,
+    _external_zarr_reload_case,
+    _missing_log_error_case,
     _tracking_guide_case,
     _stationary_tracking_case,
     _tracking_radius_case,
     _filtering_case,
     _reporter_propagation_case,
     _active_killing_case,
+    _feature_group_dead_dye_case,
+    _active_killing_complete_acceptance_case,
+    _hmm_movement_options_case,
+    _hmm_apply_all_movement_case,
+    _hmm_selected_cell_setup_case,
+    _hmm_macrophage_contact_for_tcells_case,
+    _hmm_add_binary_groups_for_tcells_case,
+    _hmm_merge_states_case,
+    _active_killing_zero_threshold_readiness_case,
     _hmm_single_frame_case,
     _trajectory_linkage_case,
     _functional_experiment_context_case,
     _safety_profiling_context_case,
+    _historical_btrack_examples_case,
+    _historical_calcium_example_case,
+    _historical_microglia_example_case,
+    _experiment_reference_metadata_conflict_case,
 ]
 
 

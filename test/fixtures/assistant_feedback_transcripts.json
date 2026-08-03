@@ -19,6 +19,32 @@
     ]
   },
   {
+    "id": "segmentation_asks_about_bleed_through",
+    "step": "segmentation",
+    "user": "Would Cellpose-SAM work, and which channels should I use?",
+    "required": [
+      "signal bleed-through is not metadata",
+      "ask whether each target is isolated",
+      "image shape can provide the channel count",
+      "channel-by-channel map",
+      "fluorophore names such as gfp/rfp are not needed"
+    ]
+  },
+  {
+    "id": "apoc_channel_and_feature_setup",
+    "step": "segmentation",
+    "user": "How do I choose APOC image channel inputs and tune the features before training?",
+    "required": [
+      "per-cell-type image channel inputs",
+      "generate training data",
+      "does not mean apoc always uses every channel",
+      "configure channels and classifier features before training",
+      "small structures",
+      "large structures",
+      "tune features refers"
+    ]
+  },
+  {
     "id": "apoc_mode_and_thresholds",
     "step": "segmentation",
     "user": "My APOC probability-map cells are touching and not split. What should I tune?",
@@ -81,16 +107,44 @@
     ]
   },
   {
+    "id": "feature_mandatory_dead_dye",
+    "step": "feature_extraction",
+    "user": "Can I drop intensity from the T-cell feature groups?",
+    "required": [
+      "intensity and contact mandatory",
+      "death mandatory when a dead channel is configured",
+      "mean dead-dye",
+      "never suggest dropping it"
+    ]
+  },
+  {
     "id": "active_killing_calibration",
     "step": "feature_extraction",
     "user": "How should I choose the active killing window and threshold?",
     "required": [
-      "one target type per run",
+      "multiple selected targets",
+      "runs each target independently",
+      "combined analysis",
       "metadata time interval",
       "dead-mask pixel count",
       "absolute increase threshold",
+      "incomplete while its value is 0",
       "do not reuse 20-30 pixels blindly",
       "minimum contact duration"
+    ]
+  },
+  {
+    "id": "hmm_movement_options",
+    "step": "analysis",
+    "user": "For Behavioral State, which movement features can I choose?",
+    "required": [
+      "enumerate all movement columns",
+      "timepoint features",
+      "additional window features",
+      "speed",
+      "directional persistence",
+      "straightness",
+      "never imply that the two currently selected features are the complete list"
     ]
   },
   {
@@ -149,8 +203,9 @@
       "complete is a reasonable comparison",
       "single linkage performs poorly",
       "original behav3d feature-based mode is deprecated",
-      "contact-based comparison plots",
-      "exemplar track"
+      "categorical dtw supports contact-based grouping",
+      "contact state-shift analysis",
+      "requires behavioral state results"
     ]
   },
   {
@@ -164,6 +219,16 @@
     "step": "segmentation",
     "user": "Calcula el EDT segun la resolucion de mis imagenes.",
     "required": ["10 um cell", "xy pixel size", "20%, 25%, and 30%", "cell widths"]
+  },
+  {
+    "id": "metadata_zarr_reload",
+    "step": "data_preparation",
+    "user": "I converted the data to Zarr. Do I need to reload the metadata?",
+    "required": [
+      "external zarr conversion",
+      "load metadata",
+      "in-app zarr converter reloads all tabs automatically"
+    ]
   },
   {
     "id": "interactive_track_counts",
@@ -182,6 +247,159 @@
     "required": [
       "equal minimum and maximum lengths are valid",
       "maximum trims retained tracks"
+    ]
+  },
+  {
+    "id": "organoid_lines_are_not_processing_types",
+    "step": "data_preparation",
+    "user": "I have three organoid lines. Help me build metadata.",
+    "required": [
+      "organoid lines are not necessarily separate processing types",
+      "share one organoid type",
+      "segmentation/tracking"
+    ]
+  },
+  {
+    "id": "metadata_well_and_lines_are_mandatory",
+    "step": "data_preparation",
+    "user": "Is this metadata all that is needed?",
+    "required": [
+      "well and each configured population's line are mandatory",
+      "condition is optional",
+      "line value 'not_added'"
+    ]
+  },
+  {
+    "id": "analysis_choice_does_not_loop",
+    "step": "analysis",
+    "user": "Choose analysis",
+    "required": [
+      "death dynamics",
+      "interaction analysis",
+      "invasiveness analysis",
+      "active killing",
+      "behavioral state",
+      "state trajectory",
+      "contact-based grouping",
+      "contact state-shift analysis",
+      "backprojection"
+    ],
+    "forbidden": ["contact-based comparison plots are currently known to produce empty output"]
+  },
+  {
+    "id": "metadata_does_not_own_channel_mapping",
+    "step": "data_preparation",
+    "user": "My replicates have swapped channels. Where do I map channels in metadata?",
+    "required": [
+      "metadata builder does not map raw channel indices",
+      "selected segmentation method",
+      "generic processing population slots",
+      "line field"
+    ]
+  },
+  {
+    "id": "apoc_dead_channel_is_not_negative_class",
+    "step": "segmentation",
+    "user": "Which APOC channels should I use, and should I include the dead channel?",
+    "required": [
+      "do not add a dead channel merely as a negative class",
+      "dead target is still the same target population",
+      "genuinely informative"
+    ]
+  },
+  {
+    "id": "apoc_custom_feature_grid_is_real",
+    "step": "segmentation",
+    "user": "Can I set APOC filter sigmas in the feature grid?",
+    "required": [
+      "custom feature scales in pixels",
+      "difference of gaussians",
+      "laplacian of gaussian",
+      "sobel-of-gaussian",
+      "sog"
+    ]
+  },
+  {
+    "id": "apoc_edt_directions_are_strategy_scoped",
+    "step": "segmentation",
+    "user": "Explain the APOC EDT direction correctly.",
+    "required": [
+      "in mask + edt, higher edt generally splits more",
+      "in peak edt, lower edt splits more"
+    ]
+  },
+  {
+    "id": "contact_pixel_is_not_diagonal",
+    "step": "feature_extraction",
+    "user": "Does a contact distance equal to my XY pixel size mean strict touching?",
+    "required": [
+      "one-xy-pixel gap",
+      "not strict touching",
+      "not a voxel diagonal"
+    ]
+  },
+  {
+    "id": "apoc_tune_features_stays_in_segmentation",
+    "step": "segmentation",
+    "user": "Explain how to tune features in the APOC Tune Features panel.",
+    "required": [
+      "small structures selects all four filters",
+      "large structures uses 1, 2, 5, 10, and 25",
+      "original-intensity checkbox adds raw pixel intensity",
+      "never means minimum size",
+      "feature extraction"
+    ]
+  },
+  {
+    "id": "btrack_step_2_is_part_of_complete_setup",
+    "step": "tracking",
+    "user": "What about Step 2 and global optimization?",
+    "required": [
+      "global optimization is step 2",
+      "after step 1 has been previewed",
+      "offer to enable step 2",
+      "false positive, initialization, termination, and linking",
+      "largest gap to bridge"
+    ]
+  },
+  {
+    "id": "segmentation_minimum_size_is_resolution_based",
+    "step": "segmentation",
+    "user": "How should I set Minimum size for single cells?",
+    "required": [
+      "estimated cell diameter",
+      "full spherical volume",
+      "start at 50%",
+      "xy pixel size squared times z pixel size",
+      "preview value"
+    ]
+  },
+  {
+    "id": "hmm_selected_cell_type_controls_contact_meaning",
+    "step": "analysis",
+    "user": "Would macrophage contact be useful as an HMM binary group while T-cells are selected?",
+    "required": [
+      "always read and state the live selected cell type",
+      "macrophages contact while t-cells are selected means a t-cell touching a macrophage"
+    ]
+  },
+  {
+    "id": "hmm_states_can_be_merged_in_step_two",
+    "step": "analysis",
+    "user": "If I have six HMM states, can I merge the ones I do not want?",
+    "required": [
+      "assigning the same biological name to multiple primary clusters merges them",
+      "full behavioral clusters"
+    ]
+  },
+  {
+    "id": "metadata_absence_uses_csv_safe_value",
+    "step": "data_preparation",
+    "user": "There were no macrophages in this sample.",
+    "required": [
+      "describe it as not added",
+      "line value 'not_added'",
+      "never use none"
     ]
   }
 ]

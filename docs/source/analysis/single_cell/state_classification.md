@@ -55,6 +55,14 @@ Optional clean-up applied to the chosen features before fitting:
 
 Contains checkboxes for the binary (**categorical / true-false**) flags that are assigned to cells at each timepoint in the features table (for example a `dead` flag, an `*_contact` column, or an active-killing flag). These are deliberately **kept out of the HMM fit** — clustering on binary columns tends to create artificial states — and instead **subdivide** each behavioural state afterwards. A state such as *slow-moving* can be split into *slow-moving & in contact* vs *slow-moving & not in contact*. This is what later produces the **full behavioural clusters** (see Step 2).
 
+```{tip}
+**`any_organoid_contact` / `any_immune_cell_contact` vs. per-type contact columns** - Feature Extraction writes a separate contact column for each specific organoid or immune subtype (e.g. `organoid_lineA_contact`, `organoid_lineB_contact`). `any_organoid_contact` and `any_immune_cell_contact` are a simpler summary of these: `True` whenever a cell is touching any of that type — any organoid, or any immune cell — no matter which specific subtype it happens to be.
+
+**Reach for the `any_*` version**, when you have several organoid lines or immune subtypes in the same dataset and you believe behavior should be unrelated to whatever subtype it is contacting (e.g. you want organoid engagement to not depend on what organoid type it is engaging with but keep engagement as a general behavior). It keeps things to a plain "in contact or not."
+
+**Use a per-type column instead** when *which* subtype was contacted is actually part of the behavior you are trying to find (e.g. contact between different immune components (e.g. T-cells and macrophages), where contact could actually be a different behavior) — you'll get more, smaller full behavioural clusters in exchange for that detail.
+```
+
 ### Number of states
 
 **n_states** (default `4`, range 2–50) — the number of behavioural states the HMM fits. The value is used directly.

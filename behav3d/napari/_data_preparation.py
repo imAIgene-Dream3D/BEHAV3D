@@ -304,6 +304,7 @@ class DataPreparationTab(QWidget):
         self._sample_t_counts: dict = {}       # sample_name -> T count (Section 5)
         self._edit_mode: bool = False          # True when editing loaded metadata
         self._loaded_csv_path: str = ""        # CSV path of last loaded metadata
+        self._metadata_builder_dirty: bool = False
 
         # Build UI --------------------------------------------------------
         scroll = QScrollArea(self)
@@ -395,11 +396,17 @@ class DataPreparationTab(QWidget):
         self.n_organoid_spin = QSpinBox(); self.n_organoid_spin.setMinimum(0); self.n_organoid_spin.setValue(0); self.n_organoid_spin.setMaximumWidth(60)
         self.n_immune_spin = QSpinBox(); self.n_immune_spin.setMinimum(0); self.n_immune_spin.setValue(0); self.n_immune_spin.setMaximumWidth(60)
         self.n_other_spin = QSpinBox(); self.n_other_spin.setMinimum(0); self.n_other_spin.setValue(0); self.n_other_spin.setMaximumWidth(60)
+        for spin in (
+            self.n_samples_spin, self.n_organoid_spin,
+            self.n_immune_spin, self.n_other_spin,
+        ):
+            spin.valueChanged.connect(self._mark_metadata_builder_dirty)
         pop_form.addRow("Organoid types:", self.n_organoid_spin)
         pop_form.addRow("Immune types:", self.n_immune_spin)
         pop_form.addRow("Other types:", self.n_other_spin)
         dead_row = QHBoxLayout()
         self.include_dead_cb = QCheckBox("Include dead channel")
+        self.include_dead_cb.stateChanged.connect(self._mark_metadata_builder_dirty)
         dead_row.addWidget(self.include_dead_cb)
         dead_row.addWidget(HelpButton(
             "Include Dead Channel",
@@ -452,6 +459,12 @@ class DataPreparationTab(QWidget):
         self._other_name_edits: list[QLineEdit] = []
         self._sample_forms: list[dict] = []
 
+    def _mark_metadata_builder_dirty(self, *_args):
+        """Record unsaved form edits for the assistant's metadata context."""
+        builder = getattr(self, "builder_grp", None)
+        if builder is None or builder.isChecked():
+            self._metadata_builder_dirty = True
+
     # --- configure cell-type naming fields --------------------------------
     def _on_configure_cell_types(self, force: bool = False):
         # Idempotent: when the existing naming fields already match the configured
@@ -480,6 +493,7 @@ class DataPreparationTab(QWidget):
             e.setPlaceholderText(f"Organoid type {i + 1} name")
             self.cell_type_naming_container.addWidget(QLabel(f"Organoid {i + 1}:"))
             self.cell_type_naming_container.addWidget(e)
+            e.textChanged.connect(self._mark_metadata_builder_dirty)
             self._organoid_name_edits.append(e)
 
         for i in range(self.n_immune_spin.value()):
@@ -488,6 +502,7 @@ class DataPreparationTab(QWidget):
             e.setPlaceholderText(f"Immune type {i + 1} name")
             self.cell_type_naming_container.addWidget(QLabel(f"Immune {i + 1}:"))
             self.cell_type_naming_container.addWidget(e)
+            e.textChanged.connect(self._mark_metadata_builder_dirty)
             self._immune_name_edits.append(e)
 
             # ── Multicolor controls (one row per immune type) ─────────
@@ -511,6 +526,8 @@ class DataPreparationTab(QWidget):
                 spin.setEnabled(bool(state))
 
             multi_chk.stateChanged.connect(_toggle_multi)
+            multi_chk.stateChanged.connect(self._mark_metadata_builder_dirty)
+            multi_n.valueChanged.connect(self._mark_metadata_builder_dirty)
             multi_row.addWidget(multi_chk)
             multi_row.addWidget(multi_n)
             multi_row.addStretch()
@@ -523,6 +540,7 @@ class DataPreparationTab(QWidget):
             e.setPlaceholderText(f"Other type {i + 1} name")
             self.cell_type_naming_container.addWidget(QLabel(f"Other {i + 1}:"))
             self.cell_type_naming_container.addWidget(e)
+            e.textChanged.connect(self._mark_metadata_builder_dirty)
             self._other_name_edits.append(e)
 
         # After naming is set, build sample forms
@@ -600,6 +618,22 @@ class DataPreparationTab(QWidget):
                 out.append(base)
         return out
 
+    @staticmethod
+    def _ensure_sample_prefix(name: str) -> str:
+        """Guarantee a sample name starts with ``S``.
+
+        Purely numeric sample names (e.g. ``"12"``) cause downstream problems
+        in the pipeline (they get parsed as integers when read back from CSV,
+        break path/column construction, etc.). Prepending ``S`` forces a
+        non-numeric name. An empty entry is left empty so required-field
+        validation still fires, and a name that already starts with ``S`` is
+        returned unchanged so repeated edits/saves never stack extra prefixes.
+        """
+        name = name.strip().strip('"').strip("'")
+        if not name or name.startswith("S"):
+            return name
+        return "S" + name
+
     def _create_sample_form(self, idx: int, org_names, imm_names, oth_names, include_dead) -> dict:
         grp = QGroupBox(f"Sample {idx + 1}")
         layout = QFormLayout(grp)
@@ -612,6 +646,15 @@ class DataPreparationTab(QWidget):
         # Basic fields
         fields["sample_name"] = QLineEdit()
         fields["sample_name"].setPlaceholderText("e.g. Sample001")
+        fields["sample_name"].setToolTip(
+            "Sample names are automatically prefixed with 'S' so they are never "
+            "purely numeric (numeric names break parts of the pipeline)."
+        )
+        # Apply the 'S' prefix as soon as the user leaves the field so the
+        # change is visible in the form, not only in the saved CSV.
+        fields["sample_name"].editingFinished.connect(
+            lambda w=fields["sample_name"]: w.setText(self._ensure_sample_prefix(w.text()))
+        )
         layout.addRow("Name*:", fields["sample_name"])
 
         fields["exp_nr"] = QSpinBox(); fields["exp_nr"].setMaximum(9999); fields["exp_nr"].setValue(1); fields["exp_nr"].setMaximumWidth(70)
@@ -767,6 +810,24 @@ class DataPreparationTab(QWidget):
                         
                         w.textChanged.connect(make_slot())
 
+        for widget in fields.values():
+            signal = getattr(widget, "textChanged", None)
+            if signal is None:
+                signal = getattr(widget, "valueChanged", None)
+            if signal is None:
+                signal = getattr(widget, "currentTextChanged", None)
+            if signal is not None:
+                signal.connect(self._mark_metadata_builder_dirty)
+        for widget in dead_fields.values():
+            signal = getattr(widget, "textChanged", None)
+            if signal is None:
+                signal = getattr(widget, "valueChanged", None)
+            if signal is not None:
+                signal.connect(self._mark_metadata_builder_dirty)
+        for ct_fields in cell_type_fields.values():
+            for widget in ct_fields.values():
+                widget.textChanged.connect(self._mark_metadata_builder_dirty)
+
         return {
             "group": grp,
             "basic": fields,
@@ -880,6 +941,7 @@ class DataPreparationTab(QWidget):
     def _reset_builder(self):
         """Reset the builder UI and internal state to blank."""
         self._edit_mode = False
+        self._metadata_builder_dirty = False
         
         # Reset spins without triggering configuration
         for s in [self.n_samples_spin, self.n_organoid_spin, self.n_immune_spin, self.n_other_spin]:
@@ -1072,6 +1134,7 @@ class DataPreparationTab(QWidget):
                         ct_fields[fld].setText(str(v))
 
         self._log("📝 Metadata loaded into builder for editing.")
+        self._metadata_builder_dirty = False
 
     @staticmethod
     def _collapse_multicolor_immune_names(imm_types):
@@ -1120,7 +1183,7 @@ class DataPreparationTab(QWidget):
             
             clicked = msg.clickedButton()
             if clicked == btn_cancel:
-                return
+                return False
             
             self.builder_grp.blockSignals(True)
             self.builder_grp.setChecked(True)
@@ -1136,7 +1199,7 @@ class DataPreparationTab(QWidget):
                     "background-color: #4CAF50; color: white; font-weight: bold;"
                 )
                 self.btn_fill.setEnabled(True)
-            return
+            return False
 
         # Determine save target
         if self._edit_mode and self._loaded_csv_path:
@@ -1145,7 +1208,7 @@ class DataPreparationTab(QWidget):
             out_dir = self.output_dir_edit.text().strip()
             if not out_dir or not Path(out_dir).exists():
                 QMessageBox.warning(self, "Error", "Please set a valid output directory first.")
-                return
+                return False
             csv_path = Path(out_dir) / "metadata.csv"
 
         org_names = [e.text().strip() for e in self._organoid_name_edits]
@@ -1158,7 +1221,10 @@ class DataPreparationTab(QWidget):
             row: dict = {}
             for k, w in form["basic"].items():
                 if isinstance(w, QLineEdit):
-                    row[k] = w.text().strip().strip('"').strip("'")
+                    val = w.text().strip().strip('"').strip("'")
+                    if k == "sample_name":
+                        val = self._ensure_sample_prefix(val)
+                    row[k] = val
                 elif isinstance(w, QComboBox):
                     row[k] = w.currentText()
                 elif isinstance(w, QSpinBox):
@@ -1203,11 +1269,11 @@ class DataPreparationTab(QWidget):
         except AssertionError as exc:
             QMessageBox.warning(self, "Invalid metadata", str(exc))
             self._log("❌ Metadata validation failed; save cancelled.")
-            return
+            return False
         except Exception as exc:
             QMessageBox.warning(self, "Validation error", str(exc))
             self._log(f"❌ Unexpected metadata validation error: {exc}")
-            return
+            return False
 
         # Overwrite prompt
         if csv_path.exists():
@@ -1218,11 +1284,12 @@ class DataPreparationTab(QWidget):
             )
             if res != QMessageBox.Yes:
                 self._log("Save cancelled by user.")
-                return
+                return False
 
         df.to_csv(csv_path, index=False)
         self.metadata = df
         self._loaded_csv_path = str(csv_path)
+        self._metadata_builder_dirty = False
         self._populate_metadata_overview()
         self._log(f"✅ Metadata saved to {csv_path}  ({len(df)} samples, {len(df.columns)} columns)")
 
@@ -1246,6 +1313,7 @@ class DataPreparationTab(QWidget):
         # Reload + emit so other tabs update
         self.csv_path_edit.setText(str(csv_path))
         self.metadata_loaded.emit(self.metadata)
+        return True
 
     # ══════════════════════════════════════════════════════════════════════
     # Section 3 – Metadata Loader
@@ -1285,13 +1353,13 @@ class DataPreparationTab(QWidget):
 
         if not csv_path or not csv_path.lower().endswith(".csv"):
             QMessageBox.warning(self, "Error", "Please select a valid .csv file.")
-            return
+            return False
         if not Path(csv_path).exists():
             QMessageBox.warning(self, "Error", f"File not found: {csv_path}")
-            return
+            return False
 
         if getattr(self, "_metadata_load_worker", None) is not None and self._metadata_load_worker.isRunning():
-            return
+            return False
 
         self.btn_load_metadata.setEnabled(False)
         self.btn_load_metadata.setText("Loading…")
@@ -1301,6 +1369,7 @@ class DataPreparationTab(QWidget):
         self._metadata_load_worker.progress.connect(lambda msg: self._log(msg))
         self._metadata_load_worker.finished.connect(self._on_metadata_load_finished)
         self._metadata_load_worker.start()
+        return True
 
     def _on_metadata_load_finished(self, result: dict):
         self.btn_load_metadata.setEnabled(True)
@@ -1332,6 +1401,7 @@ class DataPreparationTab(QWidget):
         self.metadata_info_label.setText("  |  ".join(info_parts))
         self._log(f"✅ Metadata loaded from {csv_path}")
         self._loaded_csv_path = csv_path
+        self._metadata_builder_dirty = False
 
         # Switch save button to "Edit Metadata CSV" (yellow)
         self.btn_save_metadata.setText("Edit Metadata CSV")
@@ -1786,7 +1856,16 @@ class DataPreparationTab(QWidget):
         except Exception as e:
             self._log(f"⚠ Could not refresh metadata overview: {e}")
 
-        # 4) Offer deletion of the now-redundant original files
+        # 4) Refresh every workflow tab immediately. This happens before the
+        # optional cleanup dialog so declining deletion cannot leave stale
+        # pre-conversion paths in Visualization or Segmentation.
+        try:
+            self.metadata_loaded.emit(self.metadata)
+            self._log("✅ Converted metadata reloaded in all tabs automatically.")
+        except Exception as e:
+            self._log(f"⚠ Could not auto-reload converted metadata: {e}")
+
+        # 5) Offer deletion of the now-redundant original files
         self._offer_delete_originals(originals_map or [])
 
     # ══════════════════════════════════════════════════════════════════════
@@ -2000,14 +2079,6 @@ class DataPreparationTab(QWidget):
             )
         summary.setStandardButtons(QMessageBox.Ok)
         summary.exec_()
-
-        # Re-emit metadata_loaded so all other tabs (segmentation, tracking, etc.)
-        # automatically pick up the updated zarr paths without a manual reload.
-        try:
-            self.metadata_loaded.emit(self.metadata)
-            self._log("✅ Metadata reloaded in all tabs automatically.")
-        except Exception as e:
-            self._log(f"⚠ Could not auto-reload metadata: {e}")
 
     # ══════════════════════════════════════════════════════════════════════
     # Utility
