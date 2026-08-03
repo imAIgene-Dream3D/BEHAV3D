@@ -36,6 +36,10 @@ from behav3d.napari._assistant_recommendations import (
 from behav3d.napari._assistant import (
     researcher_facing_text, streaming_transcript_block, transcript_block_role,
 )
+from behav3d.napari._assistant_client import (
+    ChatWorker, classify_request_failure, diagnose_assistant_service,
+    request_failure_is_retryable,
+)
 from behav3d.analysis.track_counts import (
     calculate_track_count_table, format_track_count_summary,
     generate_track_count_summary,
@@ -1127,6 +1131,130 @@ def test_chat_transcript_shows_waiting_block_and_tracks_role_colors():
         "**BEHAV3D Assistant**\n\n*Preparing a response...*"
     )
     assert streaming_transcript_block(False, None) is None
+
+
+def test_chat_transcript_waiting_block_shows_current_service_stage():
+    assert streaming_transcript_block(
+        True, "", "Waiting for response..."
+    ) == "**BEHAV3D Assistant**\n\n*Waiting for response...*"
+
+
+def test_request_failures_identify_modal_and_deepseek_separately():
+    ConnectTimeout = type("ConnectTimeout", (Exception,), {})
+    ReadTimeout = type("ReadTimeout", (Exception,), {})
+
+    modal = classify_request_failure(ConnectTimeout(), stage="connecting")
+    assert modal["component"] == "modal"
+    assert modal["code"] == "modal_connect_timeout"
+    assert request_failure_is_retryable(modal)
+
+    provider = classify_request_failure(
+        ReadTimeout(), stage="provider", read_timeout=60
+    )
+    assert provider["component"] == "deepseek"
+    assert provider["code"] == "deepseek_timeout"
+    assert "Modal is reachable" in provider["message"]
+    assert request_failure_is_retryable(provider)
+
+
+def test_health_diagnostic_maps_modal_rag_and_provider_status():
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "ok": True,
+                "service": {"status": "online"},
+                "retrieval": {"status": "ready", "chunks": 971},
+                "provider": {"status": "online", "latency_ms": 120},
+                "model": "deepseek-v4-flash",
+                "knowledge_version": "test-version",
+            }
+
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        return Response()
+
+    result = diagnose_assistant_service(
+        {"endpoint": "https://assistant.test", "timeout": 60},
+        probe_provider=True,
+        requester=fake_get,
+    )
+    assert calls[0][0] == "https://assistant.test/health"
+    assert calls[0][1]["params"] == {"probe_provider": "true"}
+    assert result["level"] == "online"
+    assert result["modal"] == "online"
+    assert result["retrieval"] == "ready"
+    assert result["deepseek"] == "online"
+    assert result["chunks"] == 971
+
+
+def test_health_diagnostic_explains_missing_endpoint():
+    result = diagnose_assistant_service({"endpoint": "", "timeout": 60})
+    assert result["level"] == "offline"
+    assert result["code"] == "endpoint_missing"
+    assert result["deepseek"] == "not_checked"
+
+
+def test_chat_worker_retries_transient_failure_once_before_output():
+    from unittest.mock import patch
+
+    class RetryWorker(ChatWorker):
+        def __init__(self):
+            super().__init__(messages=[], context={}, tools=[])
+            self.attempts = 0
+
+        def _stream(self, cfg):
+            self.attempts += 1
+            if self.attempts == 1:
+                return {
+                    "level": "offline",
+                    "component": "modal",
+                    "code": "modal_unreachable",
+                    "message": "Modal is temporarily unavailable.",
+                }
+            return None
+
+    worker = RetryWorker()
+    statuses = []
+    finished = []
+    worker.status.connect(statuses.append)
+    worker.finished.connect(lambda: finished.append(True))
+    with patch(
+        "behav3d.napari._assistant_client.load_client_config",
+        return_value={"endpoint": "https://assistant.test", "timeout": 60},
+    ), patch("behav3d.napari._assistant_client.time.sleep"):
+        worker.run()
+
+    assert worker.attempts == 2
+    assert any(status.get("code") == "automatic_retry" for status in statuses)
+    assert finished == [True]
+
+
+def test_chat_worker_offline_fallback_keeps_reason_and_always_finishes():
+    from unittest.mock import patch
+
+    worker = ChatWorker(
+        messages=[{"role": "user", "content": "What does search range mean?"}],
+        context={},
+        tools=[],
+    )
+    degraded = []
+    finished = []
+    worker.degraded.connect(degraded.append)
+    worker.finished.connect(lambda: finished.append(True))
+    with patch(
+        "behav3d.napari._assistant_client.load_client_config",
+        return_value={"endpoint": "", "timeout": 60},
+    ):
+        worker.run()
+
+    assert "Assistant endpoint is not configured" in degraded[0]
+    assert "local parameter reference" in degraded[0]
+    assert finished == [True]
     role = transcript_block_role("You")
     assert role == "user"
     assert transcript_block_role("My question", role) == "user"
