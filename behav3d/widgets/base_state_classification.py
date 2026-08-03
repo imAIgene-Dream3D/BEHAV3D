@@ -24,7 +24,12 @@ from behav3d.core.metadata import (
     detect_other_cell_types_from_metadata,
 )
 from behav3d.core.utils import expand_column_patterns
-from behav3d.widgets.utils import PathPicker, behav3d_calculated_features, spinning_loader
+from behav3d.widgets.utils import (
+    PathPicker,
+    behav3d_calculated_features,
+    excluded_non_behavior_columns,
+    spinning_loader,
+)
 
 
 def normalize_binary_value(value, tol=1e-9):
@@ -792,48 +797,9 @@ class BaseStateClassificationPanel:
         return binary_cols
 
     def _excluded_non_behavior_columns(self, cols):
-        col_set = {str(c) for c in cols}
-        excluded = {
-            "sample_name",
-            "TrackID",
-            "sub_TrackID",
-            "position_t",
-            "position_x",
-            "position_y",
-            "position_z",
-            "segment_id",
-            "lineage_id",
-            "frame",
-            "t",
-            "interpolated",
-            "exp_nr",
-            "well",
-            "origin_cell_type",
-            "origin_TrackID",
-        }
-
         md = getattr(self.metadata_loader, "metadata", None)
-        if isinstance(md, pd.DataFrame):
-            excluded.update({str(c) for c in md.columns})
-
-        for c in col_set:
-            lc = str(c).lower()
-            if lc.endswith("_line_condition"):
-                excluded.add(c)
-            if lc.endswith("_tracks_csv_path"):
-                excluded.add(c)
-            if lc.endswith("_segments_image_path"):
-                excluded.add(c)
-            if lc.endswith("_tracks_image_path"):
-                excluded.add(c)
-            if lc.endswith("_raw_image_path"):
-                excluded.add(c)
-            if lc.endswith("_dead_mask_path"):
-                excluded.add(c)
-            if lc.startswith("channel_") and lc.endswith("_label"):
-                excluded.add(c)
-
-        return excluded.intersection(col_set)
+        metadata = md if isinstance(md, pd.DataFrame) else None
+        return excluded_non_behavior_columns(cols, metadata=metadata)
 
     def _panel_cfg(self):
         params = getattr(self.metadata_loader, "behav3d_parameters", None)

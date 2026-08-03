@@ -228,8 +228,12 @@ def plot_page_stacked_proportion_barh_grid(
     return fig
 
 
+SIGNIFICANCE_LEGEND_TEXT = "n.s. p≥0.05    * p<0.05    ** p<0.01    *** p<0.001    **** p<0.0001"
+
+
 def welch_ttest_stars(p_value):
-    """'' if p is NaN/>=0.05, else '*' p<0.05, '**' p<0.01, '***' p<0.001, '****' p<0.0001."""
+    """'' if p is NaN (test not run, e.g. too few samples), 'n.s.' if p>=0.05, else '*' p<0.05,
+    '**' p<0.01, '***' p<0.001, '****' p<0.0001."""
     if p_value is None or not np.isfinite(p_value):
         return ""
     if p_value < 1e-4:
@@ -240,7 +244,14 @@ def welch_ttest_stars(p_value):
         return "**"
     if p_value < 5e-2:
         return "*"
-    return ""
+    return "n.s."
+
+
+def add_significance_legend(fig, *, y=0.005, fontsize=7):
+    """Draw the shared star-notation legend ('n.s.'/'*'/'**'/'***'/'****' thresholds) centered
+    near the bottom of `fig`, so every panel using `welch_ttest_stars` stays self-explanatory
+    even when nothing is significant."""
+    fig.text(0.5, y, SIGNIFICANCE_LEGEND_TEXT, ha="center", va="bottom", fontsize=fontsize)
 
 
 def _welch_diff_rows(class_order, vals_a_panel, vals_b_panel):
@@ -255,8 +266,20 @@ def _welch_diff_rows(class_order, vals_a_panel, vals_b_panel):
             t_stat, p_value = stats.ttest_ind(vals_b, vals_a, equal_var=False, nan_policy="omit")
             t_stat = float(t_stat)
             p_value = float(p_value)
+            # Same quantity Welch's t-test divides by (t = diff / se_diff).
+            var_a = float(np.var(vals_a, ddof=1))
+            var_b = float(np.var(vals_b, ddof=1))
+            se_diff = float(np.sqrt(var_a / len(vals_a) + var_b / len(vals_b)))
+            # Welch-Satterthwaite df (same df scipy uses internally for p_value), used to turn
+            # se_diff into a 95% CI margin - unlike a flat 1*se_diff, this has a fixed
+            # relationship to the significance stars: if it reaches past zero when mirrored
+            # inward around diff, the result is exactly "n.s." at alpha=0.05.
+            df = (var_a / len(vals_a) + var_b / len(vals_b)) ** 2 / (
+                (var_a / len(vals_a)) ** 2 / (len(vals_a) - 1) + (var_b / len(vals_b)) ** 2 / (len(vals_b) - 1)
+            )
+            ci95_diff = float(stats.t.ppf(0.975, df) * se_diff)
         else:
-            t_stat, p_value = float("nan"), float("nan")
+            t_stat, p_value, se_diff, ci95_diff = float("nan"), float("nan"), float("nan"), float("nan")
         rows.append({
             "class": class_name,
             "mean_a": mean_a,
@@ -264,6 +287,8 @@ def _welch_diff_rows(class_order, vals_a_panel, vals_b_panel):
             "diff": (mean_b - mean_a) if np.isfinite(mean_a) and np.isfinite(mean_b) else float("nan"),
             "t_stat": t_stat,
             "p_value": p_value,
+            "se_diff": se_diff,
+            "ci95_diff": ci95_diff,
             "stars": welch_ttest_stars(p_value),
             "n_a": int(len(vals_a)),
             "n_b": int(len(vals_b)),
@@ -325,7 +350,13 @@ def compute_condition_diff_stats_pairwise(
             vals_a_panel = panel[cond == level_a]
             vals_b_panel = panel[cond == level_b]
             rows = _welch_diff_rows(class_order, vals_a_panel, vals_b_panel)
-            pair_stats[(level_a, level_b)] = pd.DataFrame(rows)
+            df_rows = pd.DataFrame(rows)
+            # Raw unit counts on each side (before per-class NaN dropping) - i.e. how many
+            # samples were merged into level_a/level_b for this group, for display in plot
+            # headers. Distinct from the per-class n_a/n_b above.
+            df_rows["n_samples_a"] = int(len(vals_a_panel))
+            df_rows["n_samples_b"] = int(len(vals_b_panel))
+            pair_stats[(level_a, level_b)] = df_rows
         out[str(group_label)] = pair_stats
     return out
 
@@ -342,8 +373,10 @@ def draw_diff_barh(
     label_fontsize=8,
 ):
     """One horizontal bar per class showing signed proportion difference (diff_df['diff'] in
-    fractional units, plotted as percent), with a significance star at the bar tip. class_order[0]
-    is drawn at the top (matches typical reference-figure convention: first cluster on top)."""
+    fractional units, plotted as percent), with a one-sided whisker (95% CI margin of the
+    difference, extending only outward from zero, cap drawn only at the outer end - not at
+    the bar tip) and a significance star past the whisker cap. class_order[0] is drawn at the
+    top (matches typical reference-figure convention: first cluster on top)."""
     class_order = [str(c) for c in list(class_order)]
     by_class = diff_df.set_index("class")
     rows = list(reversed(class_order))
@@ -351,8 +384,11 @@ def draw_diff_barh(
 
     max_abs = 0.0
     for class_name in rows:
-        diff_pct = float(by_class.loc[class_name, "diff"]) * 100.0 if class_name in by_class.index else 0.0
-        max_abs = max(max_abs, abs(diff_pct))
+        if class_name not in by_class.index:
+            continue
+        diff_pct = float(by_class.loc[class_name, "diff"]) * 100.0
+        ci_pct = float(by_class.loc[class_name, "ci95_diff"]) * 100.0 if np.isfinite(by_class.loc[class_name, "ci95_diff"]) else 0.0
+        max_abs = max(max_abs, abs(diff_pct) + ci_pct)
     xmax = xlim if xlim is not None else max(max_abs * 1.35, 5.0)
 
     for y, class_name in zip(y_positions, rows):
@@ -360,11 +396,28 @@ def draw_diff_barh(
             continue
         row = by_class.loc[class_name]
         diff_pct = float(row["diff"]) * 100.0 if np.isfinite(row["diff"]) else 0.0
+        ci_pct = float(row["ci95_diff"]) * 100.0 if np.isfinite(row.get("ci95_diff", float("nan"))) else 0.0
         color = colors.get(class_name, "#808080")
         ax.barh([y], [diff_pct], height=bar_height_frac, color=color, edgecolor="none", linewidth=0.0)
+        if ci_pct > 0:
+            # One-sided: only extend further away from zero, not back toward it, so the
+            # whisker doesn't double up on top of the bar / neighboring rows. Cap is drawn
+            # only at the outer endpoint (not at the bar tip) via a separate marker, since
+            # ax.errorbar's capsize would otherwise draw a redundant cap at both ends.
+            outer_x = diff_pct + ci_pct if diff_pct >= 0 else diff_pct - ci_pct
+            xerr = [[0.0], [ci_pct]] if diff_pct >= 0 else [[ci_pct], [0.0]]
+            ax.errorbar(
+                [diff_pct], [y], xerr=xerr, fmt="none", ecolor="black",
+                elinewidth=1.0, capsize=0, zorder=3,
+            )
+            ax.plot(
+                [outer_x], [y], marker="|", markersize=6, markeredgewidth=1.0,
+                color="black", zorder=3,
+            )
         stars = str(row.get("stars", ""))
         if stars:
-            tip = diff_pct + (xmax * 0.03 if diff_pct >= 0 else -xmax * 0.03)
+            edge = diff_pct + ci_pct if diff_pct >= 0 else diff_pct - ci_pct
+            tip = edge + (xmax * 0.03 if diff_pct >= 0 else -xmax * 0.03)
             ha = "left" if diff_pct >= 0 else "right"
             ax.text(tip, y, stars, ha=ha, va="center", fontsize=star_fontsize)
 
@@ -383,6 +436,30 @@ def draw_diff_barh(
 def _diff_df_has_data(diff_df):
     """True if at least one class has a finite diff (i.e. both condition sides had samples)."""
     return diff_df is not None and bool(np.isfinite(diff_df["diff"].to_numpy(dtype=float)).any())
+
+
+def _diff_plus_se_max(diff_df):
+    """Max of |diff| + ci95_diff (percent) across a diff_df's rows, treating a non-finite
+    ci95_diff as 0 - matches the one-sided whisker drawn by `draw_diff_barh` so it's never
+    clipped."""
+    diff_pct = diff_df["diff"].to_numpy(dtype=float) * 100.0
+    ci_pct = np.nan_to_num(diff_df["ci95_diff"].to_numpy(dtype=float), nan=0.0) * 100.0
+    finite = np.isfinite(diff_pct)
+    if not finite.any():
+        return 0.0
+    return float(np.nanmax(np.abs(diff_pct[finite]) + ci_pct[finite]))
+
+
+def _panel_n_label(diff_df):
+    """'n=<a>      n=<b>' from a diff_df's (constant-across-rows) n_samples_a/n_samples_b
+    columns, or '' if unavailable/empty."""
+    if diff_df is None or len(diff_df) == 0:
+        return ""
+    if "n_samples_a" not in diff_df.columns or "n_samples_b" not in diff_df.columns:
+        return ""
+    n_a = int(diff_df["n_samples_a"].iloc[0])
+    n_b = int(diff_df["n_samples_b"].iloc[0])
+    return f"n={n_a}      n={n_b}"
 
 
 def plot_condition_diff_grid(
@@ -418,7 +495,7 @@ def plot_condition_diff_grid(
     for pairs in diff_stats_by_group.values():
         for df in pairs.values():
             if len(df) > 0:
-                global_xmax = max(global_xmax, float(np.nanmax(np.abs(df["diff"].to_numpy(dtype=float))) * 100.0))
+                global_xmax = max(global_xmax, _diff_plus_se_max(df))
     global_xmax = max(global_xmax * 1.35, 5.0)
 
     out_pdf = str(out_pdf)
@@ -432,7 +509,7 @@ def plot_condition_diff_grid(
                 nrows=1 + n_pairs, ncols=n_cols, figure=fig,
                 width_ratios=[panel_w] * n_cols,
                 height_ratios=[header_h] + [1.0] * n_pairs,
-                hspace=0.55, wspace=0.25,
+                hspace=0.75, wspace=0.25,
             )
 
             for c, group_label in enumerate(page_groups):
@@ -448,11 +525,15 @@ def plot_condition_diff_grid(
             for r, (level_a, level_b) in enumerate(pair_keys):
                 for c, group_label in enumerate(page_groups):
                     ax = fig.add_subplot(outer[r + 1, c])
-                    ax.set_title(
-                        _wrap_row_label(f"{level_a}  vs  {level_b}"),
-                        fontsize=max(label_fontsize - 2, 6), fontweight="normal", pad=4,
-                    )
                     diff_df = diff_stats_by_group[group_label].get((level_a, level_b))
+                    header = _wrap_row_label(f"{level_a}  vs  {level_b}")
+                    n_label = _panel_n_label(diff_df)
+                    if n_label:
+                        header = f"{header}\n{n_label}"
+                    ax.set_title(
+                        header,
+                        fontsize=max(label_fontsize - 2, 6), fontweight="normal", pad=8,
+                    )
                     if not _diff_df_has_data(diff_df):
                         ax.text(0.5, 0.5, "—", ha="center", va="center", fontsize=10, transform=ax.transAxes)
                         ax.axis("off")
@@ -468,7 +549,8 @@ def plot_condition_diff_grid(
                     long_rows.append(df_long)
 
             fig.suptitle(title, fontsize=11, fontweight="bold", y=0.99)
-            fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+            add_significance_legend(fig)
+            fig.tight_layout(rect=(0.0, 0.02, 1.0, 0.95))
             pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
 
@@ -560,7 +642,7 @@ def plot_condition_diff_grid_2d(
                 for pairs in diff_stats_by_facet.values():
                     d = pairs.get((level_a, level_b))
                     if d is not None and len(d) > 0:
-                        global_xmax = max(global_xmax, float(np.nanmax(np.abs(d["diff"].to_numpy(dtype=float))) * 100.0))
+                        global_xmax = max(global_xmax, _diff_plus_se_max(d))
             global_xmax = max(global_xmax * 1.35, 5.0)
 
             fig = plt.figure(figsize=(header_w + panel_w * ncols_data, header_h + panel_h * nrows_data))
@@ -568,7 +650,7 @@ def plot_condition_diff_grid_2d(
                 nrows=1 + nrows_data, ncols=1 + ncols_data, figure=fig,
                 width_ratios=[header_w] + [panel_w] * ncols_data,
                 height_ratios=[header_h] + [panel_h] * nrows_data,
-                hspace=0.55, wspace=0.25,
+                hspace=0.75, wspace=0.25,
             )
             fig.add_subplot(outer[0, 0]).axis("off")
 
@@ -595,11 +677,15 @@ def plot_condition_diff_grid_2d(
                     ax = fig.add_subplot(outer[r + 1, c + 1])
                     diff_df = None
                     if level_a is not None:
-                        ax.set_title(
-                            f"{level_a}  vs  {level_b}",
-                            fontsize=max(label_fontsize - 2, 6), fontweight="normal", pad=4,
-                        )
                         diff_df = diff_stats_by_facet.get(facet_label, {}).get((level_a, level_b))
+                        header = f"{level_a}  vs  {level_b}"
+                        n_label = _panel_n_label(diff_df)
+                        if n_label:
+                            header = f"{header}\n{n_label}"
+                        ax.set_title(
+                            header,
+                            fontsize=max(label_fontsize - 2, 6), fontweight="normal", pad=8,
+                        )
                     if not _diff_df_has_data(diff_df):
                         ax.text(0.5, 0.5, "—", ha="center", va="center", fontsize=10, transform=ax.transAxes)
                         ax.axis("off")
@@ -622,7 +708,8 @@ def plot_condition_diff_grid_2d(
             if page_key != "(all)":
                 page_title += f" ({', '.join(extra_group_cols)}: {page_key})"
             fig.suptitle(page_title, fontsize=11, fontweight="bold", y=0.99)
-            fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+            add_significance_legend(fig)
+            fig.tight_layout(rect=(0.0, 0.02, 1.0, 0.95))
             pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
 

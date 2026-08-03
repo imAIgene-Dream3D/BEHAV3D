@@ -2250,6 +2250,13 @@ class DeathDynamicsTab(QWidget):
 # ═══════════════════════════════════════════════════════════════════════════
 from behav3d.napari._single_cell import SingleCellTab  # noqa: E402  (re-exported)
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Feature Backprojection sub-tab — real implementation imported from
+# _feature_backprojection.py (imported after SingleCellTab/CollapsibleSection
+# above so its own imports resolve cleanly).
+# ═══════════════════════════════════════════════════════════════════════════
+from behav3d.napari._feature_backprojection import FeatureBackprojectionTab  # noqa: E402  (re-exported)
+
 
 # NOTE: ResultsPanel used to be defined here; it now lives in
 # behav3d/napari/_results_panel.py so the Filtering and Feature
@@ -2350,6 +2357,11 @@ class AnalysisTab(QWidget):
         self.inner_tabs = QTabWidget()
         self.splitter.addWidget(self.inner_tabs)
 
+        self.feature_backprojection_tab = FeatureBackprojectionTab(
+            viewer=viewer, metadata_loader=metadata_loader, parent=self
+        )
+        self.inner_tabs.addTab(self.feature_backprojection_tab, "🔬 Feature Backprojection")
+
         self.death_dynamics_tab = DeathDynamicsTab(
             viewer=viewer, metadata_loader=metadata_loader, parent=self
         )
@@ -2404,6 +2416,8 @@ class AnalysisTab(QWidget):
 
     def _on_metadata_updated(self, *_):
         """Cascade metadata updates to inner tabs and results panel."""
+        if hasattr(self, "feature_backprojection_tab"):
+            self.feature_backprojection_tab._on_metadata_updated()
         if hasattr(self, "death_dynamics_tab"):
             self.death_dynamics_tab._on_metadata_updated()
         if hasattr(self, "single_cell_tab"):

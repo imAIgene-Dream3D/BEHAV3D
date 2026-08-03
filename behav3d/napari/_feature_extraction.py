@@ -2671,9 +2671,9 @@ class ActiveKillingPanel(QWidget):
         params_form.addRow("", self.abs_hint_label)
 
         self.spin_abs_threshold = QDoubleSpinBox()
-        self.spin_abs_threshold.setRange(0.0, 10000.0)
-        self.spin_abs_threshold.setSingleStep(0.01)
-        self.spin_abs_threshold.setDecimals(4)
+        # Range/decimals/step are set per selected death signal column in
+        # _update_abs_hint (percentage_dead_mask is a 0.0-1.0 fraction, the
+        # others are unbounded-ish raw counts/intensities).
         self.spin_abs_threshold.setValue(0.0)
         self.spin_abs_threshold.setMaximumWidth(100)
         self.spin_abs_threshold.setEnabled(False)
@@ -2798,9 +2798,31 @@ class ActiveKillingPanel(QWidget):
         self._update_abs_hint()
 
     def _update_abs_hint(self):
-        """Show a non-blocking recommendation to use nr_dead_mask_pixels with an absolute threshold."""
+        """Keep the Absolute threshold spinbox's range/step matched to the selected
+        death signal's units, and show a non-blocking recommendation to use
+        nr_dead_mask_pixels with an absolute threshold."""
         using_absolute = self.check_abs_threshold.isChecked()
-        wrong_column = self.death_signal_combo.currentText() != "nr_dead_mask_pixels"
+        column = self.death_signal_combo.currentText()
+
+        old_value = self.spin_abs_threshold.value()
+        if column == "percentage_dead_mask":
+            # percentage_dead_mask is a fraction (0.0-1.0), not a 0-100 percent -
+            # see calculate_death()'s scale note in timepoint_features.py.
+            self.spin_abs_threshold.setRange(0.0, 1.0)
+            self.spin_abs_threshold.setDecimals(4)
+            self.spin_abs_threshold.setSingleStep(0.001)
+        elif column == "nr_dead_mask_pixels":
+            # Raw pixel count - integer valued, can be large for 3D segments.
+            self.spin_abs_threshold.setRange(0.0, 100000.0)
+            self.spin_abs_threshold.setDecimals(0)
+            self.spin_abs_threshold.setSingleStep(1)
+        else:  # mean_dead_dye - raw intensity, scale depends on image bit depth
+            self.spin_abs_threshold.setRange(0.0, 100000.0)
+            self.spin_abs_threshold.setDecimals(4)
+            self.spin_abs_threshold.setSingleStep(0.01)
+        self.spin_abs_threshold.setValue(min(old_value, self.spin_abs_threshold.maximum()))
+
+        wrong_column = column != "nr_dead_mask_pixels"
         if using_absolute and wrong_column:
             self.abs_hint_label.setText(
                 "💡 Recommended: use nr_dead_mask_pixels as the death signal when using "

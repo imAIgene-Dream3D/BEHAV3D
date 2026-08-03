@@ -1395,7 +1395,7 @@ class StateClassificationSubTab(QWidget):
         show_matplotlib_figure(fig, title=title, parent=self)
 
     def _populate_dynamic_features(self, ct):
-        from behav3d.widgets.utils import behav3d_calculated_features
+        from behav3d.widgets.utils import behav3d_calculated_features, excluded_non_behavior_columns
         from behav3d.core.utils import expand_column_patterns
         import pandas as pd
         out = self._out_dir()
@@ -1505,10 +1505,8 @@ class StateClassificationSubTab(QWidget):
                 self.spin_seed.setValue(int(cfg["random_state"]))
 
             cols = list(pd.read_csv(csv_path, nrows=0).columns)
-            excluded = [
-                "TrackID", "position_t", "position_x", "position_y", "position_z",
-                "frame", "file", "index", "id", "sample_name", "Condition", "Timepoint"
-            ]
+            md = getattr(self.metadata_loader, "metadata", None) if self.metadata_loader else None
+            excluded = excluded_non_behavior_columns(cols, metadata=md)
             usable_cols = [c for c in cols if c not in excluded]
             # Value-based binary detection over the full CSV (see
             # behav3d.widgets.base_state_classification.detect_binary_columns_from_csv).
@@ -3217,6 +3215,26 @@ class TrackClassificationSubTab(QWidget):
             "A track counts as 'contact' if it has at least one unbroken run of this many "
             "consecutive contact timepoints; otherwise it is 'no_contact'."
         ))
+        self.chk_use_target_class = QCheckBox("Use contact cell classification")
+        self.chk_use_target_class.setChecked(False)
+        contact_form.addRow("", self.chk_use_target_class)
+        self.combo_target_class_source = QComboBox()
+        self.combo_target_class_source.addItem("State classification", "state")
+        self.combo_target_class_source.addItem("Track classification", "track")
+        contact_form.addRow("Target classification:", self.combo_target_class_source)
+        self.combo_target_state_col = QComboBox()
+        self.combo_target_state_col.addItems(
+            ["full_behavioral_cluster", "intrinsic_behavioral_cluster", "raw_hmm_state"]
+        )
+        contact_form.addRow("Target state column:", self.combo_target_state_col)
+        self.label_target_class_warning = QLabel("")
+        self.label_target_class_warning.setWordWrap(True)
+        self.label_target_class_warning.setStyleSheet(
+            "QLabel { background: #3d2200; color: #ffaa44; border-radius: 4px; "
+            "padding: 6px 8px; font-size: 11px; }"
+        )
+        self.label_target_class_warning.hide()
+        contact_form.addRow("", self.label_target_class_warning)
         self.combo_contact_group_x = QComboBox()
         self.combo_contact_group_x.setMinimumWidth(160)
         contact_form.addRow("Group in X:", self.combo_contact_group_x)
@@ -3269,6 +3287,25 @@ class TrackClassificationSubTab(QWidget):
         self.btn_view_contact_state_shift = _make_view_btn()
         shift_row.addWidget(self.btn_view_contact_state_shift)
         g_contact.addLayout(shift_row)
+
+        g_contact.addWidget(QLabel(
+            "Track contact overview (full state trajectory + contact-bout markers, one page per sample):"
+        ))
+        overview_form = QFormLayout()
+        overview_form.setSpacing(3)
+        self.spin_track_overview_rows_per_page = QSpinBox()
+        self.spin_track_overview_rows_per_page.setRange(1, 100)
+        self.spin_track_overview_rows_per_page.setValue(6)
+        self.spin_track_overview_rows_per_page.setMaximumWidth(100)
+        overview_form.addRow("Tracks per page:", self.spin_track_overview_rows_per_page)
+        g_contact.addLayout(overview_form)
+        overview_row = QHBoxLayout()
+        self.btn_track_contact_overview = QPushButton("▶ Create Track Contact Overview")
+        _style_secondary(self.btn_track_contact_overview)
+        overview_row.addWidget(self.btn_track_contact_overview, stretch=1)
+        self.btn_view_track_contact_overview = _make_view_btn()
+        overview_row.addWidget(self.btn_view_track_contact_overview)
+        g_contact.addLayout(overview_row)
 
         self.grp_exemplar = QGroupBox("Exemplar Tracks")
         g_exemplar = QVBoxLayout(self.grp_exemplar)
@@ -3482,8 +3519,13 @@ class TrackClassificationSubTab(QWidget):
         )
         self.btn_contact_analysis.clicked.connect(self._on_contact_analysis)
         self.btn_view_contact_analysis.clicked.connect(lambda: self._on_view("contact_analysis"))
+        self.combo_contact_col.currentTextChanged.connect(self._sync_contact_target_class_controls)
+        self.chk_use_target_class.stateChanged.connect(self._sync_contact_target_class_controls)
+        self.combo_target_class_source.currentTextChanged.connect(self._sync_contact_target_class_controls)
         self.btn_contact_state_shift.clicked.connect(self._on_contact_state_shift_analysis)
         self.btn_view_contact_state_shift.clicked.connect(lambda: self._on_view("contact_state_shift"))
+        self.btn_track_contact_overview.clicked.connect(self._on_track_contact_overview)
+        self.btn_view_track_contact_overview.clicked.connect(lambda: self._on_view("track_contact_overview"))
         self.btn_browse_pretrained_clf.clicked.connect(self._browse_pretrained_clf)
         self.btn_browse_pretrained_states.clicked.connect(self._browse_pretrained_states)
         self.btn_run_apply_pretrained.clicked.connect(self._on_apply_pretrained)
@@ -4115,6 +4157,78 @@ class TrackClassificationSubTab(QWidget):
             return filtered
         return base / f"BEHAV3D_{ct}_combined_track_features.csv"
 
+    def _contact_target_cell_type(self) -> Optional[str]:
+        from behav3d.analysis.behavior.track.contact_grouping import contact_col_target_cell_type
+        contact_col = self.combo_contact_col.currentText()
+        if not contact_col:
+            return None
+        try:
+            return contact_col_target_cell_type(contact_col)
+        except ValueError:
+            return None
+
+    def _target_class_availability(self):
+        """(available, warning_text) for the currently selected target-classification option.
+        ``available`` is always True when the checkbox is unchecked (nothing to block)."""
+        import pandas as pd
+        from behav3d.analysis.behavior.track.contact_grouping import touching_column_name
+        if not self.chk_use_target_class.isChecked():
+            return True, ""
+
+        target_ct = self._contact_target_cell_type()
+        if not target_ct:
+            return False, "Select a contact column first."
+
+        ct = self._cell_type()
+        csv_path = self._track_features_csv_path(ct) if ct else None
+        touching_col = touching_column_name(target_ct)
+        has_touching = False
+        if csv_path and csv_path.exists():
+            try:
+                has_touching = touching_col in pd.read_csv(csv_path, nrows=0).columns
+            except Exception:
+                has_touching = False
+        if not has_touching:
+            return False, (
+                f"Per-cell contact identity isn't available for '{self.combo_contact_col.currentText()}' "
+                f"('{touching_col}' column missing). Recompute contact features with the pixel/mask-based "
+                f"method to enable this."
+            )
+
+        if self.combo_target_class_source.currentData() == "track":
+            if self._track_adata_path(target_ct) is None:
+                return False, (
+                    f"No track classification found for '{target_ct}'. Run Track Classification for "
+                    f"'{target_ct}' first."
+                )
+        else:
+            state_path = self._state_adata_path(target_ct)
+            if not state_path or not state_path.exists():
+                return False, (
+                    f"No behavioral state classification found for '{target_ct}'. Run State "
+                    f"Classification for '{target_ct}' first."
+                )
+        return True, ""
+
+    def _sync_contact_target_class_controls(self):
+        use_target = self.chk_use_target_class.isChecked()
+        self.combo_target_class_source.setVisible(use_target)
+        self.combo_target_state_col.setVisible(
+            use_target and self.combo_target_class_source.currentData() == "state"
+        )
+        available, warning = self._target_class_availability()
+        if use_target and warning:
+            self.label_target_class_warning.setText(warning)
+            self.label_target_class_warning.show()
+        else:
+            self.label_target_class_warning.hide()
+        contact_cols_present = self.combo_contact_col.count() > 0
+        self.btn_contact_analysis.setEnabled(
+            contact_cols_present
+            and self._track_adata is not None
+            and not (use_target and not available)
+        )
+
     def _refresh_contact_columns(self):
         import pandas as pd
         from behav3d.analysis.behavior.track.contact_grouping import list_available_contact_columns
@@ -4135,10 +4249,13 @@ class TrackClassificationSubTab(QWidget):
             self.combo_contact_col.setCurrentText(prev)
         self.combo_contact_col.blockSignals(False)
         self.combo_contact_col.setEnabled(len(contact_cols) > 0)
-        self.btn_contact_analysis.setEnabled(len(contact_cols) > 0 and self._track_adata is not None)
+        self._sync_contact_target_class_controls()
         state_adata_path = self._state_adata_path(ct) if ct else None
         has_states = bool(state_adata_path and state_adata_path.exists())
         self.btn_contact_state_shift.setEnabled(
+            len(contact_cols) > 0 and self._track_adata is not None and has_states
+        )
+        self.btn_track_contact_overview.setEnabled(
             len(contact_cols) > 0 and self._track_adata is not None and has_states
         )
 
@@ -4151,7 +4268,7 @@ class TrackClassificationSubTab(QWidget):
                 self.btn_view_diagnostics, self.btn_view_track_proportions,
                 self.btn_view_window_transitions,
                 self.btn_view_track_condition_comparison, self.btn_view_contact_analysis,
-                self.btn_view_contact_state_shift,
+                self.btn_view_contact_state_shift, self.btn_view_track_contact_overview,
             ):
                 btn.setEnabled(False)
             return
@@ -4207,6 +4324,13 @@ class TrackClassificationSubTab(QWidget):
                 contact_dir
                 and contact_dir.exists()
                 and any(contact_dir.glob("*/contact_state_shift.pdf"))
+            )
+        )
+        self.btn_view_track_contact_overview.setEnabled(
+            bool(
+                contact_dir
+                and contact_dir.exists()
+                and any(contact_dir.glob("*/track_contact_overview.pdf"))
             )
         )
 
@@ -5195,6 +5319,14 @@ class TrackClassificationSubTab(QWidget):
         if not csv_path or not csv_path.exists():
             QMessageBox.warning(self, "No data", "Track-features CSV not found. Run feature extraction first.")
             return
+        use_target_class = self.chk_use_target_class.isChecked()
+        target_available, target_warning = self._target_class_availability()
+        if use_target_class and not target_available:
+            QMessageBox.warning(self, "Target classification unavailable", target_warning)
+            return
+        target_ct = self._contact_target_cell_type() if use_target_class else None
+        target_source = self.combo_target_class_source.currentData() if use_target_class else None
+        target_state_choice = self.combo_target_state_col.currentText()
         out = self._out_dir()
         self._log(f"▶ Running contact-vs-no-contact analysis for '{ct}'…")
         track_adata = self._track_adata
@@ -5207,6 +5339,13 @@ class TrackClassificationSubTab(QWidget):
 
         def _run(**kw):
             import pandas as pd
+            import anndata as ad
+            from behav3d.analysis.behavior.state.classification import FULL_STATE_COL
+            from behav3d.analysis.behavior.track.contact_grouping import (
+                touching_column_name,
+                build_target_class_lookup_from_state_adata,
+                build_target_class_lookup_from_track_adata,
+            )
             from behav3d.analysis.behavior.track.utils import _resolve_dtaidistance_paths
             from behav3d.analysis.behavior.track.visualization.plots.reports import (
                 save_track_contact_group_analysis,
@@ -5220,6 +5359,32 @@ class TrackClassificationSubTab(QWidget):
             cols_to_merge = [c for c in all_extra_cols if c not in track_adata.obs.columns]
             if cols_to_merge and md is not None:
                 merge_condition_columns_into_obs(track_adata, md, cols_to_merge)
+
+            target_class_kwargs = {}
+            if use_target_class:
+                touching_col = touching_column_name(target_ct)
+                if target_source == "track":
+                    adata_target = ad.read_h5ad(str(self._track_adata_path(target_ct)))
+                    target_class_lookup = build_target_class_lookup_from_track_adata(
+                        adata_target, class_col="ClusterID",
+                    )
+                    time_varying = False
+                else:
+                    adata_target = ad.read_h5ad(str(self._state_adata_path(target_ct)))
+                    state_col = (
+                        FULL_STATE_COL if target_state_choice == "full_behavioral_cluster" else target_state_choice
+                    )
+                    target_class_lookup = build_target_class_lookup_from_state_adata(
+                        adata_target, state_col=state_col,
+                    )
+                    time_varying = True
+                target_class_kwargs = dict(
+                    target_class_lookup=target_class_lookup,
+                    touching_col=touching_col,
+                    time_varying=time_varying,
+                    target_cell_type_label=target_ct,
+                )
+
             return save_track_contact_group_analysis(
                 track_adata,
                 df_timepoints,
@@ -5232,6 +5397,7 @@ class TrackClassificationSubTab(QWidget):
                 group_x=group_x,
                 group_y=group_y,
                 verbose=True,
+                **target_class_kwargs,
             )
 
         self._bg.run(
@@ -5320,6 +5486,77 @@ class TrackClassificationSubTab(QWidget):
                 self._notify_results(),
             ),
             on_failed=lambda e: self._log(f"❌ Contact state-shift analysis failed: {e}"),
+        )
+
+    def _on_track_contact_overview(self):
+        ct = self._cell_type()
+        if not ct:
+            return
+        if self._track_adata is None:
+            QMessageBox.warning(self, "No data", "Run track clustering first.")
+            return
+        if self._bg.is_running():
+            QMessageBox.warning(self, "Busy", "Another operation is running.")
+            return
+        contact_col = self.combo_contact_col.currentText()
+        if not contact_col:
+            QMessageBox.warning(self, "Missing selection", "Select a contact column to analyze.")
+            return
+        state_adata_path = self._state_adata_path(ct)
+        if not state_adata_path or not state_adata_path.exists():
+            QMessageBox.warning(
+                self, "No data",
+                "Behavioral states h5ad not found. Run State Classification first.",
+            )
+            return
+        csv_path = self._track_features_csv_path(ct)
+        if not csv_path or not csv_path.exists():
+            QMessageBox.warning(self, "No data", "Track-features CSV not found. Run feature extraction first.")
+            return
+        min_bout_length = int(self.spin_contact_min_bout.value())
+        state_col_choice = self.combo_contact_shift_state_col.currentText()
+        rows_per_page = int(self.spin_track_overview_rows_per_page.value())
+        out = self._out_dir()
+        track_adata = self._track_adata
+        self._log(f"▶ Creating track contact overview for '{ct}'…")
+
+        def _run(**kw):
+            import pandas as pd
+            import anndata as _ad
+            from behav3d.analysis.behavior.state.classification import FULL_STATE_COL
+            from behav3d.analysis.behavior.track.utils import _resolve_dtaidistance_paths
+            from behav3d.analysis.behavior.track.visualization.plots.contact_state_shift_report import (
+                save_track_contact_overview_report,
+            )
+            state_col = FULL_STATE_COL if state_col_choice == "full_behavioral_cluster" else state_col_choice
+            full_adata = _ad.read_h5ad(str(state_adata_path))
+            df_timepoints = pd.read_csv(csv_path)
+            contact_dir = _resolve_dtaidistance_paths(str(out) if out else "", ct)["outfolder"]
+            return save_track_contact_overview_report(
+                track_adata,
+                df_timepoints,
+                full_adata,
+                contact_dir,
+                contact_col=contact_col,
+                min_bout_length=min_bout_length,
+                state_col=state_col,
+                rows_per_page=rows_per_page,
+                verbose=True,
+            )
+
+        self._bg.run(
+            fn=_run,
+            desc=f"Track contact overview ({ct})…",
+            progress_row=self.progress_row,
+            buttons=[self.btn_track_contact_overview],
+            viewer=self.viewer,
+            inject_progress=False,
+            on_done=lambda r: (
+                self._log(f"✅ Track contact overview done for '{ct}'."),
+                self._update_view_buttons(),
+                self._notify_results(),
+            ),
+            on_failed=lambda e: self._log(f"❌ Track contact overview failed: {e}"),
         )
 
     # ── Backprojection ───────────────────────────────────────────────────
@@ -5575,6 +5812,12 @@ class TrackClassificationSubTab(QWidget):
             candidates = [
                 (f.parent.name, f)
                 for f in sorted(contact_dir.glob("*/contact_state_shift.pdf"))
+            ]
+        elif kind == "track_contact_overview" and traj_dir:
+            contact_dir = traj_dir / "contact_analysis"
+            candidates = [
+                (f.parent.name, f)
+                for f in sorted(contact_dir.glob("*/track_contact_overview.pdf"))
             ]
 
         existing = [(lbl, p) for lbl, p in candidates if p and p.exists()]

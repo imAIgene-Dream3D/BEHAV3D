@@ -367,6 +367,28 @@ def analyze_active_killing_per_timepoint(
     return pd.DataFrame(killing_results)
 
 
+class StaleDataError(RuntimeError):
+    """Raised when a derived CSV predates the raw input it was built from."""
+
+
+def _check_not_stale(derived_path: Path, raw_path: Path, derived_label: str, upstream_label: str) -> None:
+    """
+    Raise StaleDataError if `raw_path` was modified more recently than
+    `derived_path` — meaning `upstream_label` was rerun after `derived_label`
+    last produced this file, so `derived_path` no longer reflects the current
+    data.
+    """
+    if not derived_path.exists() or not raw_path.exists():
+        return
+    if raw_path.stat().st_mtime > derived_path.stat().st_mtime:
+        raise StaleDataError(
+            f"{derived_path.name} is older than {raw_path.name} — it looks like "
+            f"{upstream_label} was rerun after {derived_label} last produced this file. "
+            f"The underlying data no longer matches. Re-run {derived_label} to refresh "
+            f"it from the current data before continuing."
+        )
+
+
 def find_advanced_features_csv(output_dir: Union[str, Path], cell_type: str) -> Optional[Path]:
     """
     Locate the active-killing advanced-features CSV for a cell type.
@@ -376,8 +398,13 @@ def find_advanced_features_csv(output_dir: Union[str, Path], cell_type: str) -> 
     searches analysis/<cell_type>/active_killing/*/ rather than assuming a
     flat layout. Falls back to the legacy flat path for older runs. Returns
     the most recently modified match, or None if none exist.
+
+    Raises StaleDataError if the best match predates the cell type's raw
+    combined_track_features.csv, i.e. Feature Extraction was rerun after
+    Active Killing last produced this file.
     """
-    active_killing_dir = Path(output_dir) / "analysis" / cell_type / "active_killing"
+    output_dir = Path(output_dir)
+    active_killing_dir = output_dir / "analysis" / cell_type / "active_killing"
     if not active_killing_dir.exists():
         return None
     filename = f"BEHAV3D_{cell_type}_advanced_track_features.csv"
@@ -387,7 +414,10 @@ def find_advanced_features_csv(output_dir: Union[str, Path], cell_type: str) -> 
         candidates.append(legacy)
     if not candidates:
         return None
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+    best = max(candidates, key=lambda p: p.stat().st_mtime)
+    raw_path = output_dir / "analysis" / cell_type / "track_features" / f"BEHAV3D_{cell_type}_combined_track_features.csv"
+    _check_not_stale(best, raw_path, derived_label="Active Killing", upstream_label="Feature Extraction")
+    return best
 
 
 def run_active_killing_analysis(
@@ -479,12 +509,15 @@ def run_active_killing_analysis(
     
     # Load immune cell tracks
     immune_feature_dir = output_dir / "analysis" / immune_cell_type / "track_features"
+    immune_raw_path = immune_feature_dir / f"BEHAV3D_{immune_cell_type}_combined_track_features.csv"
     immune_tracks_path = immune_feature_dir / f"BEHAV3D_{immune_cell_type}_combined_track_features_filtered.csv"
-    
-    if not immune_tracks_path.exists():
+
+    if immune_tracks_path.exists():
+        _check_not_stale(immune_tracks_path, immune_raw_path, derived_label="Filtering", upstream_label="Feature Extraction")
+    else:
         # Try non-filtered version
-        immune_tracks_path = immune_feature_dir / f"BEHAV3D_{immune_cell_type}_combined_track_features.csv"
-    
+        immune_tracks_path = immune_raw_path
+
     if not immune_tracks_path.exists():
         raise FileNotFoundError(f"Could not find immune cell tracks at {immune_tracks_path}")
     
@@ -496,11 +529,14 @@ def run_active_killing_analysis(
     
     for target_type in target_cell_types:
         target_feature_dir = output_dir / "analysis" / target_type / "track_features"
+        target_raw_path = target_feature_dir / f"BEHAV3D_{target_type}_combined_track_features.csv"
         target_tracks_path = target_feature_dir / f"BEHAV3D_{target_type}_combined_track_features_filtered.csv"
-        
-        if not target_tracks_path.exists():
-            target_tracks_path = target_feature_dir / f"BEHAV3D_{target_type}_combined_track_features.csv"
-        
+
+        if target_tracks_path.exists():
+            _check_not_stale(target_tracks_path, target_raw_path, derived_label="Filtering", upstream_label="Feature Extraction")
+        else:
+            target_tracks_path = target_raw_path
+
         if target_tracks_path.exists():
             print(f"{get_current_time()} - Loading {target_type} tracks from {target_tracks_path}")
             df_target = pd.read_csv(target_tracks_path)
