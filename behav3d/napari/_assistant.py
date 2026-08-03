@@ -17,6 +17,7 @@ All network I/O happens on a QThread worker (``ChatWorker``); the GUI never bloc
 """
 from __future__ import annotations
 
+import time
 from typing import Optional
 
 from qtpy.QtCore import Qt, QThread, QTimer, Signal
@@ -29,7 +30,9 @@ from behav3d.napari._assistant_context import build_context, context_summary_lin
 from behav3d.napari._assistant_actions import (
     build_actions, apply_action, TOOL_SCHEMA, ProposedAction, humanize_parameter_key,
 )
-from behav3d.napari._assistant_client import ChatWorker, load_client_config
+from behav3d.napari._assistant_client import (
+    ChatWorker, HealthWorker, load_client_config,
+)
 
 
 _UNSET = object()  # sentinel for "parameter not yet in config"
@@ -242,12 +245,16 @@ def researcher_facing_text(text: str) -> str:
     return result.replace("`", "")
 
 
-def streaming_transcript_block(request_active: bool, streaming_text: str | None) -> str | None:
+def streaming_transcript_block(
+    request_active: bool,
+    streaming_text: str | None,
+    status_message: str | None = None,
+) -> str | None:
     """Return the visible assistant block while a request is in progress."""
     if streaming_text is None:
         return None
     body = streaming_text or (
-        "*Preparing a response...*" if request_active else ""
+        f"*{status_message or 'Preparing a response...'}*" if request_active else ""
     )
     if not body:
         return None
@@ -344,6 +351,16 @@ class AssistantDock(QWidget):
         self._md_phase: str | None = None
         self._current_intent: str = "free_form"
         self._request_active = False
+        self._request_outcome = "idle"
+        self._status_info: dict = {
+            "level": "checking",
+            "stage": "startup",
+            "message": "Checking the assistant service...",
+        }
+        self._status_started = time.monotonic()
+        self._health_check_active = False
+        self._health_check_background = False
+        self._recovery_probe_provider = False
         # Coalesce streamed-token re-renders. Re-rendering the whole transcript on
         # every token saturates the GUI thread on long answers (the napari window
         # freezes until the stream ends). This single-shot timer batches tokens into
@@ -353,6 +370,13 @@ class AssistantDock(QWidget):
         self._render_timer.setSingleShot(True)
         self._render_timer.setInterval(90)
         self._render_timer.timeout.connect(self._render_streaming)
+        self._status_timer = QTimer(self)
+        self._status_timer.setInterval(1000)
+        self._status_timer.timeout.connect(self._refresh_status_label)
+        self._recovery_timer = QTimer(self)
+        self._recovery_timer.setSingleShot(True)
+        self._recovery_timer.setInterval(15000)
+        self._recovery_timer.timeout.connect(self._run_recovery_check)
 
         # Cohesive dark-theme styling for the whole dock (matches napari surfaces).
         self.setStyleSheet("""
@@ -403,10 +427,22 @@ class AssistantDock(QWidget):
         context_row.addWidget(self.btn_new_chat)
         root.addLayout(context_row)
 
-        self.status_label = QLabel("")
-        self.status_label.setStyleSheet("color:#9aa4aa; font-size:11px; padding:0 2px;")
-        self.status_label.setVisible(False)
-        root.addWidget(self.status_label)
+        status_row = QHBoxLayout()
+        status_row.setSpacing(6)
+        self.status_label = QLabel("Checking the assistant service...")
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("color:#9fc6e0; font-size:11px; padding:0 2px;")
+        status_row.addWidget(self.status_label, stretch=1)
+        self.btn_check_status = QPushButton("Check status")
+        self.btn_check_status.setToolTip(
+            "Test Modal, the BEHAV3D guidance index, and DeepSeek"
+        )
+        self.btn_check_status.setStyleSheet("padding:4px 7px; font-size:10px;")
+        self.btn_check_status.clicked.connect(
+            lambda: self._check_service_status(probe_provider=True)
+        )
+        status_row.addWidget(self.btn_check_status)
+        root.addLayout(status_row)
         self.thinking_progress = QProgressBar()
         self.thinking_progress.setRange(0, 0)
         self.thinking_progress.setTextVisible(False)
@@ -456,6 +492,13 @@ class AssistantDock(QWidget):
         except Exception:
             initial_idx = 0
         self._set_quick_buttons(initial_idx)
+        self._refresh_status_label()
+        QTimer.singleShot(
+            0,
+            lambda: self._check_service_status(
+                probe_provider=False, background=True
+            ),
+        )
 
     # ------------------------------------------------------------------
     # Context bar
@@ -475,6 +518,135 @@ class AssistantDock(QWidget):
             "values suit your data. I can also fill the forms in for you "
             "(you confirm first). Try *“Explain this screen”* to start, or ask "
             "*“Is all ready?”* before running the steps."
+        )
+
+    # ------------------------------------------------------------------
+    # Service diagnostics
+    # ------------------------------------------------------------------
+    def _set_service_status(self, info: dict):
+        self._status_info = dict(info or {})
+        self._status_started = time.monotonic()
+        level = self._status_info.get("level", "working")
+        colors = {
+            "online": "#82c995",
+            "checking": "#9fc6e0",
+            "working": "#9fc6e0",
+            "degraded": "#f2c078",
+            "offline": "#ffb070",
+            "error": "#ff9b9b",
+        }
+        self.status_label.setStyleSheet(
+            f"color:{colors.get(level, '#9aa4aa')}; font-size:11px; padding:0 2px;"
+        )
+        self._refresh_status_label()
+
+        details = []
+        labels = {
+            "modal": "Modal",
+            "deepseek": "DeepSeek",
+            "retrieval": "BEHAV3D guidance",
+            "model": "Model",
+            "chunks": "Guidance chunks",
+            "latency_ms": "Health latency",
+            "provider_latency_ms": "DeepSeek latency",
+            "provider_error": "DeepSeek error",
+            "request_id": "Request ID",
+            "code": "Status code",
+            "endpoint": "Endpoint",
+        }
+        for key, label in labels.items():
+            value = self._status_info.get(key)
+            if value not in (None, ""):
+                suffix = " ms" if key.endswith("latency_ms") else ""
+                details.append(f"{label}: {value}{suffix}")
+        self.status_label.setToolTip("\n".join(details))
+
+        if level == "online":
+            self._recovery_timer.stop()
+            self._recovery_probe_provider = False
+        elif level in {"offline", "error"}:
+            code = self._status_info.get("code")
+            if code != "endpoint_missing":
+                self._recovery_probe_provider = (
+                    self._recovery_probe_provider
+                    or self._status_info.get("component") == "deepseek"
+                    or str(code).startswith(("deepseek", "provider"))
+                )
+                if not self._recovery_timer.isActive():
+                    self._recovery_timer.start()
+
+    def _refresh_status_label(self):
+        info = self._status_info or {}
+        level = info.get("level", "working")
+        message = info.get("message") or "Assistant status unavailable."
+        prefixes = {
+            "online": "Online",
+            "degraded": "Limited",
+            "offline": "Offline",
+            "error": "Issue",
+        }
+        prefix = prefixes.get(level)
+        text = f"{prefix} · {message}" if prefix else message
+        if self._request_active and level in {"checking", "working", "degraded"}:
+            elapsed = max(0, int(time.monotonic() - self._status_started))
+            text = f"{text} ({elapsed}s)"
+        self.status_label.setText(text)
+
+    def _check_service_status(
+        self,
+        *,
+        probe_provider: bool = True,
+        background: bool = False,
+    ):
+        if self._health_check_active:
+            return
+        self._health_check_active = True
+        self._health_check_background = bool(background)
+        self.btn_check_status.setEnabled(False)
+        self.btn_check_status.setText("Checking...")
+        if not background or self._status_info.get("level") in {"offline", "error"}:
+            self._set_service_status({
+                "level": "checking",
+                "stage": "health",
+                "component": "service",
+                "message": (
+                    "Checking Modal, BEHAV3D guidance, and DeepSeek..."
+                    if probe_provider else
+                    "Checking Modal and BEHAV3D guidance..."
+                ),
+            })
+
+        worker = HealthWorker(probe_provider=probe_provider)
+        thread = QThread()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.result.connect(self._on_health_result)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(
+            lambda: self._on_health_finished(thread, worker)
+        )
+        self._threads.append((thread, worker))
+        thread.start()
+
+    def _on_health_result(self, info: dict):
+        if self._request_active and self._health_check_background:
+            return
+        self._set_service_status(info)
+
+    def _on_health_finished(self, thread, worker):
+        self._health_check_active = False
+        self._health_check_background = False
+        self.btn_check_status.setEnabled(True)
+        self.btn_check_status.setText("Check status")
+        self._cleanup_thread(thread, worker)
+
+    def _run_recovery_check(self):
+        if self._health_check_active:
+            self._recovery_timer.start()
+            return
+        self._check_service_status(
+            probe_provider=self._recovery_probe_provider,
+            background=True,
         )
 
     def _reset_conversation(self):
@@ -521,7 +693,9 @@ class AssistantDock(QWidget):
         self._render_timer.stop()
         blocks = list(self._md_log)
         streaming = streaming_transcript_block(
-            self._request_active, self._streaming_text
+            self._request_active,
+            self._streaming_text,
+            (self._status_info or {}).get("message"),
         )
         if streaming:
             blocks.append(streaming)
@@ -648,6 +822,7 @@ class AssistantDock(QWidget):
         # Keep only the latest 12 user/assistant exchanges. Session facts and live
         # values are carried separately in structured context.
         self._history = self._history[-24:]
+        self._request_outcome = "pending"
         self._set_busy(True)
         self._streaming_text = ""        # opens a live "Assistant:" block
         self._render()
@@ -668,6 +843,7 @@ class AssistantDock(QWidget):
         thread.started.connect(worker.run)
         worker.token.connect(self._on_token)
         worker.tool_calls.connect(self._on_tool_calls)
+        worker.status.connect(self._on_worker_status)
         worker.degraded.connect(self._on_degraded)
         worker.error.connect(self._on_error)
         worker.finished.connect(thread.quit)
@@ -680,9 +856,19 @@ class AssistantDock(QWidget):
         self._request_active = bool(busy)
         self.btn_send.setEnabled(not busy)
         self.btn_new_chat.setEnabled(not busy)
-        self.status_label.setText("Assistant is thinking..." if busy else "")
-        self.status_label.setVisible(bool(busy))
         self.thinking_progress.setVisible(bool(busy))
+        if busy:
+            self._recovery_timer.stop()
+            self._set_service_status({
+                "level": "working",
+                "stage": "connecting",
+                "component": "modal",
+                "message": "Connecting to Modal...",
+            })
+            self._status_timer.start()
+        else:
+            self._status_timer.stop()
+            self._refresh_status_label()
         # Leave the input box editable while a turn is in flight so the user can
         # type their next answer without waiting for the stream to finish.
         for i in range(self._quick_layout.count()):
@@ -697,6 +883,14 @@ class AssistantDock(QWidget):
     # ------------------------------------------------------------------
     # Worker signal handlers
     # ------------------------------------------------------------------
+    def _on_worker_status(self, info: dict):
+        level = (info or {}).get("level")
+        if level in {"offline", "error"}:
+            self._request_outcome = level
+        self._set_service_status(info)
+        if self._request_active and not self._streaming_text:
+            self._render(style=False)
+
     def _on_token(self, chunk: str):
         if self._streaming_text is None:
             self._streaming_text = ""
@@ -707,13 +901,20 @@ class AssistantDock(QWidget):
         self._schedule_render()
 
     def _on_degraded(self, full_text: str):
+        self._request_outcome = "offline"
         self._streaming_text = researcher_facing_text(full_text)
         self._render()
 
     def _on_error(self, message: str):
+        self._request_outcome = "error"
         # close any open streaming block, then show the error
         self._finalize_streaming()
-        self._append_md(message)
+        request_id = (self._status_info or {}).get("request_id")
+        support_ref = f"\n\nRequest ID: `{request_id}`" if request_id else ""
+        self._append_md(
+            f"**Request failed**\n\n{message}{support_ref}\n\n"
+            "The assistant will keep checking for recovery automatically."
+        )
         # Defensive: ensure the dock never stays stuck "thinking" if signal
         # ordering ever changes (worker.finished still clears busy too).
         self._set_busy(False)
@@ -950,6 +1151,15 @@ class AssistantDock(QWidget):
         self._finalize_streaming()
         self._render()
         self._set_busy(False)
+        if self._request_outcome not in {"offline", "error"}:
+            self._request_outcome = "complete"
+            self._set_service_status({
+                "level": "online",
+                "stage": "complete",
+                "component": "service",
+                "message": "Response completed.",
+                "request_id": (self._status_info or {}).get("request_id"),
+            })
         if had_text:
             self._append_log()
 
