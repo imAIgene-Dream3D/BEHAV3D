@@ -31,6 +31,25 @@ from scipy.ndimage import binary_dilation, binary_erosion
 from sklearn.preprocessing import MinMaxScaler
 
 
+def resolve_organoid_seg_path(sample_metadata, org_type, img_outdir, sample_name):
+    """Return the tracked-segmentation zarr path for a sample.
+
+    Prefers the metadata's ``{prefix}_{org_type}_tracks_image_path``
+    column (prefix ``or``/``im``/``ot``) so combined-experiment output
+    dirs, which retain each sample's original absolute paths but have no
+    ``images/`` folder of their own, still resolve correctly. Falls back
+    to the constructed path under ``img_outdir``.
+    """
+    if sample_metadata is not None and not sample_metadata.empty:
+        for prefix in ("or", "im", "ot"):
+            col = f"{prefix}_{org_type}_tracks_image_path"
+            if col in sample_metadata.columns:
+                seg_path_val = sample_metadata[col].values[0]
+                if pd.notna(seg_path_val) and str(seg_path_val).strip():
+                    return Path(seg_path_val)
+    return Path(img_outdir, f"{sample_name}_{org_type}_tracked.zarr")
+
+
 def run_organoid_analysis(
     dead_perc_threshold=None,
     config=None,
@@ -299,7 +318,7 @@ def run_organoid_analysis(
             if pd.notna(raw_path_val) and str(raw_path_val).strip():
                 raw_img_path = Path(raw_path_val)
 
-        organoid_seg_path = Path(img_outdir, f"{sample_name}_{org_type}_tracked.zarr")
+        organoid_seg_path = resolve_organoid_seg_path(sample_metadata, org_type, img_outdir, sample_name)
 
         # dead_mask_path: prefer metadata, fall back to constructed path
         dead_mask_path = None
