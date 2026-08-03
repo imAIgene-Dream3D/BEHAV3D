@@ -266,13 +266,20 @@ def _welch_diff_rows(class_order, vals_a_panel, vals_b_panel):
             t_stat, p_value = stats.ttest_ind(vals_b, vals_a, equal_var=False, nan_policy="omit")
             t_stat = float(t_stat)
             p_value = float(p_value)
-            # Same quantity Welch's t-test divides by (t = diff / se_diff) - shown as the
-            # error bar so a bar whose error crosses zero visually agrees with "n.s.".
+            # Same quantity Welch's t-test divides by (t = diff / se_diff).
             var_a = float(np.var(vals_a, ddof=1))
             var_b = float(np.var(vals_b, ddof=1))
             se_diff = float(np.sqrt(var_a / len(vals_a) + var_b / len(vals_b)))
+            # Welch-Satterthwaite df (same df scipy uses internally for p_value), used to turn
+            # se_diff into a 95% CI margin - unlike a flat 1*se_diff, this has a fixed
+            # relationship to the significance stars: if it reaches past zero when mirrored
+            # inward around diff, the result is exactly "n.s." at alpha=0.05.
+            df = (var_a / len(vals_a) + var_b / len(vals_b)) ** 2 / (
+                (var_a / len(vals_a)) ** 2 / (len(vals_a) - 1) + (var_b / len(vals_b)) ** 2 / (len(vals_b) - 1)
+            )
+            ci95_diff = float(stats.t.ppf(0.975, df) * se_diff)
         else:
-            t_stat, p_value, se_diff = float("nan"), float("nan"), float("nan")
+            t_stat, p_value, se_diff, ci95_diff = float("nan"), float("nan"), float("nan"), float("nan")
         rows.append({
             "class": class_name,
             "mean_a": mean_a,
@@ -281,6 +288,7 @@ def _welch_diff_rows(class_order, vals_a_panel, vals_b_panel):
             "t_stat": t_stat,
             "p_value": p_value,
             "se_diff": se_diff,
+            "ci95_diff": ci95_diff,
             "stars": welch_ttest_stars(p_value),
             "n_a": int(len(vals_a)),
             "n_b": int(len(vals_b)),
@@ -365,10 +373,10 @@ def draw_diff_barh(
     label_fontsize=8,
 ):
     """One horizontal bar per class showing signed proportion difference (diff_df['diff'] in
-    fractional units, plotted as percent), with a one-sided error bar (standard error of the
-    difference, extending only outward from zero) and a significance star past the error-bar cap.
-    class_order[0] is drawn at the top (matches typical reference-figure convention: first cluster
-    on top)."""
+    fractional units, plotted as percent), with a one-sided whisker (95% CI margin of the
+    difference, extending only outward from zero, cap drawn only at the outer end - not at
+    the bar tip) and a significance star past the whisker cap. class_order[0] is drawn at the
+    top (matches typical reference-figure convention: first cluster on top)."""
     class_order = [str(c) for c in list(class_order)]
     by_class = diff_df.set_index("class")
     rows = list(reversed(class_order))
@@ -379,8 +387,8 @@ def draw_diff_barh(
         if class_name not in by_class.index:
             continue
         diff_pct = float(by_class.loc[class_name, "diff"]) * 100.0
-        se_pct = float(by_class.loc[class_name, "se_diff"]) * 100.0 if np.isfinite(by_class.loc[class_name, "se_diff"]) else 0.0
-        max_abs = max(max_abs, abs(diff_pct) + se_pct)
+        ci_pct = float(by_class.loc[class_name, "ci95_diff"]) * 100.0 if np.isfinite(by_class.loc[class_name, "ci95_diff"]) else 0.0
+        max_abs = max(max_abs, abs(diff_pct) + ci_pct)
     xmax = xlim if xlim is not None else max(max_abs * 1.35, 5.0)
 
     for y, class_name in zip(y_positions, rows):
@@ -388,20 +396,27 @@ def draw_diff_barh(
             continue
         row = by_class.loc[class_name]
         diff_pct = float(row["diff"]) * 100.0 if np.isfinite(row["diff"]) else 0.0
-        se_pct = float(row["se_diff"]) * 100.0 if np.isfinite(row.get("se_diff", float("nan"))) else 0.0
+        ci_pct = float(row["ci95_diff"]) * 100.0 if np.isfinite(row.get("ci95_diff", float("nan"))) else 0.0
         color = colors.get(class_name, "#808080")
         ax.barh([y], [diff_pct], height=bar_height_frac, color=color, edgecolor="none", linewidth=0.0)
-        if se_pct > 0:
+        if ci_pct > 0:
             # One-sided: only extend further away from zero, not back toward it, so the
-            # error bar doesn't double up on top of the bar / neighboring rows.
-            xerr = [[0.0], [se_pct]] if diff_pct >= 0 else [[se_pct], [0.0]]
+            # whisker doesn't double up on top of the bar / neighboring rows. Cap is drawn
+            # only at the outer endpoint (not at the bar tip) via a separate marker, since
+            # ax.errorbar's capsize would otherwise draw a redundant cap at both ends.
+            outer_x = diff_pct + ci_pct if diff_pct >= 0 else diff_pct - ci_pct
+            xerr = [[0.0], [ci_pct]] if diff_pct >= 0 else [[ci_pct], [0.0]]
             ax.errorbar(
                 [diff_pct], [y], xerr=xerr, fmt="none", ecolor="black",
-                elinewidth=1.0, capsize=3, capthick=1.0, zorder=3,
+                elinewidth=1.0, capsize=0, zorder=3,
+            )
+            ax.plot(
+                [outer_x], [y], marker="|", markersize=6, markeredgewidth=1.0,
+                color="black", zorder=3,
             )
         stars = str(row.get("stars", ""))
         if stars:
-            edge = diff_pct + se_pct if diff_pct >= 0 else diff_pct - se_pct
+            edge = diff_pct + ci_pct if diff_pct >= 0 else diff_pct - ci_pct
             tip = edge + (xmax * 0.03 if diff_pct >= 0 else -xmax * 0.03)
             ha = "left" if diff_pct >= 0 else "right"
             ax.text(tip, y, stars, ha=ha, va="center", fontsize=star_fontsize)
@@ -424,14 +439,15 @@ def _diff_df_has_data(diff_df):
 
 
 def _diff_plus_se_max(diff_df):
-    """Max of |diff| + se_diff (percent) across a diff_df's rows, treating a non-finite se_diff
-    as 0 - matches the one-sided error bar drawn by `draw_diff_barh` so it's never clipped."""
+    """Max of |diff| + ci95_diff (percent) across a diff_df's rows, treating a non-finite
+    ci95_diff as 0 - matches the one-sided whisker drawn by `draw_diff_barh` so it's never
+    clipped."""
     diff_pct = diff_df["diff"].to_numpy(dtype=float) * 100.0
-    se_pct = np.nan_to_num(diff_df["se_diff"].to_numpy(dtype=float), nan=0.0) * 100.0
+    ci_pct = np.nan_to_num(diff_df["ci95_diff"].to_numpy(dtype=float), nan=0.0) * 100.0
     finite = np.isfinite(diff_pct)
     if not finite.any():
         return 0.0
-    return float(np.nanmax(np.abs(diff_pct[finite]) + se_pct[finite]))
+    return float(np.nanmax(np.abs(diff_pct[finite]) + ci_pct[finite]))
 
 
 def _panel_n_label(diff_df):
