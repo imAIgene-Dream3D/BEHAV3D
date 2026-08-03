@@ -372,8 +372,8 @@ shows the current stage and elapsed time instead of a generic loading state:
 |---|---|
 | `Connecting to Modal` | The client is opening the HTTP connection; Modal has not replied yet. |
 | `Checking BEHAV3D guidance` | Modal is online and the server is retrieving local documentation. |
-| `Waiting for DeepSeek` | Modal and retrieval are complete; the external model has not started returning data. |
-| `Receiving the response` | DeepSeek is streaming text or proposed actions. |
+| `Waiting for response` | The service is ready, but the response has not started returning yet. |
+| `Receiving response` | Text or proposed actions are streaming to the application. |
 | `Retrying automatically` | A transient failure occurred before any output; one safe retry is in progress. |
 | `Offline` / `Issue` | The tooltip and transcript identify Modal, DeepSeek, configuration, or the response stream as the failing component. |
 

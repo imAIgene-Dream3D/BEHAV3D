@@ -1135,8 +1135,8 @@ def test_chat_transcript_shows_waiting_block_and_tracks_role_colors():
 
 def test_chat_transcript_waiting_block_shows_current_service_stage():
     assert streaming_transcript_block(
-        True, "", "Waiting for DeepSeek..."
-    ) == "**BEHAV3D Assistant**\n\n*Waiting for DeepSeek...*"
+        True, "", "Waiting for response..."
+    ) == "**BEHAV3D Assistant**\n\n*Waiting for response...*"
 
 
 def test_request_failures_identify_modal_and_deepseek_separately():
