@@ -29,13 +29,12 @@ from qtpy.QtWidgets import (
     QFormLayout,
     QLabel,
     QPushButton,
-    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
 from behav3d.core.qt_help import make_help_row
-from behav3d.napari._analysis import CollapsibleSection, _detect_cell_types
+from behav3d.napari._analysis import _detect_cell_types
 from behav3d.napari._single_cell import _bp_add_raw_channels
 
 _FEATURE_BP_EXCLUDED_COLUMNS = {
@@ -113,24 +112,6 @@ class FeatureBackprojectionTab(QWidget):
         ))
 
         outer.addLayout(form)
-
-        adv = CollapsibleSection("Advanced settings", expanded=False)
-        adv_form = QFormLayout()
-        adv_form.setContentsMargins(0, 0, 0, 0)
-        adv_form.setSpacing(4)
-        self.spin_opacity = QSpinBox()
-        self.spin_opacity.setRange(10, 100)
-        self.spin_opacity.setValue(90)
-        self.spin_opacity.setSuffix(" %")
-        adv_form.addRow("Overlay opacity:", make_help_row(
-            self.spin_opacity, "Overlay opacity",
-            "Opacity of the backprojected feature layer. Takes effect on "
-            "the next 'Show Preview' / frame refresh.",
-        ))
-        adv_host = QWidget()
-        adv_host.setLayout(adv_form)
-        adv.addWidget(adv_host)
-        outer.addWidget(adv)
 
         self.btn_show = QPushButton("▶ Show Preview")
         self.btn_show.setEnabled(False)
@@ -472,18 +453,19 @@ class FeatureBackprojectionTab(QWidget):
         else:
             vmin, vmax = 0.0, 1.0
 
-        opacity = self.spin_opacity.value() / 100.0
         name = self._feature_layer_name
         try:
+            # Layer already exists: update only the data. Deliberately leave
+            # contrast_limits/opacity untouched so manual adjustments made in
+            # napari's own layer controls survive timepoint scrubbing instead
+            # of being reset by every recompute.
             layer = self.viewer.layers[name]
             layer.data = mapped
-            layer.contrast_limits = (vmin, vmax)
-            layer.opacity = opacity
             layer.refresh()
         except (KeyError, ValueError):
             self.viewer.add_image(
                 mapped, name=name, colormap="inferno",
-                contrast_limits=(vmin, vmax), opacity=opacity, blending="translucent",
+                contrast_limits=(vmin, vmax), opacity=0.5, blending="translucent",
             )
 
         self.status_label.setStyleSheet("color:#6a6;font-size:11px;")
