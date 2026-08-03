@@ -1086,7 +1086,7 @@ class StateClassificationHMMPanel(BaseStateClassificationPanel):
         )
         self.hmm_start_offset = widgets.BoundedIntText(
             description="Start offset",
-            value=0,
+            value=1,
             min=0,
             max=100000,
             style={"description_width": "initial"},

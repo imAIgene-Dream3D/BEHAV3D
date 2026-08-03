@@ -217,7 +217,7 @@ def _validate_sample_time_coverage_against_tracked(
     diag["coverage_ok"] = bool(coverage_ok)
     diag["max_missing_leading_frames_allowed"] = int(allowed_missing)
 
-    if bool(enforce) and (not coverage_ok):
+    if not coverage_ok:
         msg = (
             "Classifier rows for early frames are missing; regenerate/apply with correct window policy or clear stale "
             "artifacts. "
@@ -226,7 +226,10 @@ def _validate_sample_time_coverage_against_tracked(
             f"missing_leading_frames={diag['missing_leading_frames'][:20]}, "
             f"policy_hint={diag['policy_hint']}"
         )
-        raise ValueError(msg)
+        if bool(enforce):
+            raise ValueError(msg)
+        else:
+            warnings.warn(msg, RuntimeWarning)
 
     return diag
 
@@ -241,7 +244,7 @@ def backproject_single_sample_behavioral_states(
     code_map,
     raw_image_path=None,
     background_value=0,
-    enforce_time_coverage=True,
+    enforce_time_coverage=False,
     coverage_check_max_missing_leading_frames=0,
     sample_name=None,
     policy_hint=None,
@@ -540,7 +543,7 @@ def export_behavioral_state_backprojection_zarrs(
     track_col="TrackID",
     time_col="position_t",
     background_value=0,
-    enforce_time_coverage=True,
+    enforce_time_coverage=False,
     state_colors=None,
     state_order=None,
     raise_on_error=True,
@@ -820,7 +823,7 @@ def _ensure_behavioral_state_backprojection_for_sample(
     time_col="position_t",
     sample_col="sample_name",
     background_value=0,
-    enforce_time_coverage=True,
+    enforce_time_coverage=False,
     refresh_if_stale=True,
     verbose=True,
 ):
@@ -1216,7 +1219,7 @@ def show_behavioral_state_backprojection(
                     time_col="position_t",
                     sample_col="sample_name",
                     background_value=0,
-                    enforce_time_coverage=True,
+                    enforce_time_coverage=False,
                     refresh_if_stale=bool(refresh_if_stale),
                     verbose=verbose,
                 )
@@ -1237,7 +1240,7 @@ def show_behavioral_state_backprojection(
                 time_col="position_t",
                 sample_col="sample_name",
                 background_value=0,
-                enforce_time_coverage=True,
+                enforce_time_coverage=False,
                 refresh_if_stale=bool(refresh_if_stale),
                 verbose=verbose,
             )

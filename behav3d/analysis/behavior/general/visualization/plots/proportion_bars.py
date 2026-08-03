@@ -270,14 +270,19 @@ def _welch_diff_rows(class_order, vals_a_panel, vals_b_panel):
             var_a = float(np.var(vals_a, ddof=1))
             var_b = float(np.var(vals_b, ddof=1))
             se_diff = float(np.sqrt(var_a / len(vals_a) + var_b / len(vals_b)))
-            # Welch-Satterthwaite df (same df scipy uses internally for p_value), used to turn
-            # se_diff into a 95% CI margin - unlike a flat 1*se_diff, this has a fixed
-            # relationship to the significance stars: if it reaches past zero when mirrored
-            # inward around diff, the result is exactly "n.s." at alpha=0.05.
-            df = (var_a / len(vals_a) + var_b / len(vals_b)) ** 2 / (
-                (var_a / len(vals_a)) ** 2 / (len(vals_a) - 1) + (var_b / len(vals_b)) ** 2 / (len(vals_b) - 1)
-            )
-            ci95_diff = float(stats.t.ppf(0.975, df) * se_diff)
+            if var_a > 0.0 or var_b > 0.0:
+                # Welch-Satterthwaite df (same df scipy uses internally for p_value), used to turn
+                # se_diff into a 95% CI margin - unlike a flat 1*se_diff, this has a fixed
+                # relationship to the significance stars: if it reaches past zero when mirrored
+                # inward around diff, the result is exactly "n.s." at alpha=0.05.
+                df = (var_a / len(vals_a) + var_b / len(vals_b)) ** 2 / (
+                    (var_a / len(vals_a)) ** 2 / (len(vals_a) - 1) + (var_b / len(vals_b)) ** 2 / (len(vals_b) - 1)
+                )
+                ci95_diff = float(stats.t.ppf(0.975, df) * se_diff)
+            else:
+                # Both groups have zero variance (e.g. a class that never occurs on either side) -
+                # se_diff is exactly 0.0 too, so the CI margin is legitimately 0.0, not undefined.
+                ci95_diff = 0.0
         else:
             t_stat, p_value, se_diff, ci95_diff = float("nan"), float("nan"), float("nan"), float("nan")
         rows.append({

@@ -33,36 +33,58 @@ A top dropdown lets you pick the segmentation method. The body of the tab swaps 
 
 ## How to pick a method
 
-Method choice depends mostly on **what your objects look like**, **whether you have a GPU**, and **whether someone has already trained a model for your sample type**:
 
 ```{mermaid}
 flowchart TD
-    A["Your situation"] --> D["Already segmented elsewhere<br/>(Imaris, Ilastik, script, …)"]
-    D --> J["Import segmentation"]
+    A["Your situation"] --> Q1{"Already segmented<br/>elsewhere outside <br/>BEHAV3D-Explorer? 
+    (Imaris,Ilastik, custom script, …)"}
+    Q1 -- "Yes" --> Import["Import segmentation"]
+    Q1 -- "No" --> Q2{"Trained Cellpose model<br/>for this data?"}
 
-    A --> B["Roundish, well-separated<br/>(organoids, T cells, …)"]
-    A --> C["Subtle texture or weak boundaries"]
-    A --> E["Other shapes<br/>(elongated, irregular, clustered, …)"]
+    Q2 -- "Yes" --> Cellpose["Cellpose v3<br/>(load the model)"]
+    Q2 -- "No" --> QG{"Do you have a GPU?"}
 
-    B --> G{"Strong GPU / HPC and<br/>accuracy is the priority?"}
-    G -- "Yes, zero-shot" --> SAM["Cellpose-SAM<br/>(no training, no labels)"]
-    G -- "Pretrained model fits" --> Cellpose["Cellpose v3<br/>(load a model)"]
-    G -- "Neither" --> L
+    QG -- "No" --> PCrf
+    QG -- "Yes" --> Q3{"Channels clean?<br/>(one cell type per channel,<br/>no bleed-through)"}
 
-    C --> L
-    E --> L
+    Q3 -- "No" --> Q9
+    Q3 -- "Yes" --> Q5{"Can you tolerate a long<br/>runtime (accuracy over speed)?"}
 
-    L{"Can you paint a few<br/>foreground/background pixels?"}
-    L -- "Yes" --> PC["Train a pixel classifier<br/>(all need painted labels):<br/>APOC · ConvPaint · Pixel Classifier<br/>— pick by GPU; ConvPaint often best<br/>for subtle texture"]
-    L -- "No" --> N["Import existing masks, or<br/>Cellpose training notebook"]
+    Q5 -- "No" --> Q9
+    Q5 -- "Yes" --> Q6{"Cells a very abnormal shape?<br/>(long, thin protrusions, …)"}
+
+    Q6 -- "Yes" --> Q9
+    Q6 -- "No" --> SAM["Cellpose-SAM<br/>(zero-shot)"]
+
+    subgraph PC ["Pixel classifier tree (User-provided sparse labeling)"]
+        PCrf["Pixel Classifier<br/>(Random Forest, CPU)"]
+        Q9{"Good signal/noise, low-res,<br/>simple blob-like objects?"}
+        Q9 -- "Yes" --> APOC["APOC"]
+        Q9 -- "No" --> ConvPaint["ConvPaint"]
+        APOC --> Q10{"Good segmenation and good separation of touching<br/>objects after segmentation?"}
+        Q10 -- "Yes" --> Done["Finished"]
+        Q10 -- "No" --> ConvPaint
+    end
+
+    classDef method fill:#d7f0e4,stroke:#1b7a5c,stroke-width:2px,color:#0b3d2e;
+    class Import,Cellpose,SAM,PCrf,APOC,ConvPaint method;
 ```
 
 ```{note}
-The **Cellpose** methods appear on the *roundish, well-separated* branch because their models target roughly convex cells. **Cellpose-SAM** is zero-shot (works out of the box); classic **Cellpose v3** needs a pretrained or retrained model.
+**Cellpose-SAM vs. Cellpose v3.** **Cellpose-SAM** is zero-shot (works out of the box, no training or annotation, but slowest/most compute-heavy). Classic **Cellpose v3** needs a pretrained or retrained model — take that path only if one already exists for your sample type.
 ```
 
 Practical rules:
 
+- **Import segmentation** is *not* a way to create segmentations, it validates existing masks (.tiff/.tif) into BEHAV3D EXPLORER's canonical zarr layout so the rest of the pipeline can consume them. Use it first if this covers your case — it skips everything else.
+- **Cellpose (v3)** is the fastest remaining path when the lab already has a pretrained model for your sample type (see [Cellpose page](cellpose) and [Zenodo](https://zenodo.org/records/18872978)), or when you can retrain one on your own masks. There is no zero-shot mode — if you have neither a pretrained nor a retrainable model, it isn't a usable option.
+- **Cellpose-SAM (v4, zero-shot)** needs **all four** to hold: clean channels (no bleed-through, one cell type per channel), a GPU, tolerance for a long runtime, and roughly convex cells (no long, thin protrusions). If any one fails, fall back to the pixel-classifier tree. In exchange it needs **no training and no annotation** — at the cost of being the slowest, most compute-heavy method (3-D mode measured at roughly 10–15× slower than 2D+stitch — see [Cellpose-SAM page](cellpose_sam)). It also has no labeling step, so unlike the pixel classifiers below — which can be explicitly taught to ignore channel bleed-through by painting it as background (see [Drawing technique](#drawing-technique)) — Cellpose-SAM has no way to learn around bleed-through between channels; it works best on cleanly separated channels.
+- **Cellpose** and **Cellpose-SAM** perform **true instance segmentation in one shot** — they directly output separated cell labels, no pixel labeling and no watershed post-processing. The three pixel classifiers (APOC, ConvPaint, Pixel Classifier) instead output foreground/background or per-class probability, which BEHAV3D EXPLORER turns into instance labels by watershed post-processing.
+- Otherwise, train a **pixel classifier** — pick by GPU and image quality:
+  - **APOC** needs a GPU with working OpenCL drivers, and works best with good signal-to-noise and simple, blob-like objects. You paint a few foreground/background pixels per cell type (same labeling step as Pixel Classifier; ConvPaint paints all classes on one layer instead — see [Labeling foreground and background](#labeling-foreground-and-background)). Training is quick; inference is fast on a modern GPU.
+  - **ConvPaint** uses pretrained deep features (VGG-16 or DINOv2) instead of classical filters — reach for it when APOC's signal-to-noise/shape assumptions don't hold, or when APOC's labeling doesn't separate touching objects cleanly. Requires a PyTorch-compatible device (CUDA GPU strongly preferred; the widget exposes a CPU fallback).
+  - **Pixel Classifier (Random Forest)** is the CPU-only fallback, same family of classifier as APOC, but features are computed with `scikit-image` instead of `pyclesperanto`. Use it when no GPU is available.
+  - 
 **Choosing between the three pixel classifiers.** All three are trained the same way (paint a few foreground/background pixels — see [Labeling foreground and background](#labeling-foreground-and-background)) and differ mainly in *where their features come from* and *what hardware they need*:
 
 | Method | Hardware | Features | Speed / cost | Choose when |
@@ -71,17 +93,11 @@ Practical rules:
 | **ConvPaint** | CUDA GPU recommended | Deep features from a pretrained network (VGG-16 or DINOv2) | Slower feature extraction, more GPU memory | You have compute to spare **and** the cell type has features that are difficult to describe with classical filters — see below |
 | **Pixel Classifier (Random Forest)** | CPU only | Same classical filter bank as APOC, computed with `scikit-image` instead of on the GPU | Slowest of the three, but needs no GPU | No GPU is available at all |
 
-The cutoff between APOC and ConvPaint is **feature complexity vs. speed/memory**. 
+The cutoff between APOC and ConvPaint is **feature complexity vs. speed/memory**.
 
-**APOC**'s classical filters each describe one simple visual property at one scale — a Gaussian blur, an edge (DoG/SoG), or a blob (LoG). If a cell type is reasonably describable as "a bright/dark blob" or "an edge at roughly this scale," APOC will find it, fast and cheap. 
+**APOC**'s classical filters each describe one simple visual property at one scale — a Gaussian blur, an edge (DoG/SoG), or a blob (LoG). If a cell type is reasonably describable as "a bright/dark blob" or "an edge at roughly this scale," APOC will find it, fast and cheap.
 
 **ConvPaint** instead runs the image through a pretrained CNN or transformer, whose features encode learned, higher-order visual patterns on e.g. texture, local context and shape. That makes ConvPaint the better tool when there are subtle texture differences, low-contrast or ambiguous boundaries, or morphology that doesn't correspond to a simple blob/edge description Slower iteration, more GPU memory, and a feature space that's harder to inspect and reduce than APOC's filter-importance table — so try APOC first and only reach for ConvPaint once APOC's shows difficulty in segmentation or spliting of objects.
-
-**Cellpose** and **Cellpose-SAM** perform **true instance segmentation in one shot** — they directly output separated cell labels for roughly-spherical / convex cells, no pixel labeling and no watershed post-processing. The three pixel classifiers (APOC, ConvPaint, Pixel Classifier) instead output foreground/background or per-class probability, which BEHAV3D EXPLORER turns into instance labels by watershed post-processing.
-- **Cellpose (v3)** only works if a pretrained model already exists for your sample type, or you retrain one on your own masks — there is no zero-shot mode (see [Cellpose page](cellpose) and [Zenodo](https://zenodo.org/records/18872978)); if you have neither, it isn't a usable option.
-- **Cellpose-SAM (v4, zero-shot)** needs no training and no annotation and is the most accurate option, but it is also the slowest and most compute-heavy method (3-D mode measured at roughly 10–15× slower than 2D+stitch — see [Cellpose-SAM page](cellpose_sam)) and needs a strong GPU/HPC to be practical. It also has no labeling step, so unlike the pixel classifiers — which can be explicitly taught to ignore channel bleed-through by painting it as background (see [Drawing technique](#drawing-technique)) — Cellpose-SAM has no way to learn around bleed-through between channels; it works best on cleanly separated channels.
-
-**Import segmentation** is *not* a way to create segmentations, it validates existing masks (.tiff/ .tif) into BEHAV3D EXPLORER's canonical zarr layout so the rest of the pipeline can consume them.
 
 ## Common structure of every method page
 
