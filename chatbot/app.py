@@ -3749,7 +3749,7 @@ if modal is not None:
                     "level": "working",
                     "stage": "provider",
                     "component": "deepseek",
-                    "message": "Waiting for DeepSeek...",
+                    "message": "Waiting for response...",
                 })
                 provider_started = time.monotonic()
                 response_started = False
@@ -3776,7 +3776,7 @@ if modal is not None:
                                 "level": "working",
                                 "stage": "streaming",
                                 "component": "deepseek",
-                                "message": "Receiving the response from DeepSeek...",
+                                "message": "Receiving response...",
                                 "provider_latency_ms": round(
                                     (time.monotonic() - provider_started) * 1000
                                 ),
