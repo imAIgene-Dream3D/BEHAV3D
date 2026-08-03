@@ -2152,8 +2152,8 @@ def _load_active_killing_data(
         # writes ``targeted_track_id`` only on timepoints where
         # ``is_active_killing=True`` (it is the specific organoid whose
         # death signal increase triggered the classification; see
-        # behav3d/features/advanced_timepoint_features.py line 437). So
-        # each killing event is attributable to exactly one target.
+        # behav3d/features/advanced_timepoint_features.py line 343). So
+        # each killing timepoint is attributable to exactly one target.
         per_target_kill = None
         if killing_path is not None and killing_path.exists():
             df_tp = pd.read_csv(killing_path)
