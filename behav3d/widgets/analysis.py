@@ -1324,18 +1324,30 @@ class ActiveKillingPanel:
                     )
                 
                 df_killing = None
+                stats = {}
+                stale_filtered = set()
                 for t in selected_targets:
                     print(f"--- Running independent analysis for target: {t} ---")
-                    df_killing, _, _ = run_for_targets([t], t)
+                    df_killing, _, stats = run_for_targets([t], t)
+                    stale_filtered.update(stats.get("filtering_needs_rerun_for") or [])
 
                 if len(selected_targets) > 1:
                     print("--- Running combined analysis for all selected targets ---")
                     combined_subfolder = "combined"
-                    df_killing, _, _ = run_for_targets(selected_targets, combined_subfolder)
+                    df_killing, _, stats = run_for_targets(selected_targets, combined_subfolder)
+                    stale_filtered.update(stats.get("filtering_needs_rerun_for") or [])
                 else:
                     combined_subfolder = selected_targets[0]
-                
+
                 print("✅ Active Killing Analysis complete! Loading gallery...")
+                if stale_filtered:
+                    display(widgets.HTML(
+                        '<div style="color:#8a6d00;background:#fff8e1;border:1px solid #ffe082;'
+                        'padding:6px 10px;border-radius:4px;margin:4px 0;">'
+                        f'⚠️ Re-run <b>Filtering</b> for <b>{", ".join(sorted(stale_filtered))}</b> — '
+                        'its filtered CSV was built before this run and doesn\'t include these '
+                        'Active Killing results yet.</div>'
+                    ))
                 # Use the automated loader to ensure enriched columns (coordinates) are present
                 results_dir = Path(self.output_dir, "analysis", immune, "active_killing", combined_subfolder)
                 advanced_path = results_dir / f"BEHAV3D_{immune}_advanced_track_features.csv"

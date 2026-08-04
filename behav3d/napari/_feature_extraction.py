@@ -2521,6 +2521,11 @@ class ActiveKillingPanel(QWidget):
             if md is not None else []
         )
         self._bg = BackgroundOperation(self)
+        # Restore previously-saved settings (if any) from behav3d_parameters.yml
+        # so values survive across napari sessions instead of resetting to
+        # hard-coded defaults every time this panel is (re)built.
+        saved_params = getattr(self.metadata_loader, "behav3d_parameters", None) or {}
+        self._saved_cfg = dict(saved_params.get("active_killing", {}) or {})
         self._init_ui()
 
     # ── UI ──────────────────────────────────────────────────────────────────
@@ -2562,8 +2567,11 @@ class ActiveKillingPanel(QWidget):
         self.target_list.setMaximumHeight(60)
         if self.target_types:
             self.target_list.addItems(self.target_types)
+            saved_targets = self._saved_cfg.get("target_types")
+            saved_targets = set(saved_targets) if saved_targets else None
             for i in range(self.target_list.count()):
-                self.target_list.item(i).setSelected(True)
+                item = self.target_list.item(i)
+                item.setSelected(item.text() in saved_targets if saved_targets else True)
         else:
             self.target_list.addItem("(no targets detected)")
             self.target_list.setEnabled(False)
@@ -2585,7 +2593,7 @@ class ActiveKillingPanel(QWidget):
 
         self.spin_obs_window = QSpinBox()
         self.spin_obs_window.setRange(1, 100)
-        self.spin_obs_window.setValue(5)
+        self.spin_obs_window.setValue(int(self._saved_cfg.get("observation_window", 5)))
         self.spin_obs_window.setMaximumWidth(70)
         params_form.addRow(
             "Observation window (tp):",
@@ -2605,7 +2613,9 @@ class ActiveKillingPanel(QWidget):
         self.death_signal_combo.addItems(
             ["percentage_dead_mask", "mean_dead_dye", "nr_dead_mask_pixels"]
         )
-        self.death_signal_combo.setCurrentText("percentage_dead_mask")
+        self.death_signal_combo.setCurrentText(
+            self._saved_cfg.get("death_signal_column", "percentage_dead_mask")
+        )
         self.death_signal_combo.setMaximumWidth(220)
         self.death_signal_combo.currentTextChanged.connect(lambda _: self._update_abs_hint())
         params_form.addRow(
@@ -2627,7 +2637,7 @@ class ActiveKillingPanel(QWidget):
         self.spin_threshold_mult.setRange(0.1, 20.0)
         self.spin_threshold_mult.setSingleStep(0.1)
         self.spin_threshold_mult.setDecimals(2)
-        self.spin_threshold_mult.setValue(1.5)
+        self.spin_threshold_mult.setValue(float(self._saved_cfg.get("killing_threshold_multiplier", 1.5)))
         self.spin_threshold_mult.setMaximumWidth(90)
         params_form.addRow(
             "Killing threshold multiplier:",
@@ -2694,7 +2704,7 @@ class ActiveKillingPanel(QWidget):
 
         self.spin_min_contact = QSpinBox()
         self.spin_min_contact.setRange(1, 50)
-        self.spin_min_contact.setValue(1)
+        self.spin_min_contact.setValue(int(self._saved_cfg.get("min_contact_duration", 1)))
         self.spin_min_contact.setMaximumWidth(70)
         params_form.addRow(
             "Min contact duration (tp):",
@@ -2787,6 +2797,14 @@ class ActiveKillingPanel(QWidget):
         layout.addLayout(action_row)
         layout.addStretch()
 
+        # Restore the absolute-threshold checkbox/value last, since toggling it
+        # depends on self.spin_abs_threshold / self.spin_threshold_mult / the
+        # death-signal column above already existing.
+        self.check_abs_threshold.setChecked(bool(self._saved_cfg.get("use_absolute_threshold", False)))
+        saved_abs = self._saved_cfg.get("absolute_killing_threshold")
+        if saved_abs is not None:
+            self.spin_abs_threshold.setValue(min(float(saved_abs), self.spin_abs_threshold.maximum()))
+
         self._validate()
         self._update_abs_hint()
 
@@ -2872,6 +2890,7 @@ class ActiveKillingPanel(QWidget):
         self._validate()
         if not self.btn_run.isEnabled():
             return
+        self._persist()
         self._queue_callback()
 
     def _validate(self):
@@ -2925,6 +2944,24 @@ class ActiveKillingPanel(QWidget):
             "target_types": self._get_selected_targets()
         }
 
+    def _persist(self):
+        """Write the current Active Killing settings into behav3d_parameters
+        and save to YAML, so they survive across napari sessions."""
+        params = self.metadata_loader.behav3d_parameters
+        if params is None:
+            return
+        params.setdefault("active_killing", {}).update(self._collect_params())
+        self._saved_cfg = dict(params["active_killing"])
+
+        out_dir = self.metadata_loader.output_dir
+        if out_dir:
+            params_path = Path(out_dir) / "behav3d_parameters.yml"
+            try:
+                with open(params_path, "w") as f:
+                    yaml.safe_dump(params, f, sort_keys=False)
+            except Exception as e:
+                self.log(f"Warning: Could not save Active Killing parameters: {e}")
+
     def refresh_immune_types(self, immune_types: list):
         """Update the dropdown when metadata is reloaded."""
         self.immune_types = list(immune_types)
@@ -2954,6 +2991,8 @@ class ActiveKillingPanel(QWidget):
 
         from behav3d.features.advanced_timepoint_features import run_active_killing_analysis
 
+        # Persist + snapshot widget state before running.
+        self._persist()
         immune = self._get_immune_type()
         targets = self._get_selected_targets()
         params = self._collect_params()
@@ -3010,12 +3049,18 @@ class ActiveKillingPanel(QWidget):
             results_dir = self._active_killing_dir(immune) / subfolder
             n_active = int(stats.get("total_active_killing_timepoints", 0))
             rate = stats.get("overall_killing_rate", 0.0)
+            stale_filtered = stats.get("filtering_needs_rerun_for") or []
             self.log(
                 f"\u2705 Active Killing Analysis complete \u2014 "
                 f"{n_active} active killing timepoints ({rate:.1%} of contact timepoints)."
             )
+            if stale_filtered:
+                self.log(
+                    f"\u26a0\ufe0f Re-run Filtering for {', '.join(stale_filtered)} \u2014 its filtered CSV "
+                    "was built before this run and doesn't include these results yet."
+                )
             self.btn_run.setText("\u25b6  Run Active Killing Analysis")
-            self._offer_open_folder(results_dir)
+            self._offer_open_folder(results_dir, stale_filtered_cell_types=stale_filtered)
 
         def _on_failed(err: str):
             self.log(f"\u274c Active Killing Analysis error: {err}")
@@ -3223,12 +3268,18 @@ class ActiveKillingPanel(QWidget):
             results_dir = self._active_killing_dir(immune) / combined_subfolder
             n_active = int(stats.get("total_active_killing_timepoints", 0))
             rate = stats.get("overall_killing_rate", 0.0)
+            stale_filtered = stats.get("filtering_needs_rerun_for") or []
             self.log(
                 f"✅ Active Killing Analysis complete — "
                 f"{n_active} active killing timepoints ({rate:.1%} of contact timepoints)."
             )
+            if stale_filtered:
+                self.log(
+                    f"⚠️ Re-run Filtering for {', '.join(stale_filtered)} — its filtered CSV "
+                    "was built before this run and doesn't include these results yet."
+                )
             if interactive:
-                self._offer_open_folder(results_dir)
+                self._offer_open_folder(results_dir, stale_filtered_cell_types=stale_filtered)
             fire_extra_callback(extra_callbacks, "on_done", (df_killing, df_summary, stats, combined_subfolder))
         except Exception as e:
             import traceback as _tb
@@ -3243,15 +3294,28 @@ class ActiveKillingPanel(QWidget):
             notify_results_changed(self)
 
     # ── Folder open popup ──────────────────────────────────────────────────────
-    def _offer_open_folder(self, results_dir: Path):
-        """Show a modal dialog offering to open the output folder in the OS file manager."""
+    def _offer_open_folder(self, results_dir: Path, stale_filtered_cell_types=None):
+        """Show a modal dialog offering to open the output folder in the OS file manager.
+
+        Active Killing always reads the unfiltered track features, so any
+        filtered CSV for ``stale_filtered_cell_types`` was built before this
+        run and doesn't include these results yet -- surface that here so
+        the reminder isn't buried in the log.
+        """
         box = QMessageBox(self)
         box.setWindowTitle("Active Killing Analysis Complete")
-        box.setText(
+        text = (
             "\u2705  Active Killing Analysis finished!\n\n"
             f"Outputs saved to:\n{results_dir}\n\n"
-            "Open output folder in file manager?"
         )
+        if stale_filtered_cell_types:
+            text += (
+                "\u26a0\ufe0f Re-run Filtering for "
+                f"{', '.join(sorted(stale_filtered_cell_types))} \u2014 its filtered CSV "
+                "was built before this run and doesn't include these results yet.\n\n"
+            )
+        text += "Open output folder in file manager?"
+        box.setText(text)
         btn_open = box.addButton("Open Folder", QMessageBox.AcceptRole)
         box.addButton("Close", QMessageBox.RejectRole)
         box.exec_()
