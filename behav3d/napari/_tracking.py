@@ -598,13 +598,14 @@ class CellTypeTrackingPanel(QWidget):
         self.combo_method = QComboBox()
         self.combo_method.addItems([
             "LAP (laptrack)", "TrackPy", "Propagation",
+            "Connected-Component Propagation",
             "Reporter Propagation",
             "btrack (Bayesian)", "Import tracking",
         ])
         saved_method = tcfg.get("method", def_method)
         idx_map = {
-            "lap": 0, "trackpy": 1, "propagation": 2, "reporter_propagation": 3,
-            "btrack": 4, "import": 5,
+            "lap": 0, "trackpy": 1, "propagation": 2, "propagation_connected_component": 3,
+            "reporter_propagation": 4, "btrack": 5, "import": 6,
         }
         self.combo_method.setCurrentIndex(idx_map.get(saved_method, 0))
         method_layout.addWidget(QLabel("Method:"))
@@ -620,6 +621,14 @@ class CellTypeTrackingPanel(QWidget):
             "Propagation — no tunable parameters; identifies objects by "
             "spatial overlap/propagation instead of frame-to-frame "
             "linking cost.\n\n"
+            "Connected-Component Propagation — same watershed propagation "
+            "as Propagation, but a track ID can never span more than one "
+            "physically disconnected region. If an object splits into "
+            "disconnected pieces, each piece is re-matched against every "
+            "existing track's previous footprint (not just the one that "
+            "produced it): the best-overlapping track keeps its piece, "
+            "any track that loses out falls back to its next-best piece, "
+            "and pieces nobody claims become new tracks.\n\n"
             "Reporter Propagation — for near-static objects whose "
             "segmentation is unreliable/intermittent over time (flickers "
             "on and off): pools every segment detected at every timepoint, "
@@ -859,7 +868,43 @@ class CellTypeTrackingPanel(QWidget):
 
         self.param_stack.addWidget(prop_page)
 
-        # Page 3 — Reporter Propagation params
+        # Page 3 — Connected-Component Propagation params
+        cc_cfg = tcfg.get("propagation_connected_component", {})
+        cc_page = QWidget()
+        cc_form = QFormLayout(cc_page)
+        cc_form.setContentsMargins(6, 4, 6, 4)
+        cc_form.setSpacing(3)
+        cc_form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+
+        cc_info = QLabel(
+            "Same as Propagation, but a track ID can never span more than "
+            "one disconnected region. Split-off pieces are re-matched "
+            "against every track's previous footprint; unclaimed pieces "
+            "become new tracks."
+        )
+        cc_info.setWordWrap(True)
+        cc_info.setStyleSheet("color: #888; font-size: 10px; padding: 2px 0 6px 0;")
+        cc_form.addRow(cc_info)
+
+        self.cc_min_overlap_fraction = QDoubleSpinBox()
+        self.cc_min_overlap_fraction.setRange(0.0, 1.0)
+        self.cc_min_overlap_fraction.setSingleStep(0.05)
+        self.cc_min_overlap_fraction.setDecimals(2)
+        self.cc_min_overlap_fraction.setValue(float(cc_cfg.get("min_overlap_fraction", 0.0)))
+        self.cc_min_overlap_fraction.setMaximumWidth(90)
+        cc_form.addRow("Min overlap fraction:", make_help_row(
+            self.cc_min_overlap_fraction,
+            "Min Overlap Fraction",
+            "Minimum fraction of a disconnected piece's area that a "
+            "track's previous-frame footprint must fill for that track "
+            "to be allowed to claim it.\n\n"
+            "0 = any shared pixel qualifies (default). Raise this to stop "
+            "a track from claiming a piece it barely touches."
+        ))
+
+        self.param_stack.addWidget(cc_page)
+
+        # Page 4 — Reporter Propagation params
         rp_cfg = tcfg.get("reporter_propagation", {})
         rp_page = QWidget()
         rp_form = QFormLayout(rp_page)
@@ -908,7 +953,7 @@ class CellTypeTrackingPanel(QWidget):
 
         self.param_stack.addWidget(rp_page)
 
-        # Page 4 — btrack (Bayesian tracking)
+        # Page 5 — btrack (Bayesian tracking)
         bt_cfg = tcfg.get("btrack", {})
         btrack_page = QWidget()
         btrack_lay = QVBoxLayout(btrack_page)
@@ -1190,7 +1235,7 @@ class CellTypeTrackingPanel(QWidget):
         btrack_lay.addStretch()
         self.param_stack.addWidget(btrack_page)
 
-        # Page 5 — Import tracking
+        # Page 6 — Import tracking
         import_page = _ImportTrackingPage(
             cell_type=self.cell_type,
             category=self.category,
@@ -1225,9 +1270,9 @@ class CellTypeTrackingPanel(QWidget):
         self.btn_run.clicked.connect(self._on_run_clicked)
         layout.addWidget(self.btn_run)
 
-        # Disable run button for coming-soon methods (only Import at index 5)
+        # Disable run button for coming-soon methods (only Import at index 6)
         def _on_method_idx_changed(idx):
-            is_coming_soon = idx >= 5
+            is_coming_soon = idx >= 6
             self.btn_run.setEnabled(not is_coming_soon)
             if is_coming_soon:
                 self.btn_run.setToolTip("This tracking method is not yet available.")
@@ -1242,9 +1287,10 @@ class CellTypeTrackingPanel(QWidget):
     # Persistence
     # ------------------------------------------------------------------
     def _get_method_key(self):
-        return ["lap", "trackpy", "propagation", "reporter_propagation", "btrack", "import"][
-            self.combo_method.currentIndex()
-        ]
+        return [
+            "lap", "trackpy", "propagation", "propagation_connected_component",
+            "reporter_propagation", "btrack", "import",
+        ][self.combo_method.currentIndex()]
 
     def _bt_browse_config(self):
         """Open file dialog for custom btrack JSON config."""
@@ -1289,6 +1335,9 @@ class CellTypeTrackingPanel(QWidget):
             "propagation": {
                 # Notice: no tunable params currently exposed
             },
+            "propagation_connected_component": {
+                "min_overlap_fraction": float(self.cc_min_overlap_fraction.value()),
+            },
             "reporter_propagation": {
                 "min_overlap_fraction": float(self.rp_min_overlap_fraction.value()),
                 "segment_size_min": int(self.rp_segment_size_min.value()),
@@ -1328,8 +1377,8 @@ class CellTypeTrackingPanel(QWidget):
                 panel = parent_tab.panels[ct]
                 # Apply settings
                 idx_map = {
-                    "lap": 0, "trackpy": 1, "propagation": 2, "reporter_propagation": 3,
-                    "btrack": 4,
+                    "lap": 0, "trackpy": 1, "propagation": 2, "propagation_connected_component": 3,
+                    "reporter_propagation": 4, "btrack": 5,
                 }
                 panel.combo_method.setCurrentIndex(idx_map.get(settings["method"], 0))
 
@@ -1345,6 +1394,10 @@ class CellTypeTrackingPanel(QWidget):
                 panel.tp_memory.setValue(settings["trackpy"]["memory_frames"])
                 panel.tp_adaptive_stop.setValue(settings["trackpy"]["adaptive_stop"])
                 panel.tp_adaptive_step.setValue(settings["trackpy"]["adaptive_step"])
+
+                # Connected-Component Propagation
+                cc = settings.get("propagation_connected_component", {})
+                panel.cc_min_overlap_fraction.setValue(cc.get("min_overlap_fraction", 0.0))
 
                 # Reporter Propagation
                 rp = settings.get("reporter_propagation", {})
@@ -1419,6 +1472,9 @@ class CellTypeTrackingPanel(QWidget):
                 "memory": int(self.tp_memory.value()),
                 "adaptive_stop": float(self.tp_adaptive_stop.value()),
                 "adaptive_step": float(self.tp_adaptive_step.value()),
+            },
+            "propagation_connected_component": {
+                "min_overlap_fraction": float(self.cc_min_overlap_fraction.value()),
             },
             "reporter_propagation": {
                 "min_overlap_fraction": float(self.rp_min_overlap_fraction.value()),
@@ -1526,6 +1582,16 @@ class CellTypeTrackingPanel(QWidget):
                 dist_thresh=int(bt["dist_thresh"]) if use_opt else None,
                 time_thresh=int(bt["time_thresh"]) if use_opt else None,
                 log_callback=ThreadSafeLogger(self.log),
+                progress_cb=progress_cb,
+            )
+
+        elif method == "propagation_connected_component":
+            from behav3d.preprocessing.tracking.connected_component_propagation_tracking import run_connected_component_propagation_tracking
+            cc = params["propagation_connected_component"]
+            new_md = run_connected_component_propagation_tracking(
+                metadata=metadata, output_dir=out_dir, cell_type=cell_type,
+                overwrite=overwrite,
+                min_overlap_fraction=float(cc["min_overlap_fraction"]),
                 progress_cb=progress_cb,
             )
 
