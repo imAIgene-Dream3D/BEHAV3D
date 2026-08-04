@@ -36,6 +36,7 @@ from behav3d.napari._widgets import (
     resolve_external_path,
 )
 from behav3d.napari._units import UnitGroupManager
+from behav3d.core.qt_help import reset_scroll_on_page_change
 from behav3d.napari._background_runner import (
     BackgroundOperation,
     ProgressBarRow,
@@ -1197,6 +1198,7 @@ class CellTypeTrackingPanel(QWidget):
             switch_to_data_prep_edit_callback=self._switch_to_data_prep_edit,
         )
         self.param_stack.addWidget(import_page)
+        reset_scroll_on_page_change(self.param_stack)
 
         # Set active page
         self.param_stack.setCurrentIndex(self.combo_method.currentIndex())
@@ -2081,6 +2083,7 @@ class TrackingTab(QWidget):
         self.cell_tabs = QTabWidget()
         self.cell_tabs.setTabPosition(QTabWidget.West)
         layout.addWidget(self.cell_tabs)
+        reset_scroll_on_page_change(self.cell_tabs)
 
         # Global Run Button + Queue button
         self.btn_run_batch = QPushButton("Run Batch Tracking (All Cell Types)")

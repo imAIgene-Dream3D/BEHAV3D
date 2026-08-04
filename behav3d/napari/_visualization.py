@@ -44,6 +44,7 @@ from behav3d.core.metadata import (
     detect_other_cell_types_from_metadata,
     is_multicolor_celltype,
 )
+from behav3d.core.qt_help import reset_scroll_on_page_change
 # Channel colormaps (cycled if there are many channels)
 _CHANNEL_COLORS = ["cyan", "yellow", "green", "red", "blue", "magenta"]
 # Label colormaps per cell-type category
@@ -379,6 +380,7 @@ class VisualizationTab(QWidget):
         self.main_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.main_scroll.setWidget(self.main_content)
         self.stack.addWidget(self.main_scroll)
+        reset_scroll_on_page_change(self.stack)
         self.stack.setCurrentIndex(0)
 
     # ------------------------------------------------------------------

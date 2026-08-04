@@ -139,24 +139,32 @@ def assign_track_clusters_to_full_dataset(
     return adata_out
 
 
-def export_track_cluster_backprojection(
+def build_track_cluster_frame_assignments(
     adata_full,
     adata_tracks,
-    output_dir,
-    cell_type,
     cluster_col="ClusterID",
     output_col="track_behavioral_cluster",
     sample_name=None,
     sample_col="sample_name",
     track_col="TrackID",
     time_col="position_t",
-    n_workers=1,
     verbose=True,
 ):
     """
-    Export track-cluster backprojections by assigning each predicted track label to the
-    selected per-track window (typically the last N timepoints used for feature extraction),
-    then matching by (sample_name, TrackID, position_t) during voxel mapping.
+    Expand each track's predicted cluster label to its per-(TrackID, position_t)
+    frame window (typically the last N timepoints used for feature extraction).
+
+    Pure in-memory dataframe work — no image I/O — so it is cheap enough to
+    (re)run for a single sample as part of an interactive preview (see
+    ``prepare_track_cluster_code_lookup``/``backproject_track_cluster_at_timepoint``),
+    not just the full ``export_track_cluster_backprojection`` zarr export.
+
+    Returns
+    -------
+    backproj_obs : pandas.DataFrame
+        Columns ``[sample_col, track_col, time_col, output_col]``.
+    missing_windows : int
+        Number of tracks whose window could not be resolved against `adata_full`.
     """
     required_full = [str(sample_col), str(track_col), str(time_col)]
     missing_full = [c for c in required_full if c not in adata_full.obs.columns]
@@ -273,6 +281,40 @@ def export_track_cluster_backprojection(
         f"missing_tracks={int(missing_windows)}",
     )
 
+    return backproj_obs, missing_windows
+
+
+def export_track_cluster_backprojection(
+    adata_full,
+    adata_tracks,
+    output_dir,
+    cell_type,
+    cluster_col="ClusterID",
+    output_col="track_behavioral_cluster",
+    sample_name=None,
+    sample_col="sample_name",
+    track_col="TrackID",
+    time_col="position_t",
+    n_workers=1,
+    verbose=True,
+):
+    """
+    Export track-cluster backprojections by assigning each predicted track label to the
+    selected per-track window (typically the last N timepoints used for feature extraction),
+    then matching by (sample_name, TrackID, position_t) during voxel mapping.
+    """
+    backproj_obs, missing_windows = build_track_cluster_frame_assignments(
+        adata_full=adata_full,
+        adata_tracks=adata_tracks,
+        cluster_col=cluster_col,
+        output_col=output_col,
+        sample_name=sample_name,
+        sample_col=sample_col,
+        track_col=track_col,
+        time_col=time_col,
+        verbose=verbose,
+    )
+
     from behav3d.analysis.behavior.state.utils import (
         _get_classification_state_colors,
         _get_classification_state_order,
@@ -303,6 +345,66 @@ def export_track_cluster_backprojection(
     manifest["window_backprojection_rows"] = int(len(backproj_obs))
     manifest["window_backprojection_missing_tracks"] = int(missing_windows)
     return manifest
+
+
+def prepare_track_cluster_code_lookup(
+    backproj_obs,
+    code_map,
+    track_col="TrackID",
+    time_col="position_t",
+    output_col="track_behavioral_cluster",
+):
+    """
+    Turn the per-(TrackID, position_t) cluster-label assignments from
+    ``build_track_cluster_frame_assignments`` into a numeric-code lookup, ready
+    for ``backproject_track_cluster_at_timepoint``. Mirrors
+    ``prepare_state_code_lookup`` (see
+    ``behav3d.analysis.behavior.state.visualization.backprojection``).
+    """
+    work = backproj_obs[[track_col, time_col, output_col]].copy()
+    work["_track_id"] = pd.to_numeric(work[track_col], errors="coerce")
+    work["_time_id"] = pd.to_numeric(work[time_col], errors="coerce")
+    work["_cluster_code"] = work[output_col].astype("string").str.strip().map(code_map)
+    work = work.dropna(subset=["_track_id", "_time_id", "_cluster_code"]).copy()
+    work["_track_id"] = work["_track_id"].astype(np.int64)
+    work["_time_id"] = work["_time_id"].astype(np.int64)
+    work["_cluster_code"] = work["_cluster_code"].astype(np.int32)
+    return work.rename(columns={"_track_id": track_col, "_time_id": time_col})[
+        [track_col, time_col, "_cluster_code"]
+    ]
+
+
+def backproject_track_cluster_at_timepoint(
+    labels_frame,
+    cluster_code_lookup,
+    time_index,
+    track_col="TrackID",
+    time_col="position_t",
+    background_value=0,
+):
+    """
+    Map track-cluster codes onto a single already-sliced label frame for one
+    timepoint, so a napari "Show Track Backprojection" preview only ever
+    computes the currently-viewed frame instead of writing a full per-sample
+    zarr up front (see ``export_track_cluster_backprojection``).
+    """
+    from behav3d.analysis.backprojection import backproject_feature_at_timepoint
+
+    labels_frame = np.asarray(labels_frame)
+    time_ids = pd.to_numeric(cluster_code_lookup[time_col], errors="coerce")
+    df_t = cluster_code_lookup[time_ids == int(time_index)]
+    if df_t.empty:
+        return (
+            np.full(labels_frame.shape, background_value, dtype=np.uint16),
+            np.array([], dtype=np.int64),
+        )
+    return backproject_feature_at_timepoint(
+        labels_frame=labels_frame,
+        df_features=df_t,
+        feature_col="_cluster_code",
+        track_col=track_col,
+        background_value=background_value,
+    )
 
 
 def build_track_state_sequence_lookup(

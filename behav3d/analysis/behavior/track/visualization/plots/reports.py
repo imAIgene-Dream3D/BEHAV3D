@@ -95,8 +95,8 @@ from behav3d.analysis.behavior.general.visualization.plots.proportion_bars impor
     _chunk_list,
     _wrap_row_label,
 )
-from behav3d.analysis.behavior.general.visualization.plots.feature_violin import (
-    plot_feature_violin_by_group,
+from behav3d.analysis.behavior.general.visualization.plots.feature_box import (
+    plot_feature_box_by_group,
 )
 from behav3d.analysis.behavior.track.contact_grouping import (
     compute_track_contact_features,
@@ -645,6 +645,8 @@ def _save_contact_cluster_stack_grid_page(
     group_y,
     class_order,
     csv_dir,
+    group_x_levels_map=None,
+    group_y_levels_map=None,
     stack_order=None,
     stack_colors=None,
     title_prefix="Contact-Group Composition",
@@ -658,6 +660,10 @@ def _save_contact_cluster_stack_grid_page(
 
     Skipped entirely (returns ``n_pages=0``) when none of `group_x`/`group_y`/`extra_group_cols`
     are set, matching the plain per-sample contact-rate page which is always produced separately.
+
+    ``group_x_levels_map``/``group_y_levels_map`` : dict[str, str], optional
+        Maps raw ``group_x``/``group_y`` levels to merged group labels — when given, that axis
+        is pooled into the merged labels instead of showing one facet per raw level.
     """
     obs_cols = list(adata_tracks.obs.columns)
     extra_group_cols = [c for c in (extra_group_cols or []) if c in obs_cols]
@@ -682,6 +688,15 @@ def _save_contact_cluster_stack_grid_page(
     plot_df[group_col] = plot_df[group_col].astype("string").fillna("(unknown)").astype(str)
     for gc in dict.fromkeys(grid_axis_cols + extra_group_cols):
         plot_df[gc] = plot_df[gc].astype("string").fillna("(unknown)").astype(str)
+        if gc == group_x and group_x_levels_map:
+            plot_df[gc] = plot_df[gc].map(group_x_levels_map)
+        elif gc == group_y and group_y_levels_map:
+            plot_df[gc] = plot_df[gc].map(group_y_levels_map)
+    if grid_axis_cols and (group_x_levels_map or group_y_levels_map):
+        # A level_map applies only to whichever raw levels are still present - map() leaves
+        # anything outside the mapping as NaN, so drop those rows here rather than let them
+        # silently poison the facet grid.
+        plot_df = plot_df.dropna(subset=grid_axis_cols)
 
     if extra_group_cols:
         page_labels = _make_group_label(plot_df, extra_group_cols)
@@ -811,6 +826,8 @@ def save_track_class_proportions_by_sample_plot(
     group_cols=None,
     group_x=None,
     group_y=None,
+    group_x_levels_map=None,
+    group_y_levels_map=None,
     grid_ncols=3,
     dpi=300,
     cmap_name="tab20",
@@ -827,6 +844,12 @@ def save_track_class_proportions_by_sample_plot(
     plus optional grouped grid pages (1-2 effective group columns: true 2D grid;
     3+: flat grid). ``group_x``/``group_y`` explicitly pick the 2D grid's axes;
     ``group_cols`` is the "group per page" column list (unaffected in meaning).
+
+    ``group_x_levels_map``/``group_y_levels_map`` : dict[str, str], optional
+        Maps raw ``group_x``/``group_y`` levels to merged group labels (same semantics
+        as ``condition_groups`` in ``compute_condition_diff_stats_pairwise``) - when
+        given, that axis is pooled into the merged labels instead of showing one panel
+        per raw level. Rows whose raw level isn't in the mapping are dropped.
 
     If ``tmin_col``/``tmax_col`` (each track's active timepoint window) are present
     in ``adata_tracks.obs``, this also adds track-class proportions *over time*:
@@ -885,6 +908,16 @@ def save_track_class_proportions_by_sample_plot(
     )
     for gc in valid_group_cols:
         plot_df[gc] = plot_df[gc].astype("string").fillna("(unknown)").astype(str)
+        if gc == group_x and group_x_levels_map:
+            plot_df[gc] = plot_df[gc].map(group_x_levels_map)
+        elif gc == group_y and group_y_levels_map:
+            plot_df[gc] = plot_df[gc].map(group_y_levels_map)
+    # NB: rows whose group_x/group_y level isn't in a level map become NaN in that
+    # gc column here, but are deliberately *not* dropped from `plot_df` itself - the
+    # ungrouped per-sample proportions below must still include every sample/class
+    # row regardless of group-col mapping. Only the grouped-view block further down
+    # (guarded by `if valid_group_cols:`) drops those NaN rows, via its own filtered
+    # copy, since a merged/unmapped level only makes the *grouped* panels ambiguous.
 
     if len(plot_df) == 0:
         raise ValueError("No rows available to plot track class proportions.")
@@ -947,14 +980,17 @@ def save_track_class_proportions_by_sample_plot(
             plt.close(fig)
 
         if valid_group_cols:
+            # See the note above `if len(plot_df) == 0` - only the grouped view drops
+            # rows whose group_x/group_y level fell outside a level map.
+            grouped_plot_df = plot_df.dropna(subset=valid_group_cols)
             proportions_by_group, counts_by_group, _n_by_group = _compute_grouped_class_proportions(
-                plot_df, group_cols=valid_group_cols, class_col=class_col, class_order=class_order,
+                grouped_plot_df, group_cols=valid_group_cols, class_col=class_col, class_order=class_order,
             )
             group_label_title = ", ".join(valid_group_cols)
             unique_vals_per_col = {}
             if len(valid_group_cols) in (1, 2):
                 for col in valid_group_cols:
-                    unique_vals_per_col[col] = sorted(plot_df[col].astype(str).dropna().unique().tolist())
+                    unique_vals_per_col[col] = sorted(grouped_plot_df[col].astype(str).dropna().unique().tolist())
 
             if len(valid_group_cols) in (1, 2):
                 fig_rel = _plot_page_grouped_class_proportions_2d_grid(
@@ -1019,6 +1055,10 @@ def save_track_class_proportions_by_sample_plot(
             )
             for gc in valid_group_cols:
                 time_plot_df[gc] = time_plot_df[gc].astype("string").fillna("(unknown)").astype(str)
+                if gc == group_x and group_x_levels_map:
+                    time_plot_df[gc] = time_plot_df[gc].map(group_x_levels_map)
+                elif gc == group_y and group_y_levels_map:
+                    time_plot_df[gc] = time_plot_df[gc].map(group_y_levels_map)
 
             expanded_df = _expand_track_windows_to_timepoints(
                 time_plot_df, time_col=time_col, tmin_col=tmin_col, tmax_col=tmax_col,
@@ -1062,8 +1102,14 @@ def save_track_class_proportions_by_sample_plot(
                 ])
 
                 if valid_group_cols:
+                    # Same rationale as `grouped_plot_df` above - only the grouped
+                    # (over-time) view drops rows whose group_x/group_y level fell
+                    # outside a level map; relative_by_sample_time/overall_by_sample_time
+                    # above are unaffected since they were already computed from the
+                    # unfiltered expanded_df.
+                    grouped_expanded_df = expanded_df.dropna(subset=valid_group_cols)
                     relative_by_group_time, overall_by_group_time = _compute_grouped_relative_matrices(
-                        expanded_df, group_cols=valid_group_cols, time_col=time_col,
+                        grouped_expanded_df, group_cols=valid_group_cols, time_col=time_col,
                         state_col=class_col, state_order=class_order,
                     )
                     time_group_label_title = ", ".join(valid_group_cols)
@@ -1071,7 +1117,7 @@ def save_track_class_proportions_by_sample_plot(
                     if len(valid_group_cols) in (1, 2):
                         for col in valid_group_cols:
                             time_unique_vals_per_col[col] = sorted(
-                                expanded_df[col].astype(str).dropna().unique().tolist()
+                                grouped_expanded_df[col].astype(str).dropna().unique().tolist()
                             )
 
                     if len(valid_group_cols) in (1, 2):
@@ -1117,7 +1163,9 @@ def save_track_class_proportions_by_sample_plot(
                             plt.close(fig_gt)
 
                     time_group_label_lookup = (
-                        expanded_df.assign(_group_label=_make_group_label(expanded_df, valid_group_cols).values)
+                        grouped_expanded_df.assign(
+                            _group_label=_make_group_label(grouped_expanded_df, valid_group_cols).values
+                        )
                         .drop_duplicates(subset=["_group_label"])
                         .set_index("_group_label")[valid_group_cols]
                     )
@@ -1164,6 +1212,9 @@ def save_track_condition_comparison_report(
     group_cols=None,
     group_x=None,
     group_y=None,
+    group_x_levels_map=None,
+    group_y_levels_map=None,
+    condition_groups=None,
     class_order=None,
     class_colors=None,
     verbose=False,
@@ -1188,6 +1239,10 @@ def save_track_condition_comparison_report(
     If ``pdf_pages`` (an open ``PdfPages``) is given, the figure is appended to it instead of
     being written to its own PDF file. ``csv_dir`` overrides where the CSV is written (defaults
     to ``out_dir``).
+
+    ``group_x_levels_map``/``group_y_levels_map`` : dict[str, str], optional
+        Maps raw ``group_x``/``group_y`` levels to merged group labels — when given, that axis
+        is pooled into the merged labels instead of showing one row/column per raw level.
     """
     obs = adata_tracks.obs
     extra_group_cols = [c for c in (group_cols or []) if c in obs.columns]
@@ -1204,6 +1259,15 @@ def save_track_condition_comparison_report(
     df[condition_col] = df[condition_col].astype(str)
     for gc in valid_group_cols:
         df[gc] = df[gc].astype(str)
+        if gc == group_x and group_x_levels_map:
+            df[gc] = df[gc].map(group_x_levels_map)
+        elif gc == group_y and group_y_levels_map:
+            df[gc] = df[gc].map(group_y_levels_map)
+    if grid_axis_cols and (group_x_levels_map or group_y_levels_map):
+        # A level_map applies only to whichever raw levels are still present - map() leaves
+        # anything outside the mapping as NaN, so drop those rows rather than let them
+        # silently poison the grouped comparison.
+        df = df.dropna(subset=grid_axis_cols)
     if len(df) == 0:
         raise ValueError("No valid rows remain after filtering NaNs in required columns.")
 
@@ -1247,7 +1311,7 @@ def save_track_condition_comparison_report(
 
     title = f"{class_col} — {condition_col} pairwise comparison"
     n_condition_levels = sample_metadata[condition_col].astype(str).nunique()
-    use_2d_grid = bool(group_x) and bool(group_y) and n_condition_levels == 2
+    use_2d_grid = bool(group_x) and bool(group_y) and n_condition_levels == 2 and not condition_groups
 
     if use_2d_grid:
         result = plot_condition_diff_grid_2d(
@@ -1270,6 +1334,7 @@ def save_track_condition_comparison_report(
             class_order=resolved_class_order,
             condition_col=condition_col,
             group_cols=valid_group_cols,
+            condition_groups=condition_groups,
         )
         result = plot_condition_diff_grid(
             diff_stats_by_group,
@@ -1299,6 +1364,8 @@ def save_track_contact_group_analysis(
     extra_group_cols=None,
     group_x=None,
     group_y=None,
+    group_x_levels_map=None,
+    group_y_levels_map=None,
     target_class_lookup=None,
     touching_col=None,
     time_varying=True,
@@ -1439,6 +1506,8 @@ def save_track_contact_group_analysis(
             extra_group_cols=extra_group_cols,
             group_x=group_x,
             group_y=group_y,
+            group_x_levels_map=group_x_levels_map,
+            group_y_levels_map=group_y_levels_map,
             class_order=resolved_class_order,
             csv_dir=csv_dir,
             verbose=verbose,
@@ -1452,6 +1521,8 @@ def save_track_contact_group_analysis(
             condition_col=group_col,
             group_x=group_x,
             group_y=group_y,
+            group_x_levels_map=group_x_levels_map,
+            group_y_levels_map=group_y_levels_map,
             group_cols=list(extra_group_cols),
             class_order=resolved_class_order,
             class_colors=class_colors,
@@ -1460,7 +1531,7 @@ def save_track_contact_group_analysis(
             csv_dir=csv_dir,
         )
 
-        fig = plot_feature_violin_by_group(
+        fig = plot_feature_box_by_group(
             obs, mean_col, class_col,
             group_order=resolved_class_order, colors=resolved_colors,
             ylabel=f"Mean fraction of timepoints in contact ({contact_col})",
@@ -1469,7 +1540,7 @@ def save_track_contact_group_analysis(
         pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
 
-        fig = plot_feature_violin_by_group(
+        fig = plot_feature_box_by_group(
             obs, max_bout_col, class_col,
             group_order=resolved_class_order, colors=resolved_colors,
             ylabel=f"Longest contiguous contact bout, timepoints ({contact_col})",
@@ -1490,7 +1561,7 @@ def save_track_contact_group_analysis(
             target_stack_colors[_MULTIPLE_CLASSES_LABEL] = "#4C4C4C"
 
             long_flat = long_target_df.reset_index()
-            fig = plot_feature_violin_by_group(
+            fig = plot_feature_box_by_group(
                 long_flat, target_class_mean_col, "target_class",
                 group_order=resolved_target_class_order, colors=resolved_target_class_colors,
                 ylabel=f"Mean fraction of timepoints in contact ({contact_col})",
@@ -1499,7 +1570,7 @@ def save_track_contact_group_analysis(
             pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
 
-            fig = plot_feature_violin_by_group(
+            fig = plot_feature_box_by_group(
                 long_flat, target_class_max_bout_col, "target_class",
                 group_order=resolved_target_class_order, colors=resolved_target_class_colors,
                 ylabel=f"Longest sustained contact bout, timepoints ({contact_col})",
@@ -1516,6 +1587,8 @@ def save_track_contact_group_analysis(
                 extra_group_cols=extra_group_cols,
                 group_x=group_x,
                 group_y=group_y,
+                group_x_levels_map=group_x_levels_map,
+                group_y_levels_map=group_y_levels_map,
                 class_order=resolved_class_order,
                 csv_dir=csv_dir,
                 stack_order=target_stack_order,
@@ -1532,6 +1605,8 @@ def save_track_contact_group_analysis(
                 condition_col=target_group_col,
                 group_x=group_x,
                 group_y=group_y,
+                group_x_levels_map=group_x_levels_map,
+                group_y_levels_map=group_y_levels_map,
                 group_cols=list(extra_group_cols),
                 class_order=resolved_class_order,
                 class_colors=class_colors,

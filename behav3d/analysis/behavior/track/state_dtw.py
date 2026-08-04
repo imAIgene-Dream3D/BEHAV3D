@@ -685,6 +685,88 @@ def save_dtaidistance_exemplar_overview(
     return str(overview_pdf)
 
 
+def _build_medoid_overview_figure(
+    adata_filt,
+    adata_tracks,
+    *,
+    cluster_key,
+    state_key,
+    time_col,
+    window_key="trajectory_window_id",
+):
+    """One panel per cluster, each showing only its medoid (most representative) track.
+
+    Reuses the same distance-based medoid flags (`{cluster_key}_medoid`) that
+    `_add_cluster_medoids` computes at clustering time from the precomputed DTW
+    distance matrix - available regardless of whether clusters came from
+    `clustering_method="agglomerative"` or `"leiden"`, since both cluster that same
+    distance matrix rather than deriving medoids from the clustering method itself.
+    """
+    medoid_col = f"{cluster_key}_medoid"
+    if medoid_col not in adata_tracks.obs.columns:
+        raise ValueError(
+            f"adata_tracks.obs missing '{medoid_col}' - re-run clustering to compute cluster medoids."
+        )
+    fig, _, _ = plot_exemplar_tracks_by_cluster(
+        adata_filt,
+        adata_tracks,
+        n_per_cluster=1,
+        sample_key="sample_name",
+        track_key="TrackID",
+        time_key=time_col,
+        state_key=state_key,
+        cluster_key=cluster_key,
+        tmin_key="position_t_min",
+        tmax_key="position_t_max",
+        seed=0,
+        query=f"{medoid_col} == True",
+        window_key=window_key,
+    )
+    return fig
+
+
+def save_dtaidistance_medoid_overview(
+    adata_tracks,
+    output_dir,
+    cell_type,
+    *,
+    outfolder=None,
+    verbose=True,
+):
+    """Save a one-page overview PDF with one panel per cluster, each showing only
+    that cluster's medoid track - the single track closest (on average) to every
+    other track in its cluster under the DTW distance used for clustering.
+    """
+    paths = _resolve_dtaidistance_paths(output_dir, cell_type)
+    meta = _dtai_meta(adata_tracks)
+    resolved_cluster_key = _resolve_cluster_key(adata_tracks)
+    state_col = str(meta.get("state_col", FULL_STATE_COL))
+    time_col = str(meta.get("time_col", "position_t"))
+    adata_filt = _load_filtered_state_adata_for_model(
+        adata_tracks, output_dir, cell_type, verbose=verbose,
+    )
+    _ensure_exemplar_coordinate_columns(
+        adata_filt, output_dir=output_dir, cell_type=cell_type, require_pixel_for_video=False,
+    )
+    dest = Path(outfolder) if outfolder is not None else paths["quality_control_outfolder"]
+    dest.mkdir(parents=True, exist_ok=True)
+    fig = _build_medoid_overview_figure(
+        adata_filt,
+        adata_tracks,
+        cluster_key=resolved_cluster_key,
+        state_key=state_col,
+        time_col=time_col,
+        window_key=str(meta.get("trajectory_window_col", "trajectory_window_id")),
+    )
+    medoid_overview_pdf = dest / "medoid_tracks_overview.pdf"
+    with PdfPages(medoid_overview_pdf) as pdf:
+        pdf.savefig(fig, bbox_inches="tight", dpi=300)
+    plt.close(fig)
+    if bool(verbose):
+        _winfo("trajectory-dtai", f"saved medoid overview: {medoid_overview_pdf}")
+    return str(medoid_overview_pdf)
+
+
 def _load_filtered_state_adata_for_model(
     adata_tracks,
     output_dir,
@@ -791,6 +873,7 @@ def save_dtaidistance_exemplar_plots(
     chosen_exemplars.to_csv(exemplar_selection_csv, index=False)
 
     overview_pdf = None
+    medoid_overview_pdf = None
     per_cluster_pdf_out = {}
     backprojection_pdf_out = {}
     backprojection_mp4_out = {}
@@ -813,6 +896,24 @@ def save_dtaidistance_exemplar_plots(
         with PdfPages(overview_pdf) as pdf:
             pdf.savefig(fig_exemplar, bbox_inches="tight", dpi=300)
         plt.close(fig_exemplar)
+
+        try:
+            fig_medoid = _build_medoid_overview_figure(
+                adata_filt,
+                adata_tracks,
+                cluster_key=resolved_cluster_key,
+                state_key=state_col,
+                time_col=time_col,
+                window_key=str(meta.get("trajectory_window_col", "trajectory_window_id")),
+            )
+            medoid_overview_pdf = exemplar_root / "medoid_tracks_overview.pdf"
+            with PdfPages(medoid_overview_pdf) as pdf:
+                pdf.savefig(fig_medoid, bbox_inches="tight", dpi=300)
+            plt.close(fig_medoid)
+        except Exception as exc:
+            medoid_overview_pdf = None
+            if bool(verbose):
+                _winfo("trajectory-dtai", f"skipping medoid overview due to error: {exc}")
 
         per_cluster_pdf_out = save_exemplar_statebar_track_pdf_per_cluster(
             adata_full=adata_filt,
@@ -882,6 +983,7 @@ def save_dtaidistance_exemplar_plots(
     plot_paths = {
         "exemplar_selection_csv": str(exemplar_selection_csv),
         "exemplar_tracks_overview_pdf": str(overview_pdf) if overview_pdf is not None else None,
+        "medoid_tracks_overview_pdf": str(medoid_overview_pdf) if medoid_overview_pdf is not None else None,
         "exemplar_statebar_track_pdf_by_cluster": dict(per_cluster_pdf_out.get("pdf_paths_by_cluster", {})),
         "exemplar_statebar_track_pdf_by_example_rank": dict(
             per_cluster_pdf_out.get("pdf_paths_by_example_rank", {})
@@ -1077,6 +1179,7 @@ def run_categorical_dtaidistance_trajectory_clustering(
         )
     labels, size_mapping = _relabel_by_cluster_size(raw_labels)
     track_obs[cluster_key] = pd.Categorical(labels)
+    track_obs[f"{cluster_key}_raw"] = pd.Categorical(labels)
 
     var_names = [f"distance_to_track_{i}" for i in range(distances.shape[0])]
     adata_tracks = ad.AnnData(
@@ -1189,6 +1292,24 @@ def run_categorical_dtaidistance_trajectory_clustering(
                 pdf.savefig(fig_exemplar, bbox_inches="tight", dpi=300)
             plt.close(fig_exemplar)
 
+            medoid_overview_pdf = None
+            try:
+                fig_medoid = _build_medoid_overview_figure(
+                    adata_filt,
+                    adata_tracks,
+                    cluster_key=str(cluster_key),
+                    state_key=str(state_cols[0]),
+                    time_col=str(time_col),
+                )
+                medoid_overview_pdf = exemplar_root / "medoid_tracks_overview.pdf"
+                with PdfPages(medoid_overview_pdf) as pdf:
+                    pdf.savefig(fig_medoid, bbox_inches="tight", dpi=300)
+                plt.close(fig_medoid)
+            except Exception as exc:
+                medoid_overview_pdf = None
+                if bool(verbose):
+                    _winfo("trajectory-dtai", f"skipping medoid overview due to error: {exc}")
+
             try:
                 per_cluster_pdf_out = save_exemplar_statebar_track_pdf_per_cluster(
                     adata_full=adata_filt,
@@ -1220,6 +1341,7 @@ def run_categorical_dtaidistance_trajectory_clustering(
                 {
                     "exemplar_selection_csv": str(exemplar_selection_csv),
                     "exemplar_tracks_overview_pdf": str(overview_pdf),
+                    "medoid_tracks_overview_pdf": str(medoid_overview_pdf) if medoid_overview_pdf is not None else None,
                     "exemplar_statebar_track_pdf_by_cluster": dict(pdf_paths_by_cluster),
                     "exemplar_statebar_track_pdf_by_example_rank": dict(pdf_paths_by_example_rank),
                     "exemplar_statebar_warning": exemplar_warning,

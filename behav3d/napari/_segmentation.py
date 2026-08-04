@@ -7,6 +7,7 @@ from behav3d.napari._widgets import (
     prompt_axis_order,
     resolve_external_path,
 )
+from behav3d.core.qt_help import reset_scroll_on_page_change
 import yaml
 from magicgui.widgets import create_widget
 from qtpy.QtWidgets import (
@@ -176,7 +177,7 @@ class SegmentationTab(QWidget):
             switch_to_data_prep_edit_callback=self._switch_to_data_prep_edit,
         )
         self.param_stack.addWidget(self.import_page)
-
+        reset_scroll_on_page_change(self.param_stack)
 
         layout.addWidget(self.param_stack)
         
@@ -196,7 +197,8 @@ class SegmentationTab(QWidget):
         layout.addWidget(self.log)
 
         self.stack.addWidget(self.main_content)
-        
+        reset_scroll_on_page_change(self.stack)
+
         # Connect to metadata signal
         if hasattr(self.metadata_loader, "metadata_loaded"):
             self.metadata_loader.metadata_loaded.connect(self._on_metadata_loaded)

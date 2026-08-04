@@ -26,7 +26,7 @@ from qtpy.QtWidgets import (
 )
 from qtpy.QtCore import Qt, Signal
 
-from behav3d.core.qt_help import HelpButton, make_help_row
+from behav3d.core.qt_help import HelpButton, make_help_row, reset_scroll_on_page_change
 from behav3d.napari._units import UnitGroupManager, TimeUnitGroupManager
 from behav3d.napari._results_panel import (
     ResultsPanel,
@@ -694,6 +694,7 @@ class FilteringTab(QWidget):
         self.cell_tabs = QTabWidget()
         self.cell_tabs.setTabPosition(QTabWidget.West)
         layout.addWidget(self.cell_tabs)
+        reset_scroll_on_page_change(self.cell_tabs)
 
         self.btn_run_batch = QPushButton("Run Batch Filtering (All Cell Types)")
         self.btn_run_batch.setStyleSheet(

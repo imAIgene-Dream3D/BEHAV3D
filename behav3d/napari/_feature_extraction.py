@@ -31,7 +31,7 @@ from qtpy.QtWidgets import (
 from qtpy.QtCore import Qt
 from qtpy.QtGui import QCursor
 
-from behav3d.core.qt_help import HelpButton, make_help_row
+from behav3d.core.qt_help import HelpButton, make_help_row, reset_scroll_on_page_change
 from behav3d.napari._units import UnitGroupManager
 from behav3d.napari._results_panel import (
     ResultsPanel,
@@ -3563,6 +3563,7 @@ class FeatureExtractionTab(QWidget):
         self.cell_tabs = QTabWidget()
         self.cell_tabs.setTabPosition(QTabWidget.West)
         layout.addWidget(self.cell_tabs)
+        reset_scroll_on_page_change(self.cell_tabs)
 
         # ── Global Run + Queue ─────────────────────────────────────────────
         self.btn_run_batch = QPushButton(

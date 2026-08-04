@@ -21,35 +21,64 @@ from behav3d.analysis.behavior.state.utils import (
 
 
 def _resolve_tracked_image_path(output_dir, sample_name, cell_type, verbose=False):
+    output_dir = Path(output_dir)
     sample_dir = Path(output_dir, "images", str(sample_name))
-    if not sample_dir.exists():
-        if verbose:
-            print(f"Tracked image resolve: sample folder missing '{sample_dir}'")
-        return None
+    if sample_dir.exists():
+        candidates = [
+            sample_dir / f"{sample_name}_{cell_type}_tracked.zarr",
+            sample_dir / f"{sample_name}_{cell_type}_tracked.zarr.zip",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                if verbose:
+                    print(f"Tracked image resolve: using preferred path '{candidate}'")
+                return candidate
 
-    candidates = [
-        sample_dir / f"{sample_name}_{cell_type}_tracked.zarr",
-        sample_dir / f"{sample_name}_{cell_type}_tracked.zarr.zip",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            if verbose:
-                print(f"Tracked image resolve: using preferred path '{candidate}'")
-            return candidate
+        fallback = []
+        fallback.extend(sorted(sample_dir.glob("*tracked.zarr")))
+        fallback.extend(sorted(sample_dir.glob("*tracked.zarr.zip")))
+        token = f"_{cell_type}_"
+        for path in fallback:
+            if token in path.name:
+                if verbose:
+                    print(f"Tracked image resolve: using fallback path '{path}'")
+                return path
+    elif verbose:
+        print(f"Tracked image resolve: sample folder missing '{sample_dir}'")
 
-    fallback = []
-    fallback.extend(sorted(sample_dir.glob("*tracked.zarr")))
-    fallback.extend(sorted(sample_dir.glob("*tracked.zarr.zip")))
-    token = f"_{cell_type}_"
-    for path in fallback:
-        if token in path.name:
-            if verbose:
-                print(f"Tracked image resolve: using fallback path '{path}'")
-            return path
+    metadata_csv_path = Path(output_dir, "metadata.csv")
+    if metadata_csv_path.exists():
+        try:
+            metadata = pd.read_csv(metadata_csv_path, low_memory=False)
+            if "sample_name" in metadata.columns:
+                rows = metadata[
+                    metadata["sample_name"].astype("string").str.strip() == str(sample_name).strip()
+                ]
+                tracked_cols = [
+                    f"{pfx}_{cell_type}_tracks_image_path" for pfx in ("im", "or", "ot")
+                ] + [f"{cell_type}_tracks_image_path"]
+                for col in tracked_cols:
+                    if col not in metadata.columns:
+                        continue
+                    for tracked_path in rows[col].tolist():
+                        if pd.isna(tracked_path):
+                            continue
+                        p = Path(str(tracked_path).strip()).expanduser()
+                        if p.exists():
+                            if verbose:
+                                print(f"Tracked image resolve: using metadata.csv path '{p}'")
+                            return p
+        except Exception as exc:
+            warnings.warn(
+                f"Could not parse metadata.csv for tracked image fallback: {exc}",
+                RuntimeWarning,
+            )
+
     if verbose:
         print(
             "Tracked image resolve: no candidate matched expected patterns "
-            f"for sample='{sample_name}', cell_type='{cell_type}'."
+            f"for sample='{sample_name}', cell_type='{cell_type}' "
+            f"in '{sample_dir}' or metadata.csv."
         )
     return None
 
@@ -102,6 +131,84 @@ def _build_state_code_color_map(code_map, state_colors=None):
         for label, code in code_map.items()
         if str(label) in label_colors
     }
+
+
+def prepare_state_code_lookup(sample_obs, state_col, code_map, track_col="TrackID", time_col="position_t"):
+    """
+    Precompute a lightweight (TrackID, position_t) -> state-code lookup for one
+    sample's obs. Pure in-memory dataframe work, no image I/O — cheap enough to
+    (re)build once per "Show backprojection" click and then reuse for every
+    per-timepoint frame lookup driven by ``backproject_state_at_timepoint``.
+    """
+    work = sample_obs[[track_col, time_col, state_col]].copy()
+    work["_track_id"] = pd.to_numeric(work[track_col], errors="coerce")
+    work["_time_id"] = pd.to_numeric(work[time_col], errors="coerce")
+    work["_state_label"] = work[state_col].astype("string").str.strip()
+    work["_state_code"] = work["_state_label"].map(code_map)
+    work = work.dropna(subset=["_track_id", "_time_id", "_state_code"]).copy()
+    work["_track_id"] = work["_track_id"].astype(np.int64)
+    work["_time_id"] = work["_time_id"].astype(np.int64)
+    work["_state_code"] = work["_state_code"].astype(np.int32)
+    work = work.sort_values(["_time_id", "_track_id"]).drop_duplicates(
+        subset=["_time_id", "_track_id"],
+        keep="last",
+    )
+    return work[["_track_id", "_time_id", "_state_code"]].rename(
+        columns={"_track_id": track_col, "_time_id": time_col}
+    )
+
+
+def backproject_state_at_timepoint(
+    labels_frame,
+    state_code_lookup,
+    time_index,
+    track_col="TrackID",
+    time_col="position_t",
+    background_value=0,
+):
+    """
+    Map behavioral-state codes onto a single already-sliced label frame for one
+    timepoint. Mirrors ``backproject_feature_at_timepoint`` (see
+    ``behav3d.analysis.backprojection``) so a napari "Show ... Backprojection"
+    preview only ever computes the currently-viewed frame instead of writing a
+    full per-sample zarr up front (see ``export_behavioral_state_backprojection_zarrs``).
+
+    Parameters
+    ----------
+    labels_frame : np.ndarray
+        Single-timepoint label array (2D or 3D) already sliced from the
+        tracked image.
+    state_code_lookup : pandas.DataFrame
+        Output of ``prepare_state_code_lookup``: columns ``[track_col,
+        time_col, "_state_code"]`` for the whole sample.
+    time_index : int
+        Timepoint to filter ``state_code_lookup`` to before mapping.
+
+    Returns
+    -------
+    mapped_frame : np.ndarray
+        Same shape as `labels_frame`, state codes written at label positions,
+        `background_value` elsewhere.
+    ids_with_value : np.ndarray[int64]
+        Sorted label ids that had a state code at this timepoint.
+    """
+    from behav3d.analysis.backprojection import backproject_feature_at_timepoint
+
+    labels_frame = np.asarray(labels_frame)
+    time_ids = pd.to_numeric(state_code_lookup[time_col], errors="coerce")
+    df_t = state_code_lookup[time_ids == int(time_index)]
+    if df_t.empty:
+        return (
+            np.full(labels_frame.shape, background_value, dtype=np.uint16),
+            np.array([], dtype=np.int64),
+        )
+    return backproject_feature_at_timepoint(
+        labels_frame=labels_frame,
+        df_features=df_t,
+        feature_col="_state_code",
+        track_col=track_col,
+        background_value=background_value,
+    )
 
 
 def _write_state_color_attrs_to_zarr(path, code_map, state_colors=None):
