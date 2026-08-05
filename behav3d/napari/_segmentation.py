@@ -8,6 +8,7 @@ from behav3d.napari._widgets import (
     resolve_external_path,
 )
 from behav3d.core.qt_help import reset_scroll_on_page_change
+from behav3d.napari._preview_dims import disconnect_all_preview_dims_listeners
 import yaml
 from magicgui.widgets import create_widget
 from qtpy.QtWidgets import (
@@ -1506,6 +1507,7 @@ class PixelClassifierWidget(QWidget):
                     # Non-interactive (Queue): default to loading existing data
                     load_existing = True
 
+            disconnect_all_preview_dims_listeners(self.viewer)
             self.viewer.layers.clear() # Clear after prompting, to avoid removing if cancel
 
             if load_existing:
@@ -4160,6 +4162,7 @@ class CellposeSAMWidget(QWidget):
             # Every layer this preview adds is a plain (Z, Y, X) volume for a
             # single timepoint, so with nothing else in the viewer there is no
             # time slider left to imply "every timepoint got segmented".
+            disconnect_all_preview_dims_listeners(self.viewer)
             self.viewer.layers.clear()
             self._preview_labels = {}
             self._preview_sizes = {}
@@ -6080,6 +6083,7 @@ class APOCWidget(QWidget):
             )
 
             # Clear all viewer layers entirely
+            disconnect_all_preview_dims_listeners(self.viewer)
             self.viewer.layers.clear()
 
             # Load images
@@ -8187,6 +8191,7 @@ class ConvPaintWidget(QWidget):
                 else:
                     overwrite_images = False
 
+            disconnect_all_preview_dims_listeners(self.viewer)
             self.viewer.layers.clear()
 
             all_images, pixel_class_outdir, has_death, all_cell_types = _load_training_images(

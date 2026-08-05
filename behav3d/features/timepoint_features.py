@@ -359,6 +359,7 @@ def rerun_death_classification(
     cell_type,
     new_threshold,
     threshold_column="percentage_dead_mask",
+    propagate=True,
 ):
     """Re-apply :func:`calculate_death` to an existing combined feature CSV
     with a new ``dead_mask_percentage_threshold``.
@@ -386,6 +387,11 @@ def rerun_death_classification(
     threshold_column : str, optional
         Column in the combined CSV used by :func:`calculate_death`.
         Defaults to ``"percentage_dead_mask"``.
+    propagate : bool, optional
+        Forwarded to :func:`calculate_death`. When ``True`` (default),
+        once a track crosses the threshold it stays 'dead' for the rest of
+        the track. When ``False``, only the timepoints currently at/above
+        threshold are marked 'dead'.
 
     Returns
     -------
@@ -432,6 +438,7 @@ def rerun_death_classification(
         df,
         threshold=float(new_threshold),
         threshold_column=threshold_column,
+        propagate=propagate,
     )
     df.to_csv(combined_csv, index=False)
     print(f"Re-wrote {combined_csv} with updated 'dead' column.")
@@ -446,6 +453,7 @@ def run_feature_extraction(
     features_choice=["movement", "intensity", "morphology", "contact", "death"],
     imaris=False,
     dead_mask_percentage_threshold=None,
+    propagate_dead_signal=True,
     contact_threshold=None,
     rolling_meanspeed_window=10,
     overwrite=False,
@@ -776,7 +784,12 @@ def run_feature_extraction(
                 # Calculate death features if threshold specified and dead_channel exists
                 if dead_mask_percentage_threshold is not None and dead_channel is not None and pd.notna(dead_channel):
                     print(f"{get_current_time()} - Calculating cell death based on dead_mask_percentage_threshold {dead_mask_percentage_threshold}")
-                    df_tracks = calculate_death(df_tracks, threshold=dead_mask_percentage_threshold, threshold_column="percentage_dead_mask")
+                    df_tracks = calculate_death(
+                        df_tracks,
+                        threshold=dead_mask_percentage_threshold,
+                        threshold_column="percentage_dead_mask",
+                        propagate=propagate_dead_signal,
+                    )
                 
             # if "contact" in features_choice:    
             #     # Calculate active contact for ALL cell types that have touching columns
@@ -1295,11 +1308,10 @@ def calculate_imaris_track_features(
 def calculate_death(
     df_tracks,
     threshold,
-    threshold_column="mean_dead_dye"
+    threshold_column="mean_dead_dye",
+    propagate=True,
     ):
     # print(f"- Calculating cell death based on defined dead_dye_threshold {dead_dye_threshold}")
-    df_tracks["dead"] = False
-
     # ``threshold`` is always on the same scale as ``threshold_column``.
     # For ``percentage_dead_mask`` that means a fraction (0.0-1.0), matching
     # how that column is computed (mean of a 0/1 mask). Callers (napari's
@@ -1307,13 +1319,25 @@ def calculate_death(
     # already convert the percent-scale UI value to a fraction before it
     # reaches this function - do not convert again here.
 
+    if not propagate:
+        # Pointwise / non-sticky: a timepoint is 'dead' only while its own
+        # value is at/above threshold. The track can go back to 'alive' at a
+        # later timepoint if the signal drops again. This is appropriate for
+        # cell types (e.g. immune/T cells) that can transiently pick up dead
+        # dye signal - for example while killing a dying organoid - without
+        # actually dying themselves.
+        df_tracks["dead"] = df_tracks[threshold_column] >= threshold
+        return df_tracks
+
+    df_tracks["dead"] = False
+
     # For any cell crossing the dead_dye_threshold, set the cell to dead. Any timepoint after this timepoint are
     # Also set to dead, even if the mean dead dye intensity goes under the threshold again
     for track_id in df_tracks["TrackID"].unique():
         track_df = df_tracks[df_tracks["TrackID"] == track_id]
         track_df_reset = track_df.reset_index(drop=True)
         threshold_indices = track_df_reset.reset_index(drop=True)[track_df_reset[threshold_column] >= threshold].index
-        
+
         if not threshold_indices.empty:
             first_threshold_index = threshold_indices.min()
             df_tracks.loc[track_df.index[first_threshold_index:], "dead"] = True

@@ -34,8 +34,16 @@ from qtpy.QtWidgets import (
 )
 
 from behav3d.core.qt_help import make_help_row
+from behav3d.core.metadata import resolve_metadata_csv_path
 from behav3d.napari._analysis import _detect_cell_types
 from behav3d.napari._single_cell import _bp_add_raw_channels
+from behav3d.napari._preview_dims import (
+    disconnect_all_preview_dims_listeners,
+    register_preview_dims_listener,
+    stop_dim_playback,
+    unregister_preview_dims_listener,
+)
+from behav3d.analysis.backprojection import filter_track_image_to_ids
 
 _FEATURE_BP_EXCLUDED_COLUMNS = {
     "TrackID", "original_TrackID", "sample_name", "position_t",
@@ -159,7 +167,10 @@ class FeatureBackprojectionTab(QWidget):
         from behav3d.analysis.behavior.state.visualization.backprojection import (
             _resolve_raw_image_path,
         )
-        fallback = _resolve_raw_image_path(out_dir, sample, verbose=False)
+        gui_metadata_csv_path = resolve_metadata_csv_path(self.metadata_loader)
+        fallback = _resolve_raw_image_path(
+            out_dir, sample, verbose=False, metadata_csv_path=gui_metadata_csv_path
+        )
         return fallback if fallback is not None and Path(fallback).exists() else None
 
     def _resolve_tracked_path(self, row, out_dir: Path, sample: str, cell_type: str) -> Optional[Path]:
@@ -178,7 +189,10 @@ class FeatureBackprojectionTab(QWidget):
         from behav3d.analysis.behavior.state.visualization.backprojection import (
             _resolve_tracked_image_path,
         )
-        fallback = _resolve_tracked_image_path(out_dir, sample, cell_type, verbose=False)
+        gui_metadata_csv_path = resolve_metadata_csv_path(self.metadata_loader)
+        fallback = _resolve_tracked_image_path(
+            out_dir, sample, cell_type, verbose=False, metadata_csv_path=gui_metadata_csv_path
+        )
         return fallback if fallback is not None and Path(fallback).exists() else None
 
     def _on_metadata_updated(self, *_):
@@ -284,6 +298,7 @@ class FeatureBackprojectionTab(QWidget):
             self.viewer.dims.events.current_step.disconnect(self._dims_callback)
         except Exception:
             pass
+        unregister_preview_dims_listener(self.viewer, self)
         self._dims_callback = None
 
     def _connect_dims_listener(self):
@@ -297,6 +312,7 @@ class FeatureBackprojectionTab(QWidget):
         try:
             self.viewer.dims.events.current_step.connect(_on_step)
             self._dims_callback = _on_step
+            register_preview_dims_listener(self.viewer, self, _on_step)
         except Exception:
             self._dims_callback = None
 
@@ -367,7 +383,16 @@ class FeatureBackprojectionTab(QWidget):
             self.status_label.setText(f"Could not resolve image paths: {exc}")
             return
 
+        # Full viewer reset — not just this tab's own previously-added
+        # layers. Whatever was left in the viewer by the Visualization tab
+        # or another backprojection preview (State/Track Classification)
+        # should not linger underneath this preview's overlay, and any of
+        # their still-connected dims listeners must be dropped before we
+        # clear layers so none of them can fire reentrantly mid-clear.
         self._teardown_preview()
+        stop_dim_playback(self.viewer)
+        disconnect_all_preview_dims_listeners(self.viewer)
+        self.viewer.layers.clear()
 
         try:
             raw_img = load_image(raw_path)
@@ -379,7 +404,13 @@ class FeatureBackprojectionTab(QWidget):
             self._added_layer_names.extend(ch_names)
 
             tracked_dask = load_image(tracked_path)
-            tracked_layer_name = f"{_FEATURE_LAYER_PREFIX} {cell_type} TrackID"
+            df_sample = self._df_features
+            if "sample_name" in df_sample.columns:
+                df_sample = df_sample[df_sample["sample_name"].astype(str) == str(sample)]
+            id_col = "original_TrackID" if "original_TrackID" in df_sample.columns else "TrackID"
+            keep_ids = pd.to_numeric(df_sample[id_col], errors="coerce").dropna().astype(np.int64).unique()
+            tracked_dask = filter_track_image_to_ids(tracked_dask, keep_ids)
+            tracked_layer_name = f"{_FEATURE_LAYER_PREFIX} {cell_type} filtered TrackID"
             self.viewer.add_labels(
                 tracked_dask, name=tracked_layer_name, opacity=0.4, visible=False,
             )

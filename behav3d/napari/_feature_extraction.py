@@ -32,6 +32,7 @@ from qtpy.QtCore import Qt
 from qtpy.QtGui import QCursor
 
 from behav3d.core.qt_help import HelpButton, make_help_row, reset_scroll_on_page_change
+from behav3d.napari._analysis import CollapsibleSection
 from behav3d.napari._units import UnitGroupManager
 from behav3d.napari._results_panel import (
     ResultsPanel,
@@ -41,6 +42,11 @@ from behav3d.napari._background_runner import (
     BackgroundOperation,
     ProgressBarRow,
     fire_extra_callback,
+)
+from behav3d.napari._preview_dims import (
+    disconnect_all_preview_dims_listeners,
+    register_preview_dims_listener,
+    unregister_preview_dims_listener,
 )
 
 # Colormaps for raw channel layers (same order as the Visualization tab)
@@ -71,6 +77,14 @@ _ACTIVE_PREVIEW_HOVER: dict = {}
 # keeps firing against layers/arrays that were just cleared/replaced,
 # producing missing or clobbered "Dead/Alive" / "% Dead Mask" layers (or a
 # crash if it reaches for layers mid-teardown).
+#
+# This dict/helper only arbitrates between this *file's own* two preview
+# panels. Every connect/disconnect below also registers/unregisters with
+# ``behav3d.napari._preview_dims``'s viewer-wide registry, so that *other*
+# tabs (Visualization, State/Track Classification, Feature Backprojection)
+# can drop this tab's listener too via ``disconnect_all_preview_dims_listeners``
+# before they bulk-mutate ``viewer.layers`` — the cross-tab version of the
+# same "stale listener fires mid-teardown" hazard described above.
 _ACTIVE_PREVIEW_DIMS: dict = {}
 
 
@@ -1003,9 +1017,11 @@ class CellTypeFeaturePanel(QWidget):
             "Dead Mask Percentage Threshold",
             "Percentage of dead-mask pixels overlapping a segment's volume\n"
             "required to classify the cell as dead.\n\n"
-            "Classification is sticky: once a track crosses this threshold at\n"
-            "any timepoint, it is marked 'dead' from that timepoint onward for\n"
-            "the rest of the track, even if the percentage later drops again.\n\n"
+            "By default, classification is sticky: once a track crosses this\n"
+            "threshold at any timepoint, it is marked 'dead' from that timepoint\n"
+            "onward for the rest of the track, even if the percentage later\n"
+            "drops again. This can be turned off in Advanced Configuration\n"
+            "below ('Propagate dead signal').\n\n"
             "Set to 0 to skip dead classification.\n"
             "Entered as a percentage here; saved to behav3d_parameters.yml\n"
             "as a fraction (e.g. 3 % is saved as 0.03).",
@@ -1087,11 +1103,35 @@ class CellTypeFeaturePanel(QWidget):
         dead_group.setVisible(self._has_dead)
         self._dead_group = dead_group
 
+        # ── Advanced Configuration (death propagation) ──────────────────────
+        adv_dead_section = CollapsibleSection("⚙ Advanced Configuration", expanded=False)
+        self.check_propagate_dead = QCheckBox("Propagate dead signal")
+        self.check_propagate_dead.setChecked(
+            bool(fcfg.get("propagate_dead_signal", self.category == "organoid"))
+        )
+        adv_dead_row = make_help_row(
+            self.check_propagate_dead,
+            "Propagate Dead Signal",
+            "ON: once a track crosses the dead threshold at any timepoint, it\n"
+            "stays 'dead' for every later timepoint, even if the signal drops\n"
+            "again afterwards. Recommended for organoids - a dead organoid\n"
+            "doesn't come back to life.\n\n"
+            "OFF: only the timepoints where the signal is actually at/above\n"
+            "threshold are marked 'dead'; the track can go back to 'alive'\n"
+            "afterwards. Recommended for immune/other cells, which can\n"
+            "transiently pick up dead dye while killing a dying organoid\n"
+            "without actually dying themselves.",
+        )
+        adv_dead_section.addLayout(adv_dead_row)
+        layout.addWidget(adv_dead_section)
+        adv_dead_section.setVisible(self._has_dead)
+        self._adv_dead_section = adv_dead_section
+
         def _toggle_dead_group(state=None):
             cb = self.feature_checks.get("death")
-            self._dead_group.setVisible(
-                self._has_dead and (cb is not None and cb.isChecked())
-            )
+            visible = self._has_dead and (cb is not None and cb.isChecked())
+            self._dead_group.setVisible(visible)
+            self._adv_dead_section.setVisible(visible)
 
         if "death" in self.feature_checks:
             self.feature_checks["death"].stateChanged.connect(_toggle_dead_group)
@@ -1211,6 +1251,7 @@ class CellTypeFeaturePanel(QWidget):
             pass
         if _ACTIVE_PREVIEW_DIMS.get(id(viewer)) is self._preview_dims_callback:
             _ACTIVE_PREVIEW_DIMS.pop(id(viewer), None)
+        unregister_preview_dims_listener(viewer, self)
         self._preview_dims_callback = None
 
     def _cleanup_preview(self):
@@ -1271,6 +1312,7 @@ class CellTypeFeaturePanel(QWidget):
             viewer.dims.events.current_step.connect(_on_step)
             self._preview_dims_callback = _on_step
             _ACTIVE_PREVIEW_DIMS[id(viewer)] = _on_step
+            register_preview_dims_listener(viewer, self, _on_step)
         except Exception:
             self._preview_dims_callback = None
 
@@ -1591,6 +1633,7 @@ class CellTypeFeaturePanel(QWidget):
             # Persisted/consumed as a fraction (0.0-1.0); ``thr`` is the
             # percent-scale value shown in the spinbox.
             "dead_mask_percentage_threshold": self._threshold_as_fraction(thr) if thr > 0 else None,
+            "propagate_dead_signal": bool(self.check_propagate_dead.isChecked()),
             "n_workers": int(self.spin_workers.value()),
         }
 
@@ -1618,6 +1661,7 @@ class CellTypeFeaturePanel(QWidget):
                 # stored in ``settings``, which is scaled for persistence).
                 if not p._is_organoid and p.spin_dead_threshold is not None:
                     p.spin_dead_threshold.setValue(self._get_threshold())
+                p.check_propagate_dead.setChecked(settings["propagate_dead_signal"])
                 count += 1
         scope = "category" if category_only else "all"
         self.log(f"Applied feature settings to {count} other cell type(s) ({scope}).")
@@ -1746,6 +1790,7 @@ class CellTypeFeaturePanel(QWidget):
                     output_dir=str(Path(self.metadata_loader.output_dir).expanduser()),
                     cell_type=ct,
                     new_threshold=self._threshold_as_fraction(new_thr),
+                    propagate=bool(panel.check_propagate_dead.isChecked()),
                 )
                 panel._persist()
                 self.log(
@@ -1782,6 +1827,7 @@ class CellTypeFeaturePanel(QWidget):
             features_choice=list(params["features_choice"]),
             contact_threshold=float(params["contact_threshold"]),
             dead_mask_percentage_threshold=params["dead_mask_percentage_threshold"],
+            propagate_dead_signal=bool(params.get("propagate_dead_signal", True)),
             n_workers=int(params["n_workers"]),
             overwrite=overwrite,
             progress_cb=progress_cb,
@@ -1798,8 +1844,10 @@ class CellTypeFeaturePanel(QWidget):
         out_dir = str(Path(self.metadata_loader.output_dir).expanduser())
         if params is not None:
             new_thr = params["dead_mask_percentage_threshold"] or 0.0
+            propagate = bool(params.get("propagate_dead_signal", True))
         else:
             new_thr = self._threshold_as_fraction()
+            propagate = bool(self.check_propagate_dead.isChecked())
         if new_thr <= 0:
             self.log(
                 f"\u26a0\ufe0f Skipping death-only re-run for {cell_type}: "
@@ -1810,6 +1858,7 @@ class CellTypeFeaturePanel(QWidget):
             output_dir=out_dir,
             cell_type=cell_type,
             new_threshold=float(new_thr),
+            propagate=propagate,
         )
 
     def _check_existing_features(self, cell_types: list) -> list:
@@ -2088,21 +2137,22 @@ class CellTypeFeaturePanel(QWidget):
             print(f"[{_ts()}] [Preview] Clearing preview layers...")
             self._cleanup_preview()
             # Always tear down whichever dims listener — this panel's own,
-            # another panel's, or the shared organoid one — is currently
-            # active before clearing layers. A stale listener from whatever
-            # preview was loaded previously would otherwise fire on the
-            # dims-range change caused by clearing/re-adding layers below,
-            # recompute against its now-stale cache, and either write into
-            # layers that were just removed (crash) or silently clobber the
-            # new preview's "Dead/Alive" / "% Dead Mask" layers.
+            # another panel's, the shared organoid one, or a listener left
+            # live by a different tab entirely (State/Track Classification,
+            # Feature Backprojection) — is currently active before clearing
+            # layers. A stale listener from whatever preview was loaded
+            # previously would otherwise fire on the dims-range change
+            # caused by clearing/re-adding layers below, recompute against
+            # its now-stale cache, and either write into layers that were
+            # just removed (crash) or silently clobber the new preview's
+            # "Dead/Alive" / "% Dead Mask" layers.
             _disconnect_any_active_preview_dims(self.viewer)
+            disconnect_all_preview_dims_listeners(self.viewer)
             # Stop any running dims animation before clearing layers so napari
             # doesn't try to use slider widgets it is about to destroy.
-            from behav3d.napari._visualization import (
-                _is_addable_layer_data,
-                _stop_dim_playback,
-            )
-            _stop_dim_playback(self.viewer)
+            from behav3d.napari._visualization import _is_addable_layer_data
+            from behav3d.napari._preview_dims import stop_dim_playback
+            stop_dim_playback(self.viewer)
             self.viewer.layers.clear()
 
             # Raw channels
@@ -3776,6 +3826,7 @@ class FeatureExtractionTab(QWidget):
         })
         for panel in self.panels.values():
             panel._cleanup_preview()
+        disconnect_all_preview_dims_listeners(self.viewer)
         self.viewer.layers.clear()
         self._log("Cleaned up viewer layers.")
 
@@ -3933,6 +3984,7 @@ class FeatureExtractionTab(QWidget):
             pass
         if _ACTIVE_PREVIEW_DIMS.get(id(viewer)) is self._org_preview_dims_callback:
             _ACTIVE_PREVIEW_DIMS.pop(id(viewer), None)
+        unregister_preview_dims_listener(viewer, self)
         self._org_preview_dims_callback = None
 
     def _connect_org_preview_dims(self):
@@ -3960,6 +4012,7 @@ class FeatureExtractionTab(QWidget):
             viewer.dims.events.current_step.connect(_on_step)
             self._org_preview_dims_callback = _on_step
             _ACTIVE_PREVIEW_DIMS[id(viewer)] = _on_step
+            register_preview_dims_listener(viewer, self, _on_step)
         except Exception:
             self._org_preview_dims_callback = None
 

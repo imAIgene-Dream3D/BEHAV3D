@@ -62,8 +62,15 @@ from behav3d.napari._background_runner import (
 )
 from behav3d.napari._pdf_view import open_pdf_in_napari
 from behav3d.napari._rename_dialog import RenameClusterDialog
+from behav3d.napari._preview_dims import (
+    disconnect_all_preview_dims_listeners,
+    register_preview_dims_listener,
+    stop_dim_playback,
+    unregister_preview_dims_listener,
+)
 from behav3d.core.qt_help import HelpButton, make_help_row, reset_scroll_on_page_change
 from behav3d.core.utils import rmtree_ignore_missing, format_timepoints_as_time
+from behav3d.core.metadata import resolve_metadata_csv_path
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2750,6 +2757,7 @@ class StateClassificationSubTab(QWidget):
                 self.viewer.dims.events.current_step.disconnect(self._state_bp_dims_callback)
             except Exception:
                 pass
+        unregister_preview_dims_listener(self.viewer, self)
         self._state_bp_dims_callback = None
         self._state_bp_preview = None
 
@@ -2759,6 +2767,7 @@ class StateClassificationSubTab(QWidget):
                 self.viewer.dims.events.current_step.disconnect(self._state_bp_dims_callback)
             except Exception:
                 pass
+            unregister_preview_dims_listener(self.viewer, self)
             self._state_bp_dims_callback = None
         if self.viewer is None:
             return
@@ -2769,6 +2778,7 @@ class StateClassificationSubTab(QWidget):
         try:
             self.viewer.dims.events.current_step.connect(_on_step)
             self._state_bp_dims_callback = _on_step
+            register_preview_dims_listener(self.viewer, self, _on_step)
         except Exception:
             self._state_bp_dims_callback = None
 
@@ -2849,6 +2859,7 @@ class StateClassificationSubTab(QWidget):
                 _get_classification_state_order,
                 _normalize_label_color_map,
             )
+            from behav3d.analysis.backprojection import filter_track_image_to_ids
             from behav3d.io.images import load_image
             out_dir = self._out_dir()
             if not out_dir:
@@ -2876,10 +2887,15 @@ class StateClassificationSubTab(QWidget):
                 sample_adata.obs, state_col=state_col, code_map=code_map,
             )
 
-            raw_path = _resolve_raw_image_path(out_dir, sample_name, verbose=False)
+            gui_metadata_csv_path = resolve_metadata_csv_path(self.metadata_loader)
+            raw_path = _resolve_raw_image_path(
+                out_dir, sample_name, verbose=False, metadata_csv_path=gui_metadata_csv_path
+            )
             if raw_path is None or not Path(raw_path).exists():
                 raise FileNotFoundError(f"Raw image not found for sample '{sample_name}'.")
-            tracked_path = _resolve_tracked_image_path(out_dir, sample_name, ct, verbose=False)
+            tracked_path = _resolve_tracked_image_path(
+                out_dir, sample_name, ct, verbose=False, metadata_csv_path=gui_metadata_csv_path
+            )
             if tracked_path is None or not Path(tracked_path).exists():
                 raise FileNotFoundError(
                     f"Tracked image not found for sample '{sample_name}', cell_type '{ct}'."
@@ -2887,18 +2903,21 @@ class StateClassificationSubTab(QWidget):
             raw_img = load_image(raw_path)
             tracked_img = load_image(tracked_path)
             tracked_view = _align_labels_to_raw_shape_for_view(tracked_img, raw_img, "TrackID", verbose=False)
+            keep_ids = state_code_lookup["TrackID"].unique()
+            tracked_view = filter_track_image_to_ids(tracked_view, keep_ids)
 
-            _state_layer_names = {
-                "full_behavioral_cluster", "intrinsic_behavioral_cluster",
-                "raw_hmm_state", "behavioral_state_class",
-            }
+            # Full viewer reset — not just the specific layer names this
+            # preview itself uses. Whatever the Visualization tab (raw
+            # channels, Segments, Tracked Segments, Tracks) or another
+            # backprojection preview (Track Classification, Feature
+            # Backprojection) had loaded should not linger under this
+            # preview's overlay, and any of their still-connected dims
+            # listeners must be dropped before we clear layers so none of
+            # them can fire reentrantly mid-clear.
             self._teardown_state_bp_preview()
-            for layer in list(self.viewer.layers):
-                if layer.name in {"TrackID"} | _state_layer_names or " – Ch" in layer.name:
-                    try:
-                        self.viewer.layers.remove(layer)
-                    except Exception:
-                        pass
+            stop_dim_playback(self.viewer)
+            disconnect_all_preview_dims_listeners(self.viewer)
+            self.viewer.layers.clear()
             saved_channels = (
                 getattr(self.metadata_loader, "behav3d_parameters", {})
                 .get("viewer_display", {})
@@ -2918,7 +2937,7 @@ class StateClassificationSubTab(QWidget):
                     layer.events.colormap.connect(self._on_bp_layer_display_changed)
                 except (KeyError, IndexError):
                     pass
-            self.viewer.add_labels(tracked_view, name="TrackID", visible=False, opacity=opacity)
+            self.viewer.add_labels(tracked_view, name="filtered TrackID", visible=False, opacity=opacity)
 
             self._state_bp_preview = {
                 "tracked_path": Path(tracked_path),
@@ -3991,6 +4010,15 @@ class TrackClassificationSubTab(QWidget):
         tbp_form.addRow("Opacity:", make_help_row(
             self.spin_track_opacity, "Opacity",
             "Opacity of the colored track overlay layer in napari (10–100%)."
+        ))
+
+        self.chk_show_track_trajectories = QCheckBox("Show trajectories")
+        self.chk_show_track_trajectories.setChecked(False)
+        tbp_form.addRow("Trajectories:", _make_chk_help_row(
+            self.chk_show_track_trajectories, "Show trajectories",
+            "Overlay each track's full path as a colored line, matching its class "
+            "color below. Off by default — adds one napari Tracks layer per class "
+            "when enabled."
         ))
         g_track_view.addLayout(tbp_form)
 
@@ -6345,6 +6373,7 @@ class TrackClassificationSubTab(QWidget):
                 self.viewer.dims.events.current_step.disconnect(self._track_bp_dims_callback)
             except Exception:
                 pass
+        unregister_preview_dims_listener(self.viewer, self)
         self._track_bp_dims_callback = None
         self._track_bp_preview = None
 
@@ -6354,6 +6383,7 @@ class TrackClassificationSubTab(QWidget):
                 self.viewer.dims.events.current_step.disconnect(self._track_bp_dims_callback)
             except Exception:
                 pass
+            unregister_preview_dims_listener(self.viewer, self)
             self._track_bp_dims_callback = None
         if self.viewer is None:
             return
@@ -6364,6 +6394,7 @@ class TrackClassificationSubTab(QWidget):
         try:
             self.viewer.dims.events.current_step.connect(_on_step)
             self._track_bp_dims_callback = _on_step
+            register_preview_dims_listener(self.viewer, self, _on_step)
         except Exception:
             self._track_bp_dims_callback = None
 
@@ -6449,6 +6480,7 @@ class TrackClassificationSubTab(QWidget):
                 prepare_track_cluster_code_lookup,
                 _add_track_statebar_click_dock,
             )
+            from behav3d.analysis.backprojection import filter_track_image_to_ids
             from behav3d.io.images import load_image
             out_dir = self._out_dir()
             if not out_dir:
@@ -6483,10 +6515,15 @@ class TrackClassificationSubTab(QWidget):
                 backproj_obs, code_map, output_col=output_col,
             )
 
-            raw_path = _resolve_raw_image_path(out_dir, sample_name, verbose=False)
+            gui_metadata_csv_path = resolve_metadata_csv_path(self.metadata_loader)
+            raw_path = _resolve_raw_image_path(
+                out_dir, sample_name, verbose=False, metadata_csv_path=gui_metadata_csv_path
+            )
             if raw_path is None or not Path(raw_path).exists():
                 raise FileNotFoundError(f"Raw image not found for sample '{sample_name}'.")
-            tracked_path = _resolve_tracked_image_path(out_dir, sample_name, ct, verbose=False)
+            tracked_path = _resolve_tracked_image_path(
+                out_dir, sample_name, ct, verbose=False, metadata_csv_path=gui_metadata_csv_path
+            )
             if tracked_path is None or not Path(tracked_path).exists():
                 raise FileNotFoundError(
                     f"Tracked image not found for sample '{sample_name}', cell_type '{ct}'."
@@ -6494,14 +6531,15 @@ class TrackClassificationSubTab(QWidget):
             raw_img = load_image(raw_path)
             tracked_img = load_image(tracked_path)
             tracked_view = _align_labels_to_raw_shape_for_view(tracked_img, raw_img, "TrackID", verbose=False)
+            keep_ids = cluster_code_lookup["TrackID"].unique()
+            tracked_view = filter_track_image_to_ids(tracked_view, keep_ids)
 
+            # Full viewer reset — see the matching comment in
+            # ``_on_show_state_bp`` above.
             self._teardown_track_bp_preview()
-            for layer in list(self.viewer.layers):
-                if layer.name in ("TrackID", "behavioral_state_class") or " – Ch" in layer.name:
-                    try:
-                        self.viewer.layers.remove(layer)
-                    except Exception:
-                        pass
+            stop_dim_playback(self.viewer)
+            disconnect_all_preview_dims_listeners(self.viewer)
+            self.viewer.layers.clear()
             saved_channels = (
                 getattr(self.metadata_loader, "behav3d_parameters", {})
                 .get("viewer_display", {})
@@ -6521,7 +6559,7 @@ class TrackClassificationSubTab(QWidget):
                     layer.events.colormap.connect(self._on_bp_layer_display_changed)
                 except (KeyError, IndexError):
                     pass
-            self.viewer.add_labels(tracked_view, name="TrackID", visible=False, opacity=opacity)
+            self.viewer.add_labels(tracked_view, name="filtered TrackID", visible=False, opacity=opacity)
 
             self._track_bp_preview = {
                 "tracked_path": Path(tracked_path),
@@ -6532,6 +6570,35 @@ class TrackClassificationSubTab(QWidget):
             }
             self._refresh_track_bp_layer()
             self._connect_track_bp_dims_listener()
+
+            if self.chk_show_track_trajectories.isChecked():
+                try:
+                    from behav3d.analysis.behavior.track.visualization.plots.exemplar_coordinate_utils import (
+                        ensure_exemplar_coordinate_columns,
+                    )
+                    from behav3d.analysis.behavior.track.visualization.backprojection import (
+                        prepare_track_cluster_trajectory_data,
+                        add_track_cluster_trajectory_layers,
+                    )
+                    ensure_exemplar_coordinate_columns(
+                        adata_full, output_dir=out_dir, cell_type=ct, require_pixel_for_video=True,
+                    )
+                    trajectory_data = prepare_track_cluster_trajectory_data(
+                        adata_full=adata_full,
+                        backproj_obs=backproj_obs,
+                        output_col=output_col,
+                        sample_name=sample_name,
+                    )
+                    add_track_cluster_trajectory_layers(
+                        self.viewer,
+                        trajectory_data=trajectory_data,
+                        code_colors=code_colors,
+                        label_map=label_map,
+                        output_col=output_col,
+                        tail_length=int(tracked_img.shape[0]),
+                    )
+                except Exception as exc:
+                    self._log(f"⚠️ Could not add trajectory layers: {exc}")
 
             mapping_text = _build_state_mapping_text(label_map, code_colors)
             _add_mapping_dock_widget(

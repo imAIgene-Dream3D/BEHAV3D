@@ -20,7 +20,7 @@ from behav3d.analysis.behavior.state.utils import (
 )
 
 
-def _resolve_tracked_image_path(output_dir, sample_name, cell_type, verbose=False):
+def _resolve_tracked_image_path(output_dir, sample_name, cell_type, verbose=False, metadata_csv_path=None):
     output_dir = Path(output_dir)
     sample_dir = Path(output_dir, "images", str(sample_name))
     if sample_dir.exists():
@@ -46,10 +46,12 @@ def _resolve_tracked_image_path(output_dir, sample_name, cell_type, verbose=Fals
     elif verbose:
         print(f"Tracked image resolve: sample folder missing '{sample_dir}'")
 
-    metadata_csv_path = Path(output_dir, "metadata.csv")
-    if metadata_csv_path.exists():
+    resolved_metadata_csv_path = (
+        Path(metadata_csv_path).expanduser() if metadata_csv_path else Path(output_dir, "metadata.csv")
+    )
+    if resolved_metadata_csv_path.exists():
         try:
-            metadata = pd.read_csv(metadata_csv_path, low_memory=False)
+            metadata = pd.read_csv(resolved_metadata_csv_path, low_memory=False)
             if "sample_name" in metadata.columns:
                 rows = metadata[
                     metadata["sample_name"].astype("string").str.strip() == str(sample_name).strip()
@@ -66,11 +68,11 @@ def _resolve_tracked_image_path(output_dir, sample_name, cell_type, verbose=Fals
                         p = Path(str(tracked_path).strip()).expanduser()
                         if p.exists():
                             if verbose:
-                                print(f"Tracked image resolve: using metadata.csv path '{p}'")
+                                print(f"Tracked image resolve: using '{resolved_metadata_csv_path.name}' path '{p}'")
                             return p
         except Exception as exc:
             warnings.warn(
-                f"Could not parse metadata.csv for tracked image fallback: {exc}",
+                f"Could not parse '{resolved_metadata_csv_path.name}' for tracked image fallback: {exc}",
                 RuntimeWarning,
             )
 
@@ -78,7 +80,7 @@ def _resolve_tracked_image_path(output_dir, sample_name, cell_type, verbose=Fals
         print(
             "Tracked image resolve: no candidate matched expected patterns "
             f"for sample='{sample_name}', cell_type='{cell_type}' "
-            f"in '{sample_dir}' or metadata.csv."
+            f"in '{sample_dir}' or '{resolved_metadata_csv_path}'."
         )
     return None
 
@@ -814,7 +816,7 @@ def export_behavioral_state_backprojection_zarrs(
     return manifest
 
 
-def _resolve_raw_image_path(output_dir, sample_name, verbose=False):
+def _resolve_raw_image_path(output_dir, sample_name, verbose=False, metadata_csv_path=None):
     output_dir = Path(output_dir)
     sample_name = str(sample_name).strip()
     sample_dir = Path(output_dir, "images", sample_name)
@@ -861,10 +863,12 @@ def _resolve_raw_image_path(output_dir, sample_name, verbose=False):
                 print(f"Raw image resolve: using fallback path '{chosen}'")
             return chosen
 
-    metadata_csv_path = Path(output_dir, "metadata.csv")
-    if metadata_csv_path.exists():
+    resolved_metadata_csv_path = (
+        Path(metadata_csv_path).expanduser() if metadata_csv_path else Path(output_dir, "metadata.csv")
+    )
+    if resolved_metadata_csv_path.exists():
         try:
-            metadata = pd.read_csv(metadata_csv_path, low_memory=False)
+            metadata = pd.read_csv(resolved_metadata_csv_path, low_memory=False)
             if {"sample_name", "raw_image_path"}.issubset(metadata.columns):
                 rows = metadata[
                     metadata["sample_name"].astype("string").str.strip() == sample_name
@@ -875,17 +879,17 @@ def _resolve_raw_image_path(output_dir, sample_name, verbose=False):
                     p = Path(str(raw_path)).expanduser()
                     if p.exists():
                         if verbose:
-                            print(f"Raw image resolve: using metadata.csv path '{p}'")
+                            print(f"Raw image resolve: using '{resolved_metadata_csv_path.name}' path '{p}'")
                         return p
         except Exception as exc:
             warnings.warn(
-                f"Could not parse metadata.csv for raw image fallback: {exc}",
+                f"Could not parse '{resolved_metadata_csv_path.name}' for raw image fallback: {exc}",
                 RuntimeWarning,
             )
     if verbose:
         print(
             "Raw image resolve: no candidate found for sample "
-            f"'{sample_name}' in '{sample_dir}' or metadata.csv."
+            f"'{sample_name}' in '{sample_dir}' or '{resolved_metadata_csv_path}'."
         )
 
     return None
@@ -1261,6 +1265,25 @@ def _align_labels_to_raw_shape_for_view(labels_img, raw_img, layer_name, verbose
     return labels
 
 
+def _unique_track_ids_under_state(tracked_img_view, state_img_view):
+    """TrackIDs backing any non-background pixel of a state/cluster overlay.
+
+    Used to restrict the reference TrackID layer to tracks that actually
+    received a behavioral-state/cluster assignment (i.e. survived the
+    Filtering step upstream), without needing a separate lookup dataframe
+    or CSV read here.
+    """
+    if hasattr(tracked_img_view, "chunks") or hasattr(state_img_view, "chunks"):
+        import dask.array as da
+
+        arr = da.where(da.asarray(state_img_view) != 0, da.asarray(tracked_img_view), 0)
+        ids = da.unique(arr).compute()
+    else:
+        arr = np.where(np.asarray(state_img_view) != 0, np.asarray(tracked_img_view), 0)
+        ids = np.unique(arr)
+    return ids[ids != 0]
+
+
 def show_behavioral_state_backprojection(
     sample_name,
     output_dir,
@@ -1365,13 +1388,15 @@ def show_behavioral_state_backprojection(
                     f"'{_behavioral_state_backprojection_path(output_dir, sample_name, cell_type)}'."
                 )
 
+    from behav3d.analysis.backprojection import filter_track_image_to_ids
+
     raw_img = load_image(raw_path)
     tracked_img = load_image(tracked_path)
     state_img = load_image(state_path)
     tracked_img_view = _align_labels_to_raw_shape_for_view(
         tracked_img,
         raw_img,
-        layer_name="TrackID",
+        layer_name="filtered TrackID",
         verbose=verbose,
     )
     _state_layer_name = state_col or "state_class"
@@ -1381,12 +1406,14 @@ def show_behavioral_state_backprojection(
         layer_name=_state_layer_name,
         verbose=verbose,
     )
+    keep_ids = _unique_track_ids_under_state(tracked_img_view, state_img_view)
+    tracked_img_view = filter_track_image_to_ids(tracked_img_view, keep_ids)
 
     import napari
 
     viewer = napari.Viewer()
     viewer.add_image(raw_img, name="raw_data")
-    viewer.add_labels(tracked_img_view, name="TrackID", visible=False)
+    viewer.add_labels(tracked_img_view, name="filtered TrackID", visible=False)
     state_layer = viewer.add_labels(state_img_view, name=_state_layer_name, visible=True)
 
     label_map = _extract_state_label_map(state_path)

@@ -45,6 +45,10 @@ from behav3d.core.metadata import (
     is_multicolor_celltype,
 )
 from behav3d.core.qt_help import reset_scroll_on_page_change
+from behav3d.napari._preview_dims import (
+    disconnect_all_preview_dims_listeners,
+    stop_dim_playback,
+)
 # Channel colormaps (cycled if there are many channels)
 _CHANNEL_COLORS = ["cyan", "yellow", "green", "red", "blue", "magenta"]
 # Label colormaps per cell-type category
@@ -79,33 +83,6 @@ def _is_addable_layer_data(data) -> bool:
     return True
 
 
-def _stop_dim_playback(viewer) -> None:
-    """Best-effort stop of any running napari dims animation.
-
-    Clearing/replacing layers while a 3-D movie is playing destroys the
-    ``QtDimSliderWidget`` objects the animation thread still references,
-    raising ``RuntimeError: wrapped C/C++ object … has been deleted``. We
-    stop playback via the public ``QtDims.stop()`` and also quit the
-    animation thread directly, since depending on the napari version either
-    (or neither) attribute may be present while a movie is live.
-    """
-    try:
-        qt_dims = viewer.window._qt_viewer.dims
-    except Exception:
-        return
-    # Public stop first (handles the current napari playback implementation).
-    try:
-        qt_dims.stop()
-    except Exception:
-        pass
-    # Fall back to tearing down the animation thread if it is still around.
-    try:
-        thread = getattr(qt_dims, "_animation_thread", None)
-        if thread is not None:
-            thread.quit()
-            thread.wait()
-    except Exception:
-        pass
 # Dask cache-buster
 # ----------------------------------------------------------------------
 def _bust_dask_cache(arr: "da.Array") -> "da.Array":
@@ -428,8 +405,13 @@ class VisualizationTab(QWidget):
 
         # Stop any running napari dim animation before clearing layers
         # (prevents RuntimeError: wrapped C/C++ object has been deleted)
-        _stop_dim_playback(self.viewer)
+        stop_dim_playback(self.viewer)
         self._display_save_timer.stop()
+        # Drop any live preview-refresh listener left connected by another
+        # tab (State/Track Classification, Feature Backprojection) — one of
+        # those firing reentrantly mid-clear() is what desyncs napari's own
+        # vispy canvas bookkeeping and raises a KeyError.
+        disconnect_all_preview_dims_listeners(self.viewer)
         self.viewer.layers.clear()
 
         output_dir = self.data_prep.output_dir or ""
@@ -967,8 +949,9 @@ class VisualizationTab(QWidget):
             f"  Entering edit mode — clearing viewer and reloading "
             f"raw + '{cell_type} tracked segments' + '{cell_type} tracks' only."
         )
-        _stop_dim_playback(self.viewer)
+        stop_dim_playback(self.viewer)
         self._display_save_timer.stop()
+        disconnect_all_preview_dims_listeners(self.viewer)
         self.viewer.layers.clear()
         saved_channels = (
             self.data_prep.behav3d_parameters
