@@ -747,6 +747,112 @@ def merge_labels(
     )
 
 
+def swap_labels(
+    buf,
+    label_ids: Sequence[int],
+    t_range: Optional[Tuple[int, int]] = None,
+    n_workers: Optional[int] = None,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+) -> OpResult:
+    """Swap two label IDs across the chosen time range.
+
+    Fixes identity swaps introduced by the tracker: when two cells lie close
+    together the tracker can exchange their TrackIDs from some frame onward.
+    Selecting the two labels and the range where they are wrong re-exchanges
+    them so each track recovers its correct identity.
+
+    Frames are rewritten when at least one of the two labels exists in that
+    timepoint.  If both are present their IDs are swapped; if only one is
+    present (e.g. the other has a tracking gap) that label is rewritten to the
+    complementary ID so the relabel stays consistent across the gap.
+    Timepoints where neither label exists are left unchanged.
+
+    .. note::
+        Swapping over the **full union** of both lifetimes is a pure rename
+        (``A`` becomes ``B`` and vice-versa everywhere) and does not fix a
+        partial swap.  To repair a real ID swap, pass the ``t_range`` that
+        starts at the frame where the swap began.
+
+    Frames are processed in parallel via :class:`ThreadPoolExecutor` (numpy
+    ``==`` releases the GIL), mirroring :func:`merge_labels`.
+    """
+    ids = [int(x) for x in label_ids]
+    if len(ids) != 2:
+        raise ValueError("swap_labels needs exactly 2 labels")
+    if ids[0] == ids[1]:
+        raise ValueError("swap_labels needs two distinct labels")
+
+    a, b = ids
+    if t_range is None:
+        starts: List[int] = []
+        ends: List[int] = []
+        for lid in ids:
+            f, l = lifetime_of(buf, lid)
+            if f is not None:
+                starts.append(f)
+                ends.append(l)  # type: ignore[arg-type]
+        if not starts:
+            raise ValueError(f"none of the labels {ids} are present in the volume")
+        t_range = (min(starts), max(ends))
+
+    t0, t1 = _normalize_t_range(buf, t_range)
+
+    def _swap_one(t_frame: Tuple[int, np.ndarray]) -> Tuple[int, Optional[np.ndarray]]:
+        t, frame = t_frame
+        mask_a = frame == a
+        mask_b = frame == b
+        has_a = mask_a.any()
+        has_b = mask_b.any()
+        if not has_a and not has_b:
+            return t, None
+        out = frame.copy()
+        if has_a and has_b:
+            out[mask_a] = b
+            out[mask_b] = a
+        elif has_a:
+            out[mask_a] = b
+        else:
+            out[mask_b] = a
+        return t, out
+
+    _nw = min(max(1, int(n_workers)) if n_workers else (os.cpu_count() or 1), max(1, t1 - t0 + 1))
+    batch_size = _nw * 2
+    _total = t1 - t0 + 1
+    _processed = 0
+    new_frames: Dict[int, np.ndarray] = {}
+
+    with ThreadPoolExecutor(max_workers=_nw) as ex:
+        batch = []
+        for t in range(t0, t1 + 1):
+            frame = buf.peek(t)
+            if (frame == a).any() or (frame == b).any():
+                batch.append((t, frame.copy()))
+            else:
+                _processed += 1
+                if progress_cb:
+                    progress_cb(_processed, _total)
+
+            if len(batch) >= batch_size or t == t1:
+                if batch:
+                    for _i, (t_out, out) in enumerate(ex.map(_swap_one, batch)):
+                        _processed += 1
+                        if progress_cb:
+                            progress_cb(_processed, _total)
+                        if out is not None:
+                            new_frames[t_out] = out
+                    batch = []
+
+    return OpResult(
+        name="swap",
+        new_frames=new_frames,
+        affected_labels=sorted({a, b}),
+        new_labels=[],
+        summary=(
+            f"Swapped labels {a} and {b} across {len(new_frames)} frame(s)"
+        ),
+    )
+
+
 def erode_label(
     buf,
     label_id: int,
