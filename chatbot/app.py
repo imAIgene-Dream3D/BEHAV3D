@@ -552,7 +552,7 @@ def analysis_choice_summary(context: dict, messages: list[dict]) -> str | None:
             "How much of each immune cell surface engages an organoid? Use "
             "**Invasiveness Analysis** after extracting invasiveness features.",
             "Do sustained-contact tracks occupy different trajectory clusters, or do "
-            "cell states change after contact? Use **Contact-Based Grouping** and "
+            "cell states change after contact? Use **Contact analysis** and "
             "**Contact State-Shift Analysis** under State Trajectory.",
         ])
     if has_immune:
@@ -597,7 +597,7 @@ def analysis_choice_summary(context: dict, messages: list[dict]) -> str | None:
         "each timepoint. |\n"
         "| **State Trajectory** | Which whole-track behavioral programs occur and how "
         "their proportions differ by condition. |\n"
-        "| **Contact-Based Grouping** | Whether State Trajectory clusters differ "
+        "| **Contact analysis** | Whether State Trajectory clusters differ "
         "between tracks with and without a sustained contact bout. |\n"
         "| **Contact State-Shift Analysis** | Whether behavioral-state composition "
         "changes before versus after contact, compared with matched no-contact tracks. |\n"
@@ -3257,7 +3257,7 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "manually edited outside BEHAV3D.\n"
         "- For State Trajectory, Trajectory size cannot exceed the Filtering trim. Average linkage is the "
         "default, Complete is a reasonable comparison, and Single performs poorly. Original BEHAV3D mode is "
-        "deprecated. Categorical DTW supports Contact-Based Grouping for sustained-contact versus no-contact "
+        "deprecated. Categorical DTW supports Contact analysis for sustained-contact versus no-contact "
         "tracks and Contact State-Shift Analysis for before/after-contact state composition; the latter also "
         "requires Behavioral State results. Do not claim these current contact analyses are unavailable or "
         "known to produce empty output.\n"

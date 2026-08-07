@@ -3725,7 +3725,7 @@ class TrackClassificationSubTab(QWidget):
         track_comparison_row.addWidget(self.btn_view_track_condition_comparison)
         g_track_comparison.addLayout(track_comparison_row)
 
-        self.grp_contact_analysis = QGroupBox("Contact-based Grouping")
+        self.grp_contact_analysis = QGroupBox("Contact analysis")
         g_contact = QVBoxLayout(self.grp_contact_analysis)
         g_contact.setSpacing(4)
         g_contact.addWidget(QLabel(
@@ -3803,6 +3803,40 @@ class TrackClassificationSubTab(QWidget):
         self.btn_view_contact_analysis = _make_view_btn()
         contact_row.addWidget(self.btn_view_contact_analysis)
         g_contact.addLayout(contact_row)
+
+        g_contact.addWidget(QLabel(
+            "Contact duration comparison (how long tracks stay in contact with each touched class "
+            "of 'Use contact cell classification', pairwise and each class vs. the rest):"
+        ))
+        duration_form = QFormLayout()
+        duration_form.setSpacing(3)
+        self.combo_duration_test_mode = QComboBox()
+        self.combo_duration_test_mode.addItem("Welch's t-test (unpaired)", "welch")
+        self.combo_duration_test_mode.addItem("Paired t-test", "paired")
+        self.combo_duration_test_mode.currentIndexChanged.connect(self._on_duration_test_mode_changed)
+        duration_form.addRow("Test:", make_help_row(
+            self.combo_duration_test_mode, "Comparison test",
+            "'Welch's t-test': compares the raw per-touch durations between the two groups without "
+            "assuming equal variances. 'Paired t-test': averages durations within each 'Pairing "
+            "column' value first, then pairs the two groups' averages for the same value (e.g. the "
+            "same sample) — pairing units missing either side are dropped."
+        ))
+        self.combo_duration_pairing_col = QComboBox()
+        duration_form.addRow("Pairing column:", self.combo_duration_pairing_col)
+        self.spin_duration_comparisons_per_page = QSpinBox()
+        self.spin_duration_comparisons_per_page.setRange(1, 100)
+        self.spin_duration_comparisons_per_page.setValue(12)
+        self.spin_duration_comparisons_per_page.setMaximumWidth(100)
+        duration_form.addRow("Comparisons per page:", self.spin_duration_comparisons_per_page)
+        g_contact.addLayout(duration_form)
+        duration_row = QHBoxLayout()
+        self.btn_duration_comparison = QPushButton("▶ Create Contact Duration Comparison")
+        _style_secondary(self.btn_duration_comparison)
+        duration_row.addWidget(self.btn_duration_comparison, stretch=1)
+        self.btn_view_duration_comparison = _make_view_btn()
+        duration_row.addWidget(self.btn_view_duration_comparison)
+        g_contact.addLayout(duration_row)
+        self._on_duration_test_mode_changed()
 
         g_contact.addWidget(QLabel("State-shift analysis (behavioral state before → after contact):"))
         shift_form = QFormLayout()
@@ -4083,6 +4117,8 @@ class TrackClassificationSubTab(QWidget):
         self.combo_contact_col.currentTextChanged.connect(self._sync_contact_target_class_controls)
         self.chk_use_target_class.stateChanged.connect(self._sync_contact_target_class_controls)
         self.combo_target_class_source.currentTextChanged.connect(self._sync_contact_target_class_controls)
+        self.btn_duration_comparison.clicked.connect(self._on_duration_comparison)
+        self.btn_view_duration_comparison.clicked.connect(lambda: self._on_view("contact_duration"))
         self.btn_contact_state_shift.clicked.connect(self._on_contact_state_shift_analysis)
         self.btn_view_contact_state_shift.clicked.connect(lambda: self._on_view("contact_state_shift"))
         self.btn_track_contact_overview.clicked.connect(self._on_track_contact_overview)
@@ -4708,6 +4744,19 @@ class TrackClassificationSubTab(QWidget):
         self._sync_track_comparison_group_y_text()
         self._refresh_track_comparison_group_levels()
 
+        # Pairing column for the paired contact-duration test: "sample_name" is always offered
+        # first (the common case, matching a typical R paired-t-test workflow) even though it's
+        # not itself one of the condition-like candidate_cols above.
+        pairing_options = ["sample_name"] + [c for c in candidate_cols if c != "sample_name"]
+        prev_pairing = self.combo_duration_pairing_col.currentText()
+        self.combo_duration_pairing_col.blockSignals(True)
+        self.combo_duration_pairing_col.clear()
+        self.combo_duration_pairing_col.addItems(pairing_options)
+        self.combo_duration_pairing_col.setCurrentText(
+            prev_pairing if prev_pairing in pairing_options else "sample_name"
+        )
+        self.combo_duration_pairing_col.blockSignals(False)
+
     def _on_track_proportion_group_x_changed(self, _text):
         self._refresh_track_proportion_group_x_levels()
 
@@ -4912,6 +4961,17 @@ class TrackClassificationSubTab(QWidget):
             and self._track_adata is not None
             and not (use_target and not available)
         )
+        # Duration-by-class comparison is meaningless without a target classification to split by.
+        self.btn_duration_comparison.setEnabled(
+            contact_cols_present
+            and self._track_adata is not None
+            and use_target
+            and available
+        )
+
+    def _on_duration_test_mode_changed(self, *_args):
+        is_paired = self.combo_duration_test_mode.currentData() == "paired"
+        self.combo_duration_pairing_col.setVisible(is_paired)
 
     def _refresh_contact_columns(self):
         import pandas as pd
@@ -5015,6 +5075,13 @@ class TrackClassificationSubTab(QWidget):
                 contact_dir
                 and contact_dir.exists()
                 and any(contact_dir.glob("*/track_contact_overview.pdf"))
+            )
+        )
+        self.btn_view_duration_comparison.setEnabled(
+            bool(
+                contact_dir
+                and contact_dir.exists()
+                and any(contact_dir.glob("*/contact_duration_comparison.pdf"))
             )
         )
 
@@ -6207,6 +6274,123 @@ class TrackClassificationSubTab(QWidget):
             on_failed=lambda e: self._log(f"❌ Contact-vs-no-contact analysis failed: {e}"),
         )
 
+    def _on_duration_comparison(self):
+        ct = self._cell_type()
+        if not ct:
+            return
+        if self._track_adata is None:
+            QMessageBox.warning(self, "No data", "Run track clustering first.")
+            return
+        if self._bg.is_running():
+            QMessageBox.warning(self, "Busy", "Another operation is running.")
+            return
+        contact_col = self.combo_contact_col.currentText()
+        if not contact_col:
+            QMessageBox.warning(self, "Missing selection", "Select a contact column to group tracks by.")
+            return
+        if not self.chk_use_target_class.isChecked():
+            QMessageBox.warning(
+                self, "Target classification required",
+                "Enable \"Use contact cell classification\" to compare durations by class.",
+            )
+            return
+        target_available, target_warning = self._target_class_availability()
+        if not target_available:
+            QMessageBox.warning(self, "Target classification unavailable", target_warning)
+            return
+        min_bout_length = int(self.spin_contact_min_bout.value())
+        csv_path = self._track_features_csv_path(ct)
+        if not csv_path or not csv_path.exists():
+            QMessageBox.warning(self, "No data", "Track-features CSV not found. Run feature extraction first.")
+            return
+        test_mode = self.combo_duration_test_mode.currentData()
+        pairing_col = None
+        if test_mode == "paired":
+            pairing_col = self.combo_duration_pairing_col.currentText().strip()
+            if not pairing_col:
+                QMessageBox.warning(self, "Missing selection", "Select a pairing column for the paired t-test.")
+                return
+        comparisons_per_page = int(self.spin_duration_comparisons_per_page.value())
+        target_ct = self._contact_target_cell_type()
+        target_source = self.combo_target_class_source.currentData()
+        target_state_choice = self.combo_target_state_col.currentText()
+        out = self._out_dir()
+        self._log(f"▶ Running contact duration comparison for '{ct}'…")
+        track_adata = self._track_adata
+        md = getattr(self.metadata_loader, "metadata", None) if self.metadata_loader else None
+
+        def _run(**kw):
+            import pandas as pd
+            import anndata as ad
+            from behav3d.analysis.behavior.state.classification import FULL_STATE_COL
+            from behav3d.analysis.behavior.track.contact_grouping import (
+                touching_column_name,
+                build_target_class_lookup_from_state_adata,
+                build_target_class_lookup_from_track_adata,
+            )
+            from behav3d.analysis.behavior.track.utils import _resolve_dtaidistance_paths
+            from behav3d.analysis.behavior.track.visualization.plots.contact_duration_report import (
+                save_track_contact_duration_comparison,
+            )
+            from behav3d.core.metadata import merge_condition_columns_into_obs
+            from behav3d.core.utils import minutes_per_frame_from_metadata
+            df_timepoints = pd.read_csv(csv_path)
+            contact_dir = _resolve_dtaidistance_paths(str(out) if out else "", ct)["outfolder"]
+
+            if pairing_col and pairing_col not in track_adata.obs.columns and md is not None:
+                merge_condition_columns_into_obs(track_adata, md, [pairing_col])
+
+            touching_col = touching_column_name(target_ct)
+            if target_source == "track":
+                adata_target = ad.read_h5ad(str(self._track_adata_path(target_ct)))
+                target_class_lookup = build_target_class_lookup_from_track_adata(
+                    adata_target, class_col="ClusterID",
+                )
+                time_varying = False
+            else:
+                adata_target = ad.read_h5ad(str(self._state_adata_path(target_ct)))
+                state_col = (
+                    FULL_STATE_COL if target_state_choice == "full_behavioral_cluster" else target_state_choice
+                )
+                target_class_lookup = build_target_class_lookup_from_state_adata(
+                    adata_target, state_col=state_col,
+                )
+                time_varying = True
+
+            minutes_per_frame, minutes_valid = minutes_per_frame_from_metadata(md)
+
+            return save_track_contact_duration_comparison(
+                track_adata,
+                df_timepoints,
+                contact_dir,
+                contact_col=contact_col,
+                min_bout_length=min_bout_length,
+                target_class_lookup=target_class_lookup,
+                touching_col=touching_col,
+                time_varying=time_varying,
+                target_cell_type_label=target_ct,
+                test_mode=test_mode,
+                pairing_col=pairing_col,
+                minutes_per_frame=minutes_per_frame if minutes_valid else None,
+                comparisons_per_page=comparisons_per_page,
+                verbose=True,
+            )
+
+        self._bg.run(
+            fn=_run,
+            desc=f"Contact duration comparison ({ct})…",
+            progress_row=self.progress_row,
+            buttons=[self.btn_duration_comparison],
+            viewer=self.viewer,
+            inject_progress=False,
+            on_done=lambda r: (
+                self._log(f"✅ Contact duration comparison done for '{ct}' ({r.get('n_comparisons')} comparisons)."),
+                self._update_view_buttons(),
+                self._notify_results(),
+            ),
+            on_failed=lambda e: self._log(f"❌ Contact duration comparison failed: {e}"),
+        )
+
     def _on_contact_state_shift_analysis(self):
         ct = self._cell_type()
         if not ct:
@@ -6747,6 +6931,12 @@ class TrackClassificationSubTab(QWidget):
             candidates = [
                 (f.parent.name, f)
                 for f in sorted(contact_dir.glob("*/track_contact_overview.pdf"))
+            ]
+        elif kind == "contact_duration" and traj_dir:
+            contact_dir = traj_dir / "contact_analysis"
+            candidates = [
+                (f.parent.name, f)
+                for f in sorted(contact_dir.glob("*/contact_duration_comparison.pdf"))
             ]
 
         existing = [(lbl, p) for lbl, p in candidates if p and p.exists()]

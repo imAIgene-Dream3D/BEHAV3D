@@ -592,7 +592,7 @@ class TrackClassificationPanel:
             ],
         )
         contact_group_box = build_plot_box(
-            title="Contact-based grouping",
+            title="Contact analysis",
             description=(
                 "Groups tracks by whether they had a sufficiently long contiguous bout of contact "
                 "with another cell type ('contact' vs 'no_contact'), then writes cluster proportions "
@@ -2203,7 +2203,7 @@ class TrackClassificationPanel:
             try:
                 if bool(self.use_original_behav3d.value):
                     raise ValueError(
-                        "Contact-based grouping is only available for the one-hot dtaidistance method."
+                        "Contact analysis is only available for the one-hot dtaidistance method."
                     )
                 contact_col = self.contact_col_dd.value
                 if not contact_col:
@@ -2270,7 +2270,7 @@ class TrackClassificationPanel:
                     **target_class_kwargs,
                 )
                 self.plot_status_html.value = (
-                    "<b>Contact-based grouping ready:</b> proportion, condition-comparison, "
+                    "<b>Contact analysis ready:</b> proportion, condition-comparison, "
                     "and violin plots were written."
                     + (" Target-class pages were also added." if use_target_class else "")
                 )

@@ -201,7 +201,7 @@ Statistically compares trajectory-cluster proportions between the levels of one 
 
 Click **▶ Condition Comparison Report**. Each cluster gets a signed bar showing the proportion difference between two condition levels, annotated with significance stars (`*`/`**`/`***`/`****`). When **Compare condition** has exactly two levels and a second grouping axis is also set, the report switches to a true 2D grid layout instead of one row per pairwise comparison.
 
-### Contact-Based Grouping
+### Contact Analysis
 
 Labels every classified track **contact** or **no_contact** with another cell type (using the `*_contact` columns from [Filtering](../filtering.md)), so you can ask whether a trajectory cluster occurs more in cells that touched, say, an organoid or macrophage.
 
@@ -229,11 +229,38 @@ Output:
 <output_dir>/analysis/<cell_type>/behavorial_trajectories/contact_analysis/<contact_col>/csv/
 ```
 
+### Contact Duration Comparison
+
+Pulled out of the bundle above so it can be run on its own: for every class the target cell type's
+classification assigns (e.g. macrophage morphology classes round / elongated / plastic), how long
+tracks stay in **sustained contact** with a target of that class — the same "max contact-bout
+length" feature as the bundle's per-target-class violin plot, in **timepoints and minutes side by
+side** (minutes needs a valid `time_interval`/`time_unit` in metadata; otherwise only timepoints are
+shown). Every class is compared against every other class **and** against every other class pooled
+together ("rest") — e.g. with round / elongated / plastic you get round-vs-elongated,
+round-vs-plastic, elongated-vs-plastic, and round-vs-rest, elongated-vs-rest, plastic-vs-rest.
+
+Requires **Use contact cell classification** (above) to be enabled — there is nothing to compare
+"by class" without it.
+
+| Control | Default | Meaning |
+|---|---|---|
+| **Test** | Welch's t-test (unpaired) | `Welch's t-test`: compares the raw per-touch durations between the two groups without assuming equal variances. `Paired t-test`: averages durations within each **Pairing column** value first (e.g. per sample), then pairs the two groups' averages for the same value — a value missing either side is dropped from that comparison. |
+| **Pairing column** | `sample_name` | Only shown for the paired test. Which column defines a pairing unit; any of the same condition-like columns offered elsewhere, plus `sample_name`. |
+| **Comparisons per page** | 12 | How many small boxplot pairs to place on each PDF page before starting a new one. |
+
+Click **▶ Create Contact Duration Comparison**. Output, written as a sibling artifact to the bundle above:
+
+```text
+<output_dir>/analysis/<cell_type>/behavorial_trajectories/contact_analysis/<contact_col>/contact_duration_comparison.pdf
+<output_dir>/analysis/<cell_type>/behavorial_trajectories/contact_analysis/<contact_col>/csv/contact_duration_comparison.csv
+```
+
 ### Contact State-Shift Analysis
 
-Where Contact-Based Grouping asks *which* clusters occur more in contacting vs. non-contacting tracks, this asks a different question: does a track's **behavioural-state mix change** once it makes contact? It compares each classified track's [State Classification](state_classification.md) state composition **before vs. after** its first sufficiently long contact bout, against a **timing-matched null** before/after split for tracks that never contact — so a state shift attributable to contact can be distinguished from a track-wide temporal trend that would show up either way.
+Where Contact Analysis asks *which* clusters occur more in contacting vs. non-contacting tracks, this asks a different question: does a track's **behavioural-state mix change** once it makes contact? It compares each classified track's [State Classification](state_classification.md) state composition **before vs. after** its first sufficiently long contact bout, against a **timing-matched null** before/after split for tracks that never contact — so a state shift attributable to contact can be distinguished from a track-wide temporal trend that would show up either way.
 
-- **Contact tracks** use the same bout definition as Contact-Based Grouping: the first contiguous run of the chosen **Contact column** at least **Min. contiguous contact bout** timepoints long (both controls above are reused here, not duplicated).
+- **Contact tracks** use the same bout definition as Contact Analysis: the first contiguous run of the chosen **Contact column** at least **Min. contiguous contact bout** timepoints long (both controls above are reused here, not duplicated).
 - **No-contact tracks** get a synthetic reference split point instead of a real bout — its relative position within the track is drawn from the empirical distribution of real bout-start positions seen elsewhere in the run (not simply the track midpoint), so the null is matched to *when* contact tends to happen.
 
 | Control | Default | Meaning |
@@ -250,7 +277,7 @@ Click **▶ Run contact state-shift analysis** (**▶ Run State-Shift Analysis**
 Only available for the **Categorical DTW** method, and only once **State Classification has been run** for this cell type (it reads the behavioral-states `.h5ad`).
 ```
 
-Output, written as sibling artifacts to the Contact-Based Grouping report (so re-running one does not overwrite the other):
+Output, written as sibling artifacts to the Contact Analysis report (so re-running one does not overwrite the other):
 
 ```text
 <output_dir>/analysis/<cell_type>/behavorial_trajectories/contact_analysis/<contact_col>/contact_state_shift.pdf
@@ -304,7 +331,8 @@ You will find there, depending on which steps you ran:
 - Additional **exemplar** PDFs under `example_tracks/` and **diagnostics** PDFs under the trajectory-clustering output folders.
 - **Track-class proportion plots** under `behavior_proportions/`: `track_class_proportions_by_sample_<class>.pdf`/`.csv`, plus `track_class_proportions_by_group_<class>.csv` when grouping is used.
 - **Condition comparison reports** under `behavior_comparisons/`: `condition_comparison_<condition>.pdf`/`.csv`.
-- **Contact-based grouping analysis** under `contact_analysis/<contact_col>/`: `contact_analysis.pdf` plus a sibling `csv/` folder with the underlying tables.
+- **Contact analysis** under `contact_analysis/<contact_col>/`: `contact_analysis.pdf` plus a sibling `csv/` folder with the underlying tables.
+- **Contact duration comparison** in the same `contact_analysis/<contact_col>/` folder: `contact_duration_comparison.pdf` plus `csv/contact_duration_comparison.csv`.
 - **Contact state-shift analysis** in the same `contact_analysis/<contact_col>/` folder: `contact_state_shift.pdf` plus `csv/state_shift_track_windows.csv`, `csv/state_shift_diff_bars.csv` and `csv/state_shift_stacked_composition.csv`.
 - Optionally the **DTW distance matrix** CSV (if you ticked *Save distance matrix CSV*).
 

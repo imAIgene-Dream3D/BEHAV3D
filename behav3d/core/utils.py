@@ -137,6 +137,17 @@ def hours_per_frame_from_metadata(metadata):
         return 1.0, False
 
 
+def minutes_per_frame_from_metadata(metadata):
+    """Return ``(minutes_per_frame, valid)`` from a metadata DataFrame.
+
+    Mirrors :func:`hours_per_frame_from_metadata` (same "first sample row, uniform interval"
+    assumption) but converts to minutes instead of hours, since per-track contact-bout lengths are
+    usually a handful of timepoints and hours would round most of them down to 0.
+    """
+    hours, valid = hours_per_frame_from_metadata(metadata)
+    return (float(hours) * 60.0, True) if valid else (1.0, False)
+
+
 _TIME_UNIT_DISPLAY_NAMES = {"s": "seconds", "m": "minutes", "h": "hours"}
 
 

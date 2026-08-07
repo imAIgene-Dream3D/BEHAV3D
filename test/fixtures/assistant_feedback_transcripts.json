@@ -203,7 +203,7 @@
       "complete is a reasonable comparison",
       "single linkage performs poorly",
       "original behav3d feature-based mode is deprecated",
-      "categorical dtw supports contact-based grouping",
+      "categorical dtw supports contact analysis",
       "contact state-shift analysis",
       "requires behavioral state results"
     ]
@@ -280,7 +280,7 @@
       "active killing",
       "behavioral state",
       "state trajectory",
-      "contact-based grouping",
+      "contact analysis",
       "contact state-shift analysis",
       "backprojection"
     ],

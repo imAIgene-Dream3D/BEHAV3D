@@ -497,7 +497,7 @@ def test_analysis_question_on_metadata_tab_is_not_hijacked_by_organoid_setup():
     assert "No metadata is loaded" in text
     assert "Interaction Analysis" in text
     assert "Invasiveness Analysis" in text
-    assert "Contact-Based Grouping" in text
+    assert "Contact analysis" in text
     assert "Contact State-Shift Analysis" in text
     assert "Before I build the metadata" not in text
     assert "separate organoid types" not in text
@@ -634,7 +634,7 @@ def test_analysis_choose_explains_and_named_view_opens_directly():
     for name in (
         "Death Dynamics", "Interaction Analysis", "Invasiveness Analysis",
         "Active Killing", "Behavioral State", "State Trajectory",
-        "Contact-Based Grouping", "Contact State-Shift Analysis", "Backprojection",
+        "Contact analysis", "Contact State-Shift Analysis", "Backprojection",
     ):
         assert name in summary
     assert "8 samples" in summary

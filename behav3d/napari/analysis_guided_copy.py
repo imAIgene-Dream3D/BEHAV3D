@@ -435,7 +435,7 @@ TRACK_COMPARISON_REPORT = {
 
 TRACK_CONTACT_GROUPING = {
     "id": "track_contact",
-    "title": "Contact-based Grouping",
+    "title": "Contact analysis",
     "subtitle": "Do tracks with a sustained contact behave differently?",
     "color": "#c98a2c",
     "what_does": (
@@ -460,9 +460,9 @@ TRACK_CONTACT_GROUPING = {
     ],
     "has_params": True,
     "seed": (
-        "Explain the BEHAV3D Contact-based Grouping analysis: how the "
-        "contact/no-contact split works and how to choose the minimum bout "
-        "length."
+        "Explain the BEHAV3D Contact analysis (contact-based grouping): how "
+        "the contact/no-contact split works and how to choose the minimum "
+        "bout length."
     ),
 }
 
