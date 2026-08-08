@@ -2,14 +2,24 @@
 single track ID span more than one physically disconnected region.
 
 Like ``propagation_tracking.py``, each timepoint's mask is watershed-seeded
-by the previous timepoint's tracked labels. But afterwards, every physically
-disconnected fragment of the result — regardless of which label watershed
-happened to paint it with — is re-identified against ALL previous-frame
-tracks' footprints via a stable matching (tracks "propose" to fragments in
-order of pixel overlap; a fragment keeps its best suitor and rejects it for
-someone with more overlap, bumping the loser back to its next-best
-candidate). A fragment nobody has (sufficient) overlap with becomes a
-brand-new track. A track ID can therefore never span disconnected geometry.
+by the previous timepoint's tracked labels — but the decision about which
+track gets to seed which piece of geometry is made BEFORE watershed runs,
+not cleaned up after the fact. The raw current-frame mask is first
+connected-component-labelled into independent "regions". Every
+previous-frame track then picks, by simple pixel-overlap argmax, the single
+region its old footprint overlaps most (several different tracks are
+allowed to pick the same region — that's what preserves genuine merge/split
+behaviour). Every track's marker pixels lying outside its chosen region are
+pruned to zero before the existing two-pass watershed runs. As a direct,
+structural consequence: a region only one track chose is flooded to that
+track's label untouched; a region several tracks chose is still split
+between them by watershed exactly as before; and a region no track chose
+(all its markers were pruned) is left completely unlabeled by watershed. A
+final pass connected-component-labels that unlabeled leftover foreground and
+hands each disconnected leftover patch its own brand-new track id. A track
+ID can therefore never span disconnected geometry — and a genuinely single
+leftover blob is never accidentally splintered into more than one new track
+just because several old tracks each grazed it.
 """
 
 from pathlib import Path
@@ -21,7 +31,7 @@ from skimage.measure import label as cc_label
 from tqdm import tqdm
 
 from behav3d.io.images import load_image, append_to_zarr
-from behav3d.preprocessing.segmentation import segment_size_filter
+from behav3d.preprocessing.segmentation import segment_size_filter, segment_2d_filter
 from behav3d.preprocessing.tracking import convert_tracked_image_to_csv
 from behav3d.preprocessing.tracking.propagation_tracking import (
     _resolve_segments_column,
@@ -31,84 +41,99 @@ from behav3d.preprocessing.tracking.propagation_tracking import (
 )
 
 
-def _resolve_fragment_identities(new_seg, seg_prev_tp, next_label, min_overlap_fraction=0.0):
-    """Reassign every connected fragment to whichever previous-frame track
-    has the largest overlap with it (stable matching across ALL tracks, not
-    just the label watershed originally painted the fragment with), using
-    exact pixel-overlap counts.
+def _prune_markers_to_best_region(regions, seg_prev_tp, min_overlap_fraction=0.0):
+    """Restrict every previous-frame track's marker pixels to the single
+    current-frame connected region it overlaps most, before watershed runs.
 
-    A track only qualifies as a candidate for a fragment if its
-    previous-frame footprint fills at least ``min_overlap_fraction`` of that
-    fragment. A fragment with no qualifying candidate becomes a brand-new
-    track. Returns ``(new_seg, next_label)``.
+    ``regions`` is the raw current-frame mask connected-component-labelled
+    independently of any track (``skimage.measure.label`` on the mask,
+    default connectivity). For every nonzero previous-frame track label T in
+    ``seg_prev_tp``, this finds the region T's old footprint overlaps most
+    by exact pixel count, and zeroes every one of T's marker pixels that
+    falls outside that one region. Downstream watershed can then never let
+    T's seed leak into a region some other track's old footprint explains
+    better.
+
+    A track only keeps a home region if that region qualifies: the
+    track/region pixel-overlap count divided by the REGION's total pixel
+    count (the whole raw current-frame region, before any watershed
+    splitting) must be >= ``min_overlap_fraction``. A track that fails this
+    for every region it touches is pruned to zero everywhere; any region it
+    was the sole candidate for is then picked up by the leftover-labelling
+    pass instead of being assigned to it.
+
+    Multiple different tracks MAY end up sharing the same best region — this
+    is intentional, not a bug: watershed still splits that region between
+    them exactly as before.
+
+    Ties (a track with exactly equal overlap against two regions) are
+    broken deterministically toward the lower region id.
+
+    Returns a new array, same shape/dtype as ``seg_prev_tp``, with every
+    non-home-region pixel zeroed. ``seg_prev_tp`` itself is not mutated.
     """
-    if not new_seg.any():
-        return new_seg, next_label
+    pruned = np.zeros_like(seg_prev_tp)
 
-    # 1. Physically-connected fragments, per-label connectivity (never let
-    #    a neighbouring different label's pixels bridge two fragments of
-    #    the same label together), each given a unique running fragment id.
-    frag_ids = np.zeros_like(new_seg, dtype=np.int64)
-    frag_masks = {}
-    next_fid = 1
-    for lbl in np.unique(new_seg):
-        if lbl == 0:
-            continue
-        components = cc_label(new_seg == lbl)
-        for cid in np.unique(components):
-            if cid == 0:
-                continue
-            comp_mask = components == cid
-            frag_ids[comp_mask] = next_fid
-            frag_masks[next_fid] = comp_mask
-            next_fid += 1
-    frag_sizes = {fid: int(mask.sum()) for fid, mask in frag_masks.items()}
+    both = (regions != 0) & (seg_prev_tp != 0)
+    if not np.any(both):
+        return pruned
 
-    # 2. Exact pixel-overlap count for every (fragment, previous track) pair
-    #    that shares at least one pixel — one vectorized pass.
-    both = (frag_ids != 0) & (seg_prev_tp != 0)
-    track_candidates = {}
-    if np.any(both):
-        pairs = np.stack([frag_ids[both], seg_prev_tp[both]], axis=1)
-        uniq_pairs, counts = np.unique(pairs, axis=0, return_counts=True)
-        for (fid, t), overlap in zip(uniq_pairs, counts):
-            fid, t, overlap = int(fid), int(t), int(overlap)
-            if overlap / frag_sizes[fid] < min_overlap_fraction:
-                continue  # doesn't fill enough of the fragment to qualify
-            track_candidates.setdefault(t, []).append((fid, overlap))
-    for t in track_candidates:
-        track_candidates[t].sort(key=lambda x: -x[1])
+    # Region sizes (denominator for min_overlap_fraction).
+    reg_ids, reg_counts = np.unique(regions[regions != 0], return_counts=True)
+    region_sizes = {int(r): int(c) for r, c in zip(reg_ids, reg_counts)}
 
-    # 3. Gale-Shapley deferred acceptance: tracks propose to fragments in
-    #    order of overlap size; a fragment always holds its best suitor.
-    next_choice = {t: 0 for t in track_candidates}
-    held_by = {}  # fragment_id -> (track, overlap)
-    free = list(track_candidates.keys())
-    while free:
-        t = free.pop()
-        choices = track_candidates[t]
-        idx = next_choice[t]
-        if idx >= len(choices):
-            continue  # exhausted candidates -> track ends here
-        fid, overlap = choices[idx]
-        next_choice[t] = idx + 1
-        current = held_by.get(fid)
+    # Exact pixel-overlap count for every (track, region) pair that shares
+    # at least one pixel — one vectorized pass.
+    pairs = np.stack([seg_prev_tp[both], regions[both]], axis=1)
+    uniq_pairs, counts = np.unique(pairs, axis=0, return_counts=True)
+    # uniq_pairs is lexicographically sorted ascending by (track, region),
+    # so within a track, candidate regions are visited in ascending region
+    # id order -> keeping only on strict improvement reproduces
+    # np.argmax's first-occurrence tie-break (lowest region id wins).
+
+    best_region = {}  # track -> (region_id, overlap)
+    for (t, r), overlap in zip(uniq_pairs, counts):
+        t, r, overlap = int(t), int(r), int(overlap)
+        if overlap / region_sizes[r] < min_overlap_fraction:
+            continue  # doesn't fill enough of the region to qualify
+        current = best_region.get(t)
         if current is None or overlap > current[1]:
-            if current is not None:
-                free.append(current[0])
-            held_by[fid] = (t, overlap)
-        else:
-            free.append(t)
+            best_region[t] = (r, overlap)
 
-    # 4. Apply the assignment; unclaimed fragments get fresh IDs.
-    out = np.zeros_like(new_seg)
-    for fid, mask in frag_masks.items():
-        holder = held_by.get(fid)
-        if holder is None:
-            out[mask] = next_label
-            next_label += 1
-        else:
-            out[mask] = holder[0]
+    for t, (r, _overlap) in best_region.items():
+        keep = (seg_prev_tp == t) & (regions == r)
+        pruned[keep] = t
+
+    return pruned
+
+
+def _label_leftover_regions(mask, new_seg, next_label):
+    """Give every disconnected patch of watershed-unclaimed foreground its
+    own brand-new track id.
+
+    After watershed floods every region that some track(s) chose as their
+    best home, any ``mask`` area belonging to a region NO track chose (all
+    its markers were pruned in ``_prune_markers_to_best_region``) is left
+    labelled 0 even though it's foreground. This connected-component-labels
+    that leftover foreground and assigns each disconnected leftover
+    component a fresh, incrementing ``next_label`` — so a genuinely single
+    leftover blob (e.g. a merge region no old track claimed as its best)
+    becomes exactly ONE new track instead of splintering into as many
+    pieces as tracks that grazed it.
+
+    Returns ``(new_seg, next_label)``; does not mutate ``new_seg`` in place.
+    """
+    leftover = mask & (new_seg == 0)
+    out = new_seg.copy()
+    if not np.any(leftover):
+        return out, next_label
+
+    leftover_components = cc_label(leftover)
+    for cid in np.unique(leftover_components):
+        if cid == 0:
+            continue
+        out[leftover_components == cid] = next_label
+        next_label += 1
     return out, next_label
 
 
@@ -117,16 +142,27 @@ def _run_single_timepoint_propagation_connected(
     seg_prev_tp,
     next_label,
     dilation_nr_pixels=2,
-    segment_size_min=100,
+    segment_size_min=20,
     min_overlap_fraction=0.0,
     ):
     mask = t_seg != 0
     seg_prev_tp[mask==0]=0
-    new_seg = _watershed_from_markers(mask, seg_prev_tp, dilation_nr_pixels)
-    new_seg, next_label = _resolve_fragment_identities(
-        new_seg, seg_prev_tp, next_label, min_overlap_fraction=min_overlap_fraction,
+
+    regions = cc_label(mask)
+    pruned_markers = _prune_markers_to_best_region(
+        regions, seg_prev_tp, min_overlap_fraction=min_overlap_fraction,
     )
+
+    # Gap-closing dilation is always disabled here (regardless of the
+    # dilation_nr_pixels argument): it would let watershed fuse an
+    # unclaimed leftover fragment into a neighboring track's label across
+    # a real background gap, producing one track ID that spans two
+    # disconnected pixel blobs.
+    new_seg = _watershed_from_markers(mask, pruned_markers, dilation_nr_pixels=0)
+    new_seg, next_label = _label_leftover_regions(mask, new_seg, next_label)
+
     new_seg = segment_size_filter(new_seg, size_min=segment_size_min)
+    new_seg = segment_2d_filter(new_seg)
     return new_seg, next_label
 
 
@@ -138,7 +174,7 @@ def propagate_tracks_connected(
     element_size_y=1,
     element_size_z=1,
     dilation_nr_pixels=2,
-    segment_size_min=100,
+    segment_size_min=20,
     min_overlap_fraction=0.0,
     **kwargs
     ):
@@ -184,7 +220,7 @@ def run_connected_component_propagation_tracking(
     cell_type,
     overwrite=False,
     dilation_nr_pixels=2,
-    segment_size_min=100,
+    segment_size_min=20,
     min_overlap_fraction=0.0,
     progress_cb=None,
     **kwargs
@@ -192,11 +228,12 @@ def run_connected_component_propagation_tracking(
     """Run Connected-Component Propagation tracking on any cell type.
 
     Behaves like propagation tracking, except a track ID can never span more
-    than one physically disconnected region: every disconnected fragment is
-    resolved against ALL previous-frame tracks' footprints (not just the
-    label watershed produced it with), so a splitting object hands its
-    leftover pieces either to whichever other track fits best, or to a new
-    track if nobody's overlap is decisive.
+    than one physically disconnected region. Before watershed runs, the raw
+    current-frame mask is split into its own connected regions and every
+    previous-frame track picks whichever region its old footprint overlaps
+    most; a track's marker is discarded everywhere outside that one region.
+    Watershed then floods each region from whichever track(s) chose it — a
+    region no track picked is left over and gets a brand-new track id.
 
     Parameters
     ----------
@@ -212,10 +249,24 @@ def run_connected_component_propagation_tracking(
         Number of pixels to dilate the mask for watershed propagation
     segment_size_min : int
         Minimum segment size in voxels (smaller segments are filtered out)
+        after watershed. Note this is NOT the same job as a segmentation-stage
+        size filter: the raw input mask has typically already been filtered
+        for whole-object size before it reaches tracking. This filter instead
+        cleans up small/degenerate fragments that watershed splitting itself
+        can introduce (e.g. a merge region divided between two tracks, or a
+        small leftover sliver spun off into a new track), so it's usually
+        set much lower than a segmentation-stage minimum. Segments are also
+        always additionally filtered for being 2D/flat (via
+        ``segment_2d_filter``), regardless of this value.
     min_overlap_fraction : float
-        Minimum fraction of a fragment's area that a previous-frame track's
-        footprint must fill for that track to be allowed to claim it.
-        ``0.0`` (default) means any positive overlap qualifies.
+        Minimum fraction of a current-frame connected region's area that a
+        previous-frame track's old footprint must fill for that track to be
+        allowed to claim the region as its home (denominator: the whole raw
+        region, before any watershed splitting). ``0.0`` (default) means any
+        positive overlap qualifies. Note: a track sharing a region with
+        others will generally read a smaller fraction here than it would
+        against just its own post-split share, so tuned non-default values
+        may need lowering.
     progress_cb : callable, optional
         Called as ``progress_cb(current, total, label)`` from inside the
         per-sample loop so a GUI can drive a progress bar. ``None`` is

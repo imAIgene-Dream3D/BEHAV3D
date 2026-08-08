@@ -623,12 +623,14 @@ class CellTypeTrackingPanel(QWidget):
             "linking cost.\n\n"
             "Connected-Component Propagation — same watershed propagation "
             "as Propagation, but a track ID can never span more than one "
-            "physically disconnected region. If an object splits into "
-            "disconnected pieces, each piece is re-matched against every "
-            "existing track's previous footprint (not just the one that "
-            "produced it): the best-overlapping track keeps its piece, "
-            "any track that loses out falls back to its next-best piece, "
-            "and pieces nobody claims become new tracks.\n\n"
+            "physically disconnected region. Before watershed runs, the "
+            "current frame's mask is split into its own connected regions "
+            "and every existing track picks whichever region its previous "
+            "footprint overlaps most (more than one track can pick the same "
+            "region). A track's seed is discarded outside its chosen region, "
+            "so an uncontested region is simply inherited whole, a region "
+            "multiple tracks chose is still split between them, and any "
+            "region no track chose becomes a new track.\n\n"
             "Reporter Propagation — for near-static objects whose "
             "segmentation is unreliable/intermittent over time (flickers "
             "on and off): pools every segment detected at every timepoint, "
@@ -878,9 +880,10 @@ class CellTypeTrackingPanel(QWidget):
 
         cc_info = QLabel(
             "Same as Propagation, but a track ID can never span more than "
-            "one disconnected region. Split-off pieces are re-matched "
-            "against every track's previous footprint; unclaimed pieces "
-            "become new tracks."
+            "one disconnected region. Each region of the current frame's "
+            "mask is claimed by whichever existing track overlaps it most, "
+            "before watershed runs; a region no track claims becomes a new "
+            "track."
         )
         cc_info.setWordWrap(True)
         cc_info.setStyleSheet("color: #888; font-size: 10px; padding: 2px 0 6px 0;")
@@ -895,11 +898,30 @@ class CellTypeTrackingPanel(QWidget):
         cc_form.addRow("Min overlap fraction:", make_help_row(
             self.cc_min_overlap_fraction,
             "Min Overlap Fraction",
-            "Minimum fraction of a disconnected piece's area that a "
+            "Minimum fraction of a current-frame region's area that a "
             "track's previous-frame footprint must fill for that track "
-            "to be allowed to claim it.\n\n"
+            "to be allowed to claim the region as its own.\n\n"
             "0 = any shared pixel qualifies (default). Raise this to stop "
-            "a track from claiming a piece it barely touches."
+            "a track from claiming a region it barely touches."
+        ))
+
+        self.cc_segment_size_min = QSpinBox()
+        self.cc_segment_size_min.setRange(1, 999999)
+        self.cc_segment_size_min.setValue(int(cc_cfg.get("segment_size_min", 20)))
+        self.cc_segment_size_min.setMaximumWidth(90)
+        cc_form.addRow("Min segment size:", make_help_row(
+            self.cc_segment_size_min,
+            "Min Segment Size",
+            "Minimum segment size in voxels, applied after watershed.\n\n"
+            "This is NOT the same as a segmentation-stage size filter — "
+            "the input mask is normally already filtered for whole-object "
+            "size before it reaches tracking. This instead cleans up small "
+            "fragments watershed splitting itself can introduce (a merge "
+            "region divided between two tracks, or a small leftover sliver "
+            "spun off into a new track), so it's usually set much lower "
+            "than a segmentation-stage minimum.\n\n"
+            "Segments that are 2D/flat (only 1 voxel thick along any axis) "
+            "are always removed as well, regardless of this value."
         ))
 
         self.param_stack.addWidget(cc_page)
@@ -1337,6 +1359,7 @@ class CellTypeTrackingPanel(QWidget):
             },
             "propagation_connected_component": {
                 "min_overlap_fraction": float(self.cc_min_overlap_fraction.value()),
+                "segment_size_min": int(self.cc_segment_size_min.value()),
             },
             "reporter_propagation": {
                 "min_overlap_fraction": float(self.rp_min_overlap_fraction.value()),
@@ -1398,6 +1421,7 @@ class CellTypeTrackingPanel(QWidget):
                 # Connected-Component Propagation
                 cc = settings.get("propagation_connected_component", {})
                 panel.cc_min_overlap_fraction.setValue(cc.get("min_overlap_fraction", 0.0))
+                panel.cc_segment_size_min.setValue(cc.get("segment_size_min", 20))
 
                 # Reporter Propagation
                 rp = settings.get("reporter_propagation", {})
@@ -1475,6 +1499,7 @@ class CellTypeTrackingPanel(QWidget):
             },
             "propagation_connected_component": {
                 "min_overlap_fraction": float(self.cc_min_overlap_fraction.value()),
+                "segment_size_min": int(self.cc_segment_size_min.value()),
             },
             "reporter_propagation": {
                 "min_overlap_fraction": float(self.rp_min_overlap_fraction.value()),
@@ -1592,6 +1617,7 @@ class CellTypeTrackingPanel(QWidget):
                 metadata=metadata, output_dir=out_dir, cell_type=cell_type,
                 overwrite=overwrite,
                 min_overlap_fraction=float(cc["min_overlap_fraction"]),
+                segment_size_min=int(cc.get("segment_size_min", 20)),
                 progress_cb=progress_cb,
             )
 

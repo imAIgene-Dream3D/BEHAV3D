@@ -278,15 +278,23 @@ class TrackingPanel:
             min=0.0, max=1.0, step=0.05,
             style={'description_width':'160px'}
         )
+        self.cc_segment_size_min = widgets.IntSlider(
+            description="Min segment size",
+            value=int(cc.get("segment_size_min", 20)),
+            min=1, max=1000,
+            style={'description_width':'160px'}
+        )
         self.cc_params = widgets.VBox([
             widgets.HTML("<b>Connected-Component Propagation tracking</b>"),
             widgets.HTML(
                 "<i>Same as Propagation, but a track ID can never span more "
-                "than one disconnected region. Split-off pieces are "
-                "re-matched against every track's previous footprint; "
-                "unclaimed pieces become new tracks.</i>"
+                "than one disconnected region. Each region of the current "
+                "frame's mask is claimed by whichever existing track "
+                "overlaps it most, before watershed runs; a region no track "
+                "claims becomes a new track.</i>"
             ),
             self.cc_min_overlap_fraction,
+            self.cc_segment_size_min,
         ])
 
         # btrack params
@@ -931,6 +939,7 @@ class TrackingPanel:
             })
             prof.setdefault("propagation_connected_component", {}).update({
                 "min_overlap_fraction": float(self.cc_min_overlap_fraction.value),
+                "segment_size_min": int(self.cc_segment_size_min.value),
             })
             bt = prof.setdefault("btrack", {})
             preset_val = str(self.bt_config_preset.value)
@@ -1006,6 +1015,7 @@ class TrackingPanel:
                         cell_type=self.cell_type,
                         overwrite=bool(self.overwrite.value),
                         min_overlap_fraction=float(self.cc_min_overlap_fraction.value),
+                        segment_size_min=int(self.cc_segment_size_min.value),
                     )
                 else:
                     new_md = run_propagation_tracking(
