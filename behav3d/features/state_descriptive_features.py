@@ -187,10 +187,16 @@ def extract_descibing_track_state_features(
         if use_transitions:
             T = transition_probs_from_runs(runs, state_to_idx, states)
             if not transition_cols:
-                transition_cols = [f"transitions_{a}>{b}" for a in states for b in states]
+                # a==b (self-transition) is excluded: RLE already collapses consecutive
+                # same-state runs, so the diagonal is exactly 0 for every track by
+                # construction. Keeping it would add K uninformative constant columns
+                # that dilute the transitions block in any downstream scaling/PCA.
+                transition_cols = [f"transitions_{a}>{b}" for a in states for b in states if a != b]
             for a in states:
                 ia = state_to_idx[a]
                 for b in states:
+                    if a == b:
+                        continue
                     ib = state_to_idx[b]
                     feats[f"transitions_{a}>{b}"] = float(T[ia, ib])
 
@@ -268,22 +274,172 @@ Accessory feature selection or scaling methods
 """
 
 
-def scale_feature_blocks(adata, blocks, layer=None, mode="sqrt"):  # "sqrt" or "linear"
+def _clr_transform_matrix(X, pseudocount=1e-3):
+    """
+    Centered log-ratio (CLR) transform for rows that are parts of a composition
+    (i.e. each row sums to 1, or to 0 for a track with no observations in this block).
+
+    Proportion-type features (state fractions, bout-count shares, transition-probability
+    rows) live on a closed simplex: running Euclidean PCA/clustering on them directly
+    manufactures spurious negative correlations between parts purely from the sum-to-1
+    constraint (Aitchison, 1986). CLR is the standard fix. Zeros (a state/transition a
+    track never visits) are handled with simple multiplicative replacement
+    (Martin-Fernandez et al., 2003) before taking logs, since log(0) is undefined.
+
+    Rows that sum to 0 (e.g. a track with < 2 bouts has no transitions at all) have no
+    defined composition and are returned as an all-zero row, matching this module's
+    existing convention for degenerate/missing tracks elsewhere.
+    """
+    X = np.asarray(X, dtype=float)
+    out = np.zeros_like(X)
+    if X.shape[1] == 0:
+        return out
+
+    row_sums = X.sum(axis=1)
+    valid = row_sums > 0
+    if not np.any(valid):
+        return out
+
+    Xv = X[valid] / row_sums[valid, None]  # defensive re-closure onto the simplex
+
+    zero_mask = Xv <= 0
+    n_zero = zero_mask.sum(axis=1)
+    has_zero = n_zero > 0
+    if np.any(has_zero):
+        n_parts = Xv.shape[1]
+        safe_delta = min(float(pseudocount), 0.9 / max(n_parts, 1))
+        scale = 1.0 - n_zero[has_zero] * safe_delta
+        Xv[has_zero] = np.where(
+            zero_mask[has_zero], safe_delta, Xv[has_zero] * scale[:, None]
+        )
+
+    log_x = np.log(Xv)
+    out[valid] = log_x - log_x.mean(axis=1, keepdims=True)
+    return out
+
+
+def clr_transform_columns(adata, cols, layer=None, pseudocount=1e-3):
+    """CLR-transform one group of columns that together form a single composition per
+    row (e.g. all `overall_fraction_*` columns, or all `bouts_nr_*` columns)."""
+    if not cols:
+        return adata
+    idx = adata.var_names.get_indexer(cols)
+    if np.any(idx < 0):
+        missing = [str(cols[i]) for i, j in enumerate(idx) if j < 0]
+        raise ValueError(f"Some CLR columns not found in adata.var_names: {missing[:20]}")
+
+    X_all = adata.layers[layer] if layer is not None else adata.X
+    X_dense = (
+        X_all.toarray().astype(float, copy=False)
+        if sparse.issparse(X_all)
+        else np.asarray(X_all, dtype=float).copy()
+    )
+    X_dense[:, idx] = _clr_transform_matrix(X_dense[:, idx], pseudocount=pseudocount)
+    if layer is not None:
+        adata.layers[layer] = X_dense
+    else:
+        adata.X = X_dense
+    return adata
+
+
+def clr_transform_transition_rows(adata, transition_cols, states, layer=None, pseudocount=1e-3):
+    """CLR-transform the transition block one *source state* at a time.
+
+    Each `transitions_{a}>*` group is its own composition (probabilities leaving state
+    `a` sum to 1 independently of every other source state's row), so it must be CLR'd
+    separately rather than as one flattened multi-row vector.
+    """
+    if not transition_cols:
+        return adata
+    by_source = {}
+    for c in transition_cols:
+        body = str(c)[len("transitions_"):]
+        a, _, _b = body.partition(">")
+        by_source.setdefault(a, []).append(c)
+    for a in states:
+        row_cols = by_source.get(a)
+        if row_cols:
+            adata = clr_transform_columns(adata, row_cols, layer=layer, pseudocount=pseudocount)
+    return adata
+
+
+def log1p_transform_columns(adata, cols, layer=None):
+    """Log1p-transform selected columns in place (e.g. bout-length features).
+
+    Bout/pause durations are typically right-skewed / heavy-tailed, so left on a linear
+    scale a handful of very long bouts dominate Euclidean distance; log1p compresses
+    that tail before scaling/PCA.
+    """
+    if not cols:
+        return adata
+    idx = adata.var_names.get_indexer(cols)
+    if np.any(idx < 0):
+        missing = [str(cols[i]) for i, j in enumerate(idx) if j < 0]
+        raise ValueError(f"Some log1p columns not found in adata.var_names: {missing[:20]}")
+
+    X_all = adata.layers[layer] if layer is not None else adata.X
+    X_dense = (
+        X_all.toarray().astype(float, copy=False)
+        if sparse.issparse(X_all)
+        else np.asarray(X_all, dtype=float).copy()
+    )
+    X_dense[:, idx] = np.log1p(np.clip(X_dense[:, idx], a_min=0.0, a_max=None))
+    if layer is not None:
+        adata.layers[layer] = X_dense
+    else:
+        adata.X = X_dense
+    return adata
+
+
+def scale_feature_blocks(adata, blocks, layer=None, mode="mfa"):  # "mfa", "sqrt", or "linear"
+    """
+    Weight feature blocks so none dominates a combined PCA purely by having more columns.
+
+    mode="mfa" (default) follows Multiple Factor Analysis (Escofier & Pages; Abdi et al.,
+    2013, https://doi.org/10.1002/wics.1246): each block is divided by the leading
+    singular value of its own centered data, so every block contributes roughly equal
+    spread to the combined PCA regardless of width or internal redundancy — a better
+    match for these blocks (K columns for fractions vs. K*(K-1) for transitions vs.
+    data-dependent vocab sizes for bigrams/trigrams) than counting columns alone.
+    "sqrt"/"linear" keep the older column-count-only weighting (1/sqrt(d) or 1/d).
+    """
     X_target = adata.layers[layer] if layer is not None else adata.X
     n_vars = int(X_target.shape[1])
     col_scale = np.ones(n_vars, dtype=float)
+
+    X_dense_full = None
+    if mode == "mfa":
+        X_dense_full = (
+            X_target.toarray().astype(float, copy=False)
+            if sparse.issparse(X_target)
+            else np.asarray(X_target, dtype=float)
+        )
 
     for block in blocks:
         d = len(block)
         if d == 0:
             continue
 
-        scale = np.sqrt(d) if mode == "sqrt" else float(d)
-
         idx = adata.var_names.get_indexer(block)
-
         if np.any(idx < 0):
             raise ValueError("Some block features not found in adata.var_names")
+
+        if mode == "mfa":
+            sub_centered = X_dense_full[:, idx]
+            sub_centered = sub_centered - sub_centered.mean(axis=0, keepdims=True)
+            scale = 1.0
+            if sub_centered.shape[0] >= 2 and np.any(sub_centered):
+                try:
+                    s1 = float(np.linalg.svd(sub_centered, compute_uv=False)[0])
+                except np.linalg.LinAlgError:
+                    s1 = 0.0
+                if s1 > 1e-12:
+                    scale = s1
+        elif mode == "linear":
+            scale = float(d)
+        else:  # "sqrt"
+            scale = np.sqrt(d)
+
         col_scale[idx] /= float(scale)
 
     if sparse.issparse(X_target):

@@ -1964,6 +1964,10 @@ class CellTypeFeaturePanel(QWidget):
 
         def _on_failed(err: str):
             self.log(f"Error during feature extraction: {err}")
+            _QMB.critical(
+                self, "Feature Extraction Error",
+                f"Feature extraction for {cell_type} failed:\n\n{err}",
+            )
             notify_results_changed(self)
 
         self._bg.run(
@@ -4382,6 +4386,10 @@ class FeatureExtractionTab(QWidget):
 
         def _on_failed(err: str):
             self._log(f"❌ Batch feature extraction error: {err}")
+            _QMB.critical(
+                self, "Batch Feature Extraction Error",
+                f"Batch feature extraction failed:\n\n{err}",
+            )
             try:
                 self.results_panel.refresh()
             except Exception:

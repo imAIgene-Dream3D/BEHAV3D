@@ -196,6 +196,12 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 
 
+class WorkerOutOfMemoryError(RuntimeError):
+    """Raised when a worker process crashes, most likely due to running out
+    of memory. Always propagates as a hard failure — a silently skipped
+    sample would produce an incomplete/incorrect combined result."""
+
+
 def _run_parallel_with_fallback(fn, args_list, n_workers, use_processes=True):
     """
     Run fn over args_list in parallel with n_workers.
@@ -210,7 +216,7 @@ def _run_parallel_with_fallback(fn, args_list, n_workers, use_processes=True):
             with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as ex:
                 return list(tqdm(ex.map(fn, args_list), total=len(args_list)))
         except BrokenProcessPool:
-            raise RuntimeError(
+            raise WorkerOutOfMemoryError(
                 f"Worker processes crashed while using {n_workers} workers "
                 f"(likely out of memory). Please lower the number of workers "
                 f"and try again."
@@ -819,6 +825,15 @@ def run_feature_extraction(
             h,m,s = format_time(start_time, end_time)
             print(f"###### DONE - elapsed time: {h}:{m:02}:{s:02}\n")
 
+        except (WorkerOutOfMemoryError, MemoryError) as exc:
+            raise WorkerOutOfMemoryError(
+                f"Feature extraction ran out of memory while processing sample "
+                f"'{sample_name}' ({cell_type}). Aborting the run instead of "
+                f"skipping this sample, since a skipped sample would silently "
+                f"produce an incomplete/incorrect combined result. Lower "
+                f"n_workers and re-run (already-completed samples/feature "
+                f"groups will be reused from cache)."
+            ) from exc
         except Exception:
             traceback.print_exc()
             print(f"⚠️  Error processing {cell_type} for sample {sample_name} – skipping to next sample.\n")

@@ -1696,7 +1696,19 @@ def generate_track_clustering_report_pdfs(
     if "X_umap" not in adata_tracks.obsm:
         sc.tl.umap(adata_tracks, random_state=0)
 
-    sc.tl.dendrogram(adata_tracks, groupby=cluster_key)
+    # Correlation/dendrogram is undefined (NaN) when the track representation
+    # collapses to a single dimension or a cluster has a zero-variance mean
+    # (e.g. a singleton cluster), which makes scanpy/scipy raise a symmetry
+    # error. Guard it the same way behav3d/analysis/behavior/state/classification.py
+    # does, and degrade gracefully instead of failing the whole report.
+    dendrogram_key = f"dendrogram_{cluster_key}"
+    dendrogram_arg = False
+    if adata_tracks.n_obs > 0 and len(resolved_order) > 1:
+        try:
+            sc.tl.dendrogram(adata_tracks, groupby=cluster_key)
+            dendrogram_arg = dendrogram_key
+        except Exception:
+            dendrogram_arg = False
 
     suffix = str(filename_suffix).strip()
     diagnostics_pdf = Path(
@@ -1706,12 +1718,16 @@ def generate_track_clustering_report_pdfs(
     diagnostics_started = _vstart(verbose, "trajectory-clustering", "write clustering diagnostics PDF")
 
     with PdfPages(diagnostics_pdf) as pdf:
-        fig, (ax_umap, ax_corr) = plt.subplots(
-            1,
-            2,
-            figsize=(14.5, 8.5),
-            gridspec_kw={"width_ratios": [1.25, 0.75]},
-        )
+        if dendrogram_arg:
+            fig, (ax_umap, ax_corr) = plt.subplots(
+                1,
+                2,
+                figsize=(14.5, 8.5),
+                gridspec_kw={"width_ratios": [1.25, 0.75]},
+            )
+        else:
+            fig, ax_umap = plt.subplots(1, 1, figsize=(10, 8.5))
+
         sc.pl.umap(
             adata_tracks,
             color=cluster_key,
@@ -1723,24 +1739,39 @@ def generate_track_clustering_report_pdfs(
         )
         ax_umap.set_aspect("equal", adjustable="box")
 
-        sc.pl.correlation_matrix(
-            adata_tracks,
-            groupby=cluster_key,
-            show_correlation_numbers=True,
-            ax=ax_corr,
-            show=False,
-        )
-        ax_corr.set_title("Cluster correlations", fontsize=10)
-        fig.suptitle("Track clustering diagnostics | UMAP + Correlation", fontsize=12, fontweight="bold", y=0.995)
-        fig.tight_layout(rect=[0, 0, 1, 0.96])
-        umap_bbox = ax_umap.get_position().frozen()
-        bbox = ax_corr.get_position()
-        extra_gap = 0.03
-        new_x = min(0.98 - bbox.width, bbox.x0 + extra_gap)
-        height_shrink = 0.5
-        new_h = bbox.height * height_shrink
-        ax_corr.set_position([new_x, bbox.y0 + (bbox.height - new_h) / 2, bbox.width, new_h])
-        ax_umap.set_position(umap_bbox)
+        if dendrogram_arg:
+            sc.pl.correlation_matrix(
+                adata_tracks,
+                groupby=cluster_key,
+                show_correlation_numbers=True,
+                ax=ax_corr,
+                show=False,
+            )
+            ax_corr.set_title("Cluster correlations", fontsize=10)
+            fig.suptitle(
+                "Track clustering diagnostics | UMAP + Correlation", fontsize=12, fontweight="bold", y=0.995
+            )
+            fig.tight_layout(rect=[0, 0, 1, 0.96])
+            umap_bbox = ax_umap.get_position().frozen()
+            bbox = ax_corr.get_position()
+            extra_gap = 0.03
+            new_x = min(0.98 - bbox.width, bbox.x0 + extra_gap)
+            height_shrink = 0.5
+            new_h = bbox.height * height_shrink
+            ax_corr.set_position([new_x, bbox.y0 + (bbox.height - new_h) / 2, bbox.width, new_h])
+            ax_umap.set_position(umap_bbox)
+        else:
+            fig.suptitle("Track clustering diagnostics | UMAP", fontsize=12, fontweight="bold", y=0.995)
+            fig.text(
+                0.5,
+                0.02,
+                "Correlation matrix/dendrogram unavailable for this clustering "
+                "(degenerate representation or a cluster with a single track).",
+                ha="center",
+                fontsize=8,
+                style="italic",
+            )
+            fig.tight_layout(rect=[0, 0.04, 1, 0.96])
         pdf.savefig(fig, dpi=int(plot_dpi), bbox_inches="tight")
         plt.close(fig)
 
@@ -1751,7 +1782,7 @@ def generate_track_clustering_report_pdfs(
             standard_scale="var",
             figsize=heatmap_figsize,
             swap_axes=True,
-            dendrogram=True,
+            dendrogram=dendrogram_arg,
             show_gene_labels=True,
             show=False,
         )
@@ -1768,7 +1799,7 @@ def generate_track_clustering_report_pdfs(
             standard_scale="var",
             figsize=matrixplot_figsize,
             swap_axes=True,
-            dendrogram=True,
+            dendrogram=dendrogram_arg,
             show=False,
         )
         fig = plt.gcf()

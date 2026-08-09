@@ -569,6 +569,12 @@ def _dtai_meta(adata_tracks):
     return meta if isinstance(meta, dict) else {}
 
 
+# Trajectory-clustering methods whose adata.X is a per-track feature matrix
+# rather than a pairwise DTW distance matrix - diagnostics that assume a
+# square (n_obs, n_obs) X must not run for these.
+FEATURE_ONLY_METHODS = {"original_behav3d_feature_dtw", "bouts_feature_clustering"}
+
+
 def _resolve_cluster_key(adata_tracks, cluster_key=None):
     if cluster_key is not None:
         return str(cluster_key)
@@ -606,11 +612,12 @@ def save_dtaidistance_diagnostics(
     """
     paths = _resolve_dtaidistance_paths(output_dir, cell_type)
     resolved_cluster_key = _resolve_cluster_key(adata_tracks, cluster_key=cluster_key)
-    if _dtai_meta(adata_tracks).get("method") == "original_behav3d_feature_dtw":
+    if _dtai_meta(adata_tracks).get("method") in FEATURE_ONLY_METHODS:
         raise ValueError(
-            "Diagnostics are not available for the 'Original BEHAV3D' feature-DTW model — "
-            "no pairwise distance matrix is stored for this clustering method. Use "
-            "_save_feature_dtw_quality_control() instead."
+            "Diagnostics are not available for this clustering model — no pairwise "
+            "distance matrix is stored for feature-based clustering methods (e.g. "
+            "'Original BEHAV3D' feature-DTW or bouts/state feature clustering). Use "
+            "the method-appropriate quality-control/diagnostics generator instead."
         )
     distances = _validate_distance_matrix(adata_tracks.X, adata_tracks.n_obs)
     plot_paths = _save_diagnostics(

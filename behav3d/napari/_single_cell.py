@@ -3259,6 +3259,36 @@ class TrackClassificationSubTab(QWidget):
         ))
         g1.addLayout(basic_form)
 
+        # Trajectory basis + clustering method — the two main choices, kept always
+        # visible (not buried in Advanced Configuration) since they each gate a
+        # different set of downstream parameter fields.
+        self._basis_method_frame = QFrame()
+        basis_method_form = QFormLayout(self._basis_method_frame)
+        basis_method_form.setSpacing(3)
+
+        self.combo_trajectory_basis = QComboBox()
+        self.combo_trajectory_basis.addItems(["dtw", "bouts"])
+        self.combo_trajectory_basis.setMaximumWidth(130)
+        basis_method_form.addRow("Basis:", make_help_row(
+            self.combo_trajectory_basis, "Trajectory basis",
+            "'dtw' clusters tracks by dynamic time warping distance over their raw "
+            "per-timepoint state sequences. 'bouts' instead describes each track with "
+            "bout/proportion features (fraction of time per state, bout counts/lengths, "
+            "state-transition probabilities, n-grams) and clusters those feature vectors."
+        ))
+
+        self.combo_clustering_method = QComboBox()
+        self.combo_clustering_method.addItems(["agglomerative", "leiden"])
+        self.combo_clustering_method.setMaximumWidth(130)
+        basis_method_form.addRow("Method:", make_help_row(
+            self.combo_clustering_method, "Clustering method",
+            "Algorithm used to group tracks from the chosen basis above. "
+            "'agglomerative' uses a fixed cluster count (N clusters, Linkage below). "
+            "'leiden' finds density-based communities instead, so the number of "
+            "clusters is emergent (set via Leiden resolution below)."
+        ))
+        g1.addWidget(self._basis_method_frame)
+
         # UMAP parameters (only in original mode)
         self._umap_frame = QFrame()
         self._umap_frame.setVisible(False)
@@ -3288,35 +3318,16 @@ class TrackClassificationSubTab(QWidget):
 
         # Advanced Configuration (hidden in original mode, contains "Use original" checkbox)
         self.adv1 = CollapsibleSection("⚙ Advanced Configuration", expanded=False)
-        dtw_form = QFormLayout()
-        dtw_form.setSpacing(3)
 
-        self.combo_clustering_method = QComboBox()
-        self.combo_clustering_method.addItems(["agglomerative", "leiden"])
-        self.combo_clustering_method.setMaximumWidth(130)
-        dtw_form.addRow("Method:", make_help_row(
-            self.combo_clustering_method, "Clustering method",
-            "Algorithm used to group track trajectories from the DTW distance matrix. "
-            "'agglomerative' uses a fixed cluster count (N clusters, Linkage below). "
-            "'leiden' finds density-based communities on the same distance matrix the "
-            "QC UMAP plot is built from, so the number of clusters is emergent (set via "
-            "Leiden resolution below) and tends to track the blobs visible in that plot "
-            "instead of a fixed split."
-        ))
-
-        self.combo_linkage = QComboBox()
-        self.combo_linkage.addItems(["average", "complete", "single"])
-        self.combo_linkage.setMaximumWidth(130)
-        dtw_form.addRow("Linkage:", make_help_row(
-            self.combo_linkage, "Linkage",
-            "Agglomerative clustering linkage method. 'average' is the most commonly used; "
-            "'complete' produces more compact clusters. Only used when Method is 'agglomerative'."
-        ))
-
+        # Trim mode + divide-long-tracks apply to both bases (DTW and Bouts/proportions
+        # both truncate/split tracks the same way before clustering), so they stay in a
+        # plain shared form rather than a basis-toggled frame.
+        trim_form = QFormLayout()
+        trim_form.setSpacing(3)
         self.combo_trim = QComboBox()
         self.combo_trim.addItems(["last", "first"])
         self.combo_trim.setMaximumWidth(130)
-        dtw_form.addRow("Trim mode:", make_help_row(
+        trim_form.addRow("Trim mode:", make_help_row(
             self.combo_trim, "Trim mode",
             "How to trim each track to Trajectory size: "
             "'last' keeps each track's final N timepoints (removes leading/early ones); "
@@ -3324,13 +3335,44 @@ class TrackClassificationSubTab(QWidget):
         ))
         self.chk_split_long_tracks = QCheckBox("Divide long tracks")
         self.chk_split_long_tracks.setChecked(False)
-        dtw_form.addRow("", _make_chk_help_row(
+        trim_form.addRow("", _make_chk_help_row(
             self.chk_split_long_tracks, "Divide long tracks",
             "Split tracks longer than Trajectory size into non-overlapping full-length "
             "analysis windows. Leftover timepoints are discarded. Original TrackID values "
             "are preserved for backprojection."
         ))
-        self.adv1.addLayout(dtw_form)
+        self.adv1.addLayout(trim_form)
+
+        # Linkage (DTW) and Bouts linkage each get their own self-contained frame —
+        # not a shared QFormLayout row — so hiding one via setVisible() also hides its
+        # label and help button together instead of leaving them stranded.
+        self._dtw_linkage_frame = QFrame()
+        dtw_linkage_form = QFormLayout(self._dtw_linkage_frame)
+        dtw_linkage_form.setSpacing(3)
+        self.combo_linkage = QComboBox()
+        self.combo_linkage.addItems(["average", "complete", "single"])
+        self.combo_linkage.setMaximumWidth(130)
+        dtw_linkage_form.addRow("Linkage:", make_help_row(
+            self.combo_linkage, "Linkage",
+            "Agglomerative clustering linkage method. 'average' is the most commonly used; "
+            "'complete' produces more compact clusters. Only used with the DTW basis and "
+            "'agglomerative' Method."
+        ))
+        self.adv1.addWidget(self._dtw_linkage_frame)
+
+        self._bouts_linkage_frame = QFrame()
+        bouts_linkage_form = QFormLayout(self._bouts_linkage_frame)
+        bouts_linkage_form.setSpacing(3)
+        self.combo_bouts_linkage = QComboBox()
+        self.combo_bouts_linkage.addItems(["ward", "complete", "average", "single"])
+        self.combo_bouts_linkage.setMaximumWidth(130)
+        bouts_linkage_form.addRow("Bouts linkage:", make_help_row(
+            self.combo_bouts_linkage, "Bouts linkage",
+            "Agglomerative clustering linkage method for the Bouts/proportions basis. "
+            "'ward' (default) minimizes within-cluster variance and is the standard choice "
+            "for feature vectors. Only used with the Bouts basis and 'agglomerative' Method."
+        ))
+        self.adv1.addWidget(self._bouts_linkage_frame)
 
         self._leiden_frame = QFrame()
         leiden_form = QFormLayout(self._leiden_frame)
@@ -3357,9 +3399,97 @@ class TrackClassificationSubTab(QWidget):
         ))
         self.adv1.addWidget(self._leiden_frame)
 
+        # Bouts/proportions-only feature toggles (which track-describing features feed
+        # the clustering) + PCA + optional exemplar-PDF generation during Run, since the
+        # bouts pipeline has no separable "diagnostics only" step like the DTW one does.
+        self._bouts_frame = QFrame()
+        bouts_form = QFormLayout(self._bouts_frame)
+        bouts_form.setSpacing(3)
+
+        self.chk_bouts_use_fractions = QCheckBox("State fractions")
+        self.chk_bouts_use_fractions.setChecked(True)
+        bouts_form.addRow("", _make_chk_help_row(
+            self.chk_bouts_use_fractions, "State fractions",
+            "Include each state's fraction of total track time as a clustering feature."
+        ))
+        self.chk_bouts_use_bout_stats = QCheckBox("Bout stats")
+        self.chk_bouts_use_bout_stats.setChecked(True)
+        bouts_form.addRow("", _make_chk_help_row(
+            self.chk_bouts_use_bout_stats, "Bout stats",
+            "Include per-state bout count, mean length, and max length as clustering features."
+        ))
+        self.chk_bouts_use_transitions = QCheckBox("Transitions")
+        self.chk_bouts_use_transitions.setChecked(True)
+        bouts_form.addRow("", _make_chk_help_row(
+            self.chk_bouts_use_transitions, "Transitions",
+            "Include state-to-state transition probabilities as clustering features."
+        ))
+        self.chk_bouts_use_ngrams = QCheckBox("Bigrams/trigrams")
+        self.chk_bouts_use_ngrams.setChecked(True)
+        bouts_form.addRow("", _make_chk_help_row(
+            self.chk_bouts_use_ngrams, "Bigrams/trigrams",
+            "Include state bigram and trigram counts as clustering features."
+        ))
+        self.chk_bouts_do_pca = QCheckBox("PCA before clustering")
+        self.chk_bouts_do_pca.setChecked(True)
+        bouts_form.addRow("", _make_chk_help_row(
+            self.chk_bouts_do_pca, "PCA before clustering",
+            "Reduce the feature matrix with PCA (95% variance retained) before clustering."
+        ))
+        self.chk_bouts_use_clr = QCheckBox("Log-ratio transform proportions (CLR)")
+        self.chk_bouts_use_clr.setChecked(True)
+        bouts_form.addRow("", _make_chk_help_row(
+            self.chk_bouts_use_clr, "Log-ratio transform proportions (CLR)",
+            "State fractions, bout-count shares, and each transition row sum to 1 by "
+            "construction (compositional data). CLR opens them up before PCA/clustering so "
+            "Euclidean distance doesn't manufacture spurious negative correlations between "
+            "states purely from that sum-to-1 constraint."
+        ))
+        self.chk_bouts_log_bout_length = QCheckBox("Log-transform bout lengths")
+        self.chk_bouts_log_bout_length.setChecked(True)
+        bouts_form.addRow("", _make_chk_help_row(
+            self.chk_bouts_log_bout_length, "Log-transform bout lengths",
+            "Bout/pause durations are typically heavy-tailed; log1p compresses that tail so "
+            "a few very long bouts don't dominate Euclidean distance."
+        ))
+        self.chk_bouts_block_scaling = QCheckBox("Balance feature blocks (MFA)")
+        self.chk_bouts_block_scaling.setChecked(True)
+        bouts_form.addRow("", _make_chk_help_row(
+            self.chk_bouts_block_scaling, "Balance feature blocks (MFA)",
+            "Fractions/bout-stats/transitions/n-grams have very different column counts. "
+            "Without balancing, PCA gives more weight to whichever block simply has more "
+            "columns. This divides each block by the leading singular value of its own PCA "
+            "(Multiple Factor Analysis) so every block contributes comparable spread."
+        ))
+        self.chk_bouts_drop_redundant = QCheckBox("Drop redundant/constant features")
+        self.chk_bouts_drop_redundant.setChecked(True)
+        bouts_form.addRow("", _make_chk_help_row(
+            self.chk_bouts_drop_redundant, "Drop redundant/constant features",
+            "Drops near-constant features and one of any pair of highly correlated features "
+            "(threshold 0.95) before clustering -- catches exact collinearities such as K "
+            "fractions that must sum to 1."
+        ))
+        self.chk_bouts_plot_exemplars = QCheckBox("Also generate exemplar PDFs")
+        self.chk_bouts_plot_exemplars.setChecked(True)
+        bouts_form.addRow("", _make_chk_help_row(
+            self.chk_bouts_plot_exemplars, "Also generate exemplar PDFs",
+            "Generate exemplar-track PDFs during Run, matching the DTW basis's automatic "
+            "exemplar overview. Bouts diagnostics/exemplar PDFs are produced inline here; "
+            "the separate Diagnostics/Exemplar PDF buttons below are DTW-only."
+        ))
+        self.adv1.addWidget(self._bouts_frame)
+
+        # Parallel computation / save-distance-matrix are DTW-distance-matrix-specific
+        # (bouts clusters feature vectors directly, no pairwise distance matrix exists),
+        # so group them in their own frame for clean hide/show.
+        self._dtw_technical_frame = QFrame()
+        dtw_technical_lay = QVBoxLayout(self._dtw_technical_frame)
+        dtw_technical_lay.setContentsMargins(0, 0, 0, 0)
+        dtw_technical_lay.setSpacing(3)
+
         self.chk_parallel = QCheckBox("Parallel computation")
         self.chk_parallel.setChecked(True)
-        self.adv1.addLayout(_make_chk_help_row(
+        dtw_technical_lay.addLayout(_make_chk_help_row(
             self.chk_parallel, "Parallel computation",
             "Use parallel computing for DTW distance matrix calculation. "
             "Faster on multi-core machines."
@@ -3367,11 +3497,12 @@ class TrackClassificationSubTab(QWidget):
 
         self.chk_save_dist = QCheckBox("Save distance matrix CSV")
         self.chk_save_dist.setChecked(False)
-        self.adv1.addLayout(_make_chk_help_row(
+        dtw_technical_lay.addLayout(_make_chk_help_row(
             self.chk_save_dist, "Save distance matrix",
             "Save the full DTW pairwise distance matrix to a CSV file. "
             "Can be large for many tracks."
         ))
+        self.adv1.addWidget(self._dtw_technical_frame)
 
         self.spin_seed = QSpinBox()
         self.spin_seed.setRange(0, 99999)
@@ -4086,11 +4217,12 @@ class TrackClassificationSubTab(QWidget):
         lay.addStretch(1)
 
         self._setup_signals()
-        self._apply_clustering_method_mode(self.combo_clustering_method.currentText())
+        self._apply_clustering_controls_mode()
 
     def _setup_signals(self):
         self.chk_apply_pretrained.toggled.connect(self._toggle_pretrained_mode)
-        self.combo_clustering_method.currentTextChanged.connect(self._apply_clustering_method_mode)
+        self.combo_trajectory_basis.currentTextChanged.connect(self._apply_clustering_controls_mode)
+        self.combo_clustering_method.currentTextChanged.connect(self._apply_clustering_controls_mode)
         self.chk_use_original.toggled.connect(self._on_original_toggled_from_adv)
         self.chk_use_original_top.toggled.connect(self._on_original_toggled_from_top)
         self.btn_run_track.clicked.connect(self._on_run_cluster)
@@ -4320,21 +4452,38 @@ class TrackClassificationSubTab(QWidget):
         if checked:
             self._show_original_dtw_disclaimer()
 
-    def _apply_clustering_method_mode(self, method: str):
-        """Update visibility/enabled state of Linkage vs Leiden-specific controls."""
-        is_leiden = str(method) == "leiden"
-        self.combo_linkage.setEnabled(not is_leiden)
+    def _apply_clustering_controls_mode(self, *_args):
+        """Update visibility of basis/method-specific controls (Linkage vs Bouts
+        linkage vs Leiden neighbors/resolution; DTW-only technical controls vs
+        bouts feature toggles)."""
+        is_bouts = self.combo_trajectory_basis.currentText() == "bouts"
+        is_leiden = self.combo_clustering_method.currentText() == "leiden"
+
         self._leiden_frame.setVisible(is_leiden)
+        self._dtw_linkage_frame.setVisible(not is_leiden and not is_bouts)
+        self._bouts_linkage_frame.setVisible(not is_leiden and is_bouts)
+
+        # Trim mode / divide-long-tracks apply to both bases, so they stay visible
+        # regardless of is_bouts. Parallel/save-distance-matrix are DTW-distance-matrix
+        # specific and bouts' own feature toggles are bouts-only.
+        self._dtw_technical_frame.setVisible(not is_bouts)
+        self._bouts_frame.setVisible(is_bouts)
+
+        if not self.chk_use_original.isChecked():
+            self.btn_run_track.setText(
+                "▶ Run Bout/Proportion Clustering" if is_bouts else "▶ Run Track Clustering"
+            )
 
     def _apply_original_mode(self, checked: bool):
-        """Update visibility of UI sections for original vs dtaidistance mode."""
+        """Update visibility of UI sections for original vs dtaidistance/bouts mode."""
         self.chk_use_original_top.setVisible(checked)
         self.adv1.setVisible(not checked)
+        self._basis_method_frame.setVisible(not checked)
         self._umap_frame.setVisible(checked)
         if checked:
             self.btn_run_track.setText("▶ Run Original BEHAV3D DTW")
         else:
-            self.btn_run_track.setText("▶ Run Track Clustering")
+            self._apply_clustering_controls_mode()
 
     def _show_original_dtw_disclaimer(self):
         """Warn the user that the original BEHAV3D DTW pipeline requires equal-length tracks."""
@@ -4395,10 +4544,22 @@ class TrackClassificationSubTab(QWidget):
         return {
             "behavioral_trajectory_size": int(self.spin_traj_size.value()),
             "n_clusters":                 int(self.spin_n_clusters.value()),
+            "trajectory_basis":           self.combo_trajectory_basis.currentText(),
             "linkage":                    self.combo_linkage.currentText(),
             "clustering_method":          self.combo_clustering_method.currentText(),
             "leiden_n_neighbors":         int(self.spin_leiden_neighbors.value()),
             "leiden_resolution":          float(self.spin_leiden_resolution.value()),
+            "bouts_linkage":              self.combo_bouts_linkage.currentText(),
+            "bouts_use_fractions":        self.chk_bouts_use_fractions.isChecked(),
+            "bouts_use_bout_stats":       self.chk_bouts_use_bout_stats.isChecked(),
+            "bouts_use_transitions":      self.chk_bouts_use_transitions.isChecked(),
+            "bouts_use_ngrams":           self.chk_bouts_use_ngrams.isChecked(),
+            "bouts_do_pca":               self.chk_bouts_do_pca.isChecked(),
+            "bouts_use_clr":              self.chk_bouts_use_clr.isChecked(),
+            "bouts_log_bout_length":      self.chk_bouts_log_bout_length.isChecked(),
+            "bouts_block_scaling":        self.chk_bouts_block_scaling.isChecked(),
+            "bouts_drop_redundant":       self.chk_bouts_drop_redundant.isChecked(),
+            "bouts_plot_exemplars":       self.chk_bouts_plot_exemplars.isChecked(),
             "trajectory_trim_mode":       self.combo_trim.currentText(),
             "split_long_tracks":          self.chk_split_long_tracks.isChecked(),
             "parallel":                   self.chk_parallel.isChecked(),
@@ -4431,6 +4592,8 @@ class TrackClassificationSubTab(QWidget):
             self.spin_traj_size.setValue(int(cfg["behavioral_trajectory_size"]))
         if "n_clusters" in cfg:
             self.spin_n_clusters.setValue(int(cfg["n_clusters"]))
+        if "trajectory_basis" in cfg:
+            self.combo_trajectory_basis.setCurrentText(cfg["trajectory_basis"])
         if "linkage" in cfg:
             self.combo_linkage.setCurrentText(cfg["linkage"])
         if "clustering_method" in cfg:
@@ -4439,7 +4602,29 @@ class TrackClassificationSubTab(QWidget):
             self.spin_leiden_neighbors.setValue(int(cfg["leiden_n_neighbors"]))
         if "leiden_resolution" in cfg:
             self.spin_leiden_resolution.setValue(float(cfg["leiden_resolution"]))
-        self._apply_clustering_method_mode(self.combo_clustering_method.currentText())
+        if "bouts_linkage" in cfg:
+            self.combo_bouts_linkage.setCurrentText(cfg["bouts_linkage"])
+        if "bouts_use_fractions" in cfg:
+            self.chk_bouts_use_fractions.setChecked(bool(cfg["bouts_use_fractions"]))
+        if "bouts_use_bout_stats" in cfg:
+            self.chk_bouts_use_bout_stats.setChecked(bool(cfg["bouts_use_bout_stats"]))
+        if "bouts_use_transitions" in cfg:
+            self.chk_bouts_use_transitions.setChecked(bool(cfg["bouts_use_transitions"]))
+        if "bouts_use_ngrams" in cfg:
+            self.chk_bouts_use_ngrams.setChecked(bool(cfg["bouts_use_ngrams"]))
+        if "bouts_do_pca" in cfg:
+            self.chk_bouts_do_pca.setChecked(bool(cfg["bouts_do_pca"]))
+        if "bouts_use_clr" in cfg:
+            self.chk_bouts_use_clr.setChecked(bool(cfg["bouts_use_clr"]))
+        if "bouts_log_bout_length" in cfg:
+            self.chk_bouts_log_bout_length.setChecked(bool(cfg["bouts_log_bout_length"]))
+        if "bouts_block_scaling" in cfg:
+            self.chk_bouts_block_scaling.setChecked(bool(cfg["bouts_block_scaling"]))
+        if "bouts_drop_redundant" in cfg:
+            self.chk_bouts_drop_redundant.setChecked(bool(cfg["bouts_drop_redundant"]))
+        if "bouts_plot_exemplars" in cfg:
+            self.chk_bouts_plot_exemplars.setChecked(bool(cfg["bouts_plot_exemplars"]))
+        self._apply_clustering_controls_mode()
         if "trajectory_trim_mode" in cfg:
             self.combo_trim.setCurrentText(cfg["trajectory_trim_mode"])
         if "split_long_tracks" in cfg:
@@ -5116,45 +5301,105 @@ class TrackClassificationSubTab(QWidget):
 
     def _dispatch_track_cluster(self, ct: str, extra_callbacks=None):
         out = self._out_dir()
-        params = {
-            "output_dir": str(out) if out else "",
-            "cell_type": ct,
-            "behavioral_trajectory_size": int(self.spin_traj_size.value()),
-            "n_clusters": int(self.spin_n_clusters.value()),
-            "random_state": int(self.spin_seed.value()),
-            "linkage": self.combo_linkage.currentText(),
-            "clustering_method": self.combo_clustering_method.currentText(),
-            "leiden_n_neighbors": int(self.spin_leiden_neighbors.value()),
-            "leiden_resolution": float(self.spin_leiden_resolution.value()),
-            "trajectory_trim_mode": self.combo_trim.currentText(),
-            "split_long_tracks": self.chk_split_long_tracks.isChecked(),
-            "parallel": self.chk_parallel.isChecked(),
-            "save_distance_matrix": self.chk_save_dist.isChecked(),
-            "plot_results": True,
-        }
+        is_bouts = self.combo_trajectory_basis.currentText() == "bouts"
+
+        if is_bouts:
+            params = {
+                "output_dir": str(out) if out else "",
+                "cell_type": ct,
+                "behavioral_trajectory_size": int(self.spin_traj_size.value()),
+                "trajectory_trim_mode": self.combo_trim.currentText(),
+                "split_long_tracks": self.chk_split_long_tracks.isChecked(),
+                "use_fractions": self.chk_bouts_use_fractions.isChecked(),
+                "use_bout_stats": self.chk_bouts_use_bout_stats.isChecked(),
+                "use_transitions": self.chk_bouts_use_transitions.isChecked(),
+                "use_bigrams": self.chk_bouts_use_ngrams.isChecked(),
+                "use_trigrams": self.chk_bouts_use_ngrams.isChecked(),
+                "do_pca": self.chk_bouts_do_pca.isChecked(),
+                "use_clr_transform": self.chk_bouts_use_clr.isChecked(),
+                "log_transform_bout_lengths": self.chk_bouts_log_bout_length.isChecked(),
+                "do_block_scaling": self.chk_bouts_block_scaling.isChecked(),
+                "drop_highly_correlated": self.chk_bouts_drop_redundant.isChecked(),
+                "drop_low_variance": self.chk_bouts_drop_redundant.isChecked(),
+                "clustering_method": self.combo_clustering_method.currentText(),
+                "n_clusters": int(self.spin_n_clusters.value()),
+                "agglomerative_linkage": self.combo_bouts_linkage.currentText(),
+                "n_neighbors": int(self.spin_leiden_neighbors.value()),
+                "leiden_resolution": float(self.spin_leiden_resolution.value()),
+                "cluster_key": "ClusterID",
+                "plot_results": True,
+                "plot_exemplars": self.chk_bouts_plot_exemplars.isChecked(),
+                "random_state": int(self.spin_seed.value()),
+                # Share the DTW basis's output folder so both bases' diagnostics/exemplar
+                # PDFs and the canonical model .h5ad land in the same place on disk.
+                "output_subdir_name": "behavorial_trajectories",
+            }
+        else:
+            params = {
+                "output_dir": str(out) if out else "",
+                "cell_type": ct,
+                "behavioral_trajectory_size": int(self.spin_traj_size.value()),
+                "n_clusters": int(self.spin_n_clusters.value()),
+                "random_state": int(self.spin_seed.value()),
+                "linkage": self.combo_linkage.currentText(),
+                "clustering_method": self.combo_clustering_method.currentText(),
+                "leiden_n_neighbors": int(self.spin_leiden_neighbors.value()),
+                "leiden_resolution": float(self.spin_leiden_resolution.value()),
+                "trajectory_trim_mode": self.combo_trim.currentText(),
+                "split_long_tracks": self.chk_split_long_tracks.isChecked(),
+                "parallel": self.chk_parallel.isChecked(),
+                "save_distance_matrix": self.chk_save_dist.isChecked(),
+                "plot_results": True,
+            }
 
         on_done_ext = extra_callbacks.get("on_done") if extra_callbacks else None
         on_fail_ext = extra_callbacks.get("on_failed") if extra_callbacks else None
 
         def _run(**kw):
-            import shutil
             _traj_dir = out / "analysis" / ct / "behavorial_trajectories"
             if _traj_dir.exists():
                 rmtree_ignore_missing(_traj_dir)
+            if is_bouts:
+                from behav3d.analysis.behavior.state.classification import FULL_STATE_COL
+                from behav3d.analysis.behavior.track.bouts import run_state_based_analysis
+                from behav3d.analysis.behavior.track.utils import (
+                    get_dtaidistance_track_trajectories_filename,
+                )
+                result = run_state_based_analysis(state_col=FULL_STATE_COL, verbose=True, **params)
+                # Write to the same canonical path the dtaidistance branch uses so rename,
+                # backprojection, exemplar training, contact analysis, etc. keep working
+                # unchanged regardless of which basis produced the model.
+                model_path = _traj_dir / get_dtaidistance_track_trajectories_filename(ct)
+                model_path.parent.mkdir(parents=True, exist_ok=True)
+                result.write(model_path, compression="gzip")
+                return result
             from behav3d.analysis.behavior.track.state_dtw import (
                 run_categorical_dtaidistance_trajectory_clustering,
             )
             return run_categorical_dtaidistance_trajectory_clustering(**params, verbose=True)
 
         def _done(r):
-            umap_error = (r.uns.get("visualization", {}) or {}).get("umap_error")
-            if umap_error:
-                self._log(f"⚠ Track clustering done for '{ct}', but UMAP was skipped: {umap_error}")
+            if is_bouts:
+                self._log(f"✅ Bout/proportion clustering done for '{ct}'.")
             else:
-                self._log(f"✅ Track clustering done for '{ct}'.")
+                umap_error = (r.uns.get("visualization", {}) or {}).get("umap_error")
+                if umap_error:
+                    self._log(f"⚠ Track clustering done for '{ct}', but UMAP was skipped: {umap_error}")
+                else:
+                    self._log(f"✅ Track clustering done for '{ct}'.")
             self._persist_track_cfg(ct)
             self._reload()
             self._notify_results()
+
+            # The auto exemplar-overview step below relies on save_dtaidistance_exemplar_overview /
+            # save_dtaidistance_medoid_overview, which need a DTW pairwise distance matrix — not
+            # applicable to a bouts-derived model. The bouts pipeline already writes its own
+            # diagnostics/exemplar PDFs inline (via plot_results/plot_exemplars above).
+            if is_bouts:
+                if on_done_ext:
+                    on_done_ext(r)
+                return
+
             _track_adata = r
             _n_per = int(self.spin_n_per_cluster.value())
             _seed = int(self.spin_seed.value())
@@ -5334,18 +5579,30 @@ class TrackClassificationSubTab(QWidget):
         def _run(**kw):
             from behav3d.analysis.behavior.track.state_dtw import save_dtaidistance_diagnostics
             from behav3d.analysis.behavior.track.visualization.plots.reports import (
+                generate_track_clustering_report_pdfs,
                 save_track_class_proportions_by_sample_plot,
             )
             from behav3d.analysis.behavior.track.utils import _resolve_dtaidistance_paths
             from behav3d.napari._rename_dialog import _track_cluster_col
             cluster_col = _track_cluster_col(track_adata) or "ClusterID"
-            diag = save_dtaidistance_diagnostics(
-                adata_tracks=track_adata,
-                output_dir=str(out) if out else "",
-                cell_type=ct,
-                verbose=True,
-            )
             paths = _resolve_dtaidistance_paths(str(out) if out else "", ct)
+            if method == "bouts_feature_clustering":
+                # adata.X is a per-track feature matrix here, not a pairwise DTW
+                # distance matrix - regenerate via the same generator bouts.py
+                # itself uses at clustering time instead of the DTW-only path.
+                diag = generate_track_clustering_report_pdfs(
+                    adata_tracks=track_adata,
+                    outfolder=paths["clustering_outfolder"],
+                    cluster_key=cluster_col,
+                    verbose=True,
+                )
+            else:
+                diag = save_dtaidistance_diagnostics(
+                    adata_tracks=track_adata,
+                    output_dir=str(out) if out else "",
+                    cell_type=ct,
+                    verbose=True,
+                )
             prop = save_track_class_proportions_by_sample_plot(
                 track_adata,
                 paths["behavior_proportions_outfolder"],
@@ -5857,6 +6114,23 @@ class TrackClassificationSubTab(QWidget):
                     proportions_outfolder=_resolve_dtaidistance_paths(
                         str(out) if out else "", ct
                     )["behavior_proportions_outfolder"],
+                )
+            elif method == "bouts_feature_clustering":
+                # adata.X is a per-track feature matrix here, not a pairwise DTW
+                # distance matrix - regenerate via the same generator bouts.py
+                # itself uses at clustering time instead of the DTW-only path.
+                from behav3d.analysis.behavior.track.visualization.plots.reports import (
+                    generate_track_clustering_report_pdfs,
+                )
+                from behav3d.analysis.behavior.track.utils import _resolve_dtaidistance_paths
+                from behav3d.napari._rename_dialog import _track_cluster_col
+                paths = _resolve_dtaidistance_paths(str(out) if out else "", ct)
+                cluster_col = _track_cluster_col(track_adata) or "ClusterID"
+                result = generate_track_clustering_report_pdfs(
+                    adata_tracks=track_adata,
+                    outfolder=paths["clustering_outfolder"],
+                    cluster_key=cluster_col,
+                    verbose=True,
                 )
             else:
                 result = save_dtaidistance_diagnostics(

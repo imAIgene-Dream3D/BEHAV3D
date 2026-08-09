@@ -26,6 +26,7 @@ from behav3d.analysis.behavior.general.visualization.plots.proportion_bars impor
 from behav3d.analysis.behavior.track.bouts import (
     apply_track_classifier_to_subtracks,
     rename_track_clusters,
+    run_state_based_analysis,
 )
 from behav3d.analysis.behavior.track.visualization.backprojection import (
     export_track_cluster_backprojection,
@@ -152,6 +153,17 @@ class TrackClassificationPanel:
             layout=widgets.Layout(width="170px"),
             style={"description_width": "80px"},
         )
+        self.clustering_basis = widgets.Dropdown(
+            description="Basis",
+            options=[
+                ("DTW distance (state sequences)", "dtw"),
+                ("Bouts / proportions (state features)", "bouts"),
+            ],
+            value="dtw",
+            layout=widgets.Layout(width="270px"),
+            style={"description_width": "60px"},
+        )
+        self.clustering_basis.observe(self._on_clustering_controls_changed, names="value")
         self.clustering_method = widgets.Dropdown(
             description="Method",
             options=[("Agglomerative", "agglomerative"), ("Leiden", "leiden")],
@@ -159,7 +171,7 @@ class TrackClassificationPanel:
             layout=widgets.Layout(width="200px"),
             style={"description_width": "70px"},
         )
-        self.clustering_method.observe(self._on_clustering_method_changed, names="value")
+        self.clustering_method.observe(self._on_clustering_controls_changed, names="value")
         self.leiden_n_neighbors = widgets.IntText(
             description="Leiden neighbors",
             value=15,
@@ -229,6 +241,48 @@ class TrackClassificationPanel:
             value="average",
             layout=widgets.Layout(width="190px"),
             style={"description_width": "80px"},
+        )
+        self.bouts_agglomerative_linkage = widgets.Dropdown(
+            description="Linkage",
+            options=["ward", "complete", "average", "single"],
+            value="ward",
+            layout=widgets.Layout(width="190px"),
+            style={"description_width": "80px"},
+        )
+        self.bouts_use_fractions = widgets.Checkbox(
+            description="State fractions", value=True, indent=False, layout=widgets.Layout(width="150px"),
+        )
+        self.bouts_use_bout_stats = widgets.Checkbox(
+            description="Bout stats", value=True, indent=False, layout=widgets.Layout(width="130px"),
+        )
+        self.bouts_use_transitions = widgets.Checkbox(
+            description="Transitions", value=True, indent=False, layout=widgets.Layout(width="140px"),
+        )
+        self.bouts_use_ngrams = widgets.Checkbox(
+            description="Bigrams/trigrams", value=True, indent=False, layout=widgets.Layout(width="170px"),
+        )
+        self.bouts_do_pca = widgets.Checkbox(
+            description="PCA before clustering", value=True, indent=False, layout=widgets.Layout(width="180px"),
+        )
+        self.bouts_use_clr = widgets.Checkbox(
+            description="Log-ratio transform proportions (CLR)", value=True, indent=False,
+            layout=widgets.Layout(width="290px"),
+        )
+        self.bouts_log_bout_length = widgets.Checkbox(
+            description="Log-transform bout lengths", value=True, indent=False,
+            layout=widgets.Layout(width="240px"),
+        )
+        self.bouts_block_scaling = widgets.Checkbox(
+            description="Balance feature blocks (MFA)", value=True, indent=False,
+            layout=widgets.Layout(width="240px"),
+        )
+        self.bouts_drop_redundant = widgets.Checkbox(
+            description="Drop redundant/constant features", value=True, indent=False,
+            layout=widgets.Layout(width="270px"),
+        )
+        self.bouts_plot_exemplars = widgets.Checkbox(
+            description="Also generate exemplar PDFs", value=True, indent=False,
+            layout=widgets.Layout(width="220px"),
         )
         self.missing_policy = widgets.Dropdown(
             description="Missing",
@@ -350,10 +404,21 @@ class TrackClassificationPanel:
         self.advanced_row_2 = widgets.HBox(
             [
                 self.trajectory_trim_mode,
-                self.clustering_method,
+                self.split_long_tracks,
                 self.linkage,
+                self.bouts_agglomerative_linkage,
                 self.leiden_n_neighbors,
                 self.leiden_resolution,
+                self.bouts_use_fractions,
+                self.bouts_use_bout_stats,
+                self.bouts_use_transitions,
+                self.bouts_use_ngrams,
+                self.bouts_do_pca,
+                self.bouts_use_clr,
+                self.bouts_log_bout_length,
+                self.bouts_block_scaling,
+                self.bouts_drop_redundant,
+                self.bouts_plot_exemplars,
                 self.parallel,
                 self.save_distance_matrix,
                 self.use_original_behav3d,
@@ -527,6 +592,8 @@ class TrackClassificationPanel:
                 widgets.HBox(
                     [
                         self.behavioral_trajectory_size,
+                        self.clustering_basis,
+                        self.clustering_method,
                         self.n_clusters,
                         self.random_state,
                         self.advanced,
@@ -931,7 +998,7 @@ class TrackClassificationPanel:
         self.btn_apply_classifier.on_click(self._on_apply_classifier_clicked)
         self._refresh_context()
         self._sync_advanced_visibility()
-        self._sync_clustering_method_visibility()
+        self._sync_clustering_controls_visibility()
         self._sync_mode()
 
     def _detect_cell_types(self):
@@ -1036,9 +1103,23 @@ class TrackClassificationPanel:
         self.trajectory_trim_mode.value = str(cfg.get("trajectory_trim_mode", self.trajectory_trim_mode.value))
         self.split_long_tracks.value = bool(cfg.get("split_long_tracks", self.split_long_tracks.value))
         self.linkage.value = str(cfg.get("linkage", self.linkage.value))
+        self.clustering_basis.value = str(cfg.get("clustering_basis", self.clustering_basis.value))
         self.clustering_method.value = str(cfg.get("clustering_method", self.clustering_method.value))
         self.leiden_n_neighbors.value = int(cfg.get("leiden_n_neighbors", self.leiden_n_neighbors.value))
         self.leiden_resolution.value = float(cfg.get("leiden_resolution", self.leiden_resolution.value))
+        self.bouts_agglomerative_linkage.value = str(
+            cfg.get("bouts_agglomerative_linkage", self.bouts_agglomerative_linkage.value)
+        )
+        self.bouts_use_fractions.value = bool(cfg.get("bouts_use_fractions", self.bouts_use_fractions.value))
+        self.bouts_use_bout_stats.value = bool(cfg.get("bouts_use_bout_stats", self.bouts_use_bout_stats.value))
+        self.bouts_use_transitions.value = bool(cfg.get("bouts_use_transitions", self.bouts_use_transitions.value))
+        self.bouts_use_ngrams.value = bool(cfg.get("bouts_use_ngrams", self.bouts_use_ngrams.value))
+        self.bouts_do_pca.value = bool(cfg.get("bouts_do_pca", self.bouts_do_pca.value))
+        self.bouts_use_clr.value = bool(cfg.get("bouts_use_clr", self.bouts_use_clr.value))
+        self.bouts_log_bout_length.value = bool(cfg.get("bouts_log_bout_length", self.bouts_log_bout_length.value))
+        self.bouts_block_scaling.value = bool(cfg.get("bouts_block_scaling", self.bouts_block_scaling.value))
+        self.bouts_drop_redundant.value = bool(cfg.get("bouts_drop_redundant", self.bouts_drop_redundant.value))
+        self.bouts_plot_exemplars.value = bool(cfg.get("bouts_plot_exemplars", self.bouts_plot_exemplars.value))
         self.missing_policy.value = str(cfg.get("missing_policy", self.missing_policy.value))
         self.parallel.value = bool(cfg.get("parallel", self.parallel.value))
         self.save_distance_matrix.value = bool(cfg.get("save_distance_matrix", self.save_distance_matrix.value))
@@ -1062,7 +1143,7 @@ class TrackClassificationPanel:
         if saved_artifact and not str(self.classifier_artifact_path.value).strip():
             self.classifier_artifact_path.value = saved_artifact
         self._sync_trim_mode_visibility()
-        self._sync_clustering_method_visibility()
+        self._sync_clustering_controls_visibility()
 
     def _persist_current_settings(self):
         cfg = self._panel_cfg()
@@ -1076,9 +1157,21 @@ class TrackClassificationPanel:
             "trajectory_trim_mode": str(self.trajectory_trim_mode.value),
             "split_long_tracks": bool(self.split_long_tracks.value),
             "linkage": str(self.linkage.value),
+            "clustering_basis": str(self.clustering_basis.value),
             "clustering_method": str(self.clustering_method.value),
             "leiden_n_neighbors": int(self.leiden_n_neighbors.value),
             "leiden_resolution": float(self.leiden_resolution.value),
+            "bouts_agglomerative_linkage": str(self.bouts_agglomerative_linkage.value),
+            "bouts_use_fractions": bool(self.bouts_use_fractions.value),
+            "bouts_use_bout_stats": bool(self.bouts_use_bout_stats.value),
+            "bouts_use_transitions": bool(self.bouts_use_transitions.value),
+            "bouts_use_ngrams": bool(self.bouts_use_ngrams.value),
+            "bouts_do_pca": bool(self.bouts_do_pca.value),
+            "bouts_use_clr": bool(self.bouts_use_clr.value),
+            "bouts_log_bout_length": bool(self.bouts_log_bout_length.value),
+            "bouts_block_scaling": bool(self.bouts_block_scaling.value),
+            "bouts_drop_redundant": bool(self.bouts_drop_redundant.value),
+            "bouts_plot_exemplars": bool(self.bouts_plot_exemplars.value),
             "missing_policy": str(self.missing_policy.value),
             "parallel": bool(self.parallel.value),
             "save_distance_matrix": bool(self.save_distance_matrix.value),
@@ -1248,6 +1341,10 @@ class TrackClassificationPanel:
         self.state_outputs_warning.value = ""
         if bool(self.use_original_behav3d.value):
             has_clusters = _feature_dtw_clustered_csv_path(self.output_dir, self._current_cell_type()).exists()
+        elif str(self.clustering_basis.value) == "bouts":
+            # save_dtaidistance_exemplar_plots requires a DTW distance matrix; not applicable to the
+            # bouts/proportions basis (its exemplar PDFs are produced during Run instead).
+            has_clusters = False
         else:
             has_clusters = self.model_adata is not None or self._model_adata_path().exists()
         self.btn_exemplars.disabled = not (has_clusters and self._any_exemplar_outputs_selected())
@@ -1257,8 +1354,13 @@ class TrackClassificationPanel:
 
     def _sync_trim_mode_visibility(self):
         has_size = str(self.behavioral_trajectory_size.value).strip() != ""
-        self.trajectory_trim_mode.layout.display = None if has_size else "none"
-        self.split_long_tracks.layout.display = None if has_size else "none"
+        is_bouts = str(self.clustering_basis.value) == "bouts"
+        # DTW treats a blank size as "unconstrained" (trim mode meaningless then), but the
+        # bouts basis always truncates to a concrete length (falls back to 100 if blank), so
+        # trim mode/split stay relevant for bouts regardless of whether the field is filled in.
+        show = is_bouts or has_size
+        self.trajectory_trim_mode.layout.display = None if show else "none"
+        self.split_long_tracks.layout.display = None if show else "none"
 
     def _on_trajectory_size_changed(self, _):
         self._sync_trim_mode_visibility()
@@ -1273,15 +1375,62 @@ class TrackClassificationPanel:
     def _on_advanced_changed(self, _):
         self._sync_advanced_visibility()
 
-    def _sync_clustering_method_visibility(self):
+    def _sync_clustering_controls_visibility(self):
+        is_bouts = str(self.clustering_basis.value) == "bouts"
         is_leiden = str(self.clustering_method.value) == "leiden"
-        self.n_clusters.disabled = is_leiden
-        self.linkage.disabled = is_leiden
-        self.leiden_n_neighbors.disabled = not is_leiden
-        self.leiden_resolution.disabled = not is_leiden
 
-    def _on_clustering_method_changed(self, _):
-        self._sync_clustering_method_visibility()
+        # shared algorithm params (Leiden vs Agglomerative), true hide/show
+        self.n_clusters.layout.display = "none" if is_leiden else None
+        self.linkage.layout.display = "none" if (is_leiden or is_bouts) else None
+        self.bouts_agglomerative_linkage.layout.display = "none" if (is_leiden or not is_bouts) else None
+        self.leiden_n_neighbors.layout.display = "none" if not is_leiden else None
+        self.leiden_resolution.layout.display = "none" if not is_leiden else None
+
+        # DTW-only technical controls
+        for widget in (
+            self.parallel,
+            self.save_distance_matrix,
+            self.use_original_behav3d,
+        ):
+            widget.layout.display = "none" if is_bouts else None
+        self._sync_trim_mode_visibility()
+
+        # Bouts-only feature toggles / PCA / exemplar checkbox
+        for widget in (
+            self.bouts_use_fractions,
+            self.bouts_use_bout_stats,
+            self.bouts_use_transitions,
+            self.bouts_use_ngrams,
+            self.bouts_do_pca,
+            self.bouts_use_clr,
+            self.bouts_log_bout_length,
+            self.bouts_block_scaling,
+            self.bouts_drop_redundant,
+            self.bouts_plot_exemplars,
+        ):
+            widget.layout.display = None if is_bouts else "none"
+
+        self.backend_summary_html.value = (
+            "<b>Bouts/proportions backend:</b> tracks are described by state fractions, bout "
+            "statistics, and transition n-grams, then optionally reduced with PCA before clustering. "
+            "Diagnostics and exemplar PDFs for this basis are written automatically when you run "
+            "clustering (use the Diagnostics/Exemplar PDF buttons below only for the DTW basis)."
+            if is_bouts else
+            "<b>dtaidistance backend:</b> one-hot vectors with <code>inner_dist='squared euclidean'</code>; "
+            "the DTW window is the main speed constraint."
+        )
+        self.btn_run.description = (
+            "Run bout/proportion clustering" if is_bouts else "Run one-hot dtaidistance clustering"
+        )
+
+        # save_dtaidistance_diagnostics/exemplar_plots require a DTW distance matrix; not applicable to bouts.
+        if not bool(self.use_original_behav3d.value) and not bool(self.apply_pretrained_classifier.value):
+            has_model = self.model_adata is not None or self._model_adata_path().exists()
+            self.btn_diagnostics.disabled = is_bouts or not has_model
+        self._sync_exemplar_state_controls()
+
+    def _on_clustering_controls_changed(self, _):
+        self._sync_clustering_controls_visibility()
 
     def _on_classifier_advanced_changed(self, _):
         display = None if bool(self.classifier_advanced.value) else "none"
@@ -1344,10 +1493,20 @@ class TrackClassificationPanel:
             self.advanced_row_2.children = [
                 self.trajectory_trim_mode,
                 self.split_long_tracks,
-                self.clustering_method,
                 self.linkage,
+                self.bouts_agglomerative_linkage,
                 self.leiden_n_neighbors,
                 self.leiden_resolution,
+                self.bouts_use_fractions,
+                self.bouts_use_bout_stats,
+                self.bouts_use_transitions,
+                self.bouts_use_ngrams,
+                self.bouts_do_pca,
+                self.bouts_use_clr,
+                self.bouts_log_bout_length,
+                self.bouts_block_scaling,
+                self.bouts_drop_redundant,
+                self.bouts_plot_exemplars,
                 self.parallel,
                 self.save_distance_matrix,
                 self.use_original_behav3d,
@@ -1394,13 +1553,14 @@ class TrackClassificationPanel:
         if self.cell_type_dd.value not in self.cell_type_dd.options:
             self.cell_type_dd.value = self.cell_type_dd.options[0]
         model_path = self._model_adata_path()
+        is_bouts_basis = str(self.clustering_basis.value) == "bouts"
         if model_path.exists():
             if not bool(self.use_original_behav3d.value):
                 self.status_html.value = "<b style='color:#080;'>Ready for plots:</b> an existing model is available."
             self.plot_status_html.value = "<b>Ready for plots:</b> an existing DTAI model is available."
-            self.btn_diagnostics.disabled = False
+            self.btn_diagnostics.disabled = is_bouts_basis
             self.btn_track_proportions.disabled = False
-            self.btn_exemplars.disabled = False
+            self.btn_exemplars.disabled = is_bouts_basis
         else:
             if not bool(self.use_original_behav3d.value):
                 self.status_html.value = (
@@ -1926,6 +2086,7 @@ class TrackClassificationPanel:
     def _on_run_clicked(self, _):
         self._set_busy(self.btn_run, self.run_spinner, busy=True)
         self.out_run.clear_output()
+        is_bouts = str(self.clustering_basis.value) == "bouts"
         with self.out_run:
             try:
                 import shutil
@@ -1933,51 +2094,12 @@ class TrackClassificationPanel:
                 if _traj_dir.exists():
                     rmtree_ignore_missing(_traj_dir)
                 trajectory_size = _resolve_optional_int(self.behavioral_trajectory_size.value)
-                _winfo(
-                    "trajectory-dtai-widget",
-                    f"Running one-hot dtaidistance on fixed state column='{FULL_STATE_COL}'",
-                )
-                self.model_adata = run_categorical_dtaidistance_trajectory_clustering(
-                    output_dir=self.output_dir,
-                    cell_type=self._current_cell_type(),
-                    behavioral_trajectory_size=trajectory_size,
-                    min_track_length=trajectory_size,
-                    trajectory_trim_mode=str(self.trajectory_trim_mode.value),
-                    split_long_tracks=bool(self.split_long_tracks.value),
-                    max_tracks=None,
-                    n_clusters=int(self.n_clusters.value),
-                    window=None,
-                    max_dist=None,
-                    max_length_diff=None,
-                    penalty=None,
-                    psi=None,
-                    parallel=bool(self.parallel.value),
-                    linkage=str(self.linkage.value),
-                    clustering_method=str(self.clustering_method.value),
-                    leiden_n_neighbors=int(self.leiden_n_neighbors.value),
-                    leiden_resolution=float(self.leiden_resolution.value),
-                    missing_policy="keep",
-                    save_distance_matrix=bool(self.save_distance_matrix.value),
-                    plot_results=True,
-                    plot_exemplars=False,
-                    n_per_cluster=int(self.n_per_cluster.value),
-                    random_state=int(self.random_state.value),
-                    verbose=True,
-                )
-                self.status_html.value = (
-                    f"<b style='color:#080;'>Saved one-hot dtaidistance model:</b> {self._model_adata_path().name} "
-                    f"({self.model_adata.n_obs} tracks)"
-                )
-                umap_error = (self.model_adata.uns.get("visualization", {}) or {}).get("umap_error")
-                if umap_error:
-                    self.plot_status_html.value = (
-                        f"<b style='color:#a60;'>⚠ UMAP was skipped in diagnostics:</b> {umap_error}"
-                    )
+                if is_bouts:
+                    self._run_bouts_clustering(trajectory_size)
                 else:
-                    self.plot_status_html.value = "<b>Ready for plots:</b> clustering finished."
-                self.btn_diagnostics.disabled = False
+                    self._run_dtw_clustering(trajectory_size)
+                self.btn_diagnostics.disabled = is_bouts
                 self.btn_track_proportions.disabled = False
-                self.btn_exemplars.disabled = False
                 self._rebuild_rename_rows()
                 self._refresh_backprojection_samples()
                 self._sync_exemplar_state_controls()
@@ -1987,6 +2109,108 @@ class TrackClassificationPanel:
                 traceback.print_exc()
             finally:
                 self._set_busy(self.btn_run, self.run_spinner, busy=False)
+
+    def _run_dtw_clustering(self, trajectory_size):
+        _winfo(
+            "trajectory-dtai-widget",
+            f"Running one-hot dtaidistance on fixed state column='{FULL_STATE_COL}'",
+        )
+        self.model_adata = run_categorical_dtaidistance_trajectory_clustering(
+            output_dir=self.output_dir,
+            cell_type=self._current_cell_type(),
+            behavioral_trajectory_size=trajectory_size,
+            min_track_length=trajectory_size,
+            trajectory_trim_mode=str(self.trajectory_trim_mode.value),
+            split_long_tracks=bool(self.split_long_tracks.value),
+            max_tracks=None,
+            n_clusters=int(self.n_clusters.value),
+            window=None,
+            max_dist=None,
+            max_length_diff=None,
+            penalty=None,
+            psi=None,
+            parallel=bool(self.parallel.value),
+            linkage=str(self.linkage.value),
+            clustering_method=str(self.clustering_method.value),
+            leiden_n_neighbors=int(self.leiden_n_neighbors.value),
+            leiden_resolution=float(self.leiden_resolution.value),
+            missing_policy="keep",
+            save_distance_matrix=bool(self.save_distance_matrix.value),
+            plot_results=True,
+            plot_exemplars=False,
+            n_per_cluster=int(self.n_per_cluster.value),
+            random_state=int(self.random_state.value),
+            verbose=True,
+        )
+        self.status_html.value = (
+            f"<b style='color:#080;'>Saved one-hot dtaidistance model:</b> {self._model_adata_path().name} "
+            f"({self.model_adata.n_obs} tracks)"
+        )
+        umap_error = (self.model_adata.uns.get("visualization", {}) or {}).get("umap_error")
+        if umap_error:
+            self.plot_status_html.value = (
+                f"<b style='color:#a60;'>⚠ UMAP was skipped in diagnostics:</b> {umap_error}"
+            )
+        else:
+            self.plot_status_html.value = "<b>Ready for plots:</b> clustering finished."
+
+    def _run_bouts_clustering(self, trajectory_size):
+        # run_state_based_analysis truncates/filters tracks to an exact length, so it needs a
+        # concrete int (unlike the DTW branch, where a blank size means "unconstrained").
+        resolved_size = int(trajectory_size) if trajectory_size else 100
+        _winfo(
+            "trajectory-dtai-widget",
+            f"Running bout/proportion clustering on fixed state column='{FULL_STATE_COL}'",
+        )
+        self.model_adata = run_state_based_analysis(
+            output_dir=self.output_dir,
+            cell_type=self._current_cell_type(),
+            state_col=FULL_STATE_COL,
+            behavioral_trajectory_size=resolved_size,
+            trajectory_trim_mode=str(self.trajectory_trim_mode.value),
+            split_long_tracks=bool(self.split_long_tracks.value),
+            use_fractions=bool(self.bouts_use_fractions.value),
+            use_bout_stats=bool(self.bouts_use_bout_stats.value),
+            use_transitions=bool(self.bouts_use_transitions.value),
+            use_bigrams=bool(self.bouts_use_ngrams.value),
+            use_trigrams=bool(self.bouts_use_ngrams.value),
+            do_pca=bool(self.bouts_do_pca.value),
+            use_clr_transform=bool(self.bouts_use_clr.value),
+            log_transform_bout_lengths=bool(self.bouts_log_bout_length.value),
+            do_block_scaling=bool(self.bouts_block_scaling.value),
+            drop_highly_correlated=bool(self.bouts_drop_redundant.value),
+            drop_low_variance=bool(self.bouts_drop_redundant.value),
+            clustering_method=str(self.clustering_method.value),
+            n_clusters=int(self.n_clusters.value),
+            agglomerative_linkage=str(self.bouts_agglomerative_linkage.value),
+            n_neighbors=int(self.leiden_n_neighbors.value),
+            leiden_resolution=float(self.leiden_resolution.value),
+            cluster_key="ClusterID",
+            plot_results=True,
+            plot_exemplars=bool(self.bouts_plot_exemplars.value),
+            n_per_cluster=int(self.n_per_cluster.value),
+            random_state=int(self.random_state.value),
+            # Share the DTW basis's output folder so both bases' diagnostics/exemplar PDFs
+            # and the canonical model .h5ad land in the same place on disk.
+            output_subdir_name="behavorial_trajectories",
+            verbose=True,
+        )
+        # Write to the same canonical path the DTW branch uses so every generic downstream
+        # feature (rename, track proportions, backprojection, contact analysis, pretrained
+        # classifier training) keeps working unchanged regardless of which basis produced it.
+        model_path = self._model_adata_path()
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        self.model_adata.write(model_path, compression="gzip")
+        self.status_html.value = (
+            f"<b style='color:#080;'>Saved bout/proportion model:</b> {model_path.name} "
+            f"({self.model_adata.n_obs} tracks)"
+        )
+        self.plot_status_html.value = (
+            "<b>Ready for plots:</b> clustering finished. Diagnostics"
+            + (" and exemplar" if bool(self.bouts_plot_exemplars.value) else "")
+            + " PDFs for this basis were written under "
+            "<code>analysis/&lt;cell_type&gt;/behavorial_trajectories/</code>."
+        )
 
     def _on_run_original_clicked(self, _):
         self._set_busy(self.btn_run_original, self.original_spinner, busy=True)
