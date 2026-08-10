@@ -389,6 +389,26 @@ def _check_not_stale(derived_path: Path, raw_path: Path, derived_label: str, ups
         )
 
 
+def _print_rerun_filtering_warning(stale_filtered_cell_types: set) -> None:
+    """
+    Print a warning that any existing filtered CSV for these cell types was
+    built before this Active Killing run and should be refreshed.
+
+    Filtering reads Active Killing's advanced-features CSV as its input when
+    one exists (see find_advanced_features_csv / filter_tracks' df_input_path),
+    so a filtered CSV produced before this run does not include the killing
+    columns this run just (re)computed.
+    """
+    if not stale_filtered_cell_types:
+        return
+    cell_types = ", ".join(sorted(stale_filtered_cell_types))
+    print(
+        f"{get_current_time()} - WARNING: Active Killing just ran using the unfiltered track "
+        f"features. The existing filtered CSV for {cell_types} was produced before this run and "
+        f"does not include these Active Killing results. Re-run Filtering to refresh it."
+    )
+
+
 def find_advanced_features_csv(output_dir: Union[str, Path], cell_type: str) -> Optional[Path]:
     """
     Locate the active-killing advanced-features CSV for a cell type.
@@ -507,35 +527,45 @@ def run_active_killing_analysis(
     else:
         print(f"Killing threshold mode: MULTIPLIER ({killing_threshold_multiplier}x organoid's own signal at each timepoint)")
     
-    # Load immune cell tracks
+    # Load immune cell tracks. Active Killing always reads the RAW (unfiltered)
+    # combined_track_features.csv, never the filtered one -- Filtering, in turn,
+    # reads Active Killing's advanced-features CSV as its own input (see
+    # find_advanced_features_csv / filter_tracks' df_input_path) so the immune
+    # killing columns survive filtering. If Active Killing preferred the filtered
+    # CSV here, the two steps would each treat the other as their upstream
+    # dependency, and a staleness check on either side could deadlock: Filtering
+    # refusing to run because Active Killing looks stale, and Active Killing
+    # refusing to run because Filtering looks stale. Always starting from raw
+    # breaks that cycle. We track which cell types already have a filtered CSV
+    # so we can tell the caller to re-run Filtering afterwards, since that CSV
+    # was built before this (possibly fresher) Active Killing output existed.
+    stale_filtered_cell_types = set()
+
     immune_feature_dir = output_dir / "analysis" / immune_cell_type / "track_features"
     immune_raw_path = immune_feature_dir / f"BEHAV3D_{immune_cell_type}_combined_track_features.csv"
-    immune_tracks_path = immune_feature_dir / f"BEHAV3D_{immune_cell_type}_combined_track_features_filtered.csv"
+    immune_filtered_path = immune_feature_dir / f"BEHAV3D_{immune_cell_type}_combined_track_features_filtered.csv"
+    immune_tracks_path = immune_raw_path
 
-    if immune_tracks_path.exists():
-        _check_not_stale(immune_tracks_path, immune_raw_path, derived_label="Filtering", upstream_label="Feature Extraction")
-    else:
-        # Try non-filtered version
-        immune_tracks_path = immune_raw_path
+    if immune_filtered_path.exists():
+        stale_filtered_cell_types.add(immune_cell_type)
 
     if not immune_tracks_path.exists():
         raise FileNotFoundError(f"Could not find immune cell tracks at {immune_tracks_path}")
-    
+
     print(f"{get_current_time()} - Loading immune cell tracks from {immune_tracks_path}")
     df_immune_tracks = pd.read_csv(immune_tracks_path)
-    
+
     # Load and combine ALL target cell tracks
     all_target_tracks = []
-    
+
     for target_type in target_cell_types:
         target_feature_dir = output_dir / "analysis" / target_type / "track_features"
         target_raw_path = target_feature_dir / f"BEHAV3D_{target_type}_combined_track_features.csv"
-        target_tracks_path = target_feature_dir / f"BEHAV3D_{target_type}_combined_track_features_filtered.csv"
+        target_filtered_path = target_feature_dir / f"BEHAV3D_{target_type}_combined_track_features_filtered.csv"
+        target_tracks_path = target_raw_path
 
-        if target_tracks_path.exists():
-            _check_not_stale(target_tracks_path, target_raw_path, derived_label="Filtering", upstream_label="Feature Extraction")
-        else:
-            target_tracks_path = target_raw_path
+        if target_filtered_path.exists():
+            stale_filtered_cell_types.add(target_type)
 
         if target_tracks_path.exists():
             print(f"{get_current_time()} - Loading {target_type} tracks from {target_tracks_path}")
@@ -578,8 +608,13 @@ def run_active_killing_analysis(
             advanced_features_path = results_dir / f"BEHAV3D_{immune_cell_type}_advanced_track_features.csv"
             df_advanced.to_csv(advanced_features_path, index=False)
             print(f"{get_current_time()} - Advanced features saved to {advanced_features_path}")
-        
-        return pd.DataFrame(), pd.DataFrame(), {"total_contacts": 0, "total_active_killing": 0}
+            _print_rerun_filtering_warning(stale_filtered_cell_types)
+
+        return pd.DataFrame(), pd.DataFrame(), {
+            "total_contacts": 0,
+            "total_active_killing": 0,
+            "filtering_needs_rerun_for": sorted(stale_filtered_cell_types),
+        }
     
     n_events = len(df_contact_events)
     n_timepoints = sum(len(e) for e in df_contact_events["contact_timepoints"])
@@ -627,7 +662,8 @@ def run_active_killing_analysis(
         "killing_threshold_multiplier": killing_threshold_multiplier,
         "absolute_killing_threshold": absolute_killing_threshold,
         "threshold_mode": "absolute" if absolute_killing_threshold is not None else "multiplier",
-        "targeted_organoids_tracked": True
+        "targeted_organoids_tracked": True,
+        "filtering_needs_rerun_for": sorted(stale_filtered_cell_types),
     }
     
     print(f"{get_current_time()} - Active killing analysis complete:")
@@ -670,7 +706,9 @@ def run_active_killing_analysis(
         # Print summary of new columns
         n_killing_contacts = df_advanced["is_active_killing"].sum()
         print(f"    Rows with active killing: {n_killing_contacts}")
-    
+
+        _print_rerun_filtering_warning(stale_filtered_cell_types)
+
     end_time = time.time()
     h, m, s = format_time(start_time, end_time)
     print(f"### DONE - elapsed time: {h}:{m:02}:{s:02}\n")

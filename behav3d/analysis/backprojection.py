@@ -225,6 +225,21 @@ def _build_summary_lookup(lookup_df, track_col, value_col, background_value=0):
     }
 
 
+def filter_track_image_to_ids(track_img, track_ids):
+    """Zero out every label id in ``track_img`` that isn't in ``track_ids``.
+
+    Pixel labels are always the original segmentation ids, so callers that
+    only know post-split ``TrackID`` values should pass ``original_TrackID``
+    (when present) instead — see the same convention in
+    ``backproject_feature_at_timepoint`` and ``backproject_columns``.
+    Works for both in-memory numpy arrays and lazy dask arrays.
+    """
+    track_ids = np.asarray(list(track_ids), dtype=np.int64)
+    if hasattr(track_img, "chunks"):
+        return da.where(da.isin(track_img, track_ids), track_img, 0)
+    return np.where(np.isin(track_img, track_ids), track_img, 0)
+
+
 def backproject_feature_at_timepoint(
     labels_frame,
     df_features,

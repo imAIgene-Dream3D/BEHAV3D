@@ -10,7 +10,7 @@ import napari
 
 from behav3d.napari._queue import ProcessingQueuePanel, StepType
 from behav3d.napari._global_workers import GlobalWorkersController
-from behav3d.core.qt_help import disable_spinbox_wheel_scroll
+from behav3d.core.qt_help import disable_spinbox_wheel_scroll, reset_scroll_on_page_change
 from pathlib import Path
 
 
@@ -267,6 +267,8 @@ class BEHAV3DWidget(QWidget):
             parent=self,
         )
         self.tabs.addTab(self.analysis_tab, "📊 Analysis")
+
+        reset_scroll_on_page_change(self.tabs)
 
         # Backprojection is now integrated into the Single Cell tab
         # (Step 4 in State Classification, Step 5 in Track Classification)

@@ -308,6 +308,7 @@ def compute_condition_diff_stats_pairwise(
     class_order,
     condition_col,
     group_cols=None,
+    condition_groups=None,
 ):
     """Per group (or a single '(all)' bucket if group_cols is empty), per pair of
     condition_col levels present anywhere in the dataset — every combination, ordered by
@@ -324,6 +325,14 @@ def compute_condition_diff_stats_pairwise(
         index=sample, columns=class_order, values=proportion (0-1).
     sample_metadata : pd.DataFrame
         index=sample, columns include condition_col (+ group_cols if given).
+    condition_groups : dict[str, str], optional
+        Maps each raw condition_col level (as str) to a merged group label, e.g.
+        {"M1": "M1+M2", "M2": "M1+M2", "not_added": "not_added"}. When given, levels
+        are relabeled to their merged group before comparison (so e.g. all "M1"/"M2"
+        samples get pooled into one "M1+M2" side), and rows whose level isn't present
+        in the mapping are dropped. Only the merged labels are compared pairwise
+        instead of every raw level - typically exactly one pair for a two-sided
+        grouping. When None (default), every raw level is compared as-is.
 
     Returns
     -------
@@ -345,11 +354,21 @@ def compute_condition_diff_stats_pairwise(
     else:
         groups = {"(all)": joined}
 
-    all_levels = sample_metadata[condition_col].astype(str).drop_duplicates().tolist()
+    if condition_groups:
+        raw_levels = sample_metadata[condition_col].astype(str).drop_duplicates().tolist()
+        all_levels = list(dict.fromkeys(
+            condition_groups[lvl] for lvl in raw_levels if lvl in condition_groups
+        ))
+    else:
+        all_levels = sample_metadata[condition_col].astype(str).drop_duplicates().tolist()
 
     out = {}
     for group_label, panel in groups.items():
         cond = panel[condition_col].astype(str)
+        if condition_groups:
+            cond = cond.map(condition_groups)
+            panel = panel[cond.notna()]
+            cond = cond[cond.notna()]
         pair_stats = {}
         for level_a, level_b in combinations(all_levels, 2):
             vals_a_panel = panel[cond == level_a]

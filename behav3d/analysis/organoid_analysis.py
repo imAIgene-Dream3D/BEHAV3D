@@ -523,7 +523,10 @@ def plot_sample_organoid_analysis(
         
         # Secondary Y axis (percent scale)
         ax_percent = ax.twinx()
-        ax_percent.set_ylim(0, 100 * ymax / max_alive)
+        if max_alive > 0:
+            ax_percent.set_ylim(0, 100 * ymax / max_alive)
+        else:
+            ax_percent.set_ylim(0, 100)
         ax_percent.set_ylabel('% Alive')
 
         fig.subplots_adjust(left=0.05, right=0.85, top=0.95, bottom=0.05)
