@@ -3,9 +3,9 @@
 LAP — Linear Assignment Problem tracking via the [laptrack](https://github.com/yfukai/laptrack) library — links per-timepoint detections by solving a global optimization on the centroid-distance cost matrix (Hungarian-style assignment). It also supports gap closing across short disappearances and optional merge/split events.
 
 ```{note}
-**Not a recommended default.** The routine trackers are **[btrack](btrack)** for motile cells
-(T cells and similar) and **[Propagation](propagation)** for organoids. LAP is an alternative —
-use it only for a reason below, not as a first choice for motile cells.
+**Not a recommended default.** The routine trackers are **[btrack](btrack)** for objects that
+do not overlap between frames, and **[fragmentation tracking](fragmentation_tracking)** for
+objects that do. LAP is an alternative — use it only for a reason below, not as a first choice.
 ```
 
 ## When to use it

@@ -28,7 +28,7 @@ Graphics from **this** tab are limited to:
   - All samples: `plots/combined_killing_efficiency_distribution.png`.
   - Top killers: `gallery/<sample>/killing_event_*.gif` (Event GIFs of cropped 3D views (maximum-intensity projections) around each top killing event; count set by **Top-N killers to display**).
 
-See [Active Killing outputs](#active-killing-outputs) for file names; plot interpretation belongs in that section (or a short “Reading the plots” subsection).
+See [Active Killing](population_analysis/active_killing.md) for file names and how to read the plots.
 ```
 
 ## Per-cell-type sub-tabs
@@ -109,104 +109,15 @@ Adjust from there until the green/red split visually matches the dead cells in y
 
 If you already ran extraction with one threshold and want another, change Dead mask % threshold and run ▶ Re-run death
 
-## Active Killing detection (immune cells only)
+## Active Killing detection
 
-The collapsible **▶ Extended Analysis — Active Killing (Immune Cells)** section at the bottom of the tab detects, for each immune cell, the **timepoints at which it is likely killing a target organoid**. It only appears when the metadata contains at least one immune cell type, and it requires that the immune cell's combined feature CSV already exists (run baseline Feature Extraction for immune cells first).
+A collapsible **▶ Extended Analysis — Active Killing (Immune Cells)** section sits at the bottom of this tab. It detects, for each effector cell, the timepoints at which the target it touched shows a signal rise large enough to count as killing.
 
-### How it works in plain terms
+**It is configured and run here, but explained with the population analyses.** It lives in this tab because it needs the per-timepoint contact and signal columns while they are being computed, and it writes its results back into the effector's own feature table. Conceptually it belongs with Death Dynamics, Interaction and Invasiveness, because it is about targets, effectors and contact.
 
-For each contact event, the detector looks at every organoid the immune cell actually touched, independently, anchored at the moment contact started:
+The panel only appears when the metadata contains at least one **immune** cell type, and it requires that cell type's combined feature CSV to exist already — so run baseline Feature Extraction for it first.
 
-> *From the start of contact to N timepoints later, does the death signal on this specific organoid rise enough to count as killing?*
-
-Whichever touched organoid clears its own threshold by the largest margin is reported as the event's target. There is no sample-wide or cross-organoid averaging involved — each organoid is judged only against its own signal.
-
-If yes (and contact lasted long enough), the whole observed contact duration is flagged `is_active_killing = True`.
-
-```{note}
-**Caveat:** when several immune cells contact the same organoid at once, all of them may be flagged as active killers for that death, even if only one actually did the killing — the detector attributes a death rise to every qualifying contact, not to a single culprit.
-```
-
-#### The killing rule (how it is computed)
-
-Each touched organoid is judged **only against its own death signal**, anchored at the timepoint the contact **started** ($t_c$) — there is no background death rate and no averaging across organoids or across the sample. Let $W$ be the observation window and $D$ the chosen death-signal column. For one touched organoid:
-
-$$
-D_{\text{start}} = D(t_c)
-\qquad
-D_{\text{end}} = D(t_c + W)
-\qquad
-\Delta D = D_{\text{end}} - D_{\text{start}}
-$$
-
-If the track ends before $t_c + W$, $D_{\text{end}}$ is read at the organoid's last available timepoint. The increase $\Delta D$ is compared to a threshold $\theta$ set by the mode:
-
-$$
-\theta =
-\begin{cases}
-\theta_{\text{abs}} & \text{(absolute mode)} \\[4pt]
-D_{\text{start}} \times (m - 1) & \text{(multiplier mode)}
-\end{cases}
-$$
-
-Multiplier mode is therefore equivalent to requiring $D_{\text{end}} > D_{\text{start}} \times m$ — the signal must grow past $m\times$ its value at contact start. A baseline of exactly $D_{\text{start}} = 0$ is replaced by $0.1$ so the threshold isn't trivially zero. The organoid is flagged as killed when
-
-$$
-\Delta D > \theta
-\qquad\text{with}\qquad
-\text{killing\_efficiency} = \frac{\Delta D}{\theta}
-$$
-
-Every touched organoid is scored this way, and the one with the **highest** `killing_efficiency` is reported as the event's target (`targeted_track_id`, set only when it is actually flagged as killed). That single per-event verdict is then written onto **every** timepoint of the observed contact, and the event is only counted once the contact has lasted at least the **minimum contact duration**.
-
-### Parameters
-
-| Control | Default | Range | Meaning |
-|---|---|---|---|
-| **Immune cell type** | first immune type | dropdown | Which immune tracks to analyse. |
-| **Observation window** | 5 | 1 – 100 timepoints | How many frames after contact starts to measure the death-signal rise on each touched organoid. |
-| **Death signal column** | `percentage_dead_mask` | dropdown of `percentage_dead_mask`, `mean_dead_dye`, `nr_dead_mask_pixels` | Which organoid column is read as the "death signal". |
-| **Killing threshold multiplier** | 1.5 | 0.1 – 20.0 | If absolute mode is off: an organoid's death signal must reach at least `signal_at_contact_start × multiplier` by the end of the window to count as killing. Scales with each organoid's own starting signal (a signal of exactly 0 is treated as 0.1 to avoid a trivial threshold). |
-| **Use absolute threshold instead of multiplier** | OFF | checkbox | When on, the multiplier is replaced by a fixed value (next field). Recommended together with `nr_dead_mask_pixels`, since a flat pixel-count cutoff is easier to reason about than one on a fraction/intensity scale. |
-| **Absolute threshold** | 0.0 | 0.0 – 10000.0 | Fixed minimum death-signal increase (only used when "Use absolute threshold" is on). |
-| **Min contact duration** | 1 | 1 – 50 timepoints | Minimum consecutive timepoints an immune cell must be in contact with the same target before a killing event can be counted. |
-| **Top-N killers to display** | 5 | 1 – 50 | Used by the preview button below. |
-
-### Choosing the window and threshold
-
-None of these values are universal — they depend on your **biology** and your **imaging cadence**.
-
-- **Observation window** — how long, after contact, you expect a kill to register. A 5-timepoint window means something very different at 1-minute vs. 30-minute intervals. Try a few window lengths and check which gives sensible results for your time interval.
-- **Minimum contact duration** — is a single-timepoint touch enough for killing to plausibly begin, or must contact persist to count as a real attempt rather than a passing brush? Again, judge against your interval.
-- **Absolute threshold vs. multiplier** — the **absolute** threshold (a fixed increase in the death signal, e.g. +20–30 dead pixels) is the general recommendation and pairs naturally with the pixel-count death signals. The **multiplier** (fold-change over each cell's own pre-contact baseline) is for two situations: a single target line where baseline differences don't matter, or wells with a mix of dying and non-dying cells where cell-to-cell baseline variation makes a single fixed threshold unreliable. With **two target lines that have different baseline death rates the multiplier becomes unreliable** — the same fold-change is a very different absolute increase per line — so prefer the absolute threshold there.
-
-```{tip}
-**Calibrating an absolute pixel threshold to "one dead cell".** The right absolute value depends directly on cell size and pixel resolution, so recompute it for your own setup rather than reusing someone else's number. As a worked estimate, a cell of diameter $d$ imaged at resolution $r$ (µm/pixel) fills roughly
-
-$$
-\text{area} \approx \frac{\pi}{r^{2}} \left(\frac{d}{2}\right)^{2} \ \text{pixels}
-$$
-
-e.g. a ~10 µm cell at 1 µm/pixel is about $\pi \times 5^2 \approx 80$ pixels if the whole cell fills with dye. "One dead cell" could therefore mean anywhere from ~20 pixels (partial/rim staining, smaller cells, coarser resolution) to ~80+ pixels (full-cell fill, larger cells, finer resolution). Use this as a starting point, then fine-tune by eye against a timepoint you trust.
-```
-
-### Buttons
-
-- **👁 Load Top Killers in Viewer** — adds a Points layer per top-killing track at every timepoint flagged as killing, so you can scrub through the movie and verify visually.
-- **▶ Run Active Killing Analysis** — runs the detector for every sample and writes the output CSVs.
-- **+🛒** — queues the analysis with the current parameters.
-
-### Active Killing outputs
-
-Written under `<output_dir>/analysis/<immune_type>/active_killing/`:
-
-| File | Contents |
-|---|---|
-| `BEHAV3D_<immune_type>_advanced_track_features.csv` | The full immune feature table with extra columns: `is_active_killing`, `killing_efficiency`, `targeted_track_id`, `contact_event_id`, and a `death_signal_increase_<N>tp` column where N is your observation window. |
-| `active_killing_per_timepoint_<immune_type>.csv` | One row per contact-event timepoint, with the event's classification and the threshold used. |
-| `active_killing_summary_<immune_type>.csv` | Per-sample aggregates: number of active-killing timepoints, mean killing efficiency, active-killing rate. |
-| `contact_events_<immune_type>.csv` | One row per contact event (start / end timepoint, duration, target track IDs). |
-| `plots/combined_killing_efficiency_distribution.png` | Histogram of killing efficiency across all active-killing timepoints. |
+**Full explanation, parameters, calibration and outputs: [Active Killing](population_analysis/active_killing.md).**
 
 ## Apply, Run, Queue
 
@@ -417,9 +328,15 @@ $$
 \text{nr\_dead\_mask\_pixels} = \text{nr\_pixels} \times \text{percentage\_dead\_mask}
 $$
 
-The three death signals capture death differently: `percentage_dead_mask` is **size-independent** (good when organoids differ in size) but saturates; `nr_dead_mask_pixels` is an **absolute** count (cannot go negative, pairs well with an absolute threshold — see [Active Killing](#active-killing-detection-immune-cells-only)); and `mean_dead_dye` (from the Intensity family) is the **mean dead-channel intensity** across the whole mask, which is the right choice when you have no dead-cell segmentation, or when the dye is diffuse and fills the whole cell (e.g. a **calcium reporter** rather than a discrete dead region).
+The three death signals capture death differently: `percentage_dead_mask` is **size-independent** (good when objects differ in size) but saturates; `nr_dead_mask_pixels` is an **absolute** count (cannot go negative, pairs well with an absolute threshold — see [Active Killing](population_analysis/active_killing.md)); and `mean_dead_dye` (from the Intensity family) is the **mean dead-channel intensity** across the whole mask, which is the right choice when you have no dead-cell segmentation, or when the dye is diffuse and fills the whole cell rather than forming a discrete region.
 
 If you set the threshold to 0, the `dead` column is not added.
+
+```{note}
+**The dead channel does not have to carry a death dye.** These columns measure how much of an object is occupied by, or how brightly it carries, whatever signal you declared as `dead_channel`. Any reporter that **switches on and stays on** — a differentiation marker, an activation or stress reporter — works here, and the downstream [Death Dynamics](population_analysis/index) and Active Killing analyses work unchanged. Read "dead" as "past the threshold you set".
+
+A **fluctuating** reporter that goes on and off, such as calcium, is a different case: a sticky flag is meaningless for it. Keep its channel out of `dead_channel`, and use its intensity as a behavioural feature in [Single Cell](single_cell/index) analysis instead.
+```
 
 ## Tips & best practices
 
@@ -433,6 +350,6 @@ If you set the threshold to 0, the `dead` column is not added.
 ## See also
 
 - [Filtering](filtering.md) — the next step. Drops low-quality tracks and produces QC plots.
-- [Death Dynamics & Interaction](death_dynamics) — uses the death and contact columns for population death dynamics and interaction analysis.
+- [Population Analysis](population_analysis/index) — uses the signal and contact columns for population dynamics, interaction, invasiveness and active killing.
 - [Single Cell](single_cell/index) — classifies per-cell behavioural states from the movement / contact / morphology table.
 - [Output Directory & File Layout](../plugin_essentials/output_layout) — where the CSVs live.

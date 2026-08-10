@@ -193,8 +193,8 @@ Then open the BEHAV3D plugin from the **Plugins** menu.
 | Column Name                    | Explanation                                                                                         |
 |-------------------------------|-----------------------------------------------------------------------------------------------------|
 | sample_name                   | Name to assign to the sample; used for naming output files/folders.                                |
-| organoid_line                 | Name of organoid cell line used in the experiment (e.g. 10T, 162M, etc.). Analysis visual results will be split on organoid lines                                     |
-| tcell_line                    | Name or type of T cell used (e.g. TEG/CAR-T/etc.). Analysis visual results will be split on tcell lines                                 |
+| organoid_line                 | Name of the multicellular structure line used in the experiment (e.g. `lineA`, `lineB` — a patient-derived organoid line, a spheroid line, etc.). Analysis visual results will be split on organoid lines                                     |
+| tcell_line                    | Name or type of immune population used (e.g. `lineA` — a CAR-T product, an engineered T-cell line, a donor identifier). Analysis visual results will be split on tcell lines                                 |
 | exp_nr                        | Experiment number for tracking and reproducibility.                                                |
 | well                          | Well identifier on the experimental plate (e.g. `well01`).                                          |
 | tcell_channel                 | Index of the fluorescence channel representing T cells in the raw image. (Channel indexing starts at 0)                                      |

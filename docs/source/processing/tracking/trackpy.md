@@ -3,9 +3,10 @@
 [TrackPy](http://soft-matter.github.io/trackpy/) is a particle-tracking library originally written for colloidal-particle tracking (Crocker-Grier algorithm). In BEHAV3D EXPLORER it provides a **simpler and faster alternative to LAP** for sparser data — when cells are well-separated and you don't need built-in merge / split modelling.
 
 ```{note}
-**Not a recommended default.** The routine trackers are **[btrack](btrack)** for motile cells
-(T cells and similar) and **[Propagation](propagation)** for organoids. TrackPy is the
-lightest-weight alternative — reach for it only when your data is genuinely easy to track.
+**Not a recommended default.** The routine trackers are **[btrack](btrack)** for objects that
+do not overlap between frames, and **[fragmentation tracking](fragmentation_tracking)** for
+objects that do. TrackPy is the lightest-weight alternative — reach for it only when your data
+is genuinely easy to track.
 ```
 
 ## When to use it

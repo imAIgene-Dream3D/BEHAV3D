@@ -67,6 +67,6 @@ If you tracked once and want to copy the result into a new output directory, set
 
 ## See also
 
-- [Data Preparation](../../preprocessing/data_preparation) — where the `*_tracks_image_path` metadata columns live.
+- [Data Preparation](../../data_preparation) — where the `*_tracks_image_path` metadata columns live.
 - [Output Directory & File Layout](../../plugin_essentials/output_layout) — the canonical paths.
 - [Import existing segmentation](../segmentation/import) — analogous workflow at the segmentation stage.

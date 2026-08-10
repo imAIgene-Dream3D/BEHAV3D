@@ -18,7 +18,7 @@ Tab 1 of the BEHAV3D EXPLORER dock widget. This is where every experiment starts
 You **must** set the output directory before any other tab can run.
 ```
 
-Click **Browse** and pick a folder. Everything BEHAV3D EXPLORER writes goes under it, following the canonical layout documented in [Output Directory & File Layout](../plugin_essentials/output_layout). We recommend short paths and no special characters.
+Click **Browse** and pick a folder. Everything BEHAV3D EXPLORER writes goes under it, following the canonical layout documented in [Output Directory & File Layout](plugin_essentials/output_layout). We recommend short paths and no special characters.
 
 ## 2 · Metadata Builder
 
@@ -32,6 +32,24 @@ Workflow:
 
 1. **Number of samples** — number of samples in the experiment you are going to process/analyze.
 2. **Population counts** — how many *organoid* / *immune* / *other* cell types your experiment has. Tick **Include dead channel** if you have it in your samples.
+
+   ```{important}
+   **A population is defined by your images. Line and Condition are defined by your experiment.**
+
+   A **population** is something you can tell apart in the imaging data, and which therefore needs its own segmentation model and its own track IDs. Count one here for each such entity — that is all this number controls.
+
+   **Line** and **Condition** are free-text labels you fill in per sample, later in the sample forms. They are not visible in the image; only you know them. The two behave identically and can be used interchangeably — put a cell line in one and a treatment in the other, or simply `line1` / `line2` in whichever fits. BEHAV3D merges them into a single `_line_condition` column and uses it to split visualisations and comparisons. Line is required; Condition is optional.
+
+   So do **not** add a population because one well was treated differently, or because it holds a different subclone that looks identical on screen. That is the same population with a different Line or Condition.
+
+   | Situation | How to declare it |
+   |---|---|
+   | One population labelled in several colours (confetti-style), same biology throughout | **One** population, tick **Multicolor** and set the colour count |
+   | Two entities you can distinguish in the image, in different or overlapping channels | **Two** populations |
+   | Visually identical, differing only by treatment, subclone, or donor | **One** population; record the difference in **Line** or **Condition** |
+
+   A colour difference *within* one population means multicolor; a colour difference *between* populations means separate populations.
+   ```
 3. Click **Configure Cell Types**. Per-cell-type name fields appear; defaults are `organoid1`, `tcell` (for the first immune), `other1`. Edit to change.
    - For each *immune* type you can tick **Multicolor** + set a channel count to declare a per-channel-split immune cell type (see *Multicolor cell types* below).
 4. Click **Create Sample Forms**. One form per sample appears.
@@ -112,7 +130,7 @@ For every cell type you declare, one of the following columns must be present (t
 
 | Column | Required? | Description |
 |---|---|---|
-| `{prefix}_{ct}_line_condition` | **Yes** | A free-form label (e.g. `10T_unstim`) used to split visualisations by condition. You enter **Line** and **Condition** as separate fields in the Metadata Builder; the tool merges them into this single column when it saves the CSV. |
+| `{prefix}_{ct}_line_condition` | **Yes** | A free-form, experimenter-defined label (e.g. `lineA_untreated`) used to split visualisations and comparisons. You enter **Line** and **Condition** as separate fields in the Metadata Builder — they behave identically, Line required and Condition optional — and the tool merges them into this single column when it saves the CSV. Nothing here is read from the image; it is your annotation of what each sample was. |
 | `{prefix}_{ct}_segments_image_path` | Optional | Path to a per-sample segmentation mask. |
 | `{prefix}_{ct}_tracks_image_path` | Optional | Path to a per-sample tracked-labels image. |
 | `{prefix}_{ct}_tracks_csv_path` | Optional | Path to a per-sample tracks CSV (paired with `_tracks_image_path`). |
@@ -120,7 +138,7 @@ For every cell type you declare, one of the following columns must be present (t
 ```{note}
 The three per-cell-type path columns above, together with `dead_mask_path` from the Optional columns table, are **blank on a first run**, and you do not have to fill them yourself: when the Segmentation, Tracking or dead-mask step finishes, the plugin writes the produced file paths back into the metadata CSV for you, so they appear automatically next time you reload.
 
-To plug in pre-existing results from outside BEHAV3D EXPLORER, first write the path in the corresponding field in the Metadata Builder, then use the dedicated **Import** workflow in the [Segmentation](../processing/segmentation/import) or [Tracking](../processing/tracking/import) tab. The external file must be in **`.tif` / `.tiff` format**, the Import widget then validates it, converts it into BEHAV3D EXPLORER's canonical zarr layout, and updates the metadata CSV for you. **Typing a path manually in the CSV is not enough**: every downstream step reads the canonical zarr, not the original file.
+To plug in pre-existing results from outside BEHAV3D EXPLORER, first write the path in the corresponding field in the Metadata Builder, then use the dedicated **Import** workflow in the [Segmentation](processing/segmentation/import) or [Tracking](processing/tracking/import) tab. The external file must be in **`.tif` / `.tiff` format**, the Import widget then validates it, converts it into BEHAV3D EXPLORER's canonical zarr layout, and updates the metadata CSV for you. **Typing a path manually in the CSV is not enough**: every downstream step reads the canonical zarr, not the original file.
 ```
 
 ### Which channel is used for segmentation?
@@ -133,14 +151,16 @@ The **only** channel number that belongs in the metadata CSV is `dead_channel` (
 
 ### Multicolor cell types
 
-Use multicolor when the **same biological cell type appears in more than one fluorescent channel** of the same image, for example, T-cell sub-clones each tagged with a different fluorophore (red + green TEGs, RFP + GFP + YFP, etc.). It is also useful when you want to track different fluorescent labels of the *same* population separately and then pool the results.
+Use multicolor when the **same biological cell type appears in more than one fluorescent channel** of the same image — sub-clones of one population, each tagged with a different fluorophore (for example T cells split across RFP, GFP and YFP). Biologically they are all the same population; only the label differs.
+
+The usual reason to do this is **to reduce the apparent density of a crowded population**. Splitting one dense population across three colours makes each colour sparser, so segmentation separates objects more reliably and tracking has fewer ambiguous links. Because the channels are merged back together after tracking, you get that benefit without losing the population.
 
 **How to declare it in the Metadata Builder:**
 
 1. In the cell-type naming section, tick **Multicolor** next to the immune name.
 2. Set `N` = number of colors (or color combinations) used for that cell type (typically 2 or 3).
 3. Click *Configure Cell Types*. The Builder now creates **`N` separate cell-type entries** in the metadata, named `{base}_1_multicolor`, `{base}_2_multicolor`, …, `{base}_N_multicolor`. Each one gets its own per-cell-type columns (`im_{base}_n_multicolor_line_condition`, `…_segments_image_path`, `…_tracks_image_path`, `…_tracks_csv_path`).
-4. In each sample form, fill in **Line** and **Condition** for every multicolor channel, they can be the same (just different colours of the same biology) or different (genuinely different sub-populations).
+4. In each sample form, fill in **Line** and **Condition** for every multicolor channel. Normally these are the same across colours, because the colours are the same biology. Only use different values when the colours mark sub-populations that you still want processed as one cell type — if they are genuinely different biology, declare them as separate cell types instead (see the tip below).
 
 **What happens downstream:**
 
@@ -158,17 +178,17 @@ Multicolor is only meaningful when the channels really belong to the *same* cell
 
 | sample_name | exp_nr | well | raw_image_path | pixel_distance_xy | pixel_distance_z | distance_unit | time_interval | time_unit | or_organoid_line_condition | im_tcell_line_condition |
 |---|---|---|---|---|---|---|---|---|---|---|
-| Sample_A1 | 1 | A1 | D:/data/exp1/A1.czi | 0.5 | 2.0 | μm | 1.0 | m | 10T_unstim | TEG_actA |
-| Sample_A2 | 1 | A2 | D:/data/exp1/A2.czi | 0.5 | 2.0 | μm | 1.0 | m | 10T_unstim | TEG_actB |
+| Sample_A1 | 1 | A1 | D:/data/exp1/A1.czi | 0.5 | 2.0 | μm | 1.0 | m | lineA_untreated | lineA_activated |
+| Sample_A2 | 1 | A2 | D:/data/exp1/A2.czi | 0.5 | 2.0 | μm | 1.0 | m | lineA_untreated | lineB_activated |
 
 (Optional `or_organoid_segments_image_path` etc. columns omitted because we'll segment from scratch.)
 
-**A multicolor example** — same organoid type, plus T cells split across 2 fluorescent channels (red and green TEGs) with a dead-stain channel. Only the columns that are different from the example above are shown:
+**A multicolor example** — same organoid type, plus one immune population split across 2 fluorescent channels (for example T cells in red and green) with a dead-stain channel. Only the columns that are different from the example above are shown:
 
 | sample_name | … | dead_channel | or_organoid_line_condition | im_tcell_1_multicolor_line_condition | im_tcell_2_multicolor_line_condition |
 |---|---|---|---|---|---|
-| Sample_A1 | … | 3 | 10T_unstim | TEG_RFP | TEG_GFP |
-| Sample_A2 | … | 3 | 10T_unstim | TEG_RFP | TEG_GFP |
+| Sample_A1 | … | 3 | lineA_untreated | colour1 | colour2 |
+| Sample_A2 | … | 3 | lineA_untreated | colour1 | colour2 |
 
 - The Builder created **two** T-cell entries: `tcell_1_multicolor` and `tcell_2_multicolor`. Each one is segmented and tracked independently.
 - After the merge step, an additional `tcell_merged_segments_image_path` (and `_tracks_image_path`, `_tracks_csv_path`) column will be added automatically. These are the columns the rest of the pipeline consumes.
@@ -191,6 +211,6 @@ BEHAV3D then sees every sample as one experiment, so you can run **Feature Extra
 - **`AssertionError: Not all required columns are present`**: the message lists exactly which columns the validator wants. 
 ## See also
 
-- [Output Directory & File Layout](../plugin_essentials/output_layout) — what gets written where.
-- [Visualization tab](../plugin_essentials/visualization) — open one sample after zarr conversion to verify channels.
-- [Segmentation overview](../processing/segmentation/index.md) — next step in the pipeline.
+- [Output Directory & File Layout](plugin_essentials/output_layout) — what gets written where.
+- [Visualization tab](plugin_essentials/visualization) — open one sample after zarr conversion to verify channels.
+- [Segmentation overview](processing/segmentation/index.md) — next step in the pipeline.

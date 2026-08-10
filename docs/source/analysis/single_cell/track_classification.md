@@ -203,7 +203,7 @@ Click **▶ Condition Comparison Report**. Each cluster gets a signed bar showin
 
 ### Contact-Based Grouping
 
-Labels every classified track **contact** or **no_contact** with another cell type (using the `*_contact` columns from [Filtering](../filtering.md)), so you can ask whether a trajectory cluster occurs more in cells that touched, say, an organoid or macrophage.
+Labels every classified track **contact** or **no_contact** with another cell type (using the `*_contact` columns from [Filtering](../filtering.md)), so you can ask whether a trajectory cluster occurs more in cells that touched a given population — a target structure, or another cell type.
 
 | Control | Default | Meaning |
 |---|---|---|

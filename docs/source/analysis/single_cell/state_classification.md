@@ -29,7 +29,7 @@ This section is populated **from the actual feature columns** found in the selec
 
 - **Timepoint features** — checkboxes for the per-timepoint measurements from Feature Extraction, grouped by family (movement, intensity, morphology, contact, death, …). Tick the ones that define the behaviour you care about. If no features appear, run [Feature Extraction](../feature_extraction) for this cell type first. **By default**, when present in the features table, **speed**, **elongation**, **sphericity**, **extent** and **solidity** are pre-ticked as a sensible starting set covering both movement and morphology.
 - **Window features** — features computed over a short, trailing, rolling window rather than a single frame (e.g. displacement, straightness):
-  - **Window size** (default `5`, range 1–500) — how many timepoints each window spans. Keep it around 5 for motility behaviour; **set it to 1 when the events you care about happen at a single timepoint** (e.g. calcium-intensity peaks), so a window doesn't smear them out. The HMM still assigns a state *per timepoint* regardless of this setting — that is what a hidden Markov model does; the window only controls how the window-based features are aggregated.
+  - **Window size** (default `5`, range 1–500) — how many timepoints each window spans. **This is a count of frames, so what it means in real time depends on your interval**: 5 windows is 10 minutes at a 2-minute interval, but 25 seconds at 5 seconds. Multiply by your `time_interval` and judge the duration, not the number. Around 5 suits motility behaviour at typical live-imaging cadences; **set it to 1 when the events you care about happen at a single timepoint** (e.g. calcium-intensity peaks), so a window doesn't smear them out. The HMM still assigns a state *per timepoint* regardless of this setting — that is what a hidden Markov model does; the window only controls how the window-based features are aggregated.
   - **net_displacement**, **straightness**, **mean_square_displacement** — tick the window-based motility summaries you want added. These are computed here, from the per-timepoint feature table — they are **not** columns in the Feature Extraction CSV. **net_displacement** is ticked by default; the other two are off by default.
 
 ```{tip}
@@ -60,7 +60,7 @@ Contains checkboxes for the binary (**categorical / true-false**) flags that are
 
 **Reach for the `any_*` version**, when you have several organoid lines or immune subtypes in the same dataset and you believe behavior should be unrelated to whatever subtype it is contacting (e.g. you want organoid engagement to not depend on what organoid type it is engaging with but keep engagement as a general behavior). It keeps things to a plain "in contact or not."
 
-**Use a per-type column instead** when *which* subtype was contacted is actually part of the behavior you are trying to find (e.g. contact between different immune components (e.g. T-cells and macrophages), where contact could actually be a different behavior) — you'll get more, smaller full behavioural clusters in exchange for that detail.
+**Use a per-type column instead** when *which* population was contacted is actually part of the behaviour you are trying to find — for example contact between two different immune populations, such as T cells and macrophages, where touching one may mean something different from touching the other. You'll get more, smaller full behavioural clusters in exchange for that detail.
 ```
 
 ### Number of states

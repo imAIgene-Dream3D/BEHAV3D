@@ -97,9 +97,9 @@ first.
   Layering it this way gives a very clean organoid border.
 - **Touching objects:** draw a thin background line between them, bordered by
   foreground, so the classifier learns to split them into separate objects. For
-  organoids, focus this on **time point 1** of each image — propagation tracking
-  copies the segmentation forward, so the classifier only has to separate objects
-  correctly on the first time point.
+  objects tracked by fragmentation tracking, focus this on **time point 1** of each
+  image — the method copies the segmentation forward, so the classifier only has to
+  separate objects correctly on the first time point.
 - **Elongated T cells:** draw the label slightly **thicker than the signal
   (~3 px)**. Segmentation connects adjacent pixels, so a one-pixel line leaves
   gaps; a little extra thickness yields one clean segment.
@@ -162,17 +162,22 @@ Shared random-forest / instance settings:
 
 ## Tracking
 
-- **Organoids — propagation:** select the organoid layer; the method auto-sets to
-  propagation. It copies segmentation frame-to-frame, so there's nothing to tune.
-  It is the slower of the two methods.
-- **T cells — btrack:** select btrack and tune Step 1 from observed
-  displacement per frame. After the Step 1 preview looks correct, enable global
-  optimization. Set its distance threshold from the largest spatial gap to
-  reconnect and its time threshold from the largest missing-frame gap. Values
-  such as 100/60/3 occur in one historical CD4/CD8 experiment but are not
-  general T-cell defaults.
-- **Run batch tracking (all cell types)** tracks organoids first, then T cells
-  (choose "skip existing" if already tracked).
+- **Check the overlap first.** Between two consecutive frames, does an object still
+  overlap where it was? Large overlap points to a propagation-family method; moving
+  about one cell diameter or more, with little or no overlap, points to btrack. This
+  depends on your frame interval, not on the cell type — the same cell is "slow" at a
+  short interval and "fast" at a long one.
+- **Objects that overlap between frames — fragmentation tracking:** select the layer;
+  the method auto-sets. It copies segmentation frame-to-frame, so there's nothing to
+  tune. It is the slower of the two methods. Typical for multicellular structures such
+  as organoids or spheroids.
+- **Objects that do not overlap between frames — btrack:** select btrack and tune
+  Step 1 from observed displacement per frame. After the Step 1 preview looks correct,
+  enable global optimization. Set its distance threshold from the largest spatial gap to
+  reconnect and its time threshold from the largest missing-frame gap. Derive every one
+  of these from your own data; there are no general defaults.
+- **Run batch tracking (all cell types)** runs each cell type's configured method in
+  sequence (choose "skip existing" if already tracked).
 - **Verify it worked:** tracked segments keep the **same colour/ID across time**;
   untracked segments get a new colour/ID every frame. Hover a label to confirm its
   ID stays constant.
@@ -304,7 +309,7 @@ first, then merge and run feature extraction and analysis jointly.
 | Segmentation | Max depth / n_trees | 5 / 100 |
 | Segmentation | Foreground / seed threshold | 0.50 / 0.80 |
 | Segmentation | Min size (trained) | ~500–1000 px (organoids) |
-| Tracking | Organoid method | propagation |
+| Tracking | Method for objects that overlap between frames | fragmentation tracking |
 | Tracking | T-cell method | btrack |
 | Tracking | Global track optimization | Enabled |
 | Tracking | Workers | ~4 |
@@ -322,6 +327,7 @@ first, then merge and run feature extraction and analysis jointly.
 | Data prep | Time interval | ~120 s (use your real value) |
 | Data prep | Zarr conversion workers | what your machine can handle |
 
-For provenance-labeled examples from IVM HIV, CD4/CD8 active killing,
-multi-organoid safety profiling, and calcium-reporter experiments, see
-[Historical experiment profiles](assistant/reference_experiment_profiles.md).
+For provenance-labeled examples — motile single cells, contact-associated killing,
+two coexisting multicellular structures, and a fluctuating reporter — see
+[Historical experiment profiles](assistant/reference_experiment_profiles.md). Those
+are worked examples tied to their own acquisition settings, not defaults to copy.

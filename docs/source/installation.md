@@ -255,7 +255,7 @@ jupyter notebook notebooks/run_behav3d.ipynb
 
 To start a pipeline you need:
 
-- A populated `metadata.csv` (see [Data Preparation](preprocessing/data_preparation) for the full schema).
+- A populated `metadata.csv` (see [Data Preparation](data_preparation) for the full schema).
 - Per sample, a raw microscopy image: `.czi`, `.tiff`, `.zarr`, `.lif` or `.ims`.
 
 ```{tip}

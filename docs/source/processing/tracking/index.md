@@ -13,7 +13,7 @@ The tracked zarr is a 4-D `uint16` `(T, Z, Y, X)` array in which the pixel value
 
 ## Per-cell-type sub-tabs
 
-Unlike the Segmentation tab, the Tracking tab is organised as **sub-tabs per cell type**. Each cell type declared in the metadata gets its own sub-tab where you pick a tracking method and its parameters independently — because what works for slow-moving organoids is rarely what works for fast-moving T cells.
+Unlike the Segmentation tab, the Tracking tab is organised as **sub-tabs per cell type**. Each cell type declared in the metadata gets its own sub-tab where you pick a tracking method and its parameters independently — because what works for objects that overlap themselves between frames is rarely what works for objects that do not.
 
 The sub-tabs use a colour code:
 
@@ -26,33 +26,48 @@ The sub-tabs use a colour code:
 Special cases:
 
 - **Multicolor cell types** (e.g. `tcell_1_multicolor`, `tcell_2_multicolor`) get a single combined panel that tracks each channel separately and then merges them into `{base}_merged`.
-- **Track all organoids together**: by **default** all organoid cell types are collapsed into a single combined **🟣 All Organoids** sub-tab (Propagation only), with the "Track all organoids together" checkbox enabled — useful when you have multiple organoid types in the same well but want one unified track set. Unticking the checkbox rebuilds one independent sub-tab per organoid type.
+- **Track all organoids together**: by **default** all organoid cell types are collapsed into a single combined **🟣 All Organoids** sub-tab (fragmentation tracking only), with the "Track all organoids together" checkbox enabled — useful when you have multiple organoid types in the same well but want one unified track set. Unticking the checkbox rebuilds one independent sub-tab per organoid type.
 
 ## The tracking methods
 
 Each cell type is tracked with one of the following methods, picked from the method dropdown in its sub-tab:
 
+```{important}
+**Fragmentation tracking** is the method previously called **Propagation**. The method
+dropdown still reads *Propagation* until the interface is updated; the documentation uses
+the new name throughout. *Reporter Propagation* is a separate method and keeps its name.
+```
+
 | Method | What it does |
 |---|---|
 | **LAP (laptrack)** | Linear Assignment Problem tracking: links detections frame-to-frame by solving a global optimization on the centroid-distance cost matrix, with gap closing and optional merge/split events. See [LAP](lap). |
 | **TrackPy** | Crocker-Grier style nearest-neighbour linker with adaptive search radius and memory-based gap recovery. Simpler/faster alternative to LAP for sparser data. See [TrackPy](trackpy). |
-| **Propagation** | Propagates the previous timepoint's labels onto the current timepoint's mask by spatial overlap (watershed-based, not centroid distance). No tunable parameters. |
+| **Fragmentation tracking** | Propagates the previous timepoint's labels onto the current timepoint's mask by spatial overlap (watershed-based, not centroid distance). No tunable parameters. Handles objects that stay put and change only by fragmenting. See [Fragmentation tracking](fragmentation_tracking). |
 | **Reporter Propagation** | Pools all segments across the whole movie, groups spatially-overlapping ones regardless of time, and stamps each group's single largest detection onto every timepoint. For near-static objects whose segmentation flickers on and off. See [Reporter Propagation](reporter_propagation). |
 | **btrack (Bayesian)** | Bayesian tracker with a Kalman-filter motion model, optionally followed by a global hypothesis optimiser. See [btrack](btrack). |
 | **Import tracking** | Validates and re-chunks an externally-produced tracked zarr / TIFF into BEHAV3D EXPLORER's canonical layout. See [Import tracking](import). |
 
 ```{note}
-**Recommended practice** (from the reference workflow): **Propagation** for organoids
-— and, in practice, microglia — which are large, slow, and overlap themselves across
-consecutive frames; **btrack** for immune / motile cells, where it is the tracker in
-routine use. These are starting points — check every method visually on at least one
-sample before committing to a batch run.
+**Pick the method from what you measure, not from the cell type.** Between two
+consecutive frames, does an object still overlap where it was?
+
+- **Large overlap** → a propagation-family method. This covers multicellular structures
+  that barely move (organoids, spheroids), and also large, morphologically plastic cells
+  — for example macrophages or microglia — whose changing protrusions fragment their
+  masks and defeat centroid-based linking.
+- **Little or no overlap** (the object moves about one cell diameter or more between
+  frames) → **btrack**.
+
+Whether a given population falls on one side or the other depends on your **frame
+interval**, not on what the cells are: the same cell is "slow" at a short interval and
+"fast" at a long one. Check the overlap in the Visualization tab before committing, and
+verify every method visually on at least one sample before a batch run.
 ```
 
 ## Generic workflow per sub-tab
 
 1. **Method dropdown** — pick the method.
-2. **Method-specific parameter panel** appears below (Propagation has no tunable parameters, btrack has a two-part layout — Kalman-filter tracking + global optimisation, Import has a per-sample status table).
+2. **Method-specific parameter panel** appears below (fragmentation tracking has no tunable parameters, btrack has a two-part layout — Kalman-filter tracking + global optimisation, Import has a per-sample status table).
 3. **Apply to all *Category* / Apply to all** — two buttons that propagate the current sub-tab's settings to other sub-tabs (same category, or all cell types).
 4. **Run *Cell type* Tracking** — the green button at the bottom of the sub-tab (e.g. *Run Tcell Tracking*). It runs the selected method for **every sample** in the metadata for this one cell type, immediately, and blocks the GUI until it finishes.
 
@@ -120,7 +135,7 @@ Full step-by-step instructions, all six tools, and tips: **[Manual editing of tr
 
 lap
 trackpy
-propagation
+fragmentation_tracking
 reporter_propagation
 btrack
 import
