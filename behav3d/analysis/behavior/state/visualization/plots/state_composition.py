@@ -749,6 +749,8 @@ def save_state_condition_comparison_report(
     condition_col,
     group_cols=None,
     group_x=None,
+    group_x_levels_map=None,
+    condition_groups=None,
     state_order=None,
     state_colors=None,
     verbose=True,
@@ -759,6 +761,15 @@ def save_state_condition_comparison_report(
     split into multiple groups (columns) via `group_x`/`group_cols`.
 
     diff = mean of the second level minus mean of the first level in each pair.
+
+    condition_groups : dict[str, str], optional
+        Maps raw condition_col levels to merged group labels (see
+        compute_condition_diff_stats_pairwise) - when given, compares the merged groups
+        instead of every raw level pairwise.
+
+    group_x_levels_map : dict[str, str], optional
+        Maps raw `group_x` levels to merged group labels - when given, `group_x` is pooled
+        into the merged labels (columns) instead of showing one column per raw level.
     """
     obs = adata.obs
     effective_group_cols, _ = _resolve_effective_group_cols(group_cols, group_x, None)
@@ -783,6 +794,13 @@ def save_state_condition_comparison_report(
     df[condition_col] = df[condition_col].astype(str)
     for gc in valid_group_cols:
         df[gc] = df[gc].astype(str)
+        if gc == group_x and group_x_levels_map:
+            df[gc] = df[gc].map(group_x_levels_map)
+    if group_x in valid_group_cols and group_x_levels_map:
+        # A level_map applies only to whichever raw levels are still present - map() leaves
+        # anything outside the mapping as NaN, so drop those rows rather than let them
+        # silently poison the grouped comparison.
+        df = df.dropna(subset=[group_x])
     if len(df) == 0:
         raise ValueError("No valid rows remain after filtering NaNs in required columns.")
 
@@ -834,6 +852,7 @@ def save_state_condition_comparison_report(
         class_order=resolved_state_order,
         condition_col=condition_col,
         group_cols=valid_group_cols,
+        condition_groups=condition_groups,
     )
 
     output_pdf_path = Path(output_pdf_path)
@@ -1331,12 +1350,20 @@ def save_state_composition_report(
     group_cols=None,
     group_x=None,
     group_y=None,
+    group_x_levels_map=None,
+    group_y_levels_map=None,
 ):
     """
     Save a combined multi-page PDF report + merged plot-data CSV for relative state composition.
 
     ``group_x``/``group_y`` explicitly pick the grouped-grid's axes; ``group_cols``
     is the "group per page" column list (unaffected in meaning).
+
+    ``group_x_levels_map``/``group_y_levels_map`` : dict[str, str], optional
+        Maps raw ``group_x``/``group_y`` levels to merged group labels (same semantics
+        as ``condition_groups`` in ``compute_condition_diff_stats_pairwise``) - when
+        given, that axis is pooled into the merged labels instead of showing one panel
+        per raw level. Rows whose raw level isn't in the mapping are dropped.
 
     Outputs:
       1) one combined PDF with all report pages
@@ -1413,9 +1440,18 @@ def save_state_composition_report(
             if gc in obs_cols_available:
                 valid_group_cols.append(gc)
                 df[gc] = adata.obs.loc[df.index, gc].astype(str).fillna("(unknown)").values
+                if gc == group_x and group_x_levels_map:
+                    df[gc] = df[gc].map(group_x_levels_map)
+                elif gc == group_y and group_y_levels_map:
+                    df[gc] = df[gc].map(group_y_levels_map)
             else:
                 if verbose:
                     print(f"  Warning: group_col '{gc}' not found in adata.obs — skipping.")
+    if valid_group_cols:
+        # A level_map applies only to whichever raw levels are still present in this
+        # dataset - map() leaves anything outside the mapping as NaN, so drop those rows
+        # here rather than let them silently poison unique_vals_per_col/group matrices.
+        df = df.dropna(subset=valid_group_cols)
 
     axis_cols = (
         requested_axis_cols

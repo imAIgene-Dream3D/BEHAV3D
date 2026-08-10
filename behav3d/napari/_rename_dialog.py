@@ -342,7 +342,28 @@ class RenameClusterDialog(QDialog):
         btn_box.addButton(self._btn_discard, QDialogButtonBox.RejectRole)
         btn_box.accepted.connect(self._on_save)
         btn_box.rejected.connect(self.reject)
-        outer.addWidget(btn_box)
+
+        self._btn_reset = QPushButton("↺  Reset Names")
+        self._btn_reset.setStyleSheet(
+            "QPushButton { background: #dc3545; color: white; font-weight: bold; "
+            "border-radius: 4px; padding: 6px 14px; }"
+            "QPushButton:hover { background: #c82333; }"
+            "QPushButton:disabled { background: #5a2a2e; color: #999; }"
+        )
+        self._btn_reset.clicked.connect(self._on_reset_clicked)
+        can_reset = self._can_reset()
+        self._btn_reset.setEnabled(can_reset)
+        if not can_reset:
+            self._btn_reset.setToolTip(
+                "Original labels unavailable for this dataset "
+                "(re-run clustering to enable reset)."
+            )
+
+        bottom_row = QHBoxLayout()
+        bottom_row.addWidget(self._btn_reset)
+        bottom_row.addStretch(1)
+        bottom_row.addWidget(btn_box)
+        outer.addLayout(bottom_row)
 
     def _make_row(self, old_name: str) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -428,6 +449,7 @@ class RenameClusterDialog(QDialog):
         if not clusters:
             self._status_lbl.setText("No clusters detected (run analysis first).")
             self._btn_save.setEnabled(False)
+            self._btn_reset.setEnabled(False)
             return
 
         self._status_lbl.setText(
@@ -649,9 +671,147 @@ class RenameClusterDialog(QDialog):
             )
 
         # Persist to disk
+        self._persist_adata()
+
+    def _persist_adata(self):
         if self._adata_path is not None:
             from behav3d.analysis.behavior.utils import _save_adata_obs_csv
 
             self._adata_path.parent.mkdir(parents=True, exist_ok=True)
             self._adata.write_h5ad(str(self._adata_path), compression="lzf")
             _save_adata_obs_csv(self._adata, self._adata_path)
+
+    # ── Reset to original ───────────────────────────────────────────────
+
+    def _can_reset(self) -> bool:
+        if self._adata is None:
+            return False
+        if self._mode == "intrinsic":
+            from behav3d.analysis.behavior.state.classification import INTRINSIC_STATE_COL
+            return INTRINSIC_STATE_COL in self._adata.obs.columns
+        if self._mode == "full":
+            return "intrinsic_behavioral_cluster" in self._adata.obs.columns
+        col = self._state_col()
+        return bool(col) and f"{col}_raw" in self._adata.obs.columns
+
+    def _on_reset_clicked(self):
+        prompts = {
+            "intrinsic": (
+                "Reset intrinsic cluster names to the original HMM cluster labels?\n\n"
+                "Combined intrinsic clusters will be un-combined. Because Full clusters "
+                "are derived from Intrinsic, Full cluster names will also revert to "
+                "their default binary-group + intrinsic combinations (any Full-specific "
+                "renaming/combining will be lost).\n\nThis cannot be undone."
+            ),
+            "full": (
+                "Reset full cluster names to the default binary-group + "
+                "intrinsic-cluster combinations?\n\nAny Full-specific renaming/combining "
+                "will be lost. Intrinsic cluster names are not affected.\n\n"
+                "This cannot be undone."
+            ),
+            "track": (
+                "Reset track cluster names to their original labels?\n\n"
+                "This cannot be undone."
+            ),
+        }
+        reply = QMessageBox.question(
+            self,
+            "Reset Names",
+            prompts[self._mode],
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            self._apply_reset()
+        except Exception as exc:
+            traceback.print_exc()
+            QMessageBox.critical(
+                self, "Reset Failed", f"Could not reset names:\n\n{exc}"
+            )
+            return
+
+        self.clusters_renamed.emit({})
+        self.accept()
+
+    def _apply_reset(self):
+        if self._mode == "intrinsic":
+            self._reset_intrinsic()
+        elif self._mode == "full":
+            self._reset_full()
+        else:
+            self._reset_track()
+        self._persist_adata()
+
+    def _reset_intrinsic(self):
+        from behav3d.analysis.behavior.state.classification import INTRINSIC_STATE_COL
+        from behav3d.analysis.behavior.state.utils import _set_classification_state_colors
+
+        col = "intrinsic_behavioral_cluster"
+        if INTRINSIC_STATE_COL not in self._adata.obs.columns:
+            raise ValueError(f"Raw column '{INTRINSIC_STATE_COL}' not found; cannot reset.")
+
+        self._adata.obs[col] = (
+            self._adata.obs[INTRINSIC_STATE_COL].astype(str).astype("category")
+        )
+        _set_classification_state_order(self._adata, col, [])
+        _set_classification_state_colors(self._adata, col, {})
+
+        if "full_behavioral_cluster" in self._adata.obs.columns:
+            from behav3d.analysis.behavior.state.utils import (
+                _rebuild_full_behavioral_cluster_from_intrinsic,
+            )
+            import copy
+
+            clustering_meta = self._adata.uns.get("clustering", {})
+            binary_cols = clustering_meta.get("binary_cols_to_merge", [])
+            bgc = copy.deepcopy(clustering_meta.get("binary_group_constraints", None))
+            enforce = isinstance(bgc, dict) and "forbidden_binary_combinations" in bgc
+            _rebuild_full_behavioral_cluster_from_intrinsic(
+                self._adata,
+                binary_cols_to_merge=binary_cols,
+                binary_group_constraints=bgc,
+                enforce_binary_group_constraints=enforce,
+            )
+            _set_classification_state_order(self._adata, "full_behavioral_cluster", [])
+            _set_classification_state_colors(self._adata, "full_behavioral_cluster", {})
+
+    def _reset_full(self):
+        from behav3d.analysis.behavior.state.utils import (
+            _rebuild_full_behavioral_cluster_from_intrinsic,
+            _set_classification_state_colors,
+        )
+        import copy
+
+        intrinsic_col = "intrinsic_behavioral_cluster"
+        if intrinsic_col not in self._adata.obs.columns:
+            raise ValueError(f"'{intrinsic_col}' not found; cannot rebuild full clusters.")
+
+        clustering_meta = self._adata.uns.get("clustering", {})
+        binary_cols = clustering_meta.get("binary_cols_to_merge", [])
+        bgc = copy.deepcopy(clustering_meta.get("binary_group_constraints", None))
+        enforce = isinstance(bgc, dict) and "forbidden_binary_combinations" in bgc
+        _rebuild_full_behavioral_cluster_from_intrinsic(
+            self._adata,
+            binary_cols_to_merge=binary_cols,
+            binary_group_constraints=bgc,
+            enforce_binary_group_constraints=enforce,
+        )
+        _set_classification_state_order(self._adata, "full_behavioral_cluster", [])
+        _set_classification_state_colors(self._adata, "full_behavioral_cluster", {})
+
+    def _reset_track(self):
+        from behav3d.analysis.behavior.state.utils import _set_classification_state_colors
+
+        col = self._state_col()
+        raw_col = f"{col}_raw" if col else None
+        if not col or raw_col not in self._adata.obs.columns:
+            raise ValueError(
+                "Original track labels are unavailable for this dataset "
+                "(re-run track clustering to enable reset)."
+            )
+        self._adata.obs[col] = self._adata.obs[raw_col].astype(str).astype("category")
+        _set_classification_state_order(self._adata, col, [])
+        _set_classification_state_colors(self._adata, col, {})

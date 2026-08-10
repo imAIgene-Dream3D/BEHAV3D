@@ -162,14 +162,14 @@ APOC, ConvPaint and the Pixel Classifier are *pixel* classifiers: their raw outp
 | **Opening px** | Morphological opening applied to the mask before watershed. Smooths boundaries and removes small protrusions / speckles. `0` disables. |
 | **Min size** | Segments smaller than this many voxels are discarded after watershed (noise / debris filter). |
 | **Fill holes** | Fill internal gaps inside objects before watershed (recommended for solid 3-D objects). |
-| **Mask threshold** *(probability strategies)* | Foreground cutoff applied to the probability map. |
+| **Mask threshold** *(probability strategies)* | Foreground cutoff applied to the probability map ti get a foreground mask. |
 | **Seed threshold** *(probability strategies)* | Higher cutoff used to place watershed seeds; should be ≥ Mask threshold. **Higher → keeps only each object's confident core as a seed, splitting more** touching objects; lower merges neighbouring cores together, splitting fewer. Same direction as EDT threshold above. |
 
 ### Instance post-processing tuning
 
 - Touching cells **merged** into one label → **raise EDT threshold** (Mask + EDT/Watershed strategy), or **raise Seed threshold** (Probability Map strategy).
 - One cell **split** into several labels → **lower EDT threshold**, or **lower Seed threshold**.
-- Background labelled as cells → **raise Mask threshold**, or add more background labels.
+- Background labelled as cells → Add more background labels or **raise Mask threshold**.
 - Cells lost at the edges → **lower Mask threshold**.
 - Small speckles appear as tiny labels → **raise Min size**; real small cells dropped → **lower Min size**.
 - Fuzzy / jagged boundaries or single stray voxels → **raise Opening**; thin structures eroded → **lower Opening** (or `0`).

@@ -50,13 +50,17 @@ from behav3d.core.metadata import (
 )
 from behav3d.analysis.behavior.general import relabel_cluster_ids
 from behav3d.features.state_descriptive_features import (
-    extract_descibing_track_state_features, 
-    scale_feature_blocks, 
+    extract_descibing_track_state_features,
+    scale_feature_blocks,
     l2_normalize_features_blocks,
     drop_highly_correlated_features,
-    drop_low_variance_features
+    drop_low_variance_features,
+    clr_transform_columns,
+    clr_transform_transition_rows,
+    log1p_transform_columns,
 )
 from behav3d.analysis.filtering import filter_and_truncate_tracks_anndata
+from behav3d.analysis.behavior.track.utils import _filter_tracks_for_dtaidistance
 from behav3d.analysis.behavior.general.leiden import (
     run_pca, 
     run_leiden_clustering
@@ -1535,6 +1539,9 @@ def run_state_based_analysis(
 
     # Track filtering / truncation
     behavioral_trajectory_size=100,
+    trajectory_trim_mode="last",  # "last" keeps each track's final N timepoints; "first" keeps its earliest N
+    split_long_tracks=False,  # divide over-length tracks into non-overlapping windows instead of dropping the rest
+    trajectory_window_col="trajectory_window_id",
 
     # Feature extraction / normalization
     use_fractions=True,
@@ -1546,13 +1553,25 @@ def run_state_based_analysis(
     use_bigrams=True,
     use_trigrams=True,
     ngram_weight="count",
-    do_block_scaling=False,
+
+    # Compositional-data / skew handling. Fractions, bout-count shares, and each
+    # transition row sum to 1 by construction (closed/compositional data) -- CLR opens
+    # them up so Euclidean PCA/clustering doesn't manufacture spurious negative
+    # correlations between states purely from the sum-to-1 constraint (Aitchison, 1986).
+    # Bout-length features aren't compositional but are typically heavy-tailed, so they
+    # get a separate log1p treatment instead.
+    use_clr_transform=True,
+    clr_pseudocount=1e-3,
+    log_transform_bout_lengths=True,
+
+    do_block_scaling=True,
+    block_scaling_mode="mfa",  # "mfa" (recommended), "sqrt", or "linear"
     do_l2_normalization=False,
 
     # Feature selection
-    drop_highly_correlated=False,
+    drop_highly_correlated=True,
     corr_threshold=0.95,
-    drop_low_variance=False,
+    drop_low_variance=True,
     low_var_threshold=1e-4,
 
     # PCA / clustering / UMAP
@@ -1634,17 +1653,28 @@ def run_state_based_analysis(
     _vdone(verbose, "trajectory-clustering", "load dataset", load_started)
 
     # --------- Filter + truncate tracks ----------
+    trim_mode = str(trajectory_trim_mode).strip().lower()
+    # When splitting, each window is treated as its own analysis trajectory downstream
+    # (same convention the DTW pipeline uses), so the window column joins groupby_cols.
+    effective_groupby_cols = list(groupby_cols)
+    if bool(split_long_tracks):
+        effective_groupby_cols = effective_groupby_cols + [str(trajectory_window_col)]
+
     filter_started = _vstart(
         verbose,
         "trajectory-clustering",
-        f"filter + truncate trajectories | behavioral_trajectory_size={int(behavioral_trajectory_size)}",
+        f"filter + truncate trajectories | behavioral_trajectory_size={int(behavioral_trajectory_size)} | "
+        f"trim_mode={trim_mode} | split_long_tracks={bool(split_long_tracks)}",
     )
-    adata_filt = filter_and_truncate_tracks_anndata(
+    adata_filt = _filter_tracks_for_dtaidistance(
         adata_full,
         groupby_cols=list(groupby_cols),
         time_col=time_col,
+        trajectory_size=int(behavioral_trajectory_size),
         min_length=int(behavioral_trajectory_size),
-        max_length=int(behavioral_trajectory_size),
+        trim_mode=trim_mode,
+        split_long_tracks=bool(split_long_tracks),
+        window_col=str(trajectory_window_col),
     )
     _vdone(verbose, "trajectory-clustering", "filter + truncate trajectories", filter_started)
     if str(state_col) not in adata_filt.obs.columns:
@@ -1661,6 +1691,7 @@ def run_state_based_analysis(
     )
     adata_state_features, blocks = extract_descibing_track_state_features(
         adata_filt,
+        group_col=tuple(effective_groupby_cols),
         state_col=state_col,
         use_fractions=use_fractions,
         use_bout_stats=use_bout_stats,
@@ -1713,22 +1744,55 @@ def run_state_based_analysis(
         "use_bigrams": bool(use_bigrams),
         "use_trigrams": bool(use_trigrams),
         "ngram_weight": str(ngram_weight),
+        "use_clr_transform": bool(use_clr_transform),
+        "clr_pseudocount": float(clr_pseudocount),
+        "log_transform_bout_lengths": bool(log_transform_bout_lengths),
+        "block_scaling_mode": str(block_scaling_mode) if do_block_scaling else None,
     }
     adata_state_features.uns["track_filtering"] = {
         "groupby_cols": [str(c) for c in list(groupby_cols)],
         "time_col": str(time_col),
         "state_col": str(state_col),
         "behavioral_trajectory_size": int(behavioral_trajectory_size),
+        "trajectory_trim_mode": trim_mode,
+        "split_long_tracks": bool(split_long_tracks),
     }
 
-    # --------- (Optional) Block scaling + L2 normalize ----------
-    if do_block_scaling:
-        adata_state_features = scale_feature_blocks(adata_state_features, blocks=blocks)
+    # --------- Compositional (CLR) + skew (log1p) transforms ----------
+    # Must run before feature selection / block scaling so both operate in the space
+    # that actually gets clustered, not on the raw closed proportions.
+    if bool(use_clr_transform):
+        clr_started = _vstart(verbose, "trajectory-clustering", "CLR-transform compositional feature blocks")
+        fraction_cols = [c for c in feature_blocks.get("fractions", []) if c in adata_state_features.var_names]
+        bouts_nr_cols = [
+            c for c in feature_blocks.get("bout_stats", [])
+            if c in adata_state_features.var_names and str(c).startswith("bouts_nr_")
+        ]
+        transitions_cols = [c for c in feature_blocks.get("transitions", []) if c in adata_state_features.var_names]
+        states_for_clr = pd.Index(adata_filt.obs[state_col].astype("category").cat.categories).tolist()
+        adata_state_features = clr_transform_columns(
+            adata_state_features, fraction_cols, pseudocount=clr_pseudocount
+        )
+        adata_state_features = clr_transform_columns(
+            adata_state_features, bouts_nr_cols, pseudocount=clr_pseudocount
+        )
+        adata_state_features = clr_transform_transition_rows(
+            adata_state_features, transitions_cols, states_for_clr, pseudocount=clr_pseudocount
+        )
+        _vdone(verbose, "trajectory-clustering", "CLR transform", clr_started)
 
-    if do_l2_normalization:
-        adata_state_features = l2_normalize_features_blocks(adata_state_features, blocks=blocks)
+    if bool(log_transform_bout_lengths):
+        length_cols = [
+            c for c in feature_blocks.get("bout_stats", [])
+            if c in adata_state_features.var_names
+            and (str(c).startswith("bouts_mean_length_") or str(c).startswith("bouts_max_length_"))
+        ]
+        adata_state_features = log1p_transform_columns(adata_state_features, length_cols)
 
     # --------- Feature selection ----------
+    # Runs on the transformed values above, ahead of block scaling, since the closure
+    # constraints within each block (fractions/bouts_nr sum to 1; each transition row
+    # sums to 1) guarantee exact collinearity that's cheap and safe to prune here.
     dropped_high_corr = []
     dropped_low_var = []
 
@@ -1747,6 +1811,18 @@ def run_state_based_analysis(
             feature_cols=kept_features,
             low_var_threshold=low_var_threshold,
         )
+
+    # --------- (Optional) Block scaling + L2 normalize ----------
+    # Recompute blocks against whatever feature selection above left behind, so a block
+    # scaler never trips over a column that was just dropped.
+    kept_var_names = set(adata_state_features.var_names)
+    blocks = [[c for c in block if c in kept_var_names] for block in blocks]
+
+    if do_block_scaling:
+        adata_state_features = scale_feature_blocks(adata_state_features, blocks=blocks, mode=str(block_scaling_mode))
+
+    if do_l2_normalization:
+        adata_state_features = l2_normalize_features_blocks(adata_state_features, blocks=blocks)
 
     resolved_leiden_use_rep = str(leiden_use_rep)
     # --------- PCA ----------
@@ -1889,6 +1965,16 @@ def run_state_based_analysis(
         "use_rep": str(resolved_leiden_use_rep),
         "umap_min_dist": float(umap_min_dist),
         "random_state": int(random_state),
+    }
+    # adata.X here is a per-track feature matrix, not a pairwise DTW distance
+    # matrix - stamp the same uns key the DTW/feature-DTW pipelines use so
+    # generic downstream consumers (rename dialog, diagnostics refresh, cluster
+    # key resolution) can recognize this model type without bouts-specific
+    # branching, the same way "original_behav3d_feature_dtw" already does
+    # (see feature_dtw.py).
+    adata_state_features.uns["dtai_trajectory_clustering"] = {
+        "method": "bouts_feature_clustering",
+        "cluster_key": str(cluster_key),
     }
 
     exemplar_statebar_track_pdf_by_cluster = {}

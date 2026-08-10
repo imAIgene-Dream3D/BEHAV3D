@@ -272,6 +272,7 @@ def _prepare_threshold_preview_features(
     contact_threshold=None,
     n_workers=None,
     overwrite=False,
+    propagate_dead_signal=True,
 ):
     output_dir = Path(metadata_loader.output_dir).expanduser()
     csv_path = _feature_output_csv_path(output_dir, cell_type)
@@ -301,6 +302,7 @@ def _prepare_threshold_preview_features(
         cell_type=cell_type,
         features_choice=["intensity", "death"],
         dead_mask_percentage_threshold=float(threshold),
+        propagate_dead_signal=bool(propagate_dead_signal),
         contact_threshold=float(contact_threshold),
         overwrite=bool(overwrite),
         n_workers=int(n_workers),
@@ -460,6 +462,34 @@ class _CellTypeFeatureExtractionPanel:
 
         self.overwrite = widgets.Checkbox(description="Overwrite existing", value=bool(fcfg.get("overwrite", False)))
 
+        # -- Advanced Configuration: death-signal propagation ---------------
+        self.propagate_dead_signal = widgets.Checkbox(
+            description="Propagate dead signal",
+            value=bool(fcfg.get("propagate_dead_signal", self.category == "organoid")),
+            indent=False,
+        )
+        self.propagate_dead_help = widgets.Button(
+            description="?",
+            tooltip=(
+                "ON: once a track crosses the dead threshold, it stays 'dead' for "
+                "every later timepoint, even if the signal drops again afterwards "
+                "(recommended for organoids - a dead organoid doesn't come back "
+                "to life). OFF: only timepoints currently at/above threshold are "
+                "'dead'; the track can go back to 'alive' later (recommended for "
+                "immune/other cells, which can transiently pick up dead dye while "
+                "killing a dying organoid without actually dying themselves)."
+            ),
+            layout=widgets.Layout(width="24px"),
+        )
+        self.advanced_toggle = widgets.Checkbox(description="Advanced", value=False, indent=False)
+        self.advanced_toggle.observe(self._on_advanced_toggle_changed, names="value")
+        self.advanced_row = widgets.HBox(
+            [self.propagate_dead_signal, self.propagate_dead_help],
+            layout=widgets.Layout(align_items="center", gap="6px"),
+        )
+        self.advanced_row.layout.display = "none"
+        self.advanced_box = widgets.VBox([self.advanced_toggle, self.advanced_row])
+
         self.btn_run = widgets.Button(description=f"Run {self.cell_type} feature extraction", button_style="success", layout=widgets.Layout(width="fit-content", flex="0 0 auto"))
         self.btn_run.on_click(self._on_run_clicked)
 
@@ -514,6 +544,7 @@ class _CellTypeFeatureExtractionPanel:
                 controls.append(
                     widgets.HTML("<div style='font-size:12px;color:#666;'>Uses the shared organoid dead % threshold above.</div>")
                 )
+            controls.append(self.advanced_box)
 
         ui_children = []
         if show_title:
@@ -549,6 +580,7 @@ class _CellTypeFeatureExtractionPanel:
         prof = params.setdefault("features", {}).setdefault(self.cell_type, {})
         prof.update({
             "dead_mask_percentage_threshold": self._current_dead_threshold(),
+            "propagate_dead_signal": bool(self.propagate_dead_signal.value),
             "features_choice": self._selected_features(),
             "n_workers": int(self.n_workers.value),
             "overwrite": bool(self.overwrite.value),
@@ -565,10 +597,15 @@ class _CellTypeFeatureExtractionPanel:
         with self.metadata_loader.behav3d_parameters_path.open("w", encoding="utf-8") as f:
             yaml.safe_dump(params, f, sort_keys=False)
 
+    def _on_advanced_toggle_changed(self, change):
+        self.advanced_row.layout.display = None if bool(change["new"]) else "none"
+
     def _lock(self, state: bool):
         widgets_to_lock = [self.n_workers, self.overwrite, self.btn_run, self.contact_threshold]
         if self._owns_threshold_widget and self.has_dead:
             widgets_to_lock.append(self.dead_mask_threshold)
+        if self.has_dead:
+            widgets_to_lock.append(self.propagate_dead_signal)
         if self.btn_preview is not None:
             widgets_to_lock.append(self.btn_preview)
         for w in widgets_to_lock:
@@ -601,6 +638,7 @@ class _CellTypeFeatureExtractionPanel:
             contact_threshold=float(self.contact_threshold.value),
             n_workers=int(self.n_workers.value),
             overwrite=bool(self.overwrite.value),
+            propagate_dead_signal=bool(self.propagate_dead_signal.value),
         )
 
     def _reset_required_intermediates(self):
@@ -657,6 +695,7 @@ class _CellTypeFeatureExtractionPanel:
                     self._reset_required_intermediates()
                 run_feature_extraction(
                     dead_mask_percentage_threshold=(self._current_dead_threshold() if self.has_dead else None),
+                    propagate_dead_signal=(bool(self.propagate_dead_signal.value) if self.has_dead else True),
                     contact_threshold=float(self.contact_threshold.value),
                     metadata=self.metadata_loader.metadata,
                     output_dir=str(self.output_dir),
@@ -1324,18 +1363,30 @@ class ActiveKillingPanel:
                     )
                 
                 df_killing = None
+                stats = {}
+                stale_filtered = set()
                 for t in selected_targets:
                     print(f"--- Running independent analysis for target: {t} ---")
-                    df_killing, _, _ = run_for_targets([t], t)
+                    df_killing, _, stats = run_for_targets([t], t)
+                    stale_filtered.update(stats.get("filtering_needs_rerun_for") or [])
 
                 if len(selected_targets) > 1:
                     print("--- Running combined analysis for all selected targets ---")
                     combined_subfolder = "combined"
-                    df_killing, _, _ = run_for_targets(selected_targets, combined_subfolder)
+                    df_killing, _, stats = run_for_targets(selected_targets, combined_subfolder)
+                    stale_filtered.update(stats.get("filtering_needs_rerun_for") or [])
                 else:
                     combined_subfolder = selected_targets[0]
-                
+
                 print("✅ Active Killing Analysis complete! Loading gallery...")
+                if stale_filtered:
+                    display(widgets.HTML(
+                        '<div style="color:#8a6d00;background:#fff8e1;border:1px solid #ffe082;'
+                        'padding:6px 10px;border-radius:4px;margin:4px 0;">'
+                        f'⚠️ Re-run <b>Filtering</b> for <b>{", ".join(sorted(stale_filtered))}</b> — '
+                        'its filtered CSV was built before this run and doesn\'t include these '
+                        'Active Killing results yet.</div>'
+                    ))
                 # Use the automated loader to ensure enriched columns (coordinates) are present
                 results_dir = Path(self.output_dir, "analysis", immune, "active_killing", combined_subfolder)
                 advanced_path = results_dir / f"BEHAV3D_{immune}_advanced_track_features.csv"
@@ -4215,10 +4266,12 @@ class MotileCellAnalysisPanel:
                 + ", ".join(missing)
             )
 
+        gui_metadata_csv_path = getattr(self.metadata_loader, "metadata_csv_path", None)
         raw_path = _resolve_raw_image_path(
             output_dir=self.output_dir,
             sample_name=sample_name,
             verbose=True,
+            metadata_csv_path=gui_metadata_csv_path,
         )
         if raw_path is None or not Path(raw_path).exists():
             raise FileNotFoundError(f"Could not find raw image for sample '{sample_name}'.")
@@ -4228,6 +4281,7 @@ class MotileCellAnalysisPanel:
             sample_name=sample_name,
             cell_type=self.cell_type,
             verbose=True,
+            metadata_csv_path=gui_metadata_csv_path,
         )
         if tracked_path is None or not Path(tracked_path).exists():
             raise FileNotFoundError(
