@@ -6,15 +6,15 @@ import numpy as np
 
 from behav3d.io.formats.zarr import save_as_zarr
 from behav3d.io.images import load_zarr
-from behav3d.preprocessing.tracking.connected_component_propagation_tracking import (
-    propagate_tracks_connected,
+from behav3d.preprocessing.tracking.bounded_propagation_tracking import (
+    propagate_tracks_bounded,
     _prune_markers_to_best_region,
     _label_leftover_regions,
 )
 
 
 def _make_case_dir(name):
-    root = Path(__file__).resolve().parent / ".tmp_connected_component_propagation_tracking"
+    root = Path(__file__).resolve().parent / ".tmp_bounded_propagation_tracking"
     root.mkdir(exist_ok=True)
     case_dir = root / f"{name}_{uuid.uuid4().hex}"
     case_dir.mkdir()
@@ -32,14 +32,14 @@ def _write_zarr(path, arr):
 
 
 def _run(case_dir, t_seg, **kwargs):
-    """Write ``t_seg`` (T,Z,Y,X), run propagate_tracks_connected, return frame 1."""
+    """Write ``t_seg`` (T,Z,Y,X), run propagate_tracks_bounded, return frame 1."""
     in_path = _write_zarr(case_dir / "segments.zarr", t_seg)
     tracked_img = case_dir / "tracked.zarr"
     tracked_csv = case_dir / "tracked.csv"
     kwargs.setdefault("dilation_nr_pixels", 1)
     kwargs.setdefault("segment_size_min", 1)
     kwargs.setdefault("min_overlap_fraction", 0.0)
-    propagate_tracks_connected(
+    propagate_tracks_bounded(
         segments_path=in_path,
         tracked_img_outpath=tracked_img,
         tracked_csv_outpath=tracked_csv,
@@ -50,7 +50,7 @@ def _run(case_dir, t_seg, **kwargs):
 
 
 # ---------------------------------------------------------------------------
-# End-to-end tests via propagate_tracks_connected
+# End-to-end tests via propagate_tracks_bounded
 # ---------------------------------------------------------------------------
 
 def test_motivating_scenario_split_marker_leftover_becomes_one_new_track():

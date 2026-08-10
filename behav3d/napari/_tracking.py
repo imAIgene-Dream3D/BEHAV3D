@@ -598,13 +598,13 @@ class CellTypeTrackingPanel(QWidget):
         self.combo_method = QComboBox()
         self.combo_method.addItems([
             "LAP (laptrack)", "TrackPy", "Propagation",
-            "Connected-Component Propagation",
+            "Bounded Propagation",
             "Reporter Propagation",
             "btrack (Bayesian)", "Import tracking",
         ])
         saved_method = tcfg.get("method", def_method)
         idx_map = {
-            "lap": 0, "trackpy": 1, "propagation": 2, "propagation_connected_component": 3,
+            "lap": 0, "trackpy": 1, "propagation": 2, "bounded_propagation": 3,
             "reporter_propagation": 4, "btrack": 5, "import": 6,
         }
         self.combo_method.setCurrentIndex(idx_map.get(saved_method, 0))
@@ -621,7 +621,7 @@ class CellTypeTrackingPanel(QWidget):
             "Propagation — no tunable parameters; identifies objects by "
             "spatial overlap/propagation instead of frame-to-frame "
             "linking cost.\n\n"
-            "Connected-Component Propagation — same watershed propagation "
+            "Bounded Propagation — same watershed propagation "
             "as Propagation, but a track ID can never span more than one "
             "physically disconnected region. Before watershed runs, the "
             "current frame's mask is split into its own connected regions "
@@ -870,33 +870,33 @@ class CellTypeTrackingPanel(QWidget):
 
         self.param_stack.addWidget(prop_page)
 
-        # Page 3 — Connected-Component Propagation params
-        cc_cfg = tcfg.get("propagation_connected_component", {})
-        cc_page = QWidget()
-        cc_form = QFormLayout(cc_page)
-        cc_form.setContentsMargins(6, 4, 6, 4)
-        cc_form.setSpacing(3)
-        cc_form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+        # Page 3 — Bounded Propagation params
+        bp_cfg = tcfg.get("bounded_propagation", {})
+        bp_page = QWidget()
+        bp_form = QFormLayout(bp_page)
+        bp_form.setContentsMargins(6, 4, 6, 4)
+        bp_form.setSpacing(3)
+        bp_form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
 
-        cc_info = QLabel(
+        bp_info = QLabel(
             "Same as Propagation, but a track ID can never span more than "
             "one disconnected region. Each region of the current frame's "
             "mask is claimed by whichever existing track overlaps it most, "
             "before watershed runs; a region no track claims becomes a new "
             "track."
         )
-        cc_info.setWordWrap(True)
-        cc_info.setStyleSheet("color: #888; font-size: 10px; padding: 2px 0 6px 0;")
-        cc_form.addRow(cc_info)
+        bp_info.setWordWrap(True)
+        bp_info.setStyleSheet("color: #888; font-size: 10px; padding: 2px 0 6px 0;")
+        bp_form.addRow(bp_info)
 
-        self.cc_min_overlap_fraction = QDoubleSpinBox()
-        self.cc_min_overlap_fraction.setRange(0.0, 1.0)
-        self.cc_min_overlap_fraction.setSingleStep(0.05)
-        self.cc_min_overlap_fraction.setDecimals(2)
-        self.cc_min_overlap_fraction.setValue(float(cc_cfg.get("min_overlap_fraction", 0.0)))
-        self.cc_min_overlap_fraction.setMaximumWidth(90)
-        cc_form.addRow("Min overlap fraction:", make_help_row(
-            self.cc_min_overlap_fraction,
+        self.bp_min_overlap_fraction = QDoubleSpinBox()
+        self.bp_min_overlap_fraction.setRange(0.0, 1.0)
+        self.bp_min_overlap_fraction.setSingleStep(0.05)
+        self.bp_min_overlap_fraction.setDecimals(2)
+        self.bp_min_overlap_fraction.setValue(float(bp_cfg.get("min_overlap_fraction", 0.0)))
+        self.bp_min_overlap_fraction.setMaximumWidth(90)
+        bp_form.addRow("Min overlap fraction:", make_help_row(
+            self.bp_min_overlap_fraction,
             "Min Overlap Fraction",
             "Minimum fraction of a current-frame region's area that a "
             "track's previous-frame footprint must fill for that track "
@@ -905,12 +905,12 @@ class CellTypeTrackingPanel(QWidget):
             "a track from claiming a region it barely touches."
         ))
 
-        self.cc_segment_size_min = QSpinBox()
-        self.cc_segment_size_min.setRange(1, 999999)
-        self.cc_segment_size_min.setValue(int(cc_cfg.get("segment_size_min", 20)))
-        self.cc_segment_size_min.setMaximumWidth(90)
-        cc_form.addRow("Min segment size:", make_help_row(
-            self.cc_segment_size_min,
+        self.bp_segment_size_min = QSpinBox()
+        self.bp_segment_size_min.setRange(1, 999999)
+        self.bp_segment_size_min.setValue(int(bp_cfg.get("segment_size_min", 20)))
+        self.bp_segment_size_min.setMaximumWidth(90)
+        bp_form.addRow("Min segment size:", make_help_row(
+            self.bp_segment_size_min,
             "Min Segment Size",
             "Minimum segment size in voxels, applied after watershed.\n\n"
             "This is NOT the same as a segmentation-stage size filter — "
@@ -924,7 +924,7 @@ class CellTypeTrackingPanel(QWidget):
             "are always removed as well, regardless of this value."
         ))
 
-        self.param_stack.addWidget(cc_page)
+        self.param_stack.addWidget(bp_page)
 
         # Page 4 — Reporter Propagation params
         rp_cfg = tcfg.get("reporter_propagation", {})
@@ -1310,7 +1310,7 @@ class CellTypeTrackingPanel(QWidget):
     # ------------------------------------------------------------------
     def _get_method_key(self):
         return [
-            "lap", "trackpy", "propagation", "propagation_connected_component",
+            "lap", "trackpy", "propagation", "bounded_propagation",
             "reporter_propagation", "btrack", "import",
         ][self.combo_method.currentIndex()]
 
@@ -1357,9 +1357,9 @@ class CellTypeTrackingPanel(QWidget):
             "propagation": {
                 # Notice: no tunable params currently exposed
             },
-            "propagation_connected_component": {
-                "min_overlap_fraction": float(self.cc_min_overlap_fraction.value()),
-                "segment_size_min": int(self.cc_segment_size_min.value()),
+            "bounded_propagation": {
+                "min_overlap_fraction": float(self.bp_min_overlap_fraction.value()),
+                "segment_size_min": int(self.bp_segment_size_min.value()),
             },
             "reporter_propagation": {
                 "min_overlap_fraction": float(self.rp_min_overlap_fraction.value()),
@@ -1400,7 +1400,7 @@ class CellTypeTrackingPanel(QWidget):
                 panel = parent_tab.panels[ct]
                 # Apply settings
                 idx_map = {
-                    "lap": 0, "trackpy": 1, "propagation": 2, "propagation_connected_component": 3,
+                    "lap": 0, "trackpy": 1, "propagation": 2, "bounded_propagation": 3,
                     "reporter_propagation": 4, "btrack": 5,
                 }
                 panel.combo_method.setCurrentIndex(idx_map.get(settings["method"], 0))
@@ -1418,10 +1418,10 @@ class CellTypeTrackingPanel(QWidget):
                 panel.tp_adaptive_stop.setValue(settings["trackpy"]["adaptive_stop"])
                 panel.tp_adaptive_step.setValue(settings["trackpy"]["adaptive_step"])
 
-                # Connected-Component Propagation
-                cc = settings.get("propagation_connected_component", {})
-                panel.cc_min_overlap_fraction.setValue(cc.get("min_overlap_fraction", 0.0))
-                panel.cc_segment_size_min.setValue(cc.get("segment_size_min", 20))
+                # Bounded Propagation
+                bp = settings.get("bounded_propagation", {})
+                panel.bp_min_overlap_fraction.setValue(bp.get("min_overlap_fraction", 0.0))
+                panel.bp_segment_size_min.setValue(bp.get("segment_size_min", 20))
 
                 # Reporter Propagation
                 rp = settings.get("reporter_propagation", {})
@@ -1497,9 +1497,9 @@ class CellTypeTrackingPanel(QWidget):
                 "adaptive_stop": float(self.tp_adaptive_stop.value()),
                 "adaptive_step": float(self.tp_adaptive_step.value()),
             },
-            "propagation_connected_component": {
-                "min_overlap_fraction": float(self.cc_min_overlap_fraction.value()),
-                "segment_size_min": int(self.cc_segment_size_min.value()),
+            "bounded_propagation": {
+                "min_overlap_fraction": float(self.bp_min_overlap_fraction.value()),
+                "segment_size_min": int(self.bp_segment_size_min.value()),
             },
             "reporter_propagation": {
                 "min_overlap_fraction": float(self.rp_min_overlap_fraction.value()),
@@ -1610,14 +1610,14 @@ class CellTypeTrackingPanel(QWidget):
                 progress_cb=progress_cb,
             )
 
-        elif method == "propagation_connected_component":
-            from behav3d.preprocessing.tracking.connected_component_propagation_tracking import run_connected_component_propagation_tracking
-            cc = params["propagation_connected_component"]
-            new_md = run_connected_component_propagation_tracking(
+        elif method == "bounded_propagation":
+            from behav3d.preprocessing.tracking.bounded_propagation_tracking import run_bounded_propagation_tracking
+            bp = params["bounded_propagation"]
+            new_md = run_bounded_propagation_tracking(
                 metadata=metadata, output_dir=out_dir, cell_type=cell_type,
                 overwrite=overwrite,
-                min_overlap_fraction=float(cc["min_overlap_fraction"]),
-                segment_size_min=int(cc.get("segment_size_min", 20)),
+                min_overlap_fraction=float(bp["min_overlap_fraction"]),
+                segment_size_min=int(bp.get("segment_size_min", 20)),
                 progress_cb=progress_cb,
             )
 

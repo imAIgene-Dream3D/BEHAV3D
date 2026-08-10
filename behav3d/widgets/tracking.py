@@ -13,7 +13,7 @@ from .utils import (
 from behav3d.preprocessing.tracking.laptracking import run_laptracking
 from behav3d.preprocessing.tracking.trackpy_tracking import run_trackpy_tracking_generic
 from behav3d.preprocessing.tracking.propagation_tracking import run_propagation_tracking
-from behav3d.preprocessing.tracking.connected_component_propagation_tracking import run_connected_component_propagation_tracking
+from behav3d.preprocessing.tracking.bounded_propagation_tracking import run_bounded_propagation_tracking
 from behav3d.preprocessing.tracking.btrack_tracking import run_btracking
 from behav3d.preprocessing.tracking import visualize_tracks, combine_multicolor_tracked_outputs_for_base
 from behav3d.core.metadata import (
@@ -171,7 +171,7 @@ class TrackingPanel:
             ("LAP (laptrack)", "lap"),
             ("TrackPy", "trackpy"),
             ("Propagation", "propagation"),
-            ("Connected-Component Propagation", "propagation_connected_component"),
+            ("Bounded Propagation", "bounded_propagation"),
         ]
         if self.category == "organoid" and not self._has_linked_organoid_mode():
             individual_method_options.append(("Propagation (all organoids)", "propagation_all_organoids"))
@@ -271,21 +271,21 @@ class TrackingPanel:
             widgets.HTML("<i>No tunable parameters.</i>")
         ])
 
-        cc = tcfg.get("propagation_connected_component", {})
-        self.cc_min_overlap_fraction = widgets.FloatSlider(
+        bp = tcfg.get("bounded_propagation", {})
+        self.bp_min_overlap_fraction = widgets.FloatSlider(
             description="Min overlap fraction",
-            value=float(cc.get("min_overlap_fraction", 0.0)),
+            value=float(bp.get("min_overlap_fraction", 0.0)),
             min=0.0, max=1.0, step=0.05,
             style={'description_width':'160px'}
         )
-        self.cc_segment_size_min = widgets.IntSlider(
+        self.bp_segment_size_min = widgets.IntSlider(
             description="Min segment size",
-            value=int(cc.get("segment_size_min", 20)),
+            value=int(bp.get("segment_size_min", 20)),
             min=1, max=1000,
             style={'description_width':'160px'}
         )
-        self.cc_params = widgets.VBox([
-            widgets.HTML("<b>Connected-Component Propagation tracking</b>"),
+        self.bp_params = widgets.VBox([
+            widgets.HTML("<b>Bounded Propagation tracking</b>"),
             widgets.HTML(
                 "<i>Same as Propagation, but a track ID can never span more "
                 "than one disconnected region. Each region of the current "
@@ -293,8 +293,8 @@ class TrackingPanel:
                 "overlaps it most, before watershed runs; a region no track "
                 "claims becomes a new track.</i>"
             ),
-            self.cc_min_overlap_fraction,
-            self.cc_segment_size_min,
+            self.bp_min_overlap_fraction,
+            self.bp_segment_size_min,
         ])
 
         # btrack params
@@ -864,7 +864,7 @@ class TrackingPanel:
         if self.method.value == "lap": self.param_container.children = (self.lap_params,)
         elif self.method.value == "trackpy": self.param_container.children = (self.tp_params,)
         elif self.method.value == "btrack": self.param_container.children = (self.bt_params,)
-        elif self.method.value == "propagation_connected_component": self.param_container.children = (self.cc_params,)
+        elif self.method.value == "bounded_propagation": self.param_container.children = (self.bp_params,)
         else: self.param_container.children = (self.prop_params,)
 
     def _lock(self, state: bool):
@@ -937,9 +937,9 @@ class TrackingPanel:
                 "adaptive_stop": float(self.tp_adaptive_stop.value),
                 "adaptive_step": float(self.tp_adaptive_step.value),
             })
-            prof.setdefault("propagation_connected_component", {}).update({
-                "min_overlap_fraction": float(self.cc_min_overlap_fraction.value),
-                "segment_size_min": int(self.cc_segment_size_min.value),
+            prof.setdefault("bounded_propagation", {}).update({
+                "min_overlap_fraction": float(self.bp_min_overlap_fraction.value),
+                "segment_size_min": int(self.bp_segment_size_min.value),
             })
             bt = prof.setdefault("btrack", {})
             preset_val = str(self.bt_config_preset.value)
@@ -1008,14 +1008,14 @@ class TrackingPanel:
                         dist_thresh=int(round(self._bt_unit_mgr.get_native(self.bt_dist_thresh))) if use_opt else None,
                         time_thresh=int(self.bt_time_thresh.value) if use_opt else None,
                     )
-                elif method == "propagation_connected_component":
-                    new_md = run_connected_component_propagation_tracking(
+                elif method == "bounded_propagation":
+                    new_md = run_bounded_propagation_tracking(
                         metadata=self.metadata_loader.metadata,
                         output_dir=str(out_dir),
                         cell_type=self.cell_type,
                         overwrite=bool(self.overwrite.value),
-                        min_overlap_fraction=float(self.cc_min_overlap_fraction.value),
-                        segment_size_min=int(self.cc_segment_size_min.value),
+                        min_overlap_fraction=float(self.bp_min_overlap_fraction.value),
+                        segment_size_min=int(self.bp_segment_size_min.value),
                     )
                 else:
                     new_md = run_propagation_tracking(

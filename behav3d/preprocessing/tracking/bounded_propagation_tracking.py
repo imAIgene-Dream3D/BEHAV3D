@@ -1,4 +1,4 @@
-"""Connected-Component Propagation: watershed propagation that never lets a
+"""Bounded Propagation: watershed propagation that never lets a
 single track ID span more than one physically disconnected region.
 
 Like ``propagation_tracking.py``, each timepoint's mask is watershed-seeded
@@ -27,7 +27,7 @@ import shutil
 
 import numpy as np
 import pandas as pd
-from skimage.measure import label as cc_label
+from skimage.measure import label as bp_label
 from tqdm import tqdm
 
 from behav3d.io.images import load_image, append_to_zarr
@@ -128,7 +128,7 @@ def _label_leftover_regions(mask, new_seg, next_label):
     if not np.any(leftover):
         return out, next_label
 
-    leftover_components = cc_label(leftover)
+    leftover_components = bp_label(leftover)
     for cid in np.unique(leftover_components):
         if cid == 0:
             continue
@@ -137,7 +137,7 @@ def _label_leftover_regions(mask, new_seg, next_label):
     return out, next_label
 
 
-def _run_single_timepoint_propagation_connected(
+def _run_single_timepoint_propagation_bounded(
     t_seg,
     seg_prev_tp,
     next_label,
@@ -148,7 +148,7 @@ def _run_single_timepoint_propagation_connected(
     mask = t_seg != 0
     seg_prev_tp[mask==0]=0
 
-    regions = cc_label(mask)
+    regions = bp_label(mask)
     pruned_markers = _prune_markers_to_best_region(
         regions, seg_prev_tp, min_overlap_fraction=min_overlap_fraction,
     )
@@ -166,7 +166,7 @@ def _run_single_timepoint_propagation_connected(
     return new_seg, next_label
 
 
-def propagate_tracks_connected(
+def propagate_tracks_bounded(
     segments_path,
     tracked_img_outpath,
     tracked_csv_outpath,
@@ -192,7 +192,7 @@ def propagate_tracks_connected(
         if t==0:
             t_tracked_seg = t_seg
         else:
-            t_tracked_seg, next_label = _run_single_timepoint_propagation_connected(
+            t_tracked_seg, next_label = _run_single_timepoint_propagation_bounded(
                 t_seg,
                 seg_prev_tp,
                 next_label,
@@ -214,7 +214,7 @@ def propagate_tracks_connected(
     return df_tracks
 
 
-def run_connected_component_propagation_tracking(
+def run_bounded_propagation_tracking(
     metadata,
     output_dir,
     cell_type,
@@ -225,7 +225,7 @@ def run_connected_component_propagation_tracking(
     progress_cb=None,
     **kwargs
     ):
-    """Run Connected-Component Propagation tracking on any cell type.
+    """Run Bounded Propagation tracking on any cell type.
 
     Behaves like propagation tracking, except a track ID can never span more
     than one physically disconnected region. Before watershed runs, the raw
@@ -314,7 +314,7 @@ def run_connected_component_propagation_tracking(
                 not tracked_img_outpath.exists()
             ) or overwrite
             ):
-            propagate_tracks_connected(
+            propagate_tracks_bounded(
                 segments_path=segments_path,
                 tracked_img_outpath=tracked_img_outpath,
                 tracked_csv_outpath=tracked_csv_outpath,
