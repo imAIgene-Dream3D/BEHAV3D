@@ -78,6 +78,11 @@ When the strategy includes a watershed post-processing, an **Instance Segmentati
 
 The defaults in the table are the **same on every tab** the first time you open APOC — only a starting point. For tips on tuning **large vs small** objects (shared with ConvPaint and Pixel Classifier), see [Advice: large vs small objects](./index.md#advice-large-vs-small-objects) on the [segmentation overview](./index.md).
 
+The `0.3` and `0.5` entries shown in **Tune Features** are Gaussian/filter scales in
+pixels. They are not a recommended range for Mask threshold or Seed threshold. For
+Probability Map + Watershed, start from **0.5 Mask / 0.8 Seed** and tune against the
+instance preview.
+
 ### 4 · Train + Preview
 
 - **▶ Train current tab** / **▶▶ Train ALL classifiers**: fit the APOC classifier for the active cell type, or for every cell type at once. The trained model is saved to `<output_dir>/images/PixelClassification/` (one file per cell type per strategy).

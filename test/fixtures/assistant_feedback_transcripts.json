@@ -52,6 +52,9 @@
       "probability map + watershed is the default",
       "seed threshold is the main splitting lever",
       "mask threshold defines the foreground contour",
+      "mask threshold 0.5",
+      "seed threshold 0.8",
+      "not threshold recommendations",
       "annotate more background",
       "excludes objects",
       "never merges"

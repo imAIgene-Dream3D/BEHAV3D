@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 
-KNOWLEDGE_VERSION = "2026.08.11.3"
+KNOWLEDGE_VERSION = "2026.08.11.6"
 
 
 GUIDANCE_CARDS = {
@@ -35,7 +35,11 @@ GUIDANCE_CARDS = {
         "the literal CSV-safe line value 'not_added'; never use None. Metadata clarification "
         "prompts must stay experiment-neutral: do not introduce example strain, line, or population "
         "names that were not read from the live context, and do not interrupt an informational "
-        "analysis question with a metadata-building clarification. A processing population is an "
+        "analysis question with a metadata-building clarification. When a confirmed correction changes "
+        "sample or population counts, population names, dead-channel inclusion, or Multicolor expansion, "
+        "rebuild the dependent sample forms and preserve every compatible value already entered. Do not "
+        "leave an old sample-form structure behind or require a separate Create Sample Forms instruction. "
+        "A processing population is an "
         "object or signal distinguishable in the images that needs its own segmentation and track "
         "IDs. Line records biological identity/source and is mandatory; Condition records treatment "
         "or experimental state and is optional. Multicolor is only for one dense biological "
@@ -126,7 +130,10 @@ GUIDANCE_CARDS = {
         "connected region should remain one instance. Mask + EDT is preferred for similarly sized "
         "touching objects. Probability Map + Watershed is the default and handles heterogeneous "
         "sizes. In probability mode, Mask threshold defines the foreground contour; Seed threshold "
-        "is the main splitting lever. Raise Seed threshold in small increments to split merged "
+        "is the main splitting lever. The documented APOC starting values are Mask threshold 0.5 "
+        "and Seed threshold 0.8; keep Seed threshold at least as high as Mask threshold. Values 0.3 "
+        "and 0.5 also occur in the classifier feature-scale list in pixels and are not threshold "
+        "recommendations or a 0.3-0.5 threshold range. Raise Seed threshold in small increments to split merged "
         "objects, but watch for cells disappearing if it becomes too strict. Raising Mask threshold "
         "can tighten borders and can add splitting when combined with Seed threshold. If tuning is "
         "not enough, annotate more background at touching-cell boundaries and retrain. In Mask + "
@@ -243,7 +250,9 @@ GUIDANCE_CARDS = {
         "Filtering must be run even when every filter is disabled: it creates the downstream CSV and "
         "interpolates missing timepoints. Minimum track length is optional because state analysis "
         "supports unequal lengths, but removing short tracks can reduce noise and computation. Read "
-        "the track-length distribution before endorsing a number. Trim to a common maximum only for "
+        "the track-length distribution before endorsing a number. An enabled minimum of 0 removes no "
+        "short tracks, and an enabled common output length of 0 does not define a usable analysis "
+        "window; never endorse those placeholders merely because they match. Trim to a common maximum only for "
         "analyses requiring uniform windows. Equal minimum and maximum lengths are valid: the minimum "
         "discards shorter tracks and the maximum trims retained tracks. Splitting divides a long "
         "track into full-size chunks and discards the remainder. For multicellular structures, filtering by initial "

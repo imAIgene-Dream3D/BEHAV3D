@@ -35,7 +35,8 @@ from behav3d.napari._assistant_recommendations import (
     calculate_edt_recommendations, format_edt_recommendations,
 )
 from behav3d.napari._assistant import (
-    researcher_facing_text, streaming_transcript_block, transcript_block_role,
+    AssistantDock, _pending_action_identity, researcher_facing_text,
+    streaming_transcript_block, transcript_block_role,
 )
 from behav3d.napari._assistant_client import (
     ChatWorker, classify_request_failure, diagnose_assistant_service,
@@ -327,8 +328,17 @@ def test_backend_hides_bulk_metadata_tool_after_forms_exist():
     forced_choice, forced_extra = app.model_tool_policy(True, True)
     assert forced_choice == "required"
     assert forced_extra == {"thinking": {"type": "disabled"}}
+    edit_choice, edit_extra = app.model_tool_policy(False, True, True)
+    assert edit_choice == "required"
+    assert edit_extra == {"thinking": {"type": "disabled"}}
     assert app.model_tool_policy(False, True) == ("auto", None)
     assert app.model_tool_policy(False, False) == (None, None)
+    assert app.should_require_edit_action(
+        {}, "Change the maximum search radius to 25", [{"name": "set_ui_value"}],
+    )
+    assert not app.should_require_edit_action(
+        {}, "How do I change the maximum search radius?", [{"name": "set_ui_value"}],
+    )
     sanitized = app.sanitize_bulk_metadata_arguments({"samples": [{
         "sample_name": "Movie_1", "dimension_order": "TCZYX",
         "pixel_distance_xy": 1.15, "pixel_distance_z": 4,
@@ -530,6 +540,45 @@ def test_metadata_completion_uses_mandatory_well_and_line_fields():
     assert "mandatory T-cells line" in response
     assert "condition" in response and "optional" in response
     assert "1" in response
+
+
+def test_metadata_count_correction_proposes_complete_structural_update():
+    import app
+
+    context = {
+        "current_step": "data_preparation",
+        "metadata_builder": {"sample_forms_created": True},
+        "ui_state": {"controls": [{
+            "id": "metadata.number_of_immune_types",
+            "label": "Number of immune cell types",
+            "value": 1,
+            "visible": True,
+            "enabled": True,
+        }]},
+    }
+    messages = [{
+        "role": "user",
+        "content": "Correct the immune cell types from 1 to 2.",
+    }]
+    result = app.metadata_structure_correction_action(context, messages)
+    assert result["calls"] == [{
+        "name": "set_ui_value",
+        "arguments": {"control_id": "metadata.number_of_immune_types", "value": 2},
+    }]
+    assert "rebuild the dependent sample forms" in result["text"]
+    deterministic = app.deterministic_turn_response(
+        context, messages, [{"name": "set_ui_value"}],
+    )
+    assert deterministic == result
+    direct_count = app.metadata_structure_correction_action(
+        context,
+        [{"role": "user", "content": "We actually have two immune cell types."}],
+    )
+    assert direct_count["calls"][0]["arguments"]["value"] == 2
+    assert app.metadata_structure_correction_action(
+        context,
+        [{"role": "user", "content": "Correct Sample 1's well to 2."}],
+    ) is None
 
 
 def test_data_preparation_requires_metadata_and_output_directory():
@@ -1657,6 +1706,24 @@ def test_equal_track_filter_review_explains_valid_fixed_length_workflow():
     assert "trims retained longer tracks" in summary
     assert "uniform window" in summary
 
+    zero_controls = [
+        {**control, "value": 0}
+        if str(control.get("id") or "").endswith(".timepoints")
+        else control
+        for control in controls
+    ]
+    zero_summary = app.equal_track_filter_summary(
+        {
+            "current_step": "filtering",
+            "active_cell_type": "tcell",
+            "ui_state": {"controls": zero_controls},
+        },
+        [{"role": "user", "content": "Review filters"}],
+    )
+    assert "need calibration" in zero_summary
+    assert "does not define a usable analysis window" in zero_summary
+    assert "matching values alone does not make them suitable" in zero_summary.lower()
+
 
 def test_merged_probability_watershed_guidance_explains_seed_confidence():
     import app
@@ -1678,6 +1745,210 @@ def test_merged_probability_watershed_guidance_explains_seed_confidence():
     assert "raise it in small increments" in result
     assert "higher-confidence seed cores" in result
     assert "less confidence" not in result
+
+
+def test_apoc_probability_threshold_defaults_are_not_feature_scales():
+    import app
+
+    context = {
+        "current_step": "segmentation",
+        "segmentation": {"method": "APOC (GPU)"},
+        "ui_state": {"controls": [
+            {
+                "id": "segmentation.apoc.tcell.mask_threshold",
+                "value": 0.5,
+            },
+            {
+                "id": "segmentation.apoc.tcell.seed_threshold",
+                "value": 0.8,
+            },
+        ]},
+    }
+    result = app.apoc_probability_threshold_defaults_guidance(
+        context,
+        [{"role": "user", "content": (
+            "What starting Mask threshold and Seed threshold do you suggest for APOC?"
+        )}],
+    )
+    assert "**Mask threshold: 0.5**" in result
+    assert "**Seed threshold: 0.8**" in result
+    assert "feature-scale list (pixels)" in result
+    assert "not a recommended probability-threshold range" in result
+
+
+def test_tracking_radius_evaluates_zero_from_measured_motion():
+    import app
+
+    control_id = "tracking.cells.btrack.maximum_search_radius"
+    result = app.tracking_radius_action(
+        {
+            "current_step": "tracking",
+            "active_cell_type": "cells",
+            "ui_state": {"controls": [{
+                "id": control_id,
+                "label": "Maximum search radius",
+                "value": 0,
+                "unit": "um",
+                "cell_type": "cells",
+                "visible": True,
+                "enabled": True,
+            }]},
+        },
+        [{"role": "user", "content": (
+            "Is the current maximum search radius of 0 correct? The objects move "
+            "about 12 um per frame."
+        )}],
+    )
+    assert result["calls"] == [{
+        "name": "set_ui_value",
+        "arguments": {"control_id": control_id, "value": 14.4},
+    }]
+    assert "below the measured one-frame displacement" in result["text"]
+    assert "too small" in result["text"]
+    assert "**14.4 µm**" in result["text"]
+
+
+def test_action_tray_is_bounded_deduplicated_and_resettable():
+    from types import SimpleNamespace
+    from qtpy.QtWidgets import QApplication
+
+    qt_app = QApplication.instance() or QApplication([])
+    dock = AssistantDock(SimpleNamespace())
+    for mutation in (
+        ProposedAction("set_ui_value", control_id="tracking.cells.radius", value=25),
+        ProposedAction("set_parameter", key="tracking.radius", value=25),
+        ProposedAction("select_segmentation_method", value="APOC"),
+    ):
+        assert dock._should_auto_apply(mutation) is False
+    first = ProposedAction(
+        "set_ui_value", control_id="metadata.samples.0.well", value="A1"
+    )
+    first.preview = "Sample 1: Well -> A1"
+    replacement = ProposedAction(
+        "set_ui_value", control_id="metadata.samples.0.well", value="B1"
+    )
+    replacement.preview = "Sample 1: Well -> B1"
+    assert _pending_action_identity(first) == _pending_action_identity(replacement)
+
+    dock._add_action_card(first)
+    dock._add_action_card(replacement)
+    assert dock.action_tray_layout.count() == 1
+    assert dock.action_tray_layout.itemAt(0).widget().action is replacement
+    assert dock.action_scroll.maximumHeight() == 180
+    assert not dock.action_tray_panel.isHidden()
+
+    for index in range(20):
+        action = ProposedAction(
+            "set_ui_value",
+            control_id=f"metadata.samples.0.extra_{index}",
+            value=index,
+        )
+        action.preview = f"Extra field {index}"
+        dock._add_action_card(action)
+    assert dock.action_tray_layout.count() == 21
+
+    observed = []
+    stale_generation = dock._conversation_generation
+    dock._request_active = True
+    dock._set_busy(True)
+    assert dock.btn_new_chat.isEnabled()
+    dock._reset_conversation()
+    dock._dispatch_request_signal(stale_generation, observed.append, "stale")
+    assert observed == []
+    assert dock.action_tray_layout.count() == 0
+    assert dock.action_tray_panel.isHidden()
+    assert dock._request_active is False
+    assert qt_app is not None
+
+
+def test_metadata_structure_correction_rebuilds_forms_and_preserves_values():
+    from types import SimpleNamespace
+
+    class _Builder:
+        def __init__(self):
+            self.builder_grp = _FakeGroup(checked=True)
+            self.n_samples_spin = _FakeSpin(2)
+            self.n_organoid_spin = _FakeSpin(0)
+            self.n_immune_spin = _FakeSpin(1)
+            self.n_other_spin = _FakeSpin(0)
+            self.include_dead_cb = _FakeCheck(False)
+            self._organoid_name_edits = []
+            self._immune_name_edits = [_FakeLine("cells")]
+            self._other_name_edits = []
+            self._immune_multicolor_flags = [_FakeCheck(False)]
+            self._immune_multicolor_counts = [_FakeSpin(2)]
+            self._metadata_builder_dirty = False
+            self._sample_forms = [
+                self._form(0, "Sample_A", "A1", "line_A", "treated"),
+                self._form(1, "Sample_B", "A2", "line_B", "control"),
+            ]
+
+        def _form(self, index, sample_name, well, line, condition):
+            immune_names = [edit.text() for edit in self._immune_name_edits]
+            return {
+                "group": _FakeGroup(f"Sample {index + 1}"),
+                "basic": {
+                    "sample_name": _FakeLine(sample_name),
+                    "well": _FakeLine(well),
+                    "pixel_distance_xy": _FakeSpin(0.75),
+                },
+                "dead_channel": {},
+                "cell_types": {
+                    name: {
+                        "line": _FakeLine(line if name == "cells" else ""),
+                        "condition": _FakeLine(
+                            condition if name == "cells" else ""
+                        ),
+                    }
+                    for name in immune_names
+                },
+                "org_names": [],
+                "imm_names": immune_names,
+                "oth_names": [],
+            }
+
+        def _on_configure_cell_types(self, force=False):
+            old_count = len(self._immune_name_edits)
+            self._immune_name_edits = [
+                _FakeLine("cells" if index == 0 else f"immune{index + 1}")
+                for index in range(self.n_immune_spin.value())
+            ]
+            self._immune_multicolor_flags = [
+                _FakeCheck(False) for _ in self._immune_name_edits
+            ]
+            self._immune_multicolor_counts = [
+                _FakeSpin(2) for _ in self._immune_name_edits
+            ]
+            assert old_count == 1 and force is True
+
+        def _build_sample_forms(self, force=False):
+            self._sample_forms = [
+                self._form(index, "", "", "", "")
+                for index in range(self.n_samples_spin.value())
+            ]
+            assert force is True
+
+    builder = _Builder()
+    action = ProposedAction(
+        "set_ui_value",
+        control_id="metadata.number_of_immune_types",
+        value=2,
+    )
+    assert apply_action(SimpleNamespace(data_prep_tab=builder), action)
+    assert action.data["reconciled_sample_forms"] is True
+    assert [edit.text() for edit in builder._immune_name_edits] == [
+        "cells", "immune2",
+    ]
+    assert len(builder._sample_forms) == 2
+    assert builder._sample_forms[0]["basic"]["sample_name"].text() == "Sample_A"
+    assert builder._sample_forms[1]["basic"]["well"].text() == "A2"
+    assert builder._sample_forms[0]["cell_types"]["cells"]["line"].text() == "line_A"
+    assert (
+        builder._sample_forms[1]["cell_types"]["cells"]["condition"].text()
+        == "control"
+    )
+    assert "immune2" in builder._sample_forms[0]["cell_types"]
+    assert builder._metadata_builder_dirty is True
 
 
 def test_metadata_channel_mapping_stays_out_of_metadata_builder():
@@ -2365,6 +2636,8 @@ def test_prompt_data_prep_reconciles_state_and_lists_tools():
     assert "Never ask for a value already present" in sp
     assert "Make responses easy to scan" in sp
     assert "The live current_step is authoritative" in sp
+    assert "Current values, schema defaults, and zero placeholders" in sp
+    assert "not evidence that a setting is suitable" in sp
     assert "n_samples" in sp  # present only as structured live context
 
 
@@ -3657,7 +3930,7 @@ def test_feedback_guidance_fixtures():
 
     fixture = Path(__file__).parent / "fixtures" / "assistant_feedback_transcripts.json"
     cases = json.loads(fixture.read_text(encoding="utf-8"))
-    assert KNOWLEDGE_VERSION == "2026.08.11.3"
+    assert KNOWLEDGE_VERSION == "2026.08.11.6"
     for case in cases:
         cards = select_guidance_cards(
             {"current_step": case["step"]}, case["user"], case.get("intent"))
