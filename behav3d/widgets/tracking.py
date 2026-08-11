@@ -170,7 +170,7 @@ class TrackingPanel:
         individual_method_options = [
             ("LAP (laptrack)", "lap"),
             ("TrackPy", "trackpy"),
-            ("Propagation", "propagation"),
+            ("Fragmentation Tracking", "propagation"),
             ("Bounded Propagation", "bounded_propagation"),
         ]
         if self.category == "organoid" and not self._has_linked_organoid_mode():
@@ -267,7 +267,7 @@ class TrackingPanel:
         ])
 
         self.prop_params = widgets.VBox([
-            widgets.HTML("<b>Propagation tracking</b>"),
+            widgets.HTML("<b>Fragmentation Tracking</b>"),
             widgets.HTML("<i>No tunable parameters.</i>")
         ])
 

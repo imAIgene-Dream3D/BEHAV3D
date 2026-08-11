@@ -7,10 +7,10 @@ its **hypothesis model** is *"used by the global optimizer to build the final se
 tracks"* ([btrack documentation](https://btrack.readthedocs.io/en/stable/user_guide/configuration.html)).
 
 In BEHAV3D EXPLORER, btrack has **two parts** that work together on a cell type's
-per-timepoint segmentation: the **Kalman-filter tracker** and the **global
-hypothesis optimiser**. In routine lab practice both are used on every run — the
-optimiser is enabled. Per the reference workflow, btrack is the tracker used for
-immune / motile cells (see [Tracking overview](index)).
+per-timepoint segmentation: the **Kalman-filter tracker** and the optional **global
+hypothesis optimiser**. The optimiser can be enabled after the first-pass links are inspected. Choose btrack when
+objects lose frame-to-frame overlap, regardless of their biological identity (see
+[Tracking overview](index)).
 
 ## The two parts
 
@@ -18,8 +18,7 @@ immune / motile cells (see [Tracking overview](index)).
   model.
 - **Global hypothesis optimisation** — resolves track merges, splits, terminations
   and false positives across the whole track set. It is switched on with the
-  **Enable global track optimization** checkbox, which **defaults off in the GUI**;
-  in lab practice it is enabled on every run.
+  **Enable global track optimization** checkbox, which **defaults off in the GUI**.
 
 Both parts run together in the final tracking.
 
@@ -29,7 +28,7 @@ Both parts run together in the final tracking.
 |---|---|---|---|
 | **Config preset** | Cell (bundled) | combo | Picks the motion / hypothesis model. `Cell` and `Particle` are bundled JSON configs shipped with BEHAV3D EXPLORER. `Custom JSON…` enables the **Custom JSON path** field below for your own file. |
 | **Custom JSON path** | — | path | Only active when the preset is "Custom JSON…". See `models/README_btrack.md` in the repo for the expected format. |
-| **Max search radius (px)** | 100 | 1–9999 | Maximum isotropic search distance for linking objects between frames. Increase for fast cells; decrease to prevent long-range false links. |
+| **Max search radius (px)** | 100 | 1–9999 | Maximum isotropic search distance for linking objects between frames. The displayed default is not a recommendation: derive it from the fastest measured one-frame displacement plus a modest margin. |
 | **Update method** | EXACT | EXACT / APPROXIMATE | EXACT = full Bayesian belief matrix (accurate, slower). APPROXIMATE = local spatial search (faster, recommended once you exceed ~1000 cells/frame). |
 | **Step size (frames)** | 100 | 1–10000 | Frames processed per tracking iteration — e.g. `100` processes 100 frames' worth of data at a time rather than loading a whole 1000-frame movie into memory at once. Only lower it (e.g. to 50 or 20) if you hit an **out-of-memory error** while tracking a long movie: each chunk then uses less RAM, at the cost of a little extra overhead stitching more chunks together. |
 | **Use visual features** | OFF | checkbox | When enabled, raw image intensity statistics (**mean and standard deviation per channel**) of each cell are computed alongside the centroids and fed to the Kalman filter as an extra cue. Requires `raw_image_path` in the metadata. |
@@ -39,7 +38,7 @@ Both parts run together in the final tracking.
 
 | Parameter | Default | Effect |
 |---|---|---|
-| **Enable global track optimization** | OFF (GUI default; enabled in routine practice) | Switches on the global optimiser. |
+| **Enable global track optimization** | OFF | Switches on the global optimiser after first-pass tracking has been inspected. |
 | **Hypotheses** | `P_FP, P_init, P_term, P_link` | Which hypotheses the optimizer considers (definitions below). `P_FP` is always required (the checkbox is disabled in the UI). `P_branch`, `P_dead` and `P_merge` are added as your biology requires. |
 | **Distance threshold** (`dist_thresh`) | 60 | BEHAV3D's help text: *"Maximum distance for generating link/branch hypotheses in the optimizer"* (in the unit selected by the µm/px toggle). btrack's own documentation does not define this field in detail. |
 | **Time threshold** (`time_thresh`) | 3 | BEHAV3D's help text: *"Maximum frame gap for generating link hypotheses in the optimizer."* btrack's own documentation does not define this field in detail. |
@@ -62,13 +61,13 @@ Both parts run together in the final tracking.
 2. From the **Method** dropdown, pick **btrack (Bayesian)**.
 3. **Configure the Kalman-filter tracking parameters**:
    - **Config preset**: start with **Cell**. Switch to **Particle** only for very small objects (bacteria, organelles). `Custom JSON…` is for advanced users with their own motion model.
-   - **Max search radius**: set to roughly the fastest cell's single-frame displacement in your data, in the same units as your metadata's `pixel_distance_xy`. Default 100 µm is generous; lower it for slower cells.
+   - **Max search radius**: measure the fastest plausible one-frame displacement, then add a modest 10-25% margin. Use the physical distance unit represented by the live control and metadata; do not copy the displayed default.
    - **Update method**: **EXACT** is more accurate; switch to **APPROXIMATE** if tracking is too slow (typically when cells-per-frame exceed a few hundred).
    - **Step size**: default 100 frames is fine for most datasets. Lower it if tracking runs out of RAM on long movies.
    - **Use visual features**: tick to add each cell's per-channel intensity mean and standard deviation as a linking cue. Requires `raw_image_path` in your metadata.
 4. **Tick *Enable global track optimization*** and configure the optimisation parameters:
-   - Tick the hypotheses your data needs (`P_branch` for cell division, `P_dead` for cell death, `P_merge` for genuine cell-cell fusion). `P_FP` is always on. Don't tick hypotheses you don't biologically expect — false positives are very disruptive.
-   - **Distance threshold** and **Time threshold** govern the candidate links / branches the optimizer considers. Defaults (60 / 3) are conservative.
+   - Tick only the hypotheses your data needs: `P_branch` for division, `P_init`/`P_term` for entry or exit at field boundaries, `P_dead` for termination within the field, and `P_merge` for genuine fusion. `P_FP` is always on.
+   - Derive **Distance threshold** from the largest spatial gap that should reconnect and **Time threshold** from the largest missing-frame gap. Report the time threshold in frames and physical duration.
 5. **Click *Run … Tracking*** (the green button at the bottom of the sub-tab, named after the cell type) and **inspect the result** in the Visualization tab.
 6. **Iterate.** Adjust the parameters of either part and re-run (see [Tuning the parameters](#tuning-the-parameters)).
 7. When happy, queue the work with the tab-level **+🛒** button below the sub-tabs. The queued step is global — it runs every cell type's currently-configured method at run time, using your saved btrack settings (see [Processing Queue](../../plugin_essentials/processing_queue)).
@@ -106,7 +105,7 @@ After inspecting the result in the Visualization tab, identify the failure mode 
 
 *The optimisation doesn't bridge gaps you expected it to*
 - Cause: `Time threshold` is too short, or `Distance threshold` is too small.
-- Fix: **raise both gradually**. Default `60 / 3` is conservative; doubling either is a reasonable next attempt.
+- Fix: measure the largest valid spatial and missing-frame gaps, then set each threshold just above that evidence. Convert the frame gap to physical duration using metadata.
 
 *The optimisation produces too many bridges across unrelated cells*
 - Cause: `Time threshold` / `Distance threshold` are too generous.
@@ -127,7 +126,7 @@ CSV columns: `TrackID, SegmentID, position_t, position_x/y/z, pixel_position_x/y
 
 ## Good practices & tips
 
-- **Start with the `Cell` preset.** It is the bundled default and the one the lab tunes against. Switch to `Particle` only for genuinely small objects (bacteria, organelles).
+- **Start with the `Cell` preset** as the bundled general motion model. Switch to `Particle` only when the observed motion is closer to small, near-random particle movement.
 - **Use `EXACT` update unless tracking is too slow.** EXACT is the safer default; switch to `APPROXIMATE` once your cells-per-frame counts exceed a few hundred and runtime becomes a problem.
 - **`Use visual features`** feeds each cell's per-channel intensity mean and standard deviation to the Kalman filter alongside the centroids. Requires `raw_image_path` in the metadata.
 - **`P_branch` is the right hypothesis for cell division.** Without it, mitosis events will be tracked as two unrelated tracks starting where the parent ended.

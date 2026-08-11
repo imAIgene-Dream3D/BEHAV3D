@@ -236,10 +236,12 @@ def test_diff_from_defaults():
 
 def test_dump_cards_json(tmp_path=None):
     import tempfile, json
+    from behav3d.napari._assistant_schema import CHOICES
     d = tmp_path or tempfile.mkdtemp()
     path = os.path.join(str(d), "cards.json")
     n = dump_cards_json(path)
     assert n > 150 and json.load(open(path))
+    assert "bounded_propagation" in CHOICES["method"]
 
 
 # --------------------------------------------------------------------------
@@ -554,6 +556,31 @@ def test_metadata_identifier_inferences_require_confirmation():
     assert "not_added" in missing_lines
 
 
+def test_metadata_taxonomy_distinguishes_image_populations_and_design_labels():
+    import app
+
+    response = app.metadata_taxonomy_guidance(
+        {},
+        [{"role": "user", "content": (
+            "What is the difference between cell types, lines and conditions?"
+        )}],
+    )
+    assert "distinguished in the images" in response
+    assert "segmentation and track IDs" in response
+    assert "biological identity" in response
+    assert "treatment or experimental state" in response
+
+    multicolor = app.metadata_taxonomy_guidance(
+        {},
+        [{"role": "user", "content": "When should I use the Multicolor option?"}],
+    )
+    for phrase in (
+        "one biological population", "same population, line, and condition",
+        "not a correction for bleed-through", "acquisition-design choice",
+    ):
+        assert phrase.lower() in multicolor.lower()
+
+
 def test_metadata_time_conversion_updates_every_sample_without_stale_action():
     import app
 
@@ -691,6 +718,13 @@ def test_generic_tracking_guide_asks_for_motion_before_method_context():
         context,
         [{"role": "user", "content": (
             "The cells move about 12 microns per frame. Help me choose a tracking method."
+        )}],
+    ) is None
+    assert app.tracking_motion_question(
+        context,
+        [{"role": "user", "content": (
+            "Which tracking method fits? The masks still overlap between frames, "
+            "but touching masks can join across disconnected regions."
         )}],
     ) is None
     assert app.tracking_motion_question(
@@ -1799,35 +1833,6 @@ def test_interface_capabilities_report_current_exposure_without_cross_module_map
     assert "Sobel-of-Gaussian" in apoc["feature_filters"]
 
 
-def test_safety_profile_summary_preserves_reference_without_claiming_execution():
-    import app
-
-    summary = app.safety_profile_summary(
-        {
-            "current_step": "analysis",
-            "metadata": {"records": [{
-                "time_interval": 2, "time_unit": "min",
-            }]},
-            "experiment_reference": {"notes": [{"text": (
-                "Exp010 is multi-organoid safety profiling with 27T and MDO. "
-                "Active killing is a contact-associated rise to 1.5 times baseline "
-                "within 5 frames after one frame of contact."
-            )}]},
-            "results": [],
-        },
-        [{"role": "user", "content": (
-            "How should I frame the safety comparison, and what exactly does "
-            "active killing mean here?"
-        )}],
-    )
-    assert "TEG cells are the immune effector" in summary
-    assert "tumor 27T and healthy MDO" in summary
-    assert "5 frames (10 minutes)" in summary
-    assert "not a completed analysis" in summary
-    assert "independent analysis for each target plus a combined analysis" in summary
-    assert "configured" not in summary.lower()
-
-
 def test_tool_call_parsing_tolerates_malformed_markers():
     import app
     # the exact malformed shape a small model emitted: no leading '<', no closing tag
@@ -2178,7 +2183,7 @@ def test_prompt_scopes_experiment_reference_and_requires_result_evidence():
     assert "Safety profiling with tumor and healthy organoids" in sp
 
 
-def test_historical_reference_profiles_are_selected_and_never_auto_applied():
+def test_reference_guidance_is_property_based_and_never_auto_applied():
     from guidance import select_guidance_cards
     import app
 
@@ -2188,10 +2193,12 @@ def test_historical_reference_profiles_are_selected_and_never_auto_applied():
     )
     profile = next(item for item in cards if item["id"] == "reference_examples")
     for phrase in (
-        "never defaults", "IVM HIV", "CD4/CD8-13T",
-        "never edit a live control from an example alone",
+        "biological name", "image spacing", "frame cadence",
+        "one-frame displacement", "never edit a live control",
     ):
         assert phrase.lower() in profile["text"].lower()
+    for forbidden in ("microglia", "t cells", "exp91", "27t", "mdo"):
+        assert forbidden not in profile["text"].lower()
 
     prompt = app.build_system_prompt(
         {
@@ -2201,72 +2208,26 @@ def test_historical_reference_profiles_are_selected_and_never_auto_applied():
         cards,
         [{"name": "set_ui_value"}],
     )
-    assert "HISTORICAL REFERENCE PROFILES are examples" in prompt
-    assert "Never issue a form action from a historical value alone" in prompt
+    assert "Base recommendations on measurable image and behavior properties" in prompt
+    assert "must never trigger a method, preset, threshold, or canned answer" in prompt
     assert "README notes for study intent" in prompt
 
 
-def test_historical_reference_guidance_preserves_provenance_and_calibration():
+def test_biological_name_does_not_trigger_a_historical_canned_response():
     import app
 
-    btrack = app.historical_reference_guidance(
-        {
-            "metadata": {"records": [{
-                "time_interval": 30,
-                "time_unit": "s",
-            }]},
-        },
+    response = app.deterministic_turn_response(
+        {"current_step": "tracking", "metadata": {"records": []}},
         [{
             "role": "user",
-            "content": (
-                "Do you have example values from a previous experiment for btrack "
-                "on T cells? Can I copy them?"
-            ),
+            "content": "What settings were used previously for microglia?",
         }],
+        [],
     )
-    for phrase in (
-        "IVM HIV", "CD4/CD8-13T", "should not be copied directly",
-        "one-frame displacement", "largest spatial gap",
-        "largest missing-frame gap",
-    ):
-        assert phrase.lower() in btrack["text"].lower()
-    assert btrack["calls"] == []
+    assert response is None
+    assert not hasattr(app, "historical_reference_guidance")
+    assert not hasattr(app, "safety_profile_summary")
 
-    calcium = app.historical_reference_guidance(
-        {},
-        [{
-            "role": "user",
-            "content": (
-                "Was there a previous experiment with near-static calcium reporter "
-                "cells? What method and example values did it use?"
-            ),
-        }],
-    )
-    for phrase in (
-        "Cellpose-SAM", "imported", "Reporter Propagation", "100-voxel",
-        "10% overlap", "example values, not defaults",
-    ):
-        assert phrase.lower() in calcium["text"].lower()
-    assert calcium["calls"] == []
-
-    microglia = app.historical_reference_guidance(
-        {},
-        [{
-            "role": "user",
-            "content": (
-                "What settings and design were used in the previous microglia "
-                "Exp91 experiment?"
-            ),
-        }],
-    )
-    for phrase in (
-        "Exp91", "eight wells", "1.77 µm", "120-second", "None_None",
-        "APOC Probability Map + Watershed", "maximum search radius 150",
-        "absolute increase of 30", "Start offset **0**", "README",
-        "n=1", "historical values, not defaults",
-    ):
-        assert phrase.lower() in microglia["text"].lower()
-    assert microglia["calls"] == []
 
 
 def test_prompt_encodes_pi_feedback_scenarios():
@@ -2288,8 +2249,10 @@ def test_prompt_encodes_pi_feedback_scenarios():
     assert "With plain Mask + EDT/Watershed, raise EDT" in sp
     assert "With Peak EDT/Watershed, lower EDT" in sp
     assert "do not infer motion from a label" in sp
-    assert "btrack is the routine default" in sp
+    assert "use Bounded Propagation" in sp
+    assert "use btrack when consecutive detections no longer overlap" in sp
     assert "Reporter Propagation" in sp
+    assert "Reporter flicker and static position are both required" in sp
     assert "60 um/min at 15 seconds per frame is 15 um/frame" in sp
     assert "Do not provide a numeric example speed" in sp
     assert "btrack Step 2 is the Global Hypothesis Optimizer" in sp
@@ -2308,7 +2271,7 @@ def test_prompt_encodes_pi_feedback_scenarios():
     assert "'Tune Features' means the classifier feature preset" in sp
     assert "ask them to copy and paste the latest error lines" in sp
     assert "Intensity and Contact are required for every cell type" in sp
-    assert "never suggest dropping it from a T-cell population" in sp
+    assert "never suggest dropping it from a population" in sp
     assert "automatically produces an independent analysis" in sp
     assert "Never apply only the mode checkbox" in sp
     assert "setup_ready true" in sp
@@ -2318,6 +2281,8 @@ def test_prompt_encodes_pi_feedback_scenarios():
     assert "assigning the same name to multiple primary clusters merges them" in sp
     assert "Death Dynamics, Interaction Analysis, Invasiveness Analysis" in sp
     assert "line to the literal CSV-safe value 'not_added'" in sp
+    assert "Multicolor means one dense biological population" in sp
+    assert "must never trigger a method, preset, threshold, or canned answer" in sp
     assert "Never narrate internal rules" in sp
     assert "Opening a result requires an open_result call" in sp
     assert "A result merely listed as viewable has not been opened" in sp
@@ -2424,13 +2389,18 @@ class _FakeTrackingPanel:
     def __init__(self, cell_type, radius):
         self.cell_type = cell_type
         self.combo_method = _FakeCombo(
-            ["LAP", "TrackPy", "Propagation", "Reporter Propagation", "btrack"],
-            4,
+            ["LAP", "TrackPy", "Fragmentation Tracking", "Bounded Propagation",
+             "Reporter Propagation", "btrack"],
+            5,
         )
         self.lap_merge_cost = _FakeSpin(0)
         self.lap_split_cost = _FakeSpin(0)
         self.tp_adaptive_stop = _FakeSpin(10.0)
         self.tp_adaptive_step = _FakeSpin(0.95)
+        self.bp_min_overlap_fraction = _FakeSpin(0.0, 0.0, 1.0)
+        self.bp_segment_size_min = _FakeSpin(20)
+        self.rp_min_overlap_fraction = _FakeSpin(0.1, 0.0, 1.0)
+        self.rp_segment_size_min = _FakeSpin(100)
         self.bt_max_search_radius = _FakeSpin(radius, 1, 9999)
         self.bt_use_visual_features = _FakeCheck(False)
         self.bt_use_optimize = _FakeCheck(False)
@@ -2476,9 +2446,7 @@ def test_live_control_registry_targets_actual_cell_type_only():
 def test_tracking_registry_separates_reporter_propagation_from_btrack():
     from types import SimpleNamespace
     panel = _FakeTrackingPanel("reporter", 100)
-    panel.combo_method.setCurrentIndex(3)
-    panel.rp_min_overlap_fraction = _FakeSpin(0.1, 0.0, 1.0)
-    panel.rp_segment_size_min = _FakeSpin(100)
+    panel.combo_method.setCurrentIndex(4)
     main = SimpleNamespace(
         tracking_tab=SimpleNamespace(
             panels={"reporter": panel},
@@ -2491,6 +2459,15 @@ def test_tracking_registry_separates_reporter_propagation_from_btrack():
     ]["visible"] is True
     assert controls[
         "tracking.reporter.btrack.maximum_search_radius"
+    ]["visible"] is False
+
+    panel.combo_method.setCurrentIndex(3)
+    controls = {item["id"]: item for item in control_registry(main)}
+    assert controls[
+        "tracking.reporter.bounded_propagation.minimum_overlap"
+    ]["visible"] is True
+    assert controls[
+        "tracking.reporter.reporter_propagation.minimum_overlap"
     ]["visible"] is False
 
 
@@ -2916,7 +2893,7 @@ def test_feature_group_guidance_keeps_intensity_for_dead_dye():
                 ],
             }]},
         },
-        [{"role": "user", "content": "Now adjust T cells"}],
+        [{"role": "user", "content": "Review the feature groups for the selected population"}],
     )
     assert "Intensity" in text
     assert "mean dead-dye intensity" in text
@@ -3329,7 +3306,7 @@ def test_feedback_guidance_fixtures():
 
     fixture = Path(__file__).parent / "fixtures" / "assistant_feedback_transcripts.json"
     cases = json.loads(fixture.read_text(encoding="utf-8"))
-    assert KNOWLEDGE_VERSION == "2026.07.27.28"
+    assert KNOWLEDGE_VERSION == "2026.08.11.1"
     for case in cases:
         cards = select_guidance_cards(
             {"current_step": case["step"]}, case["user"], case.get("intent"))
@@ -3363,7 +3340,7 @@ def test_assistant_has_no_hidden_model_continuation():
     assert "def _auto_continue" not in source
     assert "_dispatch_proactive" not in source
     assert "Checking your setup" not in source
-    assert CONTROL_CONTRACT_VERSION == "3.2"
+    assert CONTROL_CONTRACT_VERSION == "3.3"
 
 
 # --------------------------------------------------------------------------

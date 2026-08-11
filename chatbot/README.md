@@ -202,8 +202,11 @@ For experiment interpretation, use this precedence:
 3. saved YAML configuration for intended settings;
 4. discovered result files for evidence that a step actually ran.
 
-A saved configuration is not execution evidence. Historical reference profiles
-are examples only and must never generate an edit action by themselves.
+A saved configuration is not execution evidence. A biological name is never a
+method or value selector. Default guidance is expressed in measurable properties
+such as object size, overlap, one-frame displacement, topology, cadence, and signal
+persistence. Dataset-specific notes are used only when they are present in the live
+experiment reference for the current dataset.
 
 ### Guidance and RAG
 
@@ -301,16 +304,20 @@ several widgets, create a file, or invoke an existing application workflow.
 - Bump `KNOWLEDGE_VERSION`, rebuild the index when indexed sources changed, and
   rerun API scenarios.
 
-### Add an experiment reference
+### Add experiment-specific context
 
-Add reviewed, provenance-labelled examples to
-`docs/source/assistant/reference_experiment_profiles.md`. If local experiment
-README or YAML formats need new parsing, update
+Do not add named experiments or saved numeric settings to default guidance or RAG.
+`docs/source/assistant/reference_experiment_profiles.md` is a generalized phenotype
+guide despite its legacy filename. Add reusable scientific rules there only when
+they are phrased in measurable image/behavior properties.
+
+If local experiment README or YAML formats need new parsing, update
 `_experiment_reference_context()` and `_compact_experiment_config()`.
 
 Keep paths, large feature arrays, and irrelevant defaults out of model context.
-The assistant may compare a historical profile with the current experiment, but
-must ask for current measurements before proposing an edit.
+The assistant may use a reference supplied for the current dataset, but must ask
+for current measurements before proposing an edit when the reference does not
+establish them.
 
 ### Change the chat UI or quick buttons
 
@@ -341,7 +348,7 @@ Before merging an assistant change, verify:
   not a plausible guess.
 - Exact values come from live data, explicit user input, or a labelled
   deterministic calculation.
-- Historical values are named examples and do not trigger actions.
+- Biological names and unrelated historical values do not trigger answers or actions.
 - The model does not claim a configured step ran without a corresponding result.
 - Visible text uses UI labels rather than variable, control, or tool names.
 - Same-value and already-open actions do not loop.

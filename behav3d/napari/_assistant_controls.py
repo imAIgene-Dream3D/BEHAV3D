@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 
-CONTROL_CONTRACT_VERSION = "3.2"
+CONTROL_CONTRACT_VERSION = "3.3"
 
 
 def _safe(fn: Callable, default=None):
@@ -705,7 +705,7 @@ def _tracking_bindings(main_widget) -> list[dict]:
         out.append(_binding(
             "tracking.organoids.track_all_together",
             "Track all organoid types together", together,
-            step="tracking", method="Propagation",
+            step="tracking", method="Fragmentation Tracking",
             cell_type="all organoid types",
         ))
 
@@ -721,7 +721,12 @@ def _tracking_bindings(main_widget) -> list[dict]:
         ("trackpy.adaptive_stop", "TrackPy adaptive stop", "tp_adaptive_stop", "distance", "TrackPy"),
         ("trackpy.adaptive_step", "TrackPy adaptive step", "tp_adaptive_step", None, "TrackPy"),
         ("propagation.track_all_organoids", "Track all organoid types together",
-         "check_all_together_prop", None, "Propagation"),
+         "check_all_together_prop", None, "Fragmentation Tracking"),
+        ("bounded_propagation.minimum_overlap", "Bounded Propagation minimum overlap",
+         "bp_min_overlap_fraction", None, "Bounded Propagation"),
+        ("bounded_propagation.minimum_segment_size",
+         "Bounded Propagation minimum segment size",
+         "bp_segment_size_min", "voxels", "Bounded Propagation"),
         ("reporter_propagation.minimum_overlap", "Reporter Propagation minimum overlap",
          "rp_min_overlap_fraction", None, "Reporter Propagation"),
         ("reporter_propagation.minimum_segment_size",
@@ -752,12 +757,14 @@ def _tracking_bindings(main_widget) -> list[dict]:
                 visible = method_index == 0
             elif method == "TrackPy":
                 visible = method_index == 1
-            elif method == "Propagation":
+            elif method == "Fragmentation Tracking":
                 visible = method_index == 2
-            elif method == "Reporter Propagation":
+            elif method == "Bounded Propagation":
                 visible = method_index == 3
-            elif method == "btrack":
+            elif method == "Reporter Propagation":
                 visible = method_index == 4
+            elif method == "btrack":
+                visible = method_index == 5
                 if suffix in {
                     "btrack.distance_threshold", "btrack.time_threshold",
                 }:
@@ -779,7 +786,7 @@ def _tracking_bindings(main_widget) -> list[dict]:
                 f"tracking.{cell_type}.btrack.hypotheses",
                 f"{cell_type}: btrack optimization hypotheses", checks,
                 step="tracking", method="btrack", cell_type=str(cell_type),
-                visible=method_index == 4 and optimizer_enabled,
+                visible=method_index == 5 and optimizer_enabled,
                 persist=getattr(panel, "_persist", None),
             ))
     return out
