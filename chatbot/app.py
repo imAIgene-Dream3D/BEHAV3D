@@ -581,7 +581,7 @@ def metadata_absence_action(context: dict, messages: list[dict]) -> dict | None:
 
 
 def metadata_completion_summary(context: dict, messages: list[dict]) -> str | None:
-    """Report draft completeness from the same mandatory fields used at save time."""
+    """Report all Data Preparation blockers, including the output directory."""
     latest = " ".join(_latest_user_message(messages).lower().split())
     intent = str((context.get("assistant_session") or {}).get("intent") or "")
     if not (
@@ -595,8 +595,8 @@ def metadata_completion_summary(context: dict, messages: list[dict]) -> str | No
         return None
     metadata = context.get("metadata", {}) or {}
     builder = context.get("metadata_builder", {}) or {}
-    if not (builder.get("sample_forms_created") or metadata.get("records")):
-        return None
+    has_metadata = bool(metadata.get("loaded") or metadata.get("records"))
+    output_dir_set = bool(context.get("output_dir_set"))
     validation = (
         metadata.get("validation")
         or builder.get("draft_validation")
@@ -607,35 +607,48 @@ def metadata_completion_summary(context: dict, messages: list[dict]) -> str | No
         for item in validation
         if item.get("severity") == "error" and item.get("message")
     ]
-    if errors:
-        shown = "\n".join(f"- {message}" for message in errors[:16])
-        extra = (
-            f"\n- Plus {len(errors) - 16} more mandatory values."
-            if len(errors) > 16 else ""
+    blockers = []
+    if not has_metadata:
+        blockers.append("Load a metadata CSV or complete and save the Metadata Builder.")
+    if not output_dir_set:
+        blockers.append(
+            "Set an **Output directory**. BEHAV3D needs it before segmentation, "
+            "tracking, feature extraction, filtering, or analysis can run."
         )
-        well_note = (
-            "\n\nIf you have no physical well identifiers, I can propose **1** for "
-            "every sample after you confirm."
-            if any("well" in message.lower() for message in errors) else ""
+    blockers.extend(errors[:16])
+    if len(errors) > 16:
+        blockers.append(f"Plus {len(errors) - 16} more mandatory metadata values.")
+
+    if blockers:
+        shown = "\n".join(
+            f"{index}. {message}" for index, message in enumerate(blockers, start=1)
         )
-        return (
-            "Not yet. These mandatory metadata values are still missing:\n"
-            f"{shown}{extra}\n\nPopulation **condition** fields are optional; "
-            "population **line** fields are mandatory. A population confirmed absent "
-            "from a sample should be described as **not added** and use "
-            "**not_added** for its line rather than remain blank."
-            f"{well_note}"
-        )
+        notes = []
+        if errors:
+            notes.append(
+                "Population **condition** fields are optional; population **line** "
+                "fields are mandatory. For a population that was not added, use "
+                "**not_added** for its line rather than leaving it blank."
+            )
+        if any("well" in message.lower() for message in errors):
+            notes.append(
+                "If you have no physical well identifiers, I can propose **1** for "
+                "every sample after you confirm."
+            )
+        note_text = f"\n\n**Notes**\n{' '.join(notes)}" if notes else ""
+        return f"**Setup incomplete**\n\n**Next actions**\n{shown}{note_text}"
+
     save_available = bool((builder.get("actions") or {}).get("save_available"))
-    next_step = (
-        "The draft is ready to save; ask me to save it and you will get a confirmation "
-        "button."
-        if builder.get("save_required") and save_available
-        else "No mandatory metadata values are missing."
-    )
+    if builder.get("save_required") and save_available:
+        return (
+            "**Metadata complete**\n\n"
+            "**Next action**\nAsk me to save and activate the metadata; you will get "
+            "a confirmation button. The **Output directory** is already set."
+        )
     return (
-        f"{next_step} Population condition fields remain optional. "
-        "Saving from the Metadata Builder also activates the metadata for the other tabs."
+        "**Ready for processing**\n\n"
+        "The metadata is complete and the **Output directory** is set. Population "
+        "condition fields remain optional."
     )
 
 
@@ -1131,8 +1144,13 @@ def tracking_motion_question(context: dict, messages: list[dict]) -> str | None:
         if message.get("role") == "user"
     ), "")
     normalized = " ".join(latest.lower().split())
+    intent = str((context.get("assistant_session") or {}).get("intent") or "")
     generic_request = (
-        normalized in {"guide tracking", "tracking guide", "which method?"}
+        intent in {"guide_tracking", "compare_tracking_methods"}
+        or normalized in {
+            "guide tracking", "tracking guide", "which method?",
+            "choose tracking method", "choose a tracking method",
+        }
         or any(phrase in normalized for phrase in (
             "which tracking method", "choose a tracking method",
             "choose tracking method", "help choose", "help me choose",
@@ -1142,11 +1160,6 @@ def tracking_motion_question(context: dict, messages: list[dict]) -> str | None:
     if not generic_request:
         return None
 
-    user_history = " ".join(
-        str(message.get("content") or "").lower()
-        for message in messages
-        if message.get("role") == "user"
-    )
     motion_evidence = (
         "stationary", "static", "does not move", "doesn't move", "do not move",
         "don't move", "remain overlapping", "remains overlapping", "motile",
@@ -1158,14 +1171,18 @@ def tracking_motion_question(context: dict, messages: list[dict]) -> str | None:
         "moves quickly", "move quickly", "moves fast", "move fast",
         "touching masks", "disconnected region", "connected region",
     )
-    if any(phrase in user_history for phrase in motion_evidence):
+    # Only the current request is evidence for this tab. An earlier segmentation
+    # discussion may also mention overlap, but that must not suppress Tracking help.
+    if any(phrase in normalized for phrase in motion_evidence):
         return None
 
     cell_type = str(context.get("active_cell_type") or "the selected structure")
     return (
-        f"Before I recommend a tracking method for **{cell_type}**, how far does it "
-        "move between consecutive frames, or does it remain largely overlapping with "
-        "its previous position? A rough answer in micrometres or pixels is enough."
+        "**Tracking method: one detail needed**\n\n"
+        f"For **{cell_type}**, how far does the object move between consecutive "
+        "frames, or does it remain largely overlapping with its previous position?\n\n"
+        "**Reply with:** a rough displacement in micrometres or pixels, or simply "
+        "whether the masks still overlap."
     )
 
 
@@ -1192,23 +1209,20 @@ def segmentation_signal_question(context: dict, messages: list[dict]) -> str | N
     if not method_request:
         return None
 
-    user_history = " ".join(
-        str(message.get("content") or "").lower()
-        for message in messages
-        if message.get("role") == "user"
-    )
     signal_evidence = (
         "bleed-through", "bleed through", "clean channel", "isolated channel",
         "isolated signal", "same channel", "mixed signal", "multiple cell types",
         "more than one cell type", "both visible",
     )
-    if any(phrase in user_history for phrase in signal_evidence):
+    if any(phrase in normalized for phrase in signal_evidence):
         return None
 
     return (
-        "Before I recommend a segmentation method, for the target you want to "
-        "segment, is its signal isolated in a clean, high-resolution channel, or is "
-        "signal from another cell type visible in that same channel (bleed-through)?"
+        "**Segmentation method: one detail needed**\n\n"
+        "For the target you want to segment, is its signal isolated in a clean, "
+        "high-resolution channel, or is signal from another cell type visible in "
+        "that same channel (bleed-through)?\n\n"
+        "**Reply with:** **clean channel**, **bleed-through**, or **unsure**."
     )
 
 
@@ -3450,6 +3464,14 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "not invent a metadata, dimension-order, or file-path cause.\n"
         "- Ask at most one focused question when an answer is genuinely needed. Do not manufacture a "
         "step-by-step interview for a simple question.\n"
+        "- Make responses easy to scan. Lead with the direct answer or status. For setup, "
+        "troubleshooting, and recommendations, use short Markdown sections such as **Status**, "
+        "**Next action**, and **Why** only when they help; use numbered steps for a sequence and "
+        "bullets for alternatives. Keep paragraphs to at most three sentences, bold the one action "
+        "the researcher should take next, and do not bury that action in background detail.\n"
+        "- The live current_step is authoritative for ambiguous button labels and short follow-ups. "
+        "Never answer a Tracking method request with Segmentation methods, even if older messages or "
+        "a stale session intent refer to Segmentation.\n"
         "- Death, contact, and threshold language can refer to different modules. If the wording does not "
         "distinguish population signal over time, contact counts, contact-associated attribution, object "
         "signal classification, or contact distance, ask one short routing question. Never let the word "

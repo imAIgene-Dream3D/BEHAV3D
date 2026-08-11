@@ -25,7 +25,8 @@ from behav3d.napari._assistant_context import (
     summarize_metadata, _diff_from_defaults, validate_metadata_records,
     _metadata_builder_state, _experiment_reference_context,
     _image_dimensions_state, _current_log_state, _segmentation_state,
-    _interface_capabilities, _feature_extraction_state, build_context,
+    _interface_capabilities, _feature_extraction_state, _step_readiness,
+    build_context,
 )
 from behav3d.napari._assistant_controls import (
     CONTROL_CONTRACT_VERSION, active_cell_type, control_registry,
@@ -520,6 +521,7 @@ def test_metadata_completion_uses_mandatory_well_and_line_fields():
             ],
         },
         "metadata_builder": {"sample_forms_created": True},
+        "output_dir_set": True,
     }
     response = app.metadata_completion_summary(
         context, [{"role": "user", "content": "Is this all that is needed?"}]
@@ -528,6 +530,51 @@ def test_metadata_completion_uses_mandatory_well_and_line_fields():
     assert "mandatory T-cells line" in response
     assert "condition" in response and "optional" in response
     assert "1" in response
+
+
+def test_data_preparation_requires_metadata_and_output_directory():
+    from types import SimpleNamespace
+    import app
+
+    missing_output = {
+        "metadata": {"loaded": True, "records": [{"sample_name": "Sample01"}]},
+        "output_dir": "",
+        "output_dir_set": False,
+    }
+    readiness = _step_readiness(SimpleNamespace(), missing_output)
+    assert readiness["data_preparation"] == {
+        "ready": False,
+        "blockers": ["output directory not set"],
+    }
+
+    response = app.metadata_completion_summary(
+        {
+            **missing_output,
+            "assistant_session": {"intent": "check_data_setup"},
+        },
+        [{"role": "user", "content": "Check what's missing"}],
+    )
+    assert response.startswith("**Setup incomplete**")
+    assert "**Next actions**" in response
+    assert "**Output directory**" in response
+    assert "Ready for processing" not in response
+
+    both_missing = _step_readiness(SimpleNamespace(), {
+        "metadata": {"loaded": False, "records": []},
+        "output_dir": "",
+        "output_dir_set": False,
+    })["data_preparation"]
+    assert both_missing["ready"] is False
+    assert both_missing["blockers"] == [
+        "metadata not loaded", "output directory not set",
+    ]
+
+    ready = _step_readiness(SimpleNamespace(), {
+        "metadata": {"loaded": True, "records": [{"sample_name": "Sample01"}]},
+        "output_dir": "/tmp/behav3d-output",
+        "output_dir_set": True,
+    })["data_preparation"]
+    assert ready == {"ready": True, "blockers": []}
 
 
 def test_metadata_identifier_inferences_require_confirmation():
@@ -832,6 +879,22 @@ def test_generic_tracking_guide_asks_for_motion_before_method_context():
         [{"role": "user", "content": "Guide tracking"}],
     ) is None
 
+    stale_segmentation_turn = app.tracking_motion_question(
+        {
+            "current_step": "tracking",
+            "active_cell_type": "Tcell_HIV",
+            "assistant_session": {"intent": "compare_segmentation_methods"},
+        },
+        [
+            {"role": "user", "content": "The segmented masks overlap."},
+            {"role": "assistant", "content": "That affects segmentation."},
+            {"role": "user", "content": "Which method?"},
+        ],
+    )
+    assert stale_segmentation_turn.startswith("**Tracking method")
+    assert "consecutive frames" in stale_segmentation_turn
+    assert "segmentation" not in stale_segmentation_turn.lower()
+
 
 def test_segmentation_method_gate_requires_signal_cleanliness():
     import app
@@ -843,6 +906,7 @@ def test_segmentation_method_gate_requires_signal_cleanliness():
     question = app.segmentation_signal_question(
         context, [{"role": "user", "content": "Choose a method"}],
     )
+    assert question.startswith("**Segmentation method")
     assert "clean" in question
     assert "bleed-through" in question
     assert "same channel" in question
@@ -852,6 +916,15 @@ def test_segmentation_method_gate_requires_signal_cleanliness():
             "The target is isolated in a clean channel. Which segmentation method?"
         )}],
     ) is None
+    after_unrelated_history = app.segmentation_signal_question(
+        context,
+        [
+            {"role": "user", "content": "The tracking masks use the same channel."},
+            {"role": "assistant", "content": "Understood."},
+            {"role": "user", "content": "Choose a method"},
+        ],
+    )
+    assert after_unrelated_history.startswith("**Segmentation method")
 
 
 def test_stalled_operation_gate_requests_log_without_diagnosing():
@@ -2290,6 +2363,8 @@ def test_prompt_data_prep_reconciles_state_and_lists_tools():
     assert '"n_samples": 22' in sp
     assert '"loaded": false' in sp
     assert "Never ask for a value already present" in sp
+    assert "Make responses easy to scan" in sp
+    assert "The live current_step is authoritative" in sp
     assert "n_samples" in sp  # present only as structured live context
 
 
@@ -3582,7 +3657,7 @@ def test_feedback_guidance_fixtures():
 
     fixture = Path(__file__).parent / "fixtures" / "assistant_feedback_transcripts.json"
     cases = json.loads(fixture.read_text(encoding="utf-8"))
-    assert KNOWLEDGE_VERSION == "2026.08.11.2"
+    assert KNOWLEDGE_VERSION == "2026.08.11.3"
     for case in cases:
         cards = select_guidance_cards(
             {"current_step": case["step"]}, case["user"], case.get("intent"))

@@ -1432,6 +1432,11 @@ class AssistantDock(QWidget):
     # ------------------------------------------------------------------
     def _on_tab_changed(self, index: int):
         """Called whenever the user switches tabs in the main widget."""
+        # A guide belongs to the tab where it started. Keeping its intent after a
+        # tab switch can make a short reply such as "Which method?" inherit the
+        # previous module's guidance.
+        self._guided_flow_active = False
+        self._current_intent = "free_form"
         self.refresh_context_bar()
         self._set_quick_buttons(index)
 
@@ -1473,7 +1478,7 @@ class AssistantDock(QWidget):
             _row(_btn("Estimate EDT", self._estimate_edt))
         elif tab_index == 3:  # tracking
             _row(_btn("Guide tracking", self._start_tracking_guide),
-                 _btn("Which method?", self._explain_tracking_methods))
+                 _btn("Choose tracking method", self._explain_tracking_methods))
         elif tab_index == 4:  # feature_extraction
             _row(_btn("Guide setup", self._start_feature_guide),
                  _btn("Check prerequisites", self._check_feature_prereqs))
@@ -1546,7 +1551,7 @@ class AssistantDock(QWidget):
         self._send_intent("guide_tracking", "Guide tracking")
 
     def _explain_tracking_methods(self):
-        self._send_intent("compare_tracking_methods", "Which method?")
+        self._send_intent("compare_tracking_methods", "Choose tracking method")
 
     def _start_feature_guide(self):
         self._guided_flow_active = True

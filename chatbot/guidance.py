@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 
-KNOWLEDGE_VERSION = "2026.08.11.2"
+KNOWLEDGE_VERSION = "2026.08.11.3"
 
 
 GUIDANCE_CARDS = {
@@ -19,6 +19,9 @@ GUIDANCE_CARDS = {
         "An open builder containing an unchanged copy of loaded metadata does not need to be saved "
         "again. After an external Zarr conversion or external metadata-path edit, use Load Metadata "
         "to propagate the new paths. The in-app Zarr converter reloads all tabs automatically. "
+        "Data Preparation is complete only when valid metadata is loaded and an Output directory is "
+        "set. The Output directory is mandatory for downstream processing and must be reported as a "
+        "blocker whenever it is empty. "
         "The Metadata Builder does not map raw channel indices to cell types. Channel-input or "
         "channel-label controls belong to the selected segmentation method. For swapped-channel "
         "replicates, generic processing population slots with the true identity recorded in each "
