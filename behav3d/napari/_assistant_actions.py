@@ -868,6 +868,9 @@ def build_actions(
             act = ProposedAction("open_analysis_view", view=view)
             labels = {
                 "death_dynamics": "Death Dynamics",
+                "interaction": "Interaction Analysis",
+                "invasiveness": "Invasiveness Analysis",
+                "active_killing": "Active Killing",
                 "behavioral_state": "Behavioral State",
                 "state_trajectory": "State Trajectory",
             }
@@ -1309,6 +1312,18 @@ def apply_action(main_widget, action: ProposedAction) -> bool:
 
 
 def _apply_open_analysis_view(main_widget, view: str) -> bool:
+    if view == "active_killing":
+        if not apply_navigate(main_widget, "feature_extraction"):
+            return False
+        feature_tab = getattr(main_widget, "feature_extraction_tab", None)
+        toggle = getattr(feature_tab, "_ak_toggle_btn", None)
+        if toggle is None:
+            return False
+        try:
+            toggle.setChecked(True)
+            return bool(toggle.isChecked())
+        except Exception:
+            return False
     if not apply_navigate(main_widget, "analysis"):
         return False
     analysis = getattr(main_widget, "analysis_tab", None)
@@ -1316,8 +1331,12 @@ def _apply_open_analysis_view(main_widget, view: str) -> bool:
     if tabs is None:
         return False
     try:
-        if view == "death_dynamics":
+        if view in {"death_dynamics", "interaction", "invasiveness"}:
             tabs.setCurrentIndex(0)
+            death_tab = getattr(analysis, "death_dynamics_tab", None)
+            start = getattr(death_tab, "_on_guided_start", None)
+            if start is not None:
+                start(view)
             return True
         single = getattr(analysis, "single_cell_tab", None)
         start = getattr(single, "_on_guided_start", None) if single is not None else None
@@ -1835,8 +1854,9 @@ TOOL_SCHEMA = [
         "name": "open_analysis_view",
         "description": (
             "Open one specific Analysis view. Use this instead of navigating to the "
-            "generic Analysis tab when the user names Death Dynamics, Behavioral "
-            "State, or State Trajectory."
+            "generic Analysis tab when the user names Death Dynamics, Interaction "
+            "Analysis, Invasiveness Analysis, Active Killing, Behavioral State, or "
+            "State Trajectory. Active Killing opens its panel in Feature Extraction."
         ),
         "parameters": {
             "type": "object",
@@ -1845,6 +1865,9 @@ TOOL_SCHEMA = [
                     "type": "string",
                     "enum": [
                         "death_dynamics",
+                        "interaction",
+                        "invasiveness",
+                        "active_killing",
                         "behavioral_state",
                         "state_trajectory",
                     ],

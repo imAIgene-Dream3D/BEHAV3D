@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 
-KNOWLEDGE_VERSION = "2026.08.11.1"
+KNOWLEDGE_VERSION = "2026.08.11.2"
 
 
 GUIDANCE_CARDS = {
@@ -214,7 +214,10 @@ GUIDANCE_CARDS = {
     ),
     "active_killing": (
         "Active Killing accepts multiple selected targets in one setup. The implementation runs each "
-        "target independently and also creates a combined analysis when more than one target is selected. "
+        "target independently and also creates a pooled analysis when more than one target is selected. "
+        "When a researcher asks to compare targets, ask whether they want independent-only runs or those "
+        "independent outputs plus the pooled result. For independent-only results, configure one target per "
+        "run and ask which target to start with. "
         "Observation window counts forward from contact and must "
         "be calibrated to expected killing delay and the metadata time interval, not copied as a "
         "universal number. Dead-mask pixel count with an absolute increase threshold is the general "
@@ -225,7 +228,10 @@ GUIDANCE_CARDS = {
         "threshold from cell size and XY and Z sampling, then inspect it visually; do not reuse 20-30 "
         "pixels blindly. Absolute-threshold mode is incomplete while its value is 0. When the user "
         "accepts a proposed setup, include targets, signal, threshold mode and value, observation "
-        "window, and minimum contact duration in one proposal. Minimum contact duration must reflect "
+        "window, and minimum contact duration in one proposal. A request that at least one cell dies is "
+        "a signal-increase calibration requirement; it is never a one-timepoint minimum contact duration. "
+        "Preserve that requirement across follow-up turns and do not call the setup ready until it maps to "
+        "a positive calibrated dead-mask pixel-count threshold. Minimum contact duration must reflect "
         "imaging cadence and plausible biology. The module detects a contact-associated rise in a "
         "selected target signal; call it killing only when that signal is biologically validated as death. "
         "Derive effector and target roles from the experiment, never from population names or UI categories."

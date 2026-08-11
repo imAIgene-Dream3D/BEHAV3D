@@ -230,13 +230,16 @@ which service version they are testing.
 
 The order in `POST /chat` is intentional:
 
-1. **Deterministic actions** return calculated text and optional tool calls.
+1. **Intent clarification** catches overlapping analysis language before any
+   keyword handler can route it. Ambiguous death, contact, killing, and threshold
+   requests get one short choice between the relevant researcher-facing analyses.
+2. **Deterministic actions** return calculated text and optional tool calls.
    Examples include metadata conversions, analysis navigation, EDT/minimum-size
    calculations, tracking radius, and Active Killing settings.
-2. **Preflight guards** return one focused question or a scoped explanation when
+3. **Preflight guards** return one focused question or a scoped explanation when
    required evidence is missing. Examples include unknown channel mapping,
    segmentation signal quality, tracking motion, and missing log evidence.
-3. **Model path** retrieves guidance, builds the prompt, calls DeepSeek, and
+4. **Model path** retrieves guidance, builds the prompt, calls DeepSeek, and
    streams text plus native tool calls.
 
 Within the deterministic and preflight chains, the first non-`None` handler
@@ -245,6 +248,13 @@ with neighboring handlers. A preflight handler must require explicit task intent
 not just a topic word: mentioning an organoid line in an analysis question, for
 example, is not a metadata-building request. Put broad informational answers
 before setup clarifications when both could match.
+
+When analysis vocabularies overlap, update `_analysis_intent_route()` rather than
+adding another broad trigger to a downstream handler. Specific discriminators
+such as time course, attribution, counting, or physical distance should route
+directly; unresolved overlap should return a clarification from
+`analysis_intent_clarification()`. The downstream handler must still validate the
+live step, controls, units, and prerequisites.
 
 Keep deterministic response templates experiment-neutral. They may repeat names
 found in live metadata or an explicitly matched experiment reference, but must not
