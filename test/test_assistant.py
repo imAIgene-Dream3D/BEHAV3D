@@ -694,6 +694,106 @@ def test_analysis_choose_explains_and_named_view_opens_directly():
     assert ambiguous == []
 
 
+def test_analysis_intent_resolver_clarifies_overlapping_death_contact_requests():
+    import app
+
+    threshold = app.analysis_intent_clarification(
+        {"current_step": "feature_extraction"},
+        [{"role": "user", "content": (
+            "What threshold should I use for killing after contact?"
+        )}],
+    )
+    assert "signal increase" in threshold
+    assert "contact distance" in threshold
+
+    death = app.analysis_intent_clarification(
+        {"current_step": "metadata"},
+        [{"role": "user", "content": "I want to look at target death."}],
+    )
+    assert "Death Dynamics" in death
+    assert "Active Killing" in death
+    assert "Feature Extraction" in death
+
+    contact = app.analysis_intent_clarification(
+        {"current_step": "analysis"},
+        [{"role": "user", "content": (
+            "I want to look at contact between my populations."
+        )}],
+    )
+    assert "Interaction Analysis" in contact
+    assert "Contact-Based Grouping" in contact
+    assert "Contact State-Shift Analysis" in contact
+    assert "contact distance" in contact
+    assert app.analysis_intent_clarification(
+        {"current_step": "metadata"},
+        [{"role": "user", "content": "Which image channel is the dead channel?"}],
+    ) is None
+
+
+def test_specific_analysis_intents_do_not_trigger_contact_distance_guidance():
+    import app
+
+    messages = [{"role": "user", "content": (
+        "Set up an analysis to compare cells actively killing two targets. They die "
+        "30 minutes after initial contact and I need at least one cell to die."
+    )}]
+    assert app._analysis_intent_route(messages) == "active_killing"
+    assert app.feature_threshold_guidance(
+        {"current_step": "feature_extraction"}, messages,
+    ) is None
+    assert app._analysis_intent_route([{
+        "role": "user", "content": "How many contacts occur by condition?",
+    }]) == "interaction"
+    assert app._analysis_intent_route([{
+        "role": "user", "content": "How fast does death change over time?",
+    }]) == "death_dynamics"
+
+
+def test_analysis_clarification_selection_opens_the_specific_panel():
+    import app
+
+    interaction = app.analysis_navigation_action(
+        {"current_step": "metadata", "analysis": {}},
+        [
+            {"role": "assistant", "content": (
+                "Which contact question? Tell me which one and I will open it."
+            )},
+            {"role": "user", "content": "Interaction Analysis"},
+        ],
+    )
+    assert interaction["calls"] == [{
+        "name": "open_analysis_view",
+        "arguments": {"view": "interaction"},
+    }]
+    active = app.analysis_navigation_action(
+        {"current_step": "analysis", "analysis": {}},
+        [
+            {"role": "assistant", "content": (
+                "Which death question? Tell me which one and I will open it."
+            )},
+            {"role": "user", "content": "Active Killing"},
+        ],
+    )
+    assert active["calls"] == [{
+        "name": "open_analysis_view",
+        "arguments": {"view": "active_killing"},
+    }]
+
+
+def test_tool_overview_is_general_3d_time_lapse_guidance():
+    import app
+
+    text = app.tool_overview_guidance(
+        {"current_step": "data_preparation"},
+        [{"role": "user", "content": "How can I use this tool?"}],
+    )
+    assert "3D fluorescence time-lapse imaging" in text
+    assert "segment" in text and "track" in text and "extract" in text
+    assert "co-culture" not in text.lower()
+    assert "organoid" not in text.lower()
+    assert "immune" not in text.lower()
+
+
 def test_generic_tracking_guide_asks_for_motion_before_method_context():
     import app
 
@@ -819,6 +919,7 @@ def test_active_killing_action_is_cadence_grounded_and_explicitly_proposed():
             "features.active_killing.death_signal",
             "features.active_killing.use_absolute_threshold",
             "features.active_killing.absolute_threshold",
+            "features.active_killing.minimum_contact_duration",
         )
     ]
     result = app.active_killing_action(
@@ -857,15 +958,20 @@ def test_active_killing_action_refuses_incomplete_absolute_mode():
             "metadata": {"records": [{
                 "time_interval": 2, "time_unit": "min",
             }]},
-            "ui_state": {"controls": []},
+            "ui_state": {"controls": [{
+                "id": "features.active_killing.target_types",
+                "visible": True,
+                "enabled": True,
+                "choices": ["mdo"],
+            }]},
         },
         [{"role": "user", "content": (
-            "Configure active killing against 27t and mdo within 10 minutes."
+            "Configure active killing against mdo only within 10 minutes."
         )}],
     )
     assert result["calls"] == []
-    assert "positive minimum dead-mask pixel increase" in result["text"]
-    assert "remains 0" in result["text"]
+    assert "positive dead-mask pixel increase" in result["text"]
+    assert "contact-distance threshold" in result["text"]
 
 
 def test_active_killing_acceptance_proposes_every_agreed_field():
@@ -945,6 +1051,131 @@ def test_active_killing_readiness_rejects_zero_absolute_threshold():
     )
     assert "not ready yet" in summary
     assert "greater than 0" in summary
+
+
+def _active_killing_feedback_context():
+    controls = []
+    specs = {
+        "target_types": {"value": ["27T", "MDO"], "choices": ["27T", "MDO"]},
+        "observation_window": {"value": 5},
+        "death_signal": {"value": "Dead-mask percentage"},
+        "use_absolute_threshold": {"value": False},
+        "absolute_threshold": {"value": 0.0},
+        "minimum_contact_duration": {"value": 1},
+    }
+    for suffix, values in specs.items():
+        controls.append({
+            "id": f"features.active_killing.{suffix}",
+            "visible": True,
+            "enabled": True,
+            **values,
+        })
+    return {
+        "current_step": "feature_extraction",
+        "metadata": {"records": [{
+            "time_interval": 2,
+            "time_unit": "min",
+            "pixel_distance_xy": 1.7,
+            "pixel_distance_z": 4.0,
+        }]},
+        "ui_state": {"controls": controls},
+    }
+
+
+def test_active_killing_feedback_prompt_preserves_scope_timing_and_one_cell_rule():
+    import app
+
+    request = (
+        "Set up the analysis to compare the rate of T cells actively killing MDO "
+        "versus 27T. The targets die around 30 minutes after the initial contact, "
+        "and I want to know if at least one cell dies after contact."
+    )
+    context = _active_killing_feedback_context()
+    first = app.active_killing_action(
+        context, [{"role": "user", "content": request}],
+    )
+    assert first["calls"] == []
+    assert "independent-only" in first["text"]
+    assert "pooled" in first["text"]
+
+    messages = [
+        {"role": "user", "content": request},
+        {"role": "assistant", "content": first["text"]},
+        {"role": "user", "content": "Run them independently; start with MDO."},
+    ]
+    proposal = app.active_killing_action(context, messages)
+    values = {
+        call["arguments"]["control_id"]: call["arguments"]["value"]
+        for call in proposal["calls"]
+    }
+    assert values["features.active_killing.target_types"] == ["MDO"]
+    assert values["features.active_killing.observation_window"] == 15
+    assert values["features.active_killing.death_signal"] == "Dead-mask pixel count"
+    assert values["features.active_killing.use_absolute_threshold"] is True
+    assert values["features.active_killing.absolute_threshold"] == 45
+    assert values["features.active_killing.minimum_contact_duration"] == 1
+    assert "one-cell calibration" in proposal["text"].lower()
+    assert "does not mean that many cells die" in proposal["text"]
+    assert "independent target run" in proposal["text"]
+
+    ready_messages = messages + [
+        {"role": "assistant", "content": proposal["text"]},
+        {"role": "user", "content": "Yes, apply these settings"},
+        {"role": "assistant", "content": "The proposed actions were applied."},
+        {"role": "user", "content": "Is it ready?"},
+    ]
+    ready = app.active_killing_readiness_summary(
+        {
+            **context,
+            "feature_extraction": {"active_killing": {
+                "setup_ready": True,
+                "setup_issues": [],
+                "effector_cell_type": "T cells",
+                "target_cell_types": ["MDO"],
+                "observation_window": 15,
+                "death_signal": "Dead-mask pixel count",
+                "uses_absolute_threshold": True,
+                "absolute_threshold": 45,
+                "minimum_contact_duration": 1,
+            }},
+        },
+        ready_messages,
+    )
+    assert "**ready**" in ready
+    assert "one independent target run" in ready
+
+
+def test_active_killing_readiness_remembers_unresolved_one_cell_requirement():
+    import app
+
+    context = {
+            "current_step": "feature_extraction",
+            "feature_extraction": {"active_killing": {
+                "setup_ready": True,
+                "setup_issues": [],
+                "effector_cell_type": "T cells",
+                "target_cell_types": ["MDO"],
+                "observation_window": 15,
+                "death_signal": "Dead-mask percentage",
+                "uses_absolute_threshold": False,
+                "absolute_threshold": 0,
+                "minimum_contact_duration": 1,
+            }},
+        }
+    messages = [
+            {"role": "user", "content": (
+                "Set up Active Killing. I need at least one cell to die after contact."
+            )},
+            {"role": "assistant", "content": "I changed the observation window."},
+            {"role": "user", "content": "Is it ready?"},
+        ]
+    summary = app.active_killing_readiness_summary(context, messages)
+    assert "not ready yet" in summary
+    assert "at least one cell dies" in summary
+    assert "minimum contact" not in summary.lower()
+    deterministic = app.deterministic_turn_response(context, messages, [])
+    assert deterministic["text"] == summary
+    assert deterministic["calls"] == []
 
 
 def test_hmm_movement_guidance_lists_every_live_option_before_editing():
@@ -1976,12 +2207,18 @@ def test_build_actions_for_metadata_persistence_and_analysis_view():
         {"name": "save_metadata", "arguments": {}},
         {"name": "load_metadata", "arguments": {}},
         {"name": "open_analysis_view", "arguments": {"view": "death_dynamics"}},
+        {"name": "open_analysis_view", "arguments": {"view": "interaction"}},
+        {"name": "open_analysis_view", "arguments": {"view": "invasiveness"}},
+        {"name": "open_analysis_view", "arguments": {"view": "active_killing"}},
         {"name": "open_analysis_view", "arguments": {"view": "unknown"}},
     ], [], {})
     assert actions[0].ok and actions[0].kind == "save_metadata"
     assert actions[1].ok and actions[1].kind == "load_metadata"
     assert actions[2].ok and actions[2].data["view"] == "death_dynamics"
-    assert not actions[3].ok
+    assert actions[3].ok and actions[3].data["view"] == "interaction"
+    assert actions[4].ok and actions[4].data["view"] == "invasiveness"
+    assert actions[5].ok and actions[5].data["view"] == "active_killing"
+    assert not actions[6].ok
 
 
 def test_metadata_persistence_actions_call_existing_ui_handlers():
@@ -1999,6 +2236,45 @@ def test_metadata_persistence_actions_call_existing_ui_handlers():
     assert invoked == ["save", "load"]
     assert "saved and activated" in save.data["result_markdown"]
     assert "loading has started" in load.data["result_markdown"]
+
+
+def test_analysis_view_actions_focus_interaction_and_expand_active_killing():
+    from types import SimpleNamespace
+
+    class _Tabs:
+        def __init__(self):
+            self.index = None
+
+        def setCurrentIndex(self, value):
+            self.index = value
+
+    class _Toggle:
+        def __init__(self):
+            self.checked = False
+
+        def setChecked(self, value):
+            self.checked = bool(value)
+
+        def isChecked(self):
+            return self.checked
+
+    focused = []
+    main = SimpleNamespace(
+        tabs=_Tabs(),
+        feature_extraction_tab=SimpleNamespace(_ak_toggle_btn=_Toggle()),
+        analysis_tab=SimpleNamespace(
+            inner_tabs=_Tabs(),
+            death_dynamics_tab=SimpleNamespace(
+                _on_guided_start=lambda view: focused.append(view)
+            ),
+        ),
+    )
+    interaction = ProposedAction("open_analysis_view", view="interaction")
+    assert apply_action(main, interaction)
+    assert focused == ["interaction"]
+    active = ProposedAction("open_analysis_view", view="active_killing")
+    assert apply_action(main, active)
+    assert main.feature_extraction_tab._ak_toggle_btn.isChecked()
 
 
 def test_prompt_data_prep_reconciles_state_and_lists_tools():
@@ -3306,7 +3582,7 @@ def test_feedback_guidance_fixtures():
 
     fixture = Path(__file__).parent / "fixtures" / "assistant_feedback_transcripts.json"
     cases = json.loads(fixture.read_text(encoding="utf-8"))
-    assert KNOWLEDGE_VERSION == "2026.08.11.1"
+    assert KNOWLEDGE_VERSION == "2026.08.11.2"
     for case in cases:
         cards = select_guidance_cards(
             {"current_step": case["step"]}, case["user"], case.get("intent"))

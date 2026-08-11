@@ -190,6 +190,184 @@ def _asks_general_analysis_question(messages: list[dict]) -> bool:
     )
 
 
+def _analysis_intent_route(messages: list[dict]) -> str | None:
+    """Resolve overlapping researcher language before keyword handlers run."""
+    latest = _normalized_user_message(messages)
+    if not latest:
+        return None
+
+    has_death = bool(re.search(
+        r"\b(?:death|dead|dying|die|dies|surviv\w*|viab\w*|apoptos\w*)\b",
+        latest,
+    ))
+    has_killing = bool(re.search(
+        r"\b(?:kill\w*|cytotox\w*|lys(?:e|es|ed|ing|is)|destroy\w*|"
+        r"eliminat\w*|damag\w*|effector\w*)\b",
+        latest,
+    )) or any(phrase in latest for phrase in (
+        "get rid of", "cause death", "trigger death", "induce death",
+        "make them die", "top killers", "contact-associated",
+    ))
+    has_contact = bool(re.search(
+        r"\b(?:contact\w*|touch\w*|interact\w*|engag\w*|proximity|"
+        r"adjacent|near|bout)\b",
+        latest,
+    ))
+
+    if "active killing" in latest or "actively killing" in latest:
+        return "active_killing"
+    if "death dynamics" in latest:
+        return "death_dynamics"
+    if "interaction analysis" in latest:
+        return "interaction"
+    if "invasiveness analysis" in latest:
+        return "invasiveness"
+    if any(phrase in latest for phrase in (
+        "contact state-shift", "contact state shift", "state shift after contact",
+        "before and after contact", "before versus after contact",
+    )):
+        return "contact_state_shift"
+    if any(phrase in latest for phrase in (
+        "contact-based grouping", "contact based grouping",
+        "behave differently while touching", "behavior while touching",
+        "behaviour while touching",
+    )):
+        return "contact_grouping"
+
+    dead_threshold = has_death and any(phrase in latest for phrase in (
+        "dead-mask", "dead mask", "counts as dead", "classified as dead",
+        "decides when", "death threshold", "dead threshold", "preview dead",
+    ))
+    contact_distance = (
+        has_contact
+        and any(phrase in latest for phrase in (
+            "contact distance", "contact threshold", "distance threshold", "count as touching",
+            "counts as touching", "strict touching", "one pixel gap",
+        ))
+    ) or (
+        has_contact and "distance" in latest and any(
+            term in latest for term in ("set", "threshold", "correct", "mean")
+        )
+    )
+    asks_both_feature_thresholds = dead_threshold and has_contact and any(
+        phrase in latest for phrase in (
+            "contact and dead-mask", "contact and dead mask",
+            "contact threshold and dead", "contact distance and dead",
+        )
+    )
+    if dead_threshold and (contact_distance or asks_both_feature_thresholds):
+        return "feature_thresholds"
+    if dead_threshold:
+        return "death_threshold"
+    if contact_distance:
+        return "contact_distance"
+
+    ambiguous_killing_threshold = (
+        has_contact and has_killing and "threshold" in latest
+        and "signal" not in latest and "distance" not in latest
+        and "dead-mask" not in latest and "dead mask" not in latest
+    )
+    if ambiguous_killing_threshold:
+        return "clarify_killing_threshold"
+
+    agency = any(phrase in latest for phrase in (
+        "which cell", "which object", "which population", "do they cause",
+        "does it cause", "are they able", "can they kill", "killing capacity",
+        "killing efficiency", "killing rate", "die after contact",
+    ))
+    if (has_killing or agency) and (has_death or has_contact):
+        return "active_killing"
+
+    time_course = any(phrase in latest for phrase in (
+        "over time", "how fast", "death curve", "death rate", "dynamics",
+        "by condition", "how many die", "how many died",
+    ))
+    if has_death and time_course:
+        return "death_dynamics"
+
+    count_or_compare = bool(re.search(
+        r"\b(?:how many|number of|frequency|frequencies|compare|comparison)\b",
+        latest,
+    ))
+    if has_contact and count_or_compare:
+        return "interaction"
+
+    if has_death:
+        return "clarify_death"
+    if has_contact:
+        return "clarify_contact"
+    if (
+        bool(re.search(r"\b(?:feature\w*|extract\w*|readout\w*)\b", latest))
+        and any(term in latest for term in ("which", "what", "measure", "get"))
+    ):
+        return "feature_extraction"
+    return None
+
+
+def analysis_intent_clarification(
+    context: dict, messages: list[dict],
+) -> str | None:
+    """Ask one routing question when overlapping analysis terms are unresolved."""
+    latest = _normalized_user_message(messages)
+    route = _analysis_intent_route(messages)
+    if route == "clarify_killing_threshold":
+        return (
+            "Two different thresholds could apply here. Do you mean the **signal "
+            "increase that counts as a killing event** in Active Killing, or the "
+            "**contact distance that decides when two objects count as touching** in "
+            "Feature Extraction? Tell me which one and I will open the right panel."
+        )
+    if route == "clarify_death":
+        if not any(phrase in latest for phrase in (
+            "want to look", "want to analyze", "want to analyse", "interested in",
+            "which analysis", "what analysis", "study death", "investigate death",
+        )):
+            return None
+        return (
+            "There are three possible questions here. Do you want **how the fraction "
+            "of signal-positive objects changes over the movie** (Death Dynamics), "
+            "**which individual contacting objects are associated with a target's "
+            "signal rise** (Active Killing), or **the threshold that decides when an "
+            "object counts as signal-positive** (Feature Extraction)? Tell me which "
+            "one and I will open it."
+        )
+    if route == "clarify_contact":
+        if not any(phrase in latest for phrase in (
+            "want to look", "want to analyze", "want to analyse", "interested in",
+            "which analysis", "what analysis", "study contact", "investigate contact",
+        )):
+            return None
+        return (
+            "Which contact question do you want to answer: **how many contacts occur "
+            "and how groups compare** (Interaction Analysis), **whether behavior "
+            "differs while touching** (Contact-Based Grouping), **whether behavior "
+            "changes before versus after contact** (Contact State-Shift Analysis), or "
+            "**the contact distance at which objects count as touching** (Feature Extraction)? "
+            "Tell me which one and I will open it."
+        )
+    return None
+
+
+def tool_overview_guidance(context: dict, messages: list[dict]) -> str | None:
+    """Describe BEHAV3D broadly without assuming a particular biological assay."""
+    latest = _normalized_user_message(messages)
+    if not any(phrase in latest for phrase in (
+        "how can i use this tool", "how do i use this tool",
+        "what is behav3d", "what does behav3d do", "what can this tool do",
+    )):
+        return None
+    return (
+        "BEHAV3D analyzes **3D fluorescence time-lapse imaging** at object and "
+        "population level. The workflow is: describe samples and acquisition "
+        "metadata, segment the structures or signals you need, track them through "
+        "time, extract measurements such as movement, morphology, intensity, death "
+        "signal, and contact, filter tracks, then run analyses matched to the "
+        "research question. Tell me what objects or signals are visible and what you "
+        "want to measure; I can explain the relevant path and propose values in the "
+        "live controls for your confirmation."
+    )
+
+
 def metadata_taxonomy_guidance(context: dict, messages: list[dict]) -> str | None:
     """Explain image populations, biological labels, and multicolor neutrally."""
     latest = _normalized_user_message(messages)
@@ -651,19 +829,51 @@ def analysis_choice_summary(context: dict, messages: list[dict]) -> str | None:
 def analysis_navigation_action(context: dict, messages: list[dict]) -> dict | None:
     """Open a named Analysis view directly and avoid generic-tab navigation loops."""
     latest = " ".join(_latest_user_message(messages).lower().split())
+    previous = _previous_assistant_message(messages).lower()
+    answering_clarification = (
+        "tell me which" in previous
+        and len(latest.split()) <= 14
+    )
+    asks_to_open = answering_clarification or any(
+        command in latest for command in (
+            "take me", "go to", "open", "navigate", "show me",
+        )
+    )
+    if not asks_to_open:
+        return None
+
     requested = None
     for phrases, view, label in (
         (("death dynamics",), "death_dynamics", "Death Dynamics"),
+        (("interaction analysis", "contact counts", "contact comparison"),
+         "interaction", "Interaction Analysis"),
+        (("invasiveness analysis",), "invasiveness", "Invasiveness Analysis"),
+        (("active killing", "signal increase that counts as a killing event"),
+         "active_killing", "Active Killing"),
         (("behavioral state", "behavioural state"), "behavioral_state", "Behavioral State"),
         (("state trajectory", "trajectory analysis"), "state_trajectory", "State Trajectory"),
+        (("contact-based grouping", "contact based grouping", "behavior differs while touching",
+          "behaviour differs while touching"), "state_trajectory", "State Trajectory"),
+        (("contact state-shift", "contact state shift", "before versus after contact"),
+         "state_trajectory", "State Trajectory"),
     ):
-        if any(phrase in latest for phrase in phrases) and any(
-            command in latest for command in (
-                "take me", "go to", "open", "navigate", "show me",
-            )
-        ):
+        if any(phrase in latest for phrase in phrases):
             requested = (view, label)
             break
+    feature_request = any(phrase in latest for phrase in (
+        "feature extraction", "contact distance", "distance at which",
+        "threshold that decides", "object counts as signal-positive",
+    ))
+    if requested is None and feature_request:
+        if context.get("current_step") == "feature_extraction":
+            return {"text": "You are already in **Feature Extraction**.", "calls": []}
+        return {
+            "text": "Opening **Feature Extraction**.",
+            "calls": [{
+                "name": "navigate_to_step",
+                "arguments": {"step": "feature_extraction"},
+            }],
+        }
     if requested is None:
         return None
     view, label = requested
@@ -1465,15 +1675,9 @@ def feature_threshold_guidance(
     if context.get("current_step") != "feature_extraction":
         return None
     latest = " ".join(_latest_user_message(messages).lower().split())
-    contact_request = "contact" in latest and any(term in latest for term in (
-        "distance", "threshold", "set", "correct", "mean", "1.01", "touch",
-    ))
-    death_request = any(term in latest for term in ("dead", "death")) and any(
-        term in latest for term in (
-            "threshold", "percentage", "percent", "set", "correct", "preview",
-            "first time", "calibrat",
-        )
-    )
+    route = _analysis_intent_route(messages)
+    contact_request = route in {"contact_distance", "feature_thresholds"}
+    death_request = route in {"death_threshold", "feature_thresholds"}
     if not contact_request and not death_request:
         return None
 
@@ -2393,6 +2597,134 @@ def _number_from_proposal(text: str, patterns: tuple[str, ...]) -> float | None:
     return None
 
 
+def _active_killing_anchor(messages: list[dict]) -> int | None:
+    """Locate the start of the latest explicit Active Killing setup thread."""
+    candidates = []
+    explicit_setups = []
+    for index, message in enumerate(messages):
+        if message.get("role") != "user":
+            continue
+        text = str(message.get("content") or "")
+        if _analysis_intent_route([{"role": "user", "content": text}]) == "active_killing":
+            candidates.append(index)
+            lowered = text.lower()
+            if any(term in lowered for term in (
+                "set up", "setup", "configure", "start a new active killing",
+            )):
+                explicit_setups.append(index)
+    if not candidates:
+        return None
+    return explicit_setups[-1] if explicit_setups else candidates[0]
+
+
+def _active_killing_user_text(messages: list[dict]) -> str:
+    """Keep user constraints from the latest Active Killing setup thread."""
+    anchor = _active_killing_anchor(messages)
+    if anchor is None:
+        return ""
+    return "\n".join(
+        str(message.get("content") or "")
+        for message in messages[anchor:]
+        if message.get("role") == "user"
+    )
+
+
+def _active_killing_interval_minutes(context: dict) -> tuple[float, str] | None:
+    records = (context.get("metadata", {}) or {}).get("records", []) or []
+    intervals = []
+    for record in records:
+        try:
+            value = float(record["time_interval"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        unit = str(record.get("time_unit") or "").strip().lower()
+        if unit.startswith("s"):
+            minutes = value / 60
+        elif unit.startswith("m"):
+            minutes = value
+        elif unit.startswith("h"):
+            minutes = value * 60
+        else:
+            continue
+        intervals.append((round(minutes, 12), value, record.get("time_unit") or ""))
+    unique = {item[0] for item in intervals}
+    if len(intervals) != len(records) or len(unique) != 1:
+        return None
+    _, original, unit = intervals[0]
+    return float(unique.pop()), f"{original:g} {unit}".strip()
+
+
+def _active_killing_duration_minutes(text: str) -> float | None:
+    patterns = (
+        r"\bwithin\s+(\d+(?:\.\d+)?)\s+minutes?\b",
+        r"\b(?:around|about|approximately|roughly)?\s*(\d+(?:\.\d+)?)\s+"
+        r"minutes?\s+after\s+(?:the\s+)?(?:initial\s+)?contact\b",
+        r"\bdie\w*\s+(?:around|about|approximately|roughly)?\s*"
+        r"(\d+(?:\.\d+)?)\s+minutes?\s+after\b",
+    )
+    return _number_from_proposal(text, patterns)
+
+
+def _one_cell_death_requirement(text: str) -> bool:
+    return bool(re.search(
+        r"\bat least\s+(?:1|one)\s+(?:cell|object)\w*\s+"
+        r"(?:to\s+)?(?:dies?|dead|dying)\b",
+        text,
+        re.IGNORECASE,
+    ))
+
+
+def _one_cell_threshold_estimate(
+    context: dict, text: str,
+) -> tuple[int, str] | None:
+    """Estimate one full stained cell in image pixels/voxels from live spacing."""
+    diameter = _number_from_proposal(text, (
+        r"(\d+(?:\.\d+)?)\s*(?:µm|um|micromet(?:er|re)s?)\s+"
+        r"(?:cell|object)\s+diameter",
+        r"(?:cell|object)\s+diameter[^\d]{0,20}(\d+(?:\.\d+)?)\s*"
+        r"(?:µm|um|micromet(?:er|re)s?)",
+    )) or 10.0
+    records = (context.get("metadata", {}) or {}).get("records", []) or []
+    xy_values = set()
+    z_values = set()
+    valid_xy = 0
+    valid_z = 0
+    for record in records:
+        try:
+            xy = float(record.get("pixel_distance_xy"))
+        except (TypeError, ValueError):
+            xy = 0
+        try:
+            z = float(record.get("pixel_distance_z"))
+        except (TypeError, ValueError):
+            z = 0
+        if xy > 0:
+            xy_values.add(round(xy, 9))
+            valid_xy += 1
+        if z > 0:
+            z_values.add(round(z, 9))
+            valid_z += 1
+    if valid_xy != len(records) or len(xy_values) != 1:
+        return None
+    if valid_z not in {0, len(records)}:
+        return None
+    xy = next(iter(xy_values))
+    if len(z_values) == 1:
+        z = next(iter(z_values))
+        count = max(1, int(round((math.pi / 6.0 * diameter ** 3) / (xy ** 2 * z))))
+        basis = (
+            f"a {diameter:g} µm spherical cell at {xy:g} µm XY and {z:g} µm Z "
+            "sampling"
+        )
+    else:
+        count = max(1, int(round(math.pi * (diameter / 2.0) ** 2 / xy ** 2)))
+        basis = (
+            f"a {diameter:g} µm cell cross-section at {xy:g} µm per XY pixel; "
+            "Z spacing is unavailable, so this is a 2D estimate"
+        )
+    return count, basis
+
+
 def active_killing_confirmation_action(
     context: dict, messages: list[dict],
 ) -> dict | None:
@@ -2403,9 +2735,11 @@ def active_killing_confirmation_action(
     if not any(phrase in latest for phrase in (
         "settings seem ok", "settings seem okay", "looks good", "apply them",
         "apply these", "use those settings", "use these settings",
-        "yes set it up", "yes, set it up",
+        "yes set it up", "yes, set it up", "yes please", "proceed",
+        "go ahead",
     )):
-        return None
+        if latest not in {"yes", "ok", "okay"}:
+            return None
     previous = _previous_assistant_message(messages)
     if "active killing" not in previous.lower():
         return None
@@ -2423,12 +2757,26 @@ def active_killing_confirmation_action(
     previous_lower = previous.lower()
     target_control = by_suffix["target_types"]
     if target_control is not None:
-        selected_targets = [
-            str(choice) for choice in (target_control.get("choices") or [])
-            if re.search(
-                rf"\b{re.escape(str(choice).lower())}\b", previous_lower
-            )
-        ]
+        marked_target = re.search(
+            r"target for this run:\s*\*\*([^*]+)\*\*",
+            previous,
+            re.IGNORECASE,
+        )
+        if marked_target:
+            marked = marked_target.group(1).strip().lower()
+            selected_targets = [
+                str(choice) for choice in (target_control.get("choices") or [])
+                if re.search(
+                    rf"(?<!\w){re.escape(str(choice).lower())}(?!\w)", marked
+                )
+            ]
+        else:
+            selected_targets = [
+                str(choice) for choice in (target_control.get("choices") or [])
+                if re.search(
+                    rf"\b{re.escape(str(choice).lower())}\b", previous_lower
+                )
+            ]
         if selected_targets:
             expected["target_types"] = selected_targets
 
@@ -2493,12 +2841,18 @@ def active_killing_confirmation_action(
         target_control.get("value") if target_control else []
     )
     target_text = ", ".join(str(value) for value in targets) or "the selected targets"
+    scope_text = (
+        "This is one independent target run; configure the other target in a "
+        "separate run if you want to avoid a pooled result."
+        if len(targets) == 1 else
+        "Selecting multiple targets produces each independent target output and an "
+        "additional pooled analysis."
+    )
     return {
         "text": (
             "I am proposing the complete agreed Active Killing setup in one batch, "
             f"for effector cells against **{target_text}**. BEHAV3D will run each "
-            "selected target independently and also create a combined analysis when "
-            "more than one target is selected. The setup is not ready until every "
+            f"selected target independently. {scope_text} The setup is not ready until every "
             "action card below has been applied; after that the live readiness state "
             "will confirm it."
         ),
@@ -2525,6 +2879,45 @@ def active_killing_readiness_summary(
         or {}
     )
     issues = list(state.get("setup_issues") or [])
+    setup_text = _active_killing_user_text(messages)
+    if _one_cell_death_requirement(setup_text):
+        anchor = _active_killing_anchor(messages) or 0
+        assistant_text = " ".join(
+            str(message.get("content") or "").lower()
+            for message in messages[anchor:]
+            if message.get("role") == "assistant"
+        )
+        explicit_user_threshold = bool(re.search(
+            r"absolute (?:signal-increase )?threshold[^\d]{0,30}"
+            r"\d+(?:\.\d+)?\s*(?:dead[- ]mask |dead )?(?:pixels|voxels)",
+            setup_text,
+            re.IGNORECASE,
+        ))
+        calibrated = "one-cell calibration" in assistant_text or explicit_user_threshold
+        try:
+            positive_threshold = float(state.get("absolute_threshold") or 0) > 0
+        except (TypeError, ValueError):
+            positive_threshold = False
+        if not (
+            calibrated
+            and state.get("uses_absolute_threshold")
+            and str(state.get("death_signal") or "").lower() == "dead-mask pixel count"
+            and positive_threshold
+        ):
+            issues.append(
+                "The requirement that at least one cell dies has not yet been "
+                "translated into a calibrated positive dead-mask pixel increase."
+            )
+    if (
+        any(phrase in setup_text.lower() for phrase in (
+            "independently", "separately", "no combined", "without combined",
+        ))
+        and len(state.get("target_cell_types") or []) > 1
+    ):
+        issues.append(
+            "Independent-only comparison requires one target per run; multiple "
+            "selected targets would also create a pooled analysis."
+        )
     if issues:
         return (
             "Active Killing is **not ready yet**. "
@@ -2533,91 +2926,199 @@ def active_killing_readiness_summary(
             "contain every required value."
         )
     targets = ", ".join(state.get("target_cell_types") or []) or "none"
+    observation = state.get("observation_window")
+    observation_unit = "timepoint" if observation == 1 else "timepoints"
+    minimum_contact = state.get("minimum_contact_duration")
+    contact_unit = "timepoint" if minimum_contact == 1 else "timepoints"
     return (
         "Active Killing is **ready** in the live controls: effector "
         f"**{state.get('effector_cell_type')}**, targets **{targets}**, observation "
-        f"window **{state.get('observation_window')} timepoints**, and minimum "
-        f"contact **{state.get('minimum_contact_duration')} timepoints**. "
-        "When multiple targets are selected, BEHAV3D produces independent target "
-        "analyses and a combined analysis."
+        f"window **{observation} {observation_unit}**, and minimum "
+        f"contact **{minimum_contact} {contact_unit}**. "
+        + (
+            "This is one independent target run."
+            if len(state.get("target_cell_types") or []) == 1 else
+            "Multiple targets will produce independent outputs plus an additional "
+            "pooled analysis."
+        )
     )
 
 
 def active_killing_action(context: dict, messages: list[dict]) -> dict | None:
-    """Build the standard Active Killing proposal from target and cadence."""
+    """Build an Active Killing proposal from natural setup language and history."""
+    latest = _latest_user_message(messages)
+    latest_lower = " ".join(latest.lower().split())
+    if any(phrase in latest_lower for phrase in (
+        "is it set", "is it ready", "ready now", "setup complete",
+    )):
+        return None
+    setup_text = _active_killing_user_text(messages)
+    if not setup_text:
+        return None
+    setup_lower = setup_text.lower()
+    setup_request = any(term in setup_lower for term in (
+        "set up", "setup", "configure", "compare", "find out", "analyse",
+        "analyze", "active killing",
+    ))
     if context.get("current_step") != "feature_extraction":
-        return None
-    latest = next((
-        str(message.get("content") or "")
-        for message in reversed(messages)
-        if message.get("role") == "user"
-    ), "")
-    text = latest.lower()
-    if "configure active killing" not in text:
-        return None
-    target_match = re.search(
-        r"\bagainst\s+([a-z0-9_ ,&/-]+?)(?:\s+only)?(?:[.;]|\s+within\b)",
-        text,
-    )
-    window_match = re.search(r"\bwithin\s+(\d+(?:\.\d+)?)\s+minutes?\b", text)
-    if target_match is None or window_match is None:
-        return None
-    target_text = target_match.group(1).strip()
-    duration_minutes = float(window_match.group(1))
+        if not setup_request:
+            return None
+        return {
+            "text": (
+                "Opening **Active Killing** in Feature Extraction, where its "
+                "contact-associated signal settings are configured."
+            ),
+            "calls": [{
+                "name": "open_analysis_view",
+                "arguments": {"view": "active_killing"},
+            }],
+        }
 
-    records = (context.get("metadata", {}) or {}).get("records", []) or []
-    record = records[0] if records else {}
-    try:
-        interval = float(record["time_interval"])
-    except (KeyError, TypeError, ValueError):
-        return None
-    unit = str(record.get("time_unit") or "").strip().lower()
-    if unit.startswith("s"):
-        interval_minutes = interval / 60
-    elif unit.startswith("m"):
-        interval_minutes = interval
-    elif unit.startswith("h"):
-        interval_minutes = interval * 60
-    else:
-        return None
-    window = duration_minutes / interval_minutes
-    if abs(window - round(window)) > 1e-9:
-        return None
-    window = int(round(window))
-
-    controls = (context.get("ui_state", {}) or {}).get("controls", []) or []
-    by_id = {
-        str(control.get("id") or ""): control
-        for control in controls
-        if control.get("visible", True) and control.get("enabled", True)
-    }
-    target_control = by_id.get("features.active_killing.target_types", {})
+    by_id = _visible_control_map(context)
+    target_control = by_id.get("features.active_killing.target_types")
+    if target_control is None:
+        return {
+            "text": (
+                "Opening the **Active Killing** panel so I can read and edit its "
+                "live controls."
+            ),
+            "calls": [{
+                "name": "open_analysis_view",
+                "arguments": {"view": "active_killing"},
+            }],
+        }
     target_choices = [str(value) for value in (target_control.get("choices") or [])]
     targets = [
         choice for choice in target_choices
-        if re.search(rf"\b{re.escape(choice.lower())}\b", target_text)
+        if re.search(rf"(?<!\w){re.escape(choice.lower())}(?!\w)", setup_lower)
     ]
+    if not targets and not target_choices:
+        target_match = re.search(
+            r"\bagainst\s+([a-z0-9_ ,&/-]+?)(?:\s+only\b|[.;]|\s+within\b)",
+            setup_lower,
+        )
+        if target_match:
+            targets = [
+                value.strip()
+                for value in re.split(
+                    r"\s*(?:,|&|\band\b)\s*", target_match.group(1)
+                )
+                if value.strip()
+            ]
     if not targets:
-        targets = [
-            value.strip()
-            for value in re.split(r"\s*(?:,|&|\band\b)\s*", target_text)
-            if value.strip()
-        ]
-    absolute_threshold = _number_from_proposal(latest, (
-        r"absolute (?:signal-increase )?threshold[^\d]{0,30}"
-        r"(\d+(?:\.\d+)?)\s*(?:dead[- ]mask |dead )?(?:pixels|voxels)",
-    ))
-    if absolute_threshold is None or absolute_threshold <= 0:
         return {
             "text": (
-                f"The timing converts to **{window} timepoints** at {interval:g} "
-                f"{record.get('time_unit') or ''} per frame. Before I propose the "
-                "complete Active Killing setup, I still need one value: the positive "
-                "minimum dead-mask pixel increase for the absolute threshold. I will "
-                "not enable absolute-threshold mode while that value remains 0."
+                "Which contacted target population should this Active Killing run "
+                "evaluate? Choose one of the target names shown in the live panel."
             ),
             "calls": [],
         }
+
+    independent_only = any(phrase in setup_lower for phrase in (
+        "independently", "separately", "no combined", "without combined",
+        "independent only", "independent-only",
+    ))
+    include_pooled = any(phrase in setup_lower for phrase in (
+        "include combined", "include the combined", "include pooled",
+        "include the pooled", "combined too", "pooled too", "as well as combined",
+    ))
+    if len(targets) > 1 and not independent_only and not include_pooled:
+        return {
+            "text": (
+                f"I found multiple targets: **{', '.join(targets)}**. Do you want "
+                "**one target per run for independent-only results**, or should I "
+                "select them together to produce each independent output **plus an "
+                "additional pooled analysis**?"
+            ),
+            "calls": [],
+        }
+    if len(targets) > 1 and independent_only:
+        latest_targets = [
+            choice for choice in targets
+            if re.search(rf"(?<!\w){re.escape(choice.lower())}(?!\w)", latest_lower)
+        ]
+        if len(latest_targets) != 1:
+            return {
+                "text": (
+                    "I will keep the runs independent. Which target should I "
+                    f"configure first: **{'** or **'.join(targets)}**?"
+                ),
+                "calls": [],
+            }
+        targets = latest_targets
+
+    duration_minutes = _active_killing_duration_minutes(setup_text)
+    if duration_minutes is None:
+        return {
+            "text": (
+                "How long after contact should the target's signal be checked? Give "
+                "the expected delay in minutes; I will convert it using the loaded "
+                "frame interval."
+            ),
+            "calls": [],
+        }
+    interval_info = _active_killing_interval_minutes(context)
+    if interval_info is None:
+        return {
+            "text": (
+                "I cannot convert that delay reliably because the loaded samples do "
+                "not have one consistent, valid time interval and unit. Confirm the "
+                "acquisition cadence before I change the observation window."
+            ),
+            "calls": [],
+        }
+    interval_minutes, interval_label = interval_info
+    exact_window = duration_minutes / interval_minutes
+    window = max(1, int(math.ceil(exact_window - 1e-12)))
+
+    absolute_threshold = _number_from_proposal(setup_text, (
+        r"absolute (?:signal-increase )?threshold[^\d]{0,30}"
+        r"(\d+(?:\.\d+)?)\s*(?:dead[- ]mask |dead )?(?:pixels|voxels)",
+        r"minimum (?:dead[- ]mask )?(?:pixel|voxel) increase[^\d]{0,20}"
+        r"(\d+(?:\.\d+)?)",
+    ))
+    calibration_text = ""
+    if absolute_threshold is None and _one_cell_death_requirement(setup_text):
+        estimate = _one_cell_threshold_estimate(context, setup_text)
+        if estimate is None:
+            return {
+                "text": (
+                    "Your requirement that at least one cell dies belongs to the "
+                    "Active Killing **signal-increase threshold**, not Minimum contact "
+                    "duration. I need one consistent XY pixel size, and preferably Z "
+                    "spacing, to translate a cell-sized death signal into pixels."
+                ),
+                "calls": [],
+            }
+        absolute_threshold, basis = estimate
+        calibration_text = (
+            f" **One-cell calibration:** using {basis}, one fully stained cell is "
+            f"approximately **{absolute_threshold:g} dead-mask pixels/voxels**. This "
+            "is a starting estimate and must be checked against a trusted death-mask "
+            "preview because partial staining changes the count."
+        )
+    if absolute_threshold is None or absolute_threshold <= 0:
+        return {
+            "text": (
+                f"The {duration_minutes:g}-minute delay converts to **{window} "
+                f"timepoints** at {interval_label} per frame. I still need the "
+                "positive dead-mask pixel increase that should count as a killing "
+                "event; it is separate from the contact-distance threshold."
+            ),
+            "calls": [],
+        }
+
+    minimum_contact = _number_from_proposal(setup_text, (
+        r"(?:minimum|min\.?|at least)\s+contact(?: duration)?[^\d]{0,25}"
+        r"(\d+(?:\.\d+)?)\s*(?:timepoints?|frames?|tp)\b",
+    ))
+    if minimum_contact is None:
+        contact_control = by_id.get("features.active_killing.minimum_contact_duration")
+        minimum_contact = (
+            contact_control.get("value") if contact_control is not None else 1
+        )
+    minimum_contact = max(1, int(round(float(minimum_contact or 1))))
+
     expected = {
         "features.active_killing.target_types": targets,
         "features.active_killing.observation_window": window,
@@ -2625,17 +3126,39 @@ def active_killing_action(context: dict, messages: list[dict]) -> dict | None:
         "features.active_killing.use_absolute_threshold": True,
         "features.active_killing.absolute_threshold": absolute_threshold,
     }
+    if "features.active_killing.minimum_contact_duration" in by_id:
+        expected["features.active_killing.minimum_contact_duration"] = minimum_contact
     if not set(expected).issubset(by_id):
         return None
+    rounding_text = ""
+    if abs(exact_window - round(exact_window)) > 1e-9:
+        rounding_text = (
+            f" I rounded up from {exact_window:.2f} frames so the window does not end "
+            "before the stated delay."
+        )
+    scope_text = (
+        "This configures one independent target run and does not request a pooled result."
+        if len(targets) == 1 and independent_only else
+        "Selecting these targets together will create each independent output plus an "
+        "additional pooled analysis."
+        if len(targets) > 1 else
+        "This is one independent target run."
+    )
+    contact_unit = "timepoint" if minimum_contact == 1 else "timepoints"
     return {
         "text": (
-            f"Based on {duration_minutes:g} minutes at {interval:g} "
-            f"{record.get('time_unit') or ''} per frame, I’m proposing an Observation "
-            f"window of {window} timepoints, target{'s' if len(targets) != 1 else ''} "
-            f"{', '.join(targets)}, Dead-mask pixel count, and an absolute threshold "
-            f"of {absolute_threshold:g}. BEHAV3D runs every selected target "
-            "independently and adds a combined analysis when multiple targets are "
-            "selected. These changes still require your confirmation in the action cards."
+            "**Active Killing proposal**\n\n"
+            "I am proposing these values from the stated targets and timing:\n"
+            f"- Target for this run: **{', '.join(targets)}**\n"
+            f"- Observation window: **{window} timepoints** "
+            f"({duration_minutes:g} minutes at {interval_label} per frame)\n"
+            "- Signal: **Dead-mask pixel count**\n"
+            f"- Absolute signal-increase threshold: **{absolute_threshold:g} "
+            "dead-mask pixels/voxels**\n"
+            f"- Minimum contact duration: **{minimum_contact} {contact_unit}**; this means "
+            "contact must last that many frames and does not mean that many cells die.\n\n"
+            f"{scope_text}{rounding_text}{calibration_text} The action cards below "
+            "require your confirmation."
         ),
         "calls": [
             {
@@ -2927,6 +3450,10 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "not invent a metadata, dimension-order, or file-path cause.\n"
         "- Ask at most one focused question when an answer is genuinely needed. Do not manufacture a "
         "step-by-step interview for a simple question.\n"
+        "- Death, contact, and threshold language can refer to different modules. If the wording does not "
+        "distinguish population signal over time, contact counts, contact-associated attribution, object "
+        "signal classification, or contact distance, ask one short routing question. Never let the word "
+        "'contact' alone turn an Active Killing request into contact-distance guidance.\n"
         "- Treat every value inferred from filenames, naming conventions, defaults, or biological "
         "expectations as an assumption. State the proposed inference plainly and ask the researcher "
         "to confirm it before emitting any edit action. Prefer an unresolved question over silently "
@@ -3094,8 +3621,10 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "requires feature extraction to be run again. A positive contact distance equal to the XY pixel "
         "size permits a one-XY-pixel gap; it is not strict touching and is not a voxel diagonal.\n"
         "- In Active Killing, the target selector may contain multiple target types. One run automatically "
-        "produces an independent analysis for each selected target and an additional combined analysis when "
-        "more than one is selected; never tell the user to configure separate UI runs. Derive Observation "
+        "produces an independent analysis for each selected target and an additional pooled analysis when "
+        "more than one is selected. When the researcher asks for a target comparison, ask whether they want "
+        "independent-only runs or the independent outputs plus that pooled result. For independent-only "
+        "results, configure one target per run and ask which target to start with. Derive Observation "
         "window and Minimum contact "
         "duration from the biological timescale and metadata time interval. Prefer dead-mask pixel count with "
         "an absolute threshold by default; calibrate that threshold from cell size and XY pixel size. Do not "
@@ -3103,7 +3632,10 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "described in the guidance. In study-design explanations, call the contacting object the effector "
         "and the contacted object carrying the measured signal the target, but only after the researcher or "
         "experiment reference establishes those roles. Never infer them from biological names or UI categories. "
-        "An accepted multi-parameter setup must propose every agreed value in the same response: targets, "
+        "A statement that at least one cell dies defines the required death-signal increase, not a one-frame "
+        "Minimum contact duration. Preserve it across follow-up turns and calibrate a dead-mask pixel-count "
+        "threshold from cell size and live XY/Z sampling before calling the setup ready. An accepted "
+        "multi-parameter setup must propose every agreed value in the same response: targets, "
         "death signal, threshold mode and value, observation window, and minimum contact duration. Never "
         "apply only the mode checkbox while leaving an agreed absolute threshold at 0. The dependent "
         "threshold controls remain editable when inactive; read their active flag rather than omitting them. "
@@ -3325,6 +3857,9 @@ def deterministic_turn_response(
     context: dict, messages: list[dict], tools: list[dict],
 ) -> dict | None:
     """Resolve feedback-critical turns before invoking the language model."""
+    clarification = analysis_intent_clarification(context, messages)
+    if clarification:
+        return {"text": clarification, "calls": []}
     deterministic_action = (
         metadata_absence_action(context, messages)
         or metadata_persistence_action(context, messages)
@@ -3348,7 +3883,8 @@ def deterministic_turn_response(
         return deterministic_action
 
     preflight_question = (
-        metadata_taxonomy_guidance(context, messages)
+        tool_overview_guidance(context, messages)
+        or metadata_taxonomy_guidance(context, messages)
         or metadata_channel_mapping_guidance(context, messages)
         or result_opening_correction(context, messages)
         or analysis_choice_summary(context, messages)

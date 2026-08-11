@@ -125,13 +125,14 @@
     "required": [
       "multiple selected targets",
       "runs each target independently",
-      "combined analysis",
+      "pooled analysis",
       "metadata time interval",
       "dead-mask pixel count",
       "absolute increase threshold",
       "incomplete while its value is 0",
       "do not reuse 20-30 pixels blindly",
-      "minimum contact duration"
+      "minimum contact duration",
+      "at least one cell dies"
     ]
   },
   {
