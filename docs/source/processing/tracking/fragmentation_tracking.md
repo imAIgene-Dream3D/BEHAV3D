@@ -1,4 +1,4 @@
-# 🌊 Fragmentation tracking
+# 🧩 Fragmentation tracking
 
 Fragmentation tracking is **not** a centroid-distance method. For each consecutive pair of frames `t → t+1` it propagates the labels of frame `t` into frame `t+1` segmentation mask (watershed-based overlap tracking).
 
@@ -23,6 +23,13 @@ The napari plugin **does not expose any tunable parameters** for fragmentation t
 By **default**, all organoid cell types are tracked as one cohort. The Tracking tab shows a single combined **🟣 All Organoids** sub-tab (locked to fragmentation tracking) with the checkbox already enabled:
 
 > ☑ Track all organoids together
+
+```{admonition} When to set it
+:class: important
+
+- **Leave it ON (default)** to track all organoid types in **one merged watershed with a single, shared set of track IDs** — the combined `all_organoids` output. Per-type tracked files are still written from that same run (split out of the combined result), so each type can still be analysed on its own.
+- **Turn it OFF** to track each organoid type **separately** — its own pass, its own independent IDs, and each sub-tab free to pick a **different tracking method**. (The combined tab is locked to Fragmentation Tracking; separate runs share neither a watershed nor an ID space.)
+```
 
 When checked, fragmentation tracking runs **once on merged organoid masks** so track IDs are assigned in a single shared scene. This is useful when:
 

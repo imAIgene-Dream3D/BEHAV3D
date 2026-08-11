@@ -58,7 +58,7 @@ Export the result as a TIFF time-series (or a zarr) and point the metadata colum
 
 ## After importing
 
-Once each row shows ✅ Ready for tracking, the Visualization tab can load these segments as Labels layers, and the Tracking tab can run on them just like segmentations produced by APOC / ConvPaint / Pixel Classifier / Cellpose.
+Once each row shows ✅ Ready for tracking, the Visualization tab can load these segments as Labels layers, and the Tracking tab can run on them just like segmentations produced by APOC / ConvPaint / Pixel Classifier / Cellpose / Cellpose-SAM.
 
 ## Tips
 
