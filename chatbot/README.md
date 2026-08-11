@@ -202,8 +202,11 @@ For experiment interpretation, use this precedence:
 3. saved YAML configuration for intended settings;
 4. discovered result files for evidence that a step actually ran.
 
-A saved configuration is not execution evidence. Historical reference profiles
-are examples only and must never generate an edit action by themselves.
+A saved configuration is not execution evidence. A biological name is never a
+method or value selector. Default guidance is expressed in measurable properties
+such as object size, overlap, one-frame displacement, topology, cadence, and signal
+persistence. Dataset-specific notes are used only when they are present in the live
+experiment reference for the current dataset.
 
 ### Guidance and RAG
 
@@ -227,13 +230,16 @@ which service version they are testing.
 
 The order in `POST /chat` is intentional:
 
-1. **Deterministic actions** return calculated text and optional tool calls.
+1. **Intent clarification** catches overlapping analysis language before any
+   keyword handler can route it. Ambiguous death, contact, killing, and threshold
+   requests get one short choice between the relevant researcher-facing analyses.
+2. **Deterministic actions** return calculated text and optional tool calls.
    Examples include metadata conversions, analysis navigation, EDT/minimum-size
    calculations, tracking radius, and Active Killing settings.
-2. **Preflight guards** return one focused question or a scoped explanation when
+3. **Preflight guards** return one focused question or a scoped explanation when
    required evidence is missing. Examples include unknown channel mapping,
    segmentation signal quality, tracking motion, and missing log evidence.
-3. **Model path** retrieves guidance, builds the prompt, calls DeepSeek, and
+4. **Model path** retrieves guidance, builds the prompt, calls DeepSeek, and
    streams text plus native tool calls.
 
 Within the deterministic and preflight chains, the first non-`None` handler
@@ -242,6 +248,13 @@ with neighboring handlers. A preflight handler must require explicit task intent
 not just a topic word: mentioning an organoid line in an analysis question, for
 example, is not a metadata-building request. Put broad informational answers
 before setup clarifications when both could match.
+
+When analysis vocabularies overlap, update `_analysis_intent_route()` rather than
+adding another broad trigger to a downstream handler. Specific discriminators
+such as time course, attribution, counting, or physical distance should route
+directly; unresolved overlap should return a clarification from
+`analysis_intent_clarification()`. The downstream handler must still validate the
+live step, controls, units, and prerequisites.
 
 Keep deterministic response templates experiment-neutral. They may repeat names
 found in live metadata or an explicitly matched experiment reference, but must not
@@ -301,16 +314,20 @@ several widgets, create a file, or invoke an existing application workflow.
 - Bump `KNOWLEDGE_VERSION`, rebuild the index when indexed sources changed, and
   rerun API scenarios.
 
-### Add an experiment reference
+### Add experiment-specific context
 
-Add reviewed, provenance-labelled examples to
-`docs/source/assistant/reference_experiment_profiles.md`. If local experiment
-README or YAML formats need new parsing, update
+Do not add named experiments or saved numeric settings to default guidance or RAG.
+`docs/source/assistant/reference_experiment_profiles.md` is a generalized phenotype
+guide despite its legacy filename. Add reusable scientific rules there only when
+they are phrased in measurable image/behavior properties.
+
+If local experiment README or YAML formats need new parsing, update
 `_experiment_reference_context()` and `_compact_experiment_config()`.
 
 Keep paths, large feature arrays, and irrelevant defaults out of model context.
-The assistant may compare a historical profile with the current experiment, but
-must ask for current measurements before proposing an edit.
+The assistant may use a reference supplied for the current dataset, but must ask
+for current measurements before proposing an edit when the reference does not
+establish them.
 
 ### Change the chat UI or quick buttons
 
@@ -341,7 +358,7 @@ Before merging an assistant change, verify:
   not a plausible guess.
 - Exact values come from live data, explicit user input, or a labelled
   deterministic calculation.
-- Historical values are named examples and do not trigger actions.
+- Biological names and unrelated historical values do not trigger answers or actions.
 - The model does not claim a configured step ran without a corresponding result.
 - Visible text uses UI labels rather than variable, control, or tool names.
 - Same-value and already-open actions do not loop.

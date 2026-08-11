@@ -1,11 +1,5 @@
 # 🌊 Fragmentation tracking
 
-```{important}
-This is the method previously called **Propagation**. The method dropdown still reads
-*Propagation* until the interface is updated. *Reporter Propagation* is a separate method
-and keeps its name.
-```
-
 Fragmentation tracking is **not** a centroid-distance method. For each consecutive pair of frames `t → t+1` it propagates the labels of frame `t` into frame `t+1` segmentation mask (watershed-based overlap tracking).
 
 ## When it applies
@@ -36,7 +30,10 @@ When checked, fragmentation tracking runs **once on merged organoid masks** so t
 - You want a unified "any organoid" view without running separate tracking jobs per type.
 
 ```{tip}
-The strongest reason to track all organoids together is **signal bleed-through**: when organoid types don't have a cleanly separated colour and one channel leaks into another, tracking each type in isolation can double-count or mis-assign the overlapping regions. Tracking them jointly (while preserving each type of origin) resolves that in one shared scene. As a rule of thumb, **use this whenever you have more than one organoid type in the same well.**
+Track structure populations together only when they coexist in the same movie and
+should share one overlap-based tracking scene. Keep independent runs when populations
+must not influence one another or need different tracking methods. Signal bleed-through
+should be resolved or modelled during segmentation; it is not by itself a tracking rule.
 ```
 
 You **can still analyse each organoid type separately** after a combined run: BEHAV3D also writes the usual per-type tracked zarr and CSV (`<sample>_<organoidA>_tracked.zarr`, etc.), filtered from that same run. Use those files for type-specific feature extraction — use `all_organoids` only when you want everything in one cohort. For **fully independent** tracking (a separate pass per type, no shared ID space), untick the checkbox instead.
@@ -46,7 +43,7 @@ You **can still analyse each organoid type separately** after a combined run: BE
 ## Step-by-step in the napari plugin
 
 1. **Open the Tracking tab.** By default organoids appear as a single **🟣 All Organoids** sub-tab; if you previously unticked "Track all organoids together", pick the individual organoid sub-tab (🟣) instead.
-2. **Method is fragmentation tracking.** On the combined All Organoids sub-tab the method is fixed; on an individual sub-tab pick it from the **Method** dropdown (still labelled *Propagation* in the interface). Either way the parameter panel shows just one message and the checkbox — there is nothing else to tune from the GUI.
+2. **Method is Fragmentation Tracking.** On the combined All Organoids sub-tab the method is fixed; on an individual sub-tab pick it from the **Method** dropdown. Either way the parameter panel shows just one message and the checkbox — there is nothing else to tune from the GUI.
 3. **Decide whether to keep `Track all organoids together`:**
    - **On** (default) → one combined run; primary combined output is `all_organoids`, plus per-type tracked files from the same run. Use when you want the unified cohort or will analyse each type from its own `*_tracked.zarr` paths.
    - **Off** → each organoid type is tracked in **its own** pass (isolated masks, no shared ID space). Use when types must not influence each other during tracking (e.g. touching regions in the merged scene).
@@ -67,10 +64,10 @@ There are no parameters to change. Tuning it means **improving the segmentation*
 - Cause: the method assumes the foreground mask of frame `t+1` overlaps the labels of frame `t` (after a 2-pixel dilation). If your organoids actually drift more than ~2 pixels between frames, the overlap fails.
 - Fix: switch to **btrack** (with a small `Max search radius`), which handles organoid-scale motion via a centroid motion model instead of pixel overlap.
 
-**Two organoids that briefly touch end up sharing a track ID**
+**Two objects that briefly touch end up sharing a track ID**
 
 - Cause: when two distinct foreground regions merge in one frame, the watershed assigns the merged blob to one parent ID and that ID propagates from then on.
-- Fix: re-segment with stricter splitting (lower EDT threshold) so the two organoids stay separated in the binary mask.
+- Fix: try **Bounded Propagation**, which restricts each ID to one connected region before watershed. If the masks should never have joined, also improve segmentation and verify the selected strategy's EDT direction before changing its threshold.
 
 **You used `all_organoids` but needed fully separate tracking logic**
 
@@ -100,4 +97,5 @@ Metadata columns for each organoid type point at the **per-type** tracked files,
 ## See also
 
 - [Tracking overview](index).
+- [Bounded Propagation](bounded_propagation).
 - [Manual Editing](manual_editing).

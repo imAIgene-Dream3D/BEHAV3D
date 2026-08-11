@@ -25,7 +25,8 @@ from behav3d.napari._assistant_context import (
     summarize_metadata, _diff_from_defaults, validate_metadata_records,
     _metadata_builder_state, _experiment_reference_context,
     _image_dimensions_state, _current_log_state, _segmentation_state,
-    _interface_capabilities, _feature_extraction_state, build_context,
+    _interface_capabilities, _feature_extraction_state, _step_readiness,
+    build_context,
 )
 from behav3d.napari._assistant_controls import (
     CONTROL_CONTRACT_VERSION, active_cell_type, control_registry,
@@ -236,10 +237,12 @@ def test_diff_from_defaults():
 
 def test_dump_cards_json(tmp_path=None):
     import tempfile, json
+    from behav3d.napari._assistant_schema import CHOICES
     d = tmp_path or tempfile.mkdtemp()
     path = os.path.join(str(d), "cards.json")
     n = dump_cards_json(path)
     assert n > 150 and json.load(open(path))
+    assert "bounded_propagation" in CHOICES["method"]
 
 
 # --------------------------------------------------------------------------
@@ -518,6 +521,7 @@ def test_metadata_completion_uses_mandatory_well_and_line_fields():
             ],
         },
         "metadata_builder": {"sample_forms_created": True},
+        "output_dir_set": True,
     }
     response = app.metadata_completion_summary(
         context, [{"role": "user", "content": "Is this all that is needed?"}]
@@ -526,6 +530,51 @@ def test_metadata_completion_uses_mandatory_well_and_line_fields():
     assert "mandatory T-cells line" in response
     assert "condition" in response and "optional" in response
     assert "1" in response
+
+
+def test_data_preparation_requires_metadata_and_output_directory():
+    from types import SimpleNamespace
+    import app
+
+    missing_output = {
+        "metadata": {"loaded": True, "records": [{"sample_name": "Sample01"}]},
+        "output_dir": "",
+        "output_dir_set": False,
+    }
+    readiness = _step_readiness(SimpleNamespace(), missing_output)
+    assert readiness["data_preparation"] == {
+        "ready": False,
+        "blockers": ["output directory not set"],
+    }
+
+    response = app.metadata_completion_summary(
+        {
+            **missing_output,
+            "assistant_session": {"intent": "check_data_setup"},
+        },
+        [{"role": "user", "content": "Check what's missing"}],
+    )
+    assert response.startswith("**Setup incomplete**")
+    assert "**Next actions**" in response
+    assert "**Output directory**" in response
+    assert "Ready for processing" not in response
+
+    both_missing = _step_readiness(SimpleNamespace(), {
+        "metadata": {"loaded": False, "records": []},
+        "output_dir": "",
+        "output_dir_set": False,
+    })["data_preparation"]
+    assert both_missing["ready"] is False
+    assert both_missing["blockers"] == [
+        "metadata not loaded", "output directory not set",
+    ]
+
+    ready = _step_readiness(SimpleNamespace(), {
+        "metadata": {"loaded": True, "records": [{"sample_name": "Sample01"}]},
+        "output_dir": "/tmp/behav3d-output",
+        "output_dir_set": True,
+    })["data_preparation"]
+    assert ready == {"ready": True, "blockers": []}
 
 
 def test_metadata_identifier_inferences_require_confirmation():
@@ -552,6 +601,31 @@ def test_metadata_identifier_inferences_require_confirmation():
     )
     assert "line for every configured" in missing_lines
     assert "not_added" in missing_lines
+
+
+def test_metadata_taxonomy_distinguishes_image_populations_and_design_labels():
+    import app
+
+    response = app.metadata_taxonomy_guidance(
+        {},
+        [{"role": "user", "content": (
+            "What is the difference between cell types, lines and conditions?"
+        )}],
+    )
+    assert "distinguished in the images" in response
+    assert "segmentation and track IDs" in response
+    assert "biological identity" in response
+    assert "treatment or experimental state" in response
+
+    multicolor = app.metadata_taxonomy_guidance(
+        {},
+        [{"role": "user", "content": "When should I use the Multicolor option?"}],
+    )
+    for phrase in (
+        "one biological population", "same population, line, and condition",
+        "not a correction for bleed-through", "acquisition-design choice",
+    ):
+        assert phrase.lower() in multicolor.lower()
 
 
 def test_metadata_time_conversion_updates_every_sample_without_stale_action():
@@ -667,6 +741,106 @@ def test_analysis_choose_explains_and_named_view_opens_directly():
     assert ambiguous == []
 
 
+def test_analysis_intent_resolver_clarifies_overlapping_death_contact_requests():
+    import app
+
+    threshold = app.analysis_intent_clarification(
+        {"current_step": "feature_extraction"},
+        [{"role": "user", "content": (
+            "What threshold should I use for killing after contact?"
+        )}],
+    )
+    assert "signal increase" in threshold
+    assert "contact distance" in threshold
+
+    death = app.analysis_intent_clarification(
+        {"current_step": "metadata"},
+        [{"role": "user", "content": "I want to look at target death."}],
+    )
+    assert "Death Dynamics" in death
+    assert "Active Killing" in death
+    assert "Feature Extraction" in death
+
+    contact = app.analysis_intent_clarification(
+        {"current_step": "analysis"},
+        [{"role": "user", "content": (
+            "I want to look at contact between my populations."
+        )}],
+    )
+    assert "Interaction Analysis" in contact
+    assert "Contact-Based Grouping" in contact
+    assert "Contact State-Shift Analysis" in contact
+    assert "contact distance" in contact
+    assert app.analysis_intent_clarification(
+        {"current_step": "metadata"},
+        [{"role": "user", "content": "Which image channel is the dead channel?"}],
+    ) is None
+
+
+def test_specific_analysis_intents_do_not_trigger_contact_distance_guidance():
+    import app
+
+    messages = [{"role": "user", "content": (
+        "Set up an analysis to compare cells actively killing two targets. They die "
+        "30 minutes after initial contact and I need at least one cell to die."
+    )}]
+    assert app._analysis_intent_route(messages) == "active_killing"
+    assert app.feature_threshold_guidance(
+        {"current_step": "feature_extraction"}, messages,
+    ) is None
+    assert app._analysis_intent_route([{
+        "role": "user", "content": "How many contacts occur by condition?",
+    }]) == "interaction"
+    assert app._analysis_intent_route([{
+        "role": "user", "content": "How fast does death change over time?",
+    }]) == "death_dynamics"
+
+
+def test_analysis_clarification_selection_opens_the_specific_panel():
+    import app
+
+    interaction = app.analysis_navigation_action(
+        {"current_step": "metadata", "analysis": {}},
+        [
+            {"role": "assistant", "content": (
+                "Which contact question? Tell me which one and I will open it."
+            )},
+            {"role": "user", "content": "Interaction Analysis"},
+        ],
+    )
+    assert interaction["calls"] == [{
+        "name": "open_analysis_view",
+        "arguments": {"view": "interaction"},
+    }]
+    active = app.analysis_navigation_action(
+        {"current_step": "analysis", "analysis": {}},
+        [
+            {"role": "assistant", "content": (
+                "Which death question? Tell me which one and I will open it."
+            )},
+            {"role": "user", "content": "Active Killing"},
+        ],
+    )
+    assert active["calls"] == [{
+        "name": "open_analysis_view",
+        "arguments": {"view": "active_killing"},
+    }]
+
+
+def test_tool_overview_is_general_3d_time_lapse_guidance():
+    import app
+
+    text = app.tool_overview_guidance(
+        {"current_step": "data_preparation"},
+        [{"role": "user", "content": "How can I use this tool?"}],
+    )
+    assert "3D fluorescence time-lapse imaging" in text
+    assert "segment" in text and "track" in text and "extract" in text
+    assert "co-culture" not in text.lower()
+    assert "organoid" not in text.lower()
+    assert "immune" not in text.lower()
+
+
 def test_generic_tracking_guide_asks_for_motion_before_method_context():
     import app
 
@@ -694,9 +868,32 @@ def test_generic_tracking_guide_asks_for_motion_before_method_context():
         )}],
     ) is None
     assert app.tracking_motion_question(
+        context,
+        [{"role": "user", "content": (
+            "Which tracking method fits? The masks still overlap between frames, "
+            "but touching masks can join across disconnected regions."
+        )}],
+    ) is None
+    assert app.tracking_motion_question(
         {"current_step": "filtering"},
         [{"role": "user", "content": "Guide tracking"}],
     ) is None
+
+    stale_segmentation_turn = app.tracking_motion_question(
+        {
+            "current_step": "tracking",
+            "active_cell_type": "Tcell_HIV",
+            "assistant_session": {"intent": "compare_segmentation_methods"},
+        },
+        [
+            {"role": "user", "content": "The segmented masks overlap."},
+            {"role": "assistant", "content": "That affects segmentation."},
+            {"role": "user", "content": "Which method?"},
+        ],
+    )
+    assert stale_segmentation_turn.startswith("**Tracking method")
+    assert "consecutive frames" in stale_segmentation_turn
+    assert "segmentation" not in stale_segmentation_turn.lower()
 
 
 def test_segmentation_method_gate_requires_signal_cleanliness():
@@ -709,6 +906,7 @@ def test_segmentation_method_gate_requires_signal_cleanliness():
     question = app.segmentation_signal_question(
         context, [{"role": "user", "content": "Choose a method"}],
     )
+    assert question.startswith("**Segmentation method")
     assert "clean" in question
     assert "bleed-through" in question
     assert "same channel" in question
@@ -718,6 +916,15 @@ def test_segmentation_method_gate_requires_signal_cleanliness():
             "The target is isolated in a clean channel. Which segmentation method?"
         )}],
     ) is None
+    after_unrelated_history = app.segmentation_signal_question(
+        context,
+        [
+            {"role": "user", "content": "The tracking masks use the same channel."},
+            {"role": "assistant", "content": "Understood."},
+            {"role": "user", "content": "Choose a method"},
+        ],
+    )
+    assert after_unrelated_history.startswith("**Segmentation method")
 
 
 def test_stalled_operation_gate_requests_log_without_diagnosing():
@@ -785,6 +992,7 @@ def test_active_killing_action_is_cadence_grounded_and_explicitly_proposed():
             "features.active_killing.death_signal",
             "features.active_killing.use_absolute_threshold",
             "features.active_killing.absolute_threshold",
+            "features.active_killing.minimum_contact_duration",
         )
     ]
     result = app.active_killing_action(
@@ -823,15 +1031,20 @@ def test_active_killing_action_refuses_incomplete_absolute_mode():
             "metadata": {"records": [{
                 "time_interval": 2, "time_unit": "min",
             }]},
-            "ui_state": {"controls": []},
+            "ui_state": {"controls": [{
+                "id": "features.active_killing.target_types",
+                "visible": True,
+                "enabled": True,
+                "choices": ["mdo"],
+            }]},
         },
         [{"role": "user", "content": (
-            "Configure active killing against 27t and mdo within 10 minutes."
+            "Configure active killing against mdo only within 10 minutes."
         )}],
     )
     assert result["calls"] == []
-    assert "positive minimum dead-mask pixel increase" in result["text"]
-    assert "remains 0" in result["text"]
+    assert "positive dead-mask pixel increase" in result["text"]
+    assert "contact-distance threshold" in result["text"]
 
 
 def test_active_killing_acceptance_proposes_every_agreed_field():
@@ -911,6 +1124,131 @@ def test_active_killing_readiness_rejects_zero_absolute_threshold():
     )
     assert "not ready yet" in summary
     assert "greater than 0" in summary
+
+
+def _active_killing_feedback_context():
+    controls = []
+    specs = {
+        "target_types": {"value": ["27T", "MDO"], "choices": ["27T", "MDO"]},
+        "observation_window": {"value": 5},
+        "death_signal": {"value": "Dead-mask percentage"},
+        "use_absolute_threshold": {"value": False},
+        "absolute_threshold": {"value": 0.0},
+        "minimum_contact_duration": {"value": 1},
+    }
+    for suffix, values in specs.items():
+        controls.append({
+            "id": f"features.active_killing.{suffix}",
+            "visible": True,
+            "enabled": True,
+            **values,
+        })
+    return {
+        "current_step": "feature_extraction",
+        "metadata": {"records": [{
+            "time_interval": 2,
+            "time_unit": "min",
+            "pixel_distance_xy": 1.7,
+            "pixel_distance_z": 4.0,
+        }]},
+        "ui_state": {"controls": controls},
+    }
+
+
+def test_active_killing_feedback_prompt_preserves_scope_timing_and_one_cell_rule():
+    import app
+
+    request = (
+        "Set up the analysis to compare the rate of T cells actively killing MDO "
+        "versus 27T. The targets die around 30 minutes after the initial contact, "
+        "and I want to know if at least one cell dies after contact."
+    )
+    context = _active_killing_feedback_context()
+    first = app.active_killing_action(
+        context, [{"role": "user", "content": request}],
+    )
+    assert first["calls"] == []
+    assert "independent-only" in first["text"]
+    assert "pooled" in first["text"]
+
+    messages = [
+        {"role": "user", "content": request},
+        {"role": "assistant", "content": first["text"]},
+        {"role": "user", "content": "Run them independently; start with MDO."},
+    ]
+    proposal = app.active_killing_action(context, messages)
+    values = {
+        call["arguments"]["control_id"]: call["arguments"]["value"]
+        for call in proposal["calls"]
+    }
+    assert values["features.active_killing.target_types"] == ["MDO"]
+    assert values["features.active_killing.observation_window"] == 15
+    assert values["features.active_killing.death_signal"] == "Dead-mask pixel count"
+    assert values["features.active_killing.use_absolute_threshold"] is True
+    assert values["features.active_killing.absolute_threshold"] == 45
+    assert values["features.active_killing.minimum_contact_duration"] == 1
+    assert "one-cell calibration" in proposal["text"].lower()
+    assert "does not mean that many cells die" in proposal["text"]
+    assert "independent target run" in proposal["text"]
+
+    ready_messages = messages + [
+        {"role": "assistant", "content": proposal["text"]},
+        {"role": "user", "content": "Yes, apply these settings"},
+        {"role": "assistant", "content": "The proposed actions were applied."},
+        {"role": "user", "content": "Is it ready?"},
+    ]
+    ready = app.active_killing_readiness_summary(
+        {
+            **context,
+            "feature_extraction": {"active_killing": {
+                "setup_ready": True,
+                "setup_issues": [],
+                "effector_cell_type": "T cells",
+                "target_cell_types": ["MDO"],
+                "observation_window": 15,
+                "death_signal": "Dead-mask pixel count",
+                "uses_absolute_threshold": True,
+                "absolute_threshold": 45,
+                "minimum_contact_duration": 1,
+            }},
+        },
+        ready_messages,
+    )
+    assert "**ready**" in ready
+    assert "one independent target run" in ready
+
+
+def test_active_killing_readiness_remembers_unresolved_one_cell_requirement():
+    import app
+
+    context = {
+            "current_step": "feature_extraction",
+            "feature_extraction": {"active_killing": {
+                "setup_ready": True,
+                "setup_issues": [],
+                "effector_cell_type": "T cells",
+                "target_cell_types": ["MDO"],
+                "observation_window": 15,
+                "death_signal": "Dead-mask percentage",
+                "uses_absolute_threshold": False,
+                "absolute_threshold": 0,
+                "minimum_contact_duration": 1,
+            }},
+        }
+    messages = [
+            {"role": "user", "content": (
+                "Set up Active Killing. I need at least one cell to die after contact."
+            )},
+            {"role": "assistant", "content": "I changed the observation window."},
+            {"role": "user", "content": "Is it ready?"},
+        ]
+    summary = app.active_killing_readiness_summary(context, messages)
+    assert "not ready yet" in summary
+    assert "at least one cell dies" in summary
+    assert "minimum contact" not in summary.lower()
+    deterministic = app.deterministic_turn_response(context, messages, [])
+    assert deterministic["text"] == summary
+    assert deterministic["calls"] == []
 
 
 def test_hmm_movement_guidance_lists_every_live_option_before_editing():
@@ -1799,35 +2137,6 @@ def test_interface_capabilities_report_current_exposure_without_cross_module_map
     assert "Sobel-of-Gaussian" in apoc["feature_filters"]
 
 
-def test_safety_profile_summary_preserves_reference_without_claiming_execution():
-    import app
-
-    summary = app.safety_profile_summary(
-        {
-            "current_step": "analysis",
-            "metadata": {"records": [{
-                "time_interval": 2, "time_unit": "min",
-            }]},
-            "experiment_reference": {"notes": [{"text": (
-                "Exp010 is multi-organoid safety profiling with 27T and MDO. "
-                "Active killing is a contact-associated rise to 1.5 times baseline "
-                "within 5 frames after one frame of contact."
-            )}]},
-            "results": [],
-        },
-        [{"role": "user", "content": (
-            "How should I frame the safety comparison, and what exactly does "
-            "active killing mean here?"
-        )}],
-    )
-    assert "TEG cells are the immune effector" in summary
-    assert "tumor 27T and healthy MDO" in summary
-    assert "5 frames (10 minutes)" in summary
-    assert "not a completed analysis" in summary
-    assert "independent analysis for each target plus a combined analysis" in summary
-    assert "configured" not in summary.lower()
-
-
 def test_tool_call_parsing_tolerates_malformed_markers():
     import app
     # the exact malformed shape a small model emitted: no leading '<', no closing tag
@@ -1971,12 +2280,18 @@ def test_build_actions_for_metadata_persistence_and_analysis_view():
         {"name": "save_metadata", "arguments": {}},
         {"name": "load_metadata", "arguments": {}},
         {"name": "open_analysis_view", "arguments": {"view": "death_dynamics"}},
+        {"name": "open_analysis_view", "arguments": {"view": "interaction"}},
+        {"name": "open_analysis_view", "arguments": {"view": "invasiveness"}},
+        {"name": "open_analysis_view", "arguments": {"view": "active_killing"}},
         {"name": "open_analysis_view", "arguments": {"view": "unknown"}},
     ], [], {})
     assert actions[0].ok and actions[0].kind == "save_metadata"
     assert actions[1].ok and actions[1].kind == "load_metadata"
     assert actions[2].ok and actions[2].data["view"] == "death_dynamics"
-    assert not actions[3].ok
+    assert actions[3].ok and actions[3].data["view"] == "interaction"
+    assert actions[4].ok and actions[4].data["view"] == "invasiveness"
+    assert actions[5].ok and actions[5].data["view"] == "active_killing"
+    assert not actions[6].ok
 
 
 def test_metadata_persistence_actions_call_existing_ui_handlers():
@@ -1996,6 +2311,45 @@ def test_metadata_persistence_actions_call_existing_ui_handlers():
     assert "loading has started" in load.data["result_markdown"]
 
 
+def test_analysis_view_actions_focus_interaction_and_expand_active_killing():
+    from types import SimpleNamespace
+
+    class _Tabs:
+        def __init__(self):
+            self.index = None
+
+        def setCurrentIndex(self, value):
+            self.index = value
+
+    class _Toggle:
+        def __init__(self):
+            self.checked = False
+
+        def setChecked(self, value):
+            self.checked = bool(value)
+
+        def isChecked(self):
+            return self.checked
+
+    focused = []
+    main = SimpleNamespace(
+        tabs=_Tabs(),
+        feature_extraction_tab=SimpleNamespace(_ak_toggle_btn=_Toggle()),
+        analysis_tab=SimpleNamespace(
+            inner_tabs=_Tabs(),
+            death_dynamics_tab=SimpleNamespace(
+                _on_guided_start=lambda view: focused.append(view)
+            ),
+        ),
+    )
+    interaction = ProposedAction("open_analysis_view", view="interaction")
+    assert apply_action(main, interaction)
+    assert focused == ["interaction"]
+    active = ProposedAction("open_analysis_view", view="active_killing")
+    assert apply_action(main, active)
+    assert main.feature_extraction_tab._ak_toggle_btn.isChecked()
+
+
 def test_prompt_data_prep_reconciles_state_and_lists_tools():
     import app
     sp = app.build_system_prompt(
@@ -2009,6 +2363,8 @@ def test_prompt_data_prep_reconciles_state_and_lists_tools():
     assert '"n_samples": 22' in sp
     assert '"loaded": false' in sp
     assert "Never ask for a value already present" in sp
+    assert "Make responses easy to scan" in sp
+    assert "The live current_step is authoritative" in sp
     assert "n_samples" in sp  # present only as structured live context
 
 
@@ -2178,7 +2534,7 @@ def test_prompt_scopes_experiment_reference_and_requires_result_evidence():
     assert "Safety profiling with tumor and healthy organoids" in sp
 
 
-def test_historical_reference_profiles_are_selected_and_never_auto_applied():
+def test_reference_guidance_is_property_based_and_never_auto_applied():
     from guidance import select_guidance_cards
     import app
 
@@ -2188,10 +2544,12 @@ def test_historical_reference_profiles_are_selected_and_never_auto_applied():
     )
     profile = next(item for item in cards if item["id"] == "reference_examples")
     for phrase in (
-        "never defaults", "IVM HIV", "CD4/CD8-13T",
-        "never edit a live control from an example alone",
+        "biological name", "image spacing", "frame cadence",
+        "one-frame displacement", "never edit a live control",
     ):
         assert phrase.lower() in profile["text"].lower()
+    for forbidden in ("microglia", "t cells", "exp91", "27t", "mdo"):
+        assert forbidden not in profile["text"].lower()
 
     prompt = app.build_system_prompt(
         {
@@ -2201,72 +2559,26 @@ def test_historical_reference_profiles_are_selected_and_never_auto_applied():
         cards,
         [{"name": "set_ui_value"}],
     )
-    assert "HISTORICAL REFERENCE PROFILES are examples" in prompt
-    assert "Never issue a form action from a historical value alone" in prompt
+    assert "Base recommendations on measurable image and behavior properties" in prompt
+    assert "must never trigger a method, preset, threshold, or canned answer" in prompt
     assert "README notes for study intent" in prompt
 
 
-def test_historical_reference_guidance_preserves_provenance_and_calibration():
+def test_biological_name_does_not_trigger_a_historical_canned_response():
     import app
 
-    btrack = app.historical_reference_guidance(
-        {
-            "metadata": {"records": [{
-                "time_interval": 30,
-                "time_unit": "s",
-            }]},
-        },
+    response = app.deterministic_turn_response(
+        {"current_step": "tracking", "metadata": {"records": []}},
         [{
             "role": "user",
-            "content": (
-                "Do you have example values from a previous experiment for btrack "
-                "on T cells? Can I copy them?"
-            ),
+            "content": "What settings were used previously for microglia?",
         }],
+        [],
     )
-    for phrase in (
-        "IVM HIV", "CD4/CD8-13T", "should not be copied directly",
-        "one-frame displacement", "largest spatial gap",
-        "largest missing-frame gap",
-    ):
-        assert phrase.lower() in btrack["text"].lower()
-    assert btrack["calls"] == []
+    assert response is None
+    assert not hasattr(app, "historical_reference_guidance")
+    assert not hasattr(app, "safety_profile_summary")
 
-    calcium = app.historical_reference_guidance(
-        {},
-        [{
-            "role": "user",
-            "content": (
-                "Was there a previous experiment with near-static calcium reporter "
-                "cells? What method and example values did it use?"
-            ),
-        }],
-    )
-    for phrase in (
-        "Cellpose-SAM", "imported", "Reporter Propagation", "100-voxel",
-        "10% overlap", "example values, not defaults",
-    ):
-        assert phrase.lower() in calcium["text"].lower()
-    assert calcium["calls"] == []
-
-    microglia = app.historical_reference_guidance(
-        {},
-        [{
-            "role": "user",
-            "content": (
-                "What settings and design were used in the previous microglia "
-                "Exp91 experiment?"
-            ),
-        }],
-    )
-    for phrase in (
-        "Exp91", "eight wells", "1.77 µm", "120-second", "None_None",
-        "APOC Probability Map + Watershed", "maximum search radius 150",
-        "absolute increase of 30", "Start offset **0**", "README",
-        "n=1", "historical values, not defaults",
-    ):
-        assert phrase.lower() in microglia["text"].lower()
-    assert microglia["calls"] == []
 
 
 def test_prompt_encodes_pi_feedback_scenarios():
@@ -2288,8 +2600,10 @@ def test_prompt_encodes_pi_feedback_scenarios():
     assert "With plain Mask + EDT/Watershed, raise EDT" in sp
     assert "With Peak EDT/Watershed, lower EDT" in sp
     assert "do not infer motion from a label" in sp
-    assert "btrack is the routine default" in sp
+    assert "use Bounded Propagation" in sp
+    assert "use btrack when consecutive detections no longer overlap" in sp
     assert "Reporter Propagation" in sp
+    assert "Reporter flicker and static position are both required" in sp
     assert "60 um/min at 15 seconds per frame is 15 um/frame" in sp
     assert "Do not provide a numeric example speed" in sp
     assert "btrack Step 2 is the Global Hypothesis Optimizer" in sp
@@ -2308,7 +2622,7 @@ def test_prompt_encodes_pi_feedback_scenarios():
     assert "'Tune Features' means the classifier feature preset" in sp
     assert "ask them to copy and paste the latest error lines" in sp
     assert "Intensity and Contact are required for every cell type" in sp
-    assert "never suggest dropping it from a T-cell population" in sp
+    assert "never suggest dropping it from a population" in sp
     assert "automatically produces an independent analysis" in sp
     assert "Never apply only the mode checkbox" in sp
     assert "setup_ready true" in sp
@@ -2318,6 +2632,8 @@ def test_prompt_encodes_pi_feedback_scenarios():
     assert "assigning the same name to multiple primary clusters merges them" in sp
     assert "Death Dynamics, Interaction Analysis, Invasiveness Analysis" in sp
     assert "line to the literal CSV-safe value 'not_added'" in sp
+    assert "Multicolor means one dense biological population" in sp
+    assert "must never trigger a method, preset, threshold, or canned answer" in sp
     assert "Never narrate internal rules" in sp
     assert "Opening a result requires an open_result call" in sp
     assert "A result merely listed as viewable has not been opened" in sp
@@ -2424,13 +2740,18 @@ class _FakeTrackingPanel:
     def __init__(self, cell_type, radius):
         self.cell_type = cell_type
         self.combo_method = _FakeCombo(
-            ["LAP", "TrackPy", "Propagation", "Reporter Propagation", "btrack"],
-            4,
+            ["LAP", "TrackPy", "Fragmentation Tracking", "Bounded Propagation",
+             "Reporter Propagation", "btrack"],
+            5,
         )
         self.lap_merge_cost = _FakeSpin(0)
         self.lap_split_cost = _FakeSpin(0)
         self.tp_adaptive_stop = _FakeSpin(10.0)
         self.tp_adaptive_step = _FakeSpin(0.95)
+        self.bp_min_overlap_fraction = _FakeSpin(0.0, 0.0, 1.0)
+        self.bp_segment_size_min = _FakeSpin(20)
+        self.rp_min_overlap_fraction = _FakeSpin(0.1, 0.0, 1.0)
+        self.rp_segment_size_min = _FakeSpin(100)
         self.bt_max_search_radius = _FakeSpin(radius, 1, 9999)
         self.bt_use_visual_features = _FakeCheck(False)
         self.bt_use_optimize = _FakeCheck(False)
@@ -2476,9 +2797,7 @@ def test_live_control_registry_targets_actual_cell_type_only():
 def test_tracking_registry_separates_reporter_propagation_from_btrack():
     from types import SimpleNamespace
     panel = _FakeTrackingPanel("reporter", 100)
-    panel.combo_method.setCurrentIndex(3)
-    panel.rp_min_overlap_fraction = _FakeSpin(0.1, 0.0, 1.0)
-    panel.rp_segment_size_min = _FakeSpin(100)
+    panel.combo_method.setCurrentIndex(4)
     main = SimpleNamespace(
         tracking_tab=SimpleNamespace(
             panels={"reporter": panel},
@@ -2491,6 +2810,15 @@ def test_tracking_registry_separates_reporter_propagation_from_btrack():
     ]["visible"] is True
     assert controls[
         "tracking.reporter.btrack.maximum_search_radius"
+    ]["visible"] is False
+
+    panel.combo_method.setCurrentIndex(3)
+    controls = {item["id"]: item for item in control_registry(main)}
+    assert controls[
+        "tracking.reporter.bounded_propagation.minimum_overlap"
+    ]["visible"] is True
+    assert controls[
+        "tracking.reporter.reporter_propagation.minimum_overlap"
     ]["visible"] is False
 
 
@@ -2916,7 +3244,7 @@ def test_feature_group_guidance_keeps_intensity_for_dead_dye():
                 ],
             }]},
         },
-        [{"role": "user", "content": "Now adjust T cells"}],
+        [{"role": "user", "content": "Review the feature groups for the selected population"}],
     )
     assert "Intensity" in text
     assert "mean dead-dye intensity" in text
@@ -3329,7 +3657,7 @@ def test_feedback_guidance_fixtures():
 
     fixture = Path(__file__).parent / "fixtures" / "assistant_feedback_transcripts.json"
     cases = json.loads(fixture.read_text(encoding="utf-8"))
-    assert KNOWLEDGE_VERSION == "2026.07.27.28"
+    assert KNOWLEDGE_VERSION == "2026.08.11.3"
     for case in cases:
         cards = select_guidance_cards(
             {"current_step": case["step"]}, case["user"], case.get("intent"))
@@ -3363,7 +3691,7 @@ def test_assistant_has_no_hidden_model_continuation():
     assert "def _auto_continue" not in source
     assert "_dispatch_proactive" not in source
     assert "Checking your setup" not in source
-    assert CONTROL_CONTRACT_VERSION == "3.2"
+    assert CONTROL_CONTRACT_VERSION == "3.3"
 
 
 # --------------------------------------------------------------------------

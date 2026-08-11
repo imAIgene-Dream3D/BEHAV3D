@@ -46,7 +46,7 @@ _TOOL_NAMES = (
     "open_analysis_view",
 )
 _TOOL_NAME_PATTERN = "|".join(re.escape(name) for name in _TOOL_NAMES)
-CONTROL_CONTRACT_VERSION = "3.2"
+CONTROL_CONTRACT_VERSION = "3.3"
 _RESEARCHER_LABELS = {
     "pixel_distance_xy": "XY pixel size",
     "pixel_distance_z": "Z pixel size",
@@ -190,6 +190,237 @@ def _asks_general_analysis_question(messages: list[dict]) -> bool:
     )
 
 
+def _analysis_intent_route(messages: list[dict]) -> str | None:
+    """Resolve overlapping researcher language before keyword handlers run."""
+    latest = _normalized_user_message(messages)
+    if not latest:
+        return None
+
+    has_death = bool(re.search(
+        r"\b(?:death|dead|dying|die|dies|surviv\w*|viab\w*|apoptos\w*)\b",
+        latest,
+    ))
+    has_killing = bool(re.search(
+        r"\b(?:kill\w*|cytotox\w*|lys(?:e|es|ed|ing|is)|destroy\w*|"
+        r"eliminat\w*|damag\w*|effector\w*)\b",
+        latest,
+    )) or any(phrase in latest for phrase in (
+        "get rid of", "cause death", "trigger death", "induce death",
+        "make them die", "top killers", "contact-associated",
+    ))
+    has_contact = bool(re.search(
+        r"\b(?:contact\w*|touch\w*|interact\w*|engag\w*|proximity|"
+        r"adjacent|near|bout)\b",
+        latest,
+    ))
+
+    if "active killing" in latest or "actively killing" in latest:
+        return "active_killing"
+    if "death dynamics" in latest:
+        return "death_dynamics"
+    if "interaction analysis" in latest:
+        return "interaction"
+    if "invasiveness analysis" in latest:
+        return "invasiveness"
+    if any(phrase in latest for phrase in (
+        "contact state-shift", "contact state shift", "state shift after contact",
+        "before and after contact", "before versus after contact",
+    )):
+        return "contact_state_shift"
+    if any(phrase in latest for phrase in (
+        "contact-based grouping", "contact based grouping",
+        "behave differently while touching", "behavior while touching",
+        "behaviour while touching",
+    )):
+        return "contact_grouping"
+
+    dead_threshold = has_death and any(phrase in latest for phrase in (
+        "dead-mask", "dead mask", "counts as dead", "classified as dead",
+        "decides when", "death threshold", "dead threshold", "preview dead",
+    ))
+    contact_distance = (
+        has_contact
+        and any(phrase in latest for phrase in (
+            "contact distance", "contact threshold", "distance threshold", "count as touching",
+            "counts as touching", "strict touching", "one pixel gap",
+        ))
+    ) or (
+        has_contact and "distance" in latest and any(
+            term in latest for term in ("set", "threshold", "correct", "mean")
+        )
+    )
+    asks_both_feature_thresholds = dead_threshold and has_contact and any(
+        phrase in latest for phrase in (
+            "contact and dead-mask", "contact and dead mask",
+            "contact threshold and dead", "contact distance and dead",
+        )
+    )
+    if dead_threshold and (contact_distance or asks_both_feature_thresholds):
+        return "feature_thresholds"
+    if dead_threshold:
+        return "death_threshold"
+    if contact_distance:
+        return "contact_distance"
+
+    ambiguous_killing_threshold = (
+        has_contact and has_killing and "threshold" in latest
+        and "signal" not in latest and "distance" not in latest
+        and "dead-mask" not in latest and "dead mask" not in latest
+    )
+    if ambiguous_killing_threshold:
+        return "clarify_killing_threshold"
+
+    agency = any(phrase in latest for phrase in (
+        "which cell", "which object", "which population", "do they cause",
+        "does it cause", "are they able", "can they kill", "killing capacity",
+        "killing efficiency", "killing rate", "die after contact",
+    ))
+    if (has_killing or agency) and (has_death or has_contact):
+        return "active_killing"
+
+    time_course = any(phrase in latest for phrase in (
+        "over time", "how fast", "death curve", "death rate", "dynamics",
+        "by condition", "how many die", "how many died",
+    ))
+    if has_death and time_course:
+        return "death_dynamics"
+
+    count_or_compare = bool(re.search(
+        r"\b(?:how many|number of|frequency|frequencies|compare|comparison)\b",
+        latest,
+    ))
+    if has_contact and count_or_compare:
+        return "interaction"
+
+    if has_death:
+        return "clarify_death"
+    if has_contact:
+        return "clarify_contact"
+    if (
+        bool(re.search(r"\b(?:feature\w*|extract\w*|readout\w*)\b", latest))
+        and any(term in latest for term in ("which", "what", "measure", "get"))
+    ):
+        return "feature_extraction"
+    return None
+
+
+def analysis_intent_clarification(
+    context: dict, messages: list[dict],
+) -> str | None:
+    """Ask one routing question when overlapping analysis terms are unresolved."""
+    latest = _normalized_user_message(messages)
+    route = _analysis_intent_route(messages)
+    if route == "clarify_killing_threshold":
+        return (
+            "Two different thresholds could apply here. Do you mean the **signal "
+            "increase that counts as a killing event** in Active Killing, or the "
+            "**contact distance that decides when two objects count as touching** in "
+            "Feature Extraction? Tell me which one and I will open the right panel."
+        )
+    if route == "clarify_death":
+        if not any(phrase in latest for phrase in (
+            "want to look", "want to analyze", "want to analyse", "interested in",
+            "which analysis", "what analysis", "study death", "investigate death",
+        )):
+            return None
+        return (
+            "There are three possible questions here. Do you want **how the fraction "
+            "of signal-positive objects changes over the movie** (Death Dynamics), "
+            "**which individual contacting objects are associated with a target's "
+            "signal rise** (Active Killing), or **the threshold that decides when an "
+            "object counts as signal-positive** (Feature Extraction)? Tell me which "
+            "one and I will open it."
+        )
+    if route == "clarify_contact":
+        if not any(phrase in latest for phrase in (
+            "want to look", "want to analyze", "want to analyse", "interested in",
+            "which analysis", "what analysis", "study contact", "investigate contact",
+        )):
+            return None
+        return (
+            "Which contact question do you want to answer: **how many contacts occur "
+            "and how groups compare** (Interaction Analysis), **whether behavior "
+            "differs while touching** (Contact-Based Grouping), **whether behavior "
+            "changes before versus after contact** (Contact State-Shift Analysis), or "
+            "**the contact distance at which objects count as touching** (Feature Extraction)? "
+            "Tell me which one and I will open it."
+        )
+    return None
+
+
+def tool_overview_guidance(context: dict, messages: list[dict]) -> str | None:
+    """Describe BEHAV3D broadly without assuming a particular biological assay."""
+    latest = _normalized_user_message(messages)
+    if not any(phrase in latest for phrase in (
+        "how can i use this tool", "how do i use this tool",
+        "what is behav3d", "what does behav3d do", "what can this tool do",
+    )):
+        return None
+    return (
+        "BEHAV3D analyzes **3D fluorescence time-lapse imaging** at object and "
+        "population level. The workflow is: describe samples and acquisition "
+        "metadata, segment the structures or signals you need, track them through "
+        "time, extract measurements such as movement, morphology, intensity, death "
+        "signal, and contact, filter tracks, then run analyses matched to the "
+        "research question. Tell me what objects or signals are visible and what you "
+        "want to measure; I can explain the relevant path and propose values in the "
+        "live controls for your confirmation."
+    )
+
+
+def metadata_taxonomy_guidance(context: dict, messages: list[dict]) -> str | None:
+    """Explain image populations, biological labels, and multicolor neutrally."""
+    latest = _normalized_user_message(messages)
+    asks_taxonomy = (
+        any(phrase in latest for phrase in (
+            "difference between cell type", "difference between population",
+            "cell type vs", "cell types vs", "population vs",
+            "line and condition", "lines and conditions",
+            "what counts as a cell type", "what is a processing population",
+        ))
+        and any(term in latest for term in ("line", "condition", "population"))
+    )
+    asks_multicolor = "multicolor" in latest and any(
+        phrase in latest for phrase in (
+            "what is", "what does", "when should", "when do", "why use",
+            "how does", "should i", "option", "mean", "purpose",
+        )
+    )
+    if not (asks_taxonomy or asks_multicolor):
+        return None
+
+    if asks_multicolor:
+        return (
+            "**Multicolor is for one biological population deliberately split "
+            "across several fluorescence colors.** Its purpose is to make a dense "
+            "population sparser in each channel, so objects can be segmented and "
+            "tracked separately and then recombined. Every color must therefore "
+            "represent the same population, line, and condition.\n\n"
+            "Do not use Multicolor when colors identify different populations, "
+            "lines, treatments, or conditions; declare those distinctions "
+            "separately. It is also not a correction for bleed-through or a "
+            "multichannel segmentation setting. Multicolor is an acquisition-design "
+            "choice: for data that already exist, use it only if the population was "
+            "actually split across colors for this purpose."
+        )
+
+    return (
+        "These fields describe two different layers:\n\n"
+        "- **Processing population (cell type in the Builder):** an object or signal "
+        "that can be distinguished in the images and needs its own segmentation and "
+        "track IDs. The microscope channels and visible labels determine this layer.\n"
+        "- **Line:** the biological identity, source, donor, clone, or model assigned "
+        "to that population in a sample. It is mandatory.\n"
+        "- **Condition:** the treatment or experimental state assigned to that "
+        "population in a sample. It is optional.\n\n"
+        "If the same visible population is acquired in several samples but its "
+        "identity or treatment changes, keep one processing population and record "
+        "the difference in Line or Condition. If two populations are visibly "
+        "distinguishable and need independent masks or tracks, configure two "
+        "processing populations."
+    )
+
+
 def organoid_processing_question(context: dict, messages: list[dict]) -> str | None:
     """Resolve whether organoid lines are processing types before any bulk fill."""
     metadata = context.get("metadata", {}) or {}
@@ -294,7 +525,7 @@ def metadata_absence_action(context: dict, messages: list[dict]) -> dict | None:
     if not (
         any(phrase in normalized for phrase in (
             "not added", "was not added", "were not added", "is absent",
-            "are absent", "no macrophage", "no t cell", "use none",
+            "are absent", "not present", "use none",
         ))
         and re.search(r"\b(?:set|fill|mark|line|metadata|use|make)\b", normalized)
     ):
@@ -350,7 +581,7 @@ def metadata_absence_action(context: dict, messages: list[dict]) -> dict | None:
 
 
 def metadata_completion_summary(context: dict, messages: list[dict]) -> str | None:
-    """Report draft completeness from the same mandatory fields used at save time."""
+    """Report all Data Preparation blockers, including the output directory."""
     latest = " ".join(_latest_user_message(messages).lower().split())
     intent = str((context.get("assistant_session") or {}).get("intent") or "")
     if not (
@@ -364,8 +595,8 @@ def metadata_completion_summary(context: dict, messages: list[dict]) -> str | No
         return None
     metadata = context.get("metadata", {}) or {}
     builder = context.get("metadata_builder", {}) or {}
-    if not (builder.get("sample_forms_created") or metadata.get("records")):
-        return None
+    has_metadata = bool(metadata.get("loaded") or metadata.get("records"))
+    output_dir_set = bool(context.get("output_dir_set"))
     validation = (
         metadata.get("validation")
         or builder.get("draft_validation")
@@ -376,35 +607,48 @@ def metadata_completion_summary(context: dict, messages: list[dict]) -> str | No
         for item in validation
         if item.get("severity") == "error" and item.get("message")
     ]
-    if errors:
-        shown = "\n".join(f"- {message}" for message in errors[:16])
-        extra = (
-            f"\n- Plus {len(errors) - 16} more mandatory values."
-            if len(errors) > 16 else ""
+    blockers = []
+    if not has_metadata:
+        blockers.append("Load a metadata CSV or complete and save the Metadata Builder.")
+    if not output_dir_set:
+        blockers.append(
+            "Set an **Output directory**. BEHAV3D needs it before segmentation, "
+            "tracking, feature extraction, filtering, or analysis can run."
         )
-        well_note = (
-            "\n\nIf you have no physical well identifiers, I can propose **1** for "
-            "every sample after you confirm."
-            if any("well" in message.lower() for message in errors) else ""
+    blockers.extend(errors[:16])
+    if len(errors) > 16:
+        blockers.append(f"Plus {len(errors) - 16} more mandatory metadata values.")
+
+    if blockers:
+        shown = "\n".join(
+            f"{index}. {message}" for index, message in enumerate(blockers, start=1)
         )
-        return (
-            "Not yet. These mandatory metadata values are still missing:\n"
-            f"{shown}{extra}\n\nPopulation **condition** fields are optional; "
-            "population **line** fields are mandatory. A population confirmed absent "
-            "from a sample should be described as **not added** and use "
-            "**not_added** for its line rather than remain blank."
-            f"{well_note}"
-        )
+        notes = []
+        if errors:
+            notes.append(
+                "Population **condition** fields are optional; population **line** "
+                "fields are mandatory. For a population that was not added, use "
+                "**not_added** for its line rather than leaving it blank."
+            )
+        if any("well" in message.lower() for message in errors):
+            notes.append(
+                "If you have no physical well identifiers, I can propose **1** for "
+                "every sample after you confirm."
+            )
+        note_text = f"\n\n**Notes**\n{' '.join(notes)}" if notes else ""
+        return f"**Setup incomplete**\n\n**Next actions**\n{shown}{note_text}"
+
     save_available = bool((builder.get("actions") or {}).get("save_available"))
-    next_step = (
-        "The draft is ready to save; ask me to save it and you will get a confirmation "
-        "button."
-        if builder.get("save_required") and save_available
-        else "No mandatory metadata values are missing."
-    )
+    if builder.get("save_required") and save_available:
+        return (
+            "**Metadata complete**\n\n"
+            "**Next action**\nAsk me to save and activate the metadata; you will get "
+            "a confirmation button. The **Output directory** is already set."
+        )
     return (
-        f"{next_step} Population condition fields remain optional. "
-        "Saving from the Metadata Builder also activates the metadata for the other tabs."
+        "**Ready for processing**\n\n"
+        "The metadata is complete and the **Output directory** is set. Population "
+        "condition fields remain optional."
     )
 
 
@@ -506,70 +750,46 @@ def analysis_choice_summary(context: dict, messages: list[dict]) -> str | None:
             "the current records, so the overview below is not yet prioritized.\n\n"
         )
     else:
-        described = []
-        for terms, label in (
-            (("t cell", "t-cell", "tcell"), "T cells"),
-            (("macrophage",), "macrophages"),
-            (("organoid",), "organoids"),
-        ):
-            if any(term in latest for term in terms):
-                described.append(label)
-        description = (
-            f" You described **{', '.join(described)}**, so I can still suggest "
-            "relevant routes conditionally."
-            if described else ""
-        )
         snapshot = (
             "No metadata is loaded, so I cannot yet confirm sample counts, configured "
-            f"populations, lines, or death-signal availability.{description}\n\n"
+            "populations, lines, conditions, or signal availability. I can still "
+            "explain the analysis routes without assuming biological roles.\n\n"
         )
-
-    described_organoid = "organoid" in latest
-    described_immune_labels = []
-    for terms, label in (
-        (("t cell", "t-cell", "tcell"), "T cells"),
-        (("macrophage",), "macrophages"),
-        (("immune",), "immune cells"),
-    ):
-        if any(term in latest for term in terms) and label not in described_immune_labels:
-            described_immune_labels.append(label)
-    described_immune = bool(described_immune_labels)
-    has_organoid = bool(populations["organoid"]) or described_organoid
-    has_immune = bool(populations["immune"]) or described_immune
-    immune_labels = populations["immune"] or described_immune_labels
-    immune_subject = " or ".join(immune_labels[:4]) or "immune cells"
 
     questions = []
-    if has_organoid:
+    if all_populations and profile["dead_signal"]:
         questions.append(
-            "Do organoid lines differ in survival or death timing? Use **Death "
-            "Dynamics** if a death signal is available."
+            "Do populations or conditions differ in when a switch-on signal appears? "
+            "Use **Death Dynamics**. The signal can represent any measured transition; "
+            "do not interpret it as death unless that is what the reporter measures."
         )
-    if has_organoid and has_immune:
+    if len(all_populations) >= 2:
         questions.extend([
-            f"Do {immune_subject} contact different organoid lines differently, "
-            "and is contact associated with death? Use **Interaction Analysis**.",
-            "How much of each immune cell surface engages an organoid? Use "
+            "Do two selected populations differ in contact frequency, duration, or "
+            "signal state? Use **Interaction Analysis**.",
+            "How much of one selected object's surface engages another? Use "
             "**Invasiveness Analysis** after extracting invasiveness features.",
             "Do sustained-contact tracks occupy different trajectory clusters, or do "
             "cell states change after contact? Use **Contact analysis** and "
             "**Contact State-Shift Analysis** under State Trajectory.",
         ])
-    if has_immune:
+    if all_populations:
         questions.append(
-            "Do immune populations occupy different dynamic states or complete "
-            "different behavioral programs? Use **Behavioral State**, then "
-            "**State Trajectory**."
+            "Does a selected single-cell population occupy recurring states or "
+            "complete different whole-track programs? Use **Behavioral State**, "
+            "then **State Trajectory**. Choose features from the behavior you want "
+            "to classify: movement, contact, morphology, or channel intensity."
         )
-    if has_organoid and has_immune:
+    if len(all_populations) >= 2:
         availability = (
-            "The loaded metadata includes a death signal."
+            "The loaded metadata includes a switch-on signal."
             if profile["dead_signal"] else
-            "This requires a configured death signal and the relevant extracted features."
+            "This requires a suitable switch-on signal and the relevant extracted features."
         )
         questions.append(
-            "Which individual immune cells show contact-associated target killing? "
-            f"Use **Active Killing** after feature extraction. {availability}"
+            "Which individual contacting objects are associated with a signal rise "
+            "in a contacted target? Use **Active Killing** after feature extraction. "
+            f"{availability}"
         )
     if not questions:
         questions.append(
@@ -585,15 +805,16 @@ def analysis_choice_summary(context: dict, messages: list[dict]) -> str | None:
         f"{snapshot}"
         "| Analysis | What it answers |\n"
         "|---|---|\n"
-        "| **Death Dynamics** | How target survival and death timing differ across "
-        "samples or conditions. |\n"
-        "| **Interaction Analysis** | How target-contact patterns differ and whether "
-        "they are associated with target death. |\n"
-        "| **Invasiveness Analysis** | How much of an immune cell's surface engages a "
-        "target over time and per movie. |\n"
-        "| **Active Killing** | Which individual immune cells have contact-associated "
-        "target-death events; configured during Feature Extraction. |\n"
-        "| **Behavioral State** | Which recurring state each selected cell occupies at "
+        "| **Death Dynamics** | How the fraction of objects with a switch-on signal "
+        "changes across time, samples, or conditions. |\n"
+        "| **Interaction Analysis** | How contact patterns differ and whether they "
+        "are associated with the selected object's signal state. |\n"
+        "| **Invasiveness Analysis** | How much of one object's surface engages a "
+        "selected target over time and per movie. |\n"
+        "| **Active Killing** | Which individual contacting objects have "
+        "contact-associated signal-rise events in a target; configured during "
+        "Feature Extraction. |\n"
+        "| **Behavioral State** | Which recurring state each selected object occupies at "
         "each timepoint. |\n"
         "| **State Trajectory** | Which whole-track behavioral programs occur and how "
         "their proportions differ by condition. |\n"
@@ -610,9 +831,9 @@ def analysis_choice_summary(context: dict, messages: list[dict]) -> str | None:
         "State-Shift additionally requires Behavioral State results.\n\n"
         f"**{question_heading}**\n"
         f"{question_text}\n\n"
-        "For an immune-cell behavior question, the usual sequence is **Behavioral "
+        "For a single-cell behavior question, the usual sequence is **Behavioral "
         "State -> rename or merge states -> State Trajectory -> Backprojection**. "
-        "For a target-killing question, start with **Death Dynamics**, then add "
+        "For a contact-associated signal question, start with **Death Dynamics**, then add "
         "**Interaction/Invasiveness** and **Active Killing** where their prerequisites "
         "are available."
     )
@@ -621,19 +842,51 @@ def analysis_choice_summary(context: dict, messages: list[dict]) -> str | None:
 def analysis_navigation_action(context: dict, messages: list[dict]) -> dict | None:
     """Open a named Analysis view directly and avoid generic-tab navigation loops."""
     latest = " ".join(_latest_user_message(messages).lower().split())
+    previous = _previous_assistant_message(messages).lower()
+    answering_clarification = (
+        "tell me which" in previous
+        and len(latest.split()) <= 14
+    )
+    asks_to_open = answering_clarification or any(
+        command in latest for command in (
+            "take me", "go to", "open", "navigate", "show me",
+        )
+    )
+    if not asks_to_open:
+        return None
+
     requested = None
     for phrases, view, label in (
         (("death dynamics",), "death_dynamics", "Death Dynamics"),
+        (("interaction analysis", "contact counts", "contact comparison"),
+         "interaction", "Interaction Analysis"),
+        (("invasiveness analysis",), "invasiveness", "Invasiveness Analysis"),
+        (("active killing", "signal increase that counts as a killing event"),
+         "active_killing", "Active Killing"),
         (("behavioral state", "behavioural state"), "behavioral_state", "Behavioral State"),
         (("state trajectory", "trajectory analysis"), "state_trajectory", "State Trajectory"),
+        (("contact-based grouping", "contact based grouping", "behavior differs while touching",
+          "behaviour differs while touching"), "state_trajectory", "State Trajectory"),
+        (("contact state-shift", "contact state shift", "before versus after contact"),
+         "state_trajectory", "State Trajectory"),
     ):
-        if any(phrase in latest for phrase in phrases) and any(
-            command in latest for command in (
-                "take me", "go to", "open", "navigate", "show me",
-            )
-        ):
+        if any(phrase in latest for phrase in phrases):
             requested = (view, label)
             break
+    feature_request = any(phrase in latest for phrase in (
+        "feature extraction", "contact distance", "distance at which",
+        "threshold that decides", "object counts as signal-positive",
+    ))
+    if requested is None and feature_request:
+        if context.get("current_step") == "feature_extraction":
+            return {"text": "You are already in **Feature Extraction**.", "calls": []}
+        return {
+            "text": "Opening **Feature Extraction**.",
+            "calls": [{
+                "name": "navigate_to_step",
+                "arguments": {"step": "feature_extraction"},
+            }],
+        }
     if requested is None:
         return None
     view, label = requested
@@ -891,8 +1144,13 @@ def tracking_motion_question(context: dict, messages: list[dict]) -> str | None:
         if message.get("role") == "user"
     ), "")
     normalized = " ".join(latest.lower().split())
+    intent = str((context.get("assistant_session") or {}).get("intent") or "")
     generic_request = (
-        normalized in {"guide tracking", "tracking guide", "which method?"}
+        intent in {"guide_tracking", "compare_tracking_methods"}
+        or normalized in {
+            "guide tracking", "tracking guide", "which method?",
+            "choose tracking method", "choose a tracking method",
+        }
         or any(phrase in normalized for phrase in (
             "which tracking method", "choose a tracking method",
             "choose tracking method", "help choose", "help me choose",
@@ -902,27 +1160,29 @@ def tracking_motion_question(context: dict, messages: list[dict]) -> str | None:
     if not generic_request:
         return None
 
-    user_history = " ".join(
-        str(message.get("content") or "").lower()
-        for message in messages
-        if message.get("role") == "user"
-    )
     motion_evidence = (
         "stationary", "static", "does not move", "doesn't move", "do not move",
         "don't move", "remain overlapping", "remains overlapping", "motile",
+        "still overlap", "overlaps between", "overlap between", "keeps overlapping",
+        "no longer overlap", "does not overlap", "doesn't overlap",
         "moves about", "move about", "moves roughly", "move roughly",
         "displacement", "micron per", "microns per", "µm per", "um per",
         "pixel per", "pixels per", "moves slowly", "move slowly",
         "moves quickly", "move quickly", "moves fast", "move fast",
+        "touching masks", "disconnected region", "connected region",
     )
-    if any(phrase in user_history for phrase in motion_evidence):
+    # Only the current request is evidence for this tab. An earlier segmentation
+    # discussion may also mention overlap, but that must not suppress Tracking help.
+    if any(phrase in normalized for phrase in motion_evidence):
         return None
 
     cell_type = str(context.get("active_cell_type") or "the selected structure")
     return (
-        f"Before I recommend a tracking method for **{cell_type}**, how far does it "
-        "move between consecutive frames, or does it remain largely overlapping with "
-        "its previous position? A rough answer in micrometres or pixels is enough."
+        "**Tracking method: one detail needed**\n\n"
+        f"For **{cell_type}**, how far does the object move between consecutive "
+        "frames, or does it remain largely overlapping with its previous position?\n\n"
+        "**Reply with:** a rough displacement in micrometres or pixels, or simply "
+        "whether the masks still overlap."
     )
 
 
@@ -949,23 +1209,20 @@ def segmentation_signal_question(context: dict, messages: list[dict]) -> str | N
     if not method_request:
         return None
 
-    user_history = " ".join(
-        str(message.get("content") or "").lower()
-        for message in messages
-        if message.get("role") == "user"
-    )
     signal_evidence = (
         "bleed-through", "bleed through", "clean channel", "isolated channel",
         "isolated signal", "same channel", "mixed signal", "multiple cell types",
         "more than one cell type", "both visible",
     )
-    if any(phrase in user_history for phrase in signal_evidence):
+    if any(phrase in normalized for phrase in signal_evidence):
         return None
 
     return (
-        "Before I recommend a segmentation method, for the target you want to "
-        "segment, is its signal isolated in a clean, high-resolution channel, or is "
-        "signal from another cell type visible in that same channel (bleed-through)?"
+        "**Segmentation method: one detail needed**\n\n"
+        "For the target you want to segment, is its signal isolated in a clean, "
+        "high-resolution channel, or is signal from another cell type visible in "
+        "that same channel (bleed-through)?\n\n"
+        "**Reply with:** **clean channel**, **bleed-through**, or **unsure**."
     )
 
 
@@ -998,8 +1255,8 @@ def metadata_channel_mapping_guidance(
         "population's **Line** and **Condition**. Channel inputs are configured in "
         "Segmentation.\n\n"
         "For swapped-channel replicates, a valid metadata structure is to name two "
-        "generic processing slots for the physical immune channels (for example, "
-        "**blue** and **green**) and record the true identity, such as CD4 or CD8, "
+        "generic processing slots for the physical channels (for example, "
+        "**channel A** and **channel B**) and record the true biological identity "
         "in each slot's **Line** field for every sample. A slot must stay tied to "
         "the same physical raw channel across all samples processed by that model; "
         "the channel choice is not independent per sample.\n\n"
@@ -1432,15 +1689,9 @@ def feature_threshold_guidance(
     if context.get("current_step") != "feature_extraction":
         return None
     latest = " ".join(_latest_user_message(messages).lower().split())
-    contact_request = "contact" in latest and any(term in latest for term in (
-        "distance", "threshold", "set", "correct", "mean", "1.01", "touch",
-    ))
-    death_request = any(term in latest for term in ("dead", "death")) and any(
-        term in latest for term in (
-            "threshold", "percentage", "percent", "set", "correct", "preview",
-            "first time", "calibrat",
-        )
-    )
+    route = _analysis_intent_route(messages)
+    contact_request = route in {"contact_distance", "feature_thresholds"}
+    death_request = route in {"death_threshold", "feature_thresholds"}
     if not contact_request and not death_request:
         return None
 
@@ -1558,123 +1809,6 @@ def result_opening_correction(
         "result you want opened so it can be matched to a viewable result."
         + preview
     )
-
-
-def historical_reference_guidance(
-    context: dict, messages: list[dict],
-) -> dict | None:
-    """Give stable, provenance-labeled answers for explicit historical examples."""
-    latest = " ".join(_latest_user_message(messages).lower().split())
-    historical_request = any(phrase in latest for phrase in (
-        "example value", "example setting", "example configuration",
-        "previous experiment", "past experiment", "historical value",
-        "historical setting", "reference profile", "reference configuration",
-        "similar experiment", "similar dataset", "values used before",
-        "what did you use", "used previously", "prior experiment",
-    )) or (
-        any(term in latest for term in ("previous", "past", "prior", "historical"))
-        and "experiment" in latest
-    )
-    if not historical_request:
-        return None
-
-    if any(term in latest for term in (
-        "microglia", "macrophage", "exp91", "dmg", "dipg", "gd2",
-    )):
-        return {
-            "text": (
-                "**Historical example: Exp91 DMG organoid, macrophage/microglia, "
-                "and GD2 CAR-T co-culture.** The metadata CSV records eight wells, "
-                "1.77 µm isotropic sampling, 120-second frames, TCZYX order, and "
-                "five channels: brightfield 0, T cell 1, macrophage/microglia 2, "
-                "dead-cell dye 3, and organoid 4. The three organoid lines were kept "
-                "as one processing population because only one line occurred per "
-                "movie; line identity was retained for analysis. Macrophage/microglia "
-                "conditions were no added cells, M21, and M23. The historical CSV "
-                "uses the legacy value **None_None** for no added macrophages; track "
-                "paths in those wells contain segmentation noise and are not evidence "
-                "that macrophages were present.\n\n"
-                "The saved YAML uses APOC Probability Map + Watershed: organoid "
-                "channels 3 and 4 with mask/seed thresholds 0.5/0.8 and minimum size "
-                "1000 voxels; macrophage channel 2 and T-cell channel 1 with "
-                "0.5/0.6 and minimum sizes 100 and 30 voxels. Organoids and "
-                "macrophages used Propagation; T cells used btrack with maximum "
-                "search radius 150, optimizer distance 100, time threshold 5 frames, "
-                "and global optimization enabled. Active Killing was configured as "
-                "an absolute increase of 30 dead-mask pixels within 5 frames after "
-                "at least one contact frame.\n\n"
-                "Only T cells had behavioral classification: four HMM states and "
-                "50-timepoint trajectory windows. One source conflict must remain "
-                "visible: the saved YAML has HMM Start offset **0**, while the README "
-                "describes **1**. The design is also incomplete and unreplicated: "
-                "DIPG002ns has no M21 well, and each included combination has n=1, "
-                "so comparisons are descriptive or exploratory. These are sourced "
-                "historical values, not defaults, and I am not proposing form edits "
-                "from them."
-            ),
-            "calls": [],
-        }
-
-    if (
-        any(term in latest for term in ("calcium", "reporter", "islet"))
-        and any(term in latest for term in ("static", "tracking", "method", "value"))
-    ):
-        return {
-            "text": (
-                "**Historical example: near-static pancreatic islet calcium "
-                "reporter experiment.** Its metadata records 0.33 µm XY, 2.0 µm Z, "
-                "5 s between frames, and 32 frames. Segmentation was generated "
-                "externally with Cellpose-SAM and imported into BEHAV3D. Tracking "
-                "used **Reporter Propagation** because the cells were near-static "
-                "but intermittently visible. The experiment README records a "
-                "historical **100-voxel noise cutoff** and **10% overlap** grouping "
-                "rule. Filtering retained the full 32-frame duration. Its five-state "
-                "behavioral model used a top-quartile reporter-intensity fold-change "
-                "feature with smoothing 1, and the five-cluster trajectory analysis "
-                "used all 32 frames with Average linkage. These are provenance-labeled "
-                "example values, not defaults: before adapting them, confirm that "
-                "your objects are genuinely static, compare your 3D object volume and "
-                "spacing, and inspect the grouping result. I am not proposing any "
-                "form edits from this historical profile."
-            ),
-            "calls": [],
-        }
-
-    if "btrack" in latest or (
-        "tracking" in latest and any(term in latest for term in ("t cell", "t-cell"))
-    ):
-        records = (context.get("metadata", {}) or {}).get("records", []) or []
-        record = records[0] if records else {}
-        live_cadence = ""
-        try:
-            interval = float(record.get("time_interval"))
-            live_cadence = (
-                f" Your loaded metadata uses {interval:g} "
-                f"{record.get('time_unit') or ''} between frames."
-            )
-        except (TypeError, ValueError):
-            pass
-        return {
-            "text": (
-                "Two provenance-labeled T-cell examples show why these values are "
-                "not reusable defaults. **IVM HIV** used 1.15 µm XY, 4 µm Z, and "
-                "15 s frames; its saved btrack values were maximum search radii "
-                "12 and 10 µm, optimizer distance 26 µm, and time thresholds 6 and "
-                "4 frames for its two populations. **CD4/CD8-13T** used 1.01 µm XY, "
-                "1.05 µm Z, and 2 min frames; its matched T-cell settings were "
-                "maximum search radius 100 µm, optimizer distance 60 µm, and time "
-                "threshold 3 frames."
-                f"{live_cadence} These are historical examples and should not be "
-                "copied directly. For the current experiment, measure the fastest "
-                "plausible one-frame displacement and add a modest margin for the "
-                "Step 1 search radius. After that preview is correct, set Step 2 "
-                "Distance threshold from the largest spatial gap to reconnect and "
-                "Time threshold from the largest missing-frame gap. I am not "
-                "proposing any form edits from the historical values."
-            ),
-            "calls": [],
-        }
-    return None
 
 
 def tracking_radius_action(context: dict, messages: list[dict]) -> dict | None:
@@ -2014,8 +2148,15 @@ def feature_group_requirement_guidance(
     if context.get("current_step") != "feature_extraction":
         return None
     latest = _latest_user_message(messages).lower()
+    cell_type = str(context.get("active_cell_type") or "")
+    adjusts_active_population = bool(
+        cell_type
+        and "adjust" in latest
+        and " ".join(re.sub(r"[^a-z0-9]+", " ", cell_type.lower()).split())
+        in " ".join(re.sub(r"[^a-z0-9]+", " ", latest).split())
+    )
     if not (
-        re.search(r"\badjust\s+(?:the\s+)?(?:t[\s-]?cells?|tcell)", latest)
+        adjusts_active_population
         or re.search(r"\b(?:drop|remove|disable)\s+intensity\b", latest)
         or (
             "feature group" in latest
@@ -2024,7 +2165,6 @@ def feature_group_requirement_guidance(
     ):
         return None
 
-    cell_type = str(context.get("active_cell_type") or "")
     controls = _visible_control_map(context)
     control = next((
         item for control_id, item in controls.items()
@@ -2250,14 +2390,11 @@ def hmm_binary_group_guidance(
     selected = ", ".join(
         _feature_label(value) for value in (control.get("value") or [])
     ) or "none"
-    contact_choices = [
-        _feature_label(choice) for choice in choices if "contact" in choice.lower()
-    ]
+    contact_choices = [choice for choice in choices if "contact" in choice.lower()]
     recommendation = (
-        " For target engagement, prioritize an organoid or target contact group; "
-        "a macrophage contact group can additionally test whether cells in the "
-        f"selected **{cell_type}** population behave differently while touching "
-        "macrophages."
+        " Choose a contact group only when touching that named population is part "
+        "of the research question; it means the selected object is touching that "
+        "population."
         if contact_choices else ""
     )
     return (
@@ -2421,7 +2558,9 @@ def hmm_movement_feature_guidance(
     )
     asks_behavior_setup = (
         "behavior" in latest
-        and any(word in latest for word in ("interaction", "contact", "tumor"))
+        and any(word in latest for word in (
+            "interaction", "contact", "movement", "morphology", "intensity",
+        ))
         and any(word in latest for word in ("fill", "set", "configure", "select"))
     )
     asks_selection_review = (
@@ -2472,6 +2611,134 @@ def _number_from_proposal(text: str, patterns: tuple[str, ...]) -> float | None:
     return None
 
 
+def _active_killing_anchor(messages: list[dict]) -> int | None:
+    """Locate the start of the latest explicit Active Killing setup thread."""
+    candidates = []
+    explicit_setups = []
+    for index, message in enumerate(messages):
+        if message.get("role") != "user":
+            continue
+        text = str(message.get("content") or "")
+        if _analysis_intent_route([{"role": "user", "content": text}]) == "active_killing":
+            candidates.append(index)
+            lowered = text.lower()
+            if any(term in lowered for term in (
+                "set up", "setup", "configure", "start a new active killing",
+            )):
+                explicit_setups.append(index)
+    if not candidates:
+        return None
+    return explicit_setups[-1] if explicit_setups else candidates[0]
+
+
+def _active_killing_user_text(messages: list[dict]) -> str:
+    """Keep user constraints from the latest Active Killing setup thread."""
+    anchor = _active_killing_anchor(messages)
+    if anchor is None:
+        return ""
+    return "\n".join(
+        str(message.get("content") or "")
+        for message in messages[anchor:]
+        if message.get("role") == "user"
+    )
+
+
+def _active_killing_interval_minutes(context: dict) -> tuple[float, str] | None:
+    records = (context.get("metadata", {}) or {}).get("records", []) or []
+    intervals = []
+    for record in records:
+        try:
+            value = float(record["time_interval"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        unit = str(record.get("time_unit") or "").strip().lower()
+        if unit.startswith("s"):
+            minutes = value / 60
+        elif unit.startswith("m"):
+            minutes = value
+        elif unit.startswith("h"):
+            minutes = value * 60
+        else:
+            continue
+        intervals.append((round(minutes, 12), value, record.get("time_unit") or ""))
+    unique = {item[0] for item in intervals}
+    if len(intervals) != len(records) or len(unique) != 1:
+        return None
+    _, original, unit = intervals[0]
+    return float(unique.pop()), f"{original:g} {unit}".strip()
+
+
+def _active_killing_duration_minutes(text: str) -> float | None:
+    patterns = (
+        r"\bwithin\s+(\d+(?:\.\d+)?)\s+minutes?\b",
+        r"\b(?:around|about|approximately|roughly)?\s*(\d+(?:\.\d+)?)\s+"
+        r"minutes?\s+after\s+(?:the\s+)?(?:initial\s+)?contact\b",
+        r"\bdie\w*\s+(?:around|about|approximately|roughly)?\s*"
+        r"(\d+(?:\.\d+)?)\s+minutes?\s+after\b",
+    )
+    return _number_from_proposal(text, patterns)
+
+
+def _one_cell_death_requirement(text: str) -> bool:
+    return bool(re.search(
+        r"\bat least\s+(?:1|one)\s+(?:cell|object)\w*\s+"
+        r"(?:to\s+)?(?:dies?|dead|dying)\b",
+        text,
+        re.IGNORECASE,
+    ))
+
+
+def _one_cell_threshold_estimate(
+    context: dict, text: str,
+) -> tuple[int, str] | None:
+    """Estimate one full stained cell in image pixels/voxels from live spacing."""
+    diameter = _number_from_proposal(text, (
+        r"(\d+(?:\.\d+)?)\s*(?:µm|um|micromet(?:er|re)s?)\s+"
+        r"(?:cell|object)\s+diameter",
+        r"(?:cell|object)\s+diameter[^\d]{0,20}(\d+(?:\.\d+)?)\s*"
+        r"(?:µm|um|micromet(?:er|re)s?)",
+    )) or 10.0
+    records = (context.get("metadata", {}) or {}).get("records", []) or []
+    xy_values = set()
+    z_values = set()
+    valid_xy = 0
+    valid_z = 0
+    for record in records:
+        try:
+            xy = float(record.get("pixel_distance_xy"))
+        except (TypeError, ValueError):
+            xy = 0
+        try:
+            z = float(record.get("pixel_distance_z"))
+        except (TypeError, ValueError):
+            z = 0
+        if xy > 0:
+            xy_values.add(round(xy, 9))
+            valid_xy += 1
+        if z > 0:
+            z_values.add(round(z, 9))
+            valid_z += 1
+    if valid_xy != len(records) or len(xy_values) != 1:
+        return None
+    if valid_z not in {0, len(records)}:
+        return None
+    xy = next(iter(xy_values))
+    if len(z_values) == 1:
+        z = next(iter(z_values))
+        count = max(1, int(round((math.pi / 6.0 * diameter ** 3) / (xy ** 2 * z))))
+        basis = (
+            f"a {diameter:g} µm spherical cell at {xy:g} µm XY and {z:g} µm Z "
+            "sampling"
+        )
+    else:
+        count = max(1, int(round(math.pi * (diameter / 2.0) ** 2 / xy ** 2)))
+        basis = (
+            f"a {diameter:g} µm cell cross-section at {xy:g} µm per XY pixel; "
+            "Z spacing is unavailable, so this is a 2D estimate"
+        )
+    return count, basis
+
+
 def active_killing_confirmation_action(
     context: dict, messages: list[dict],
 ) -> dict | None:
@@ -2482,9 +2749,11 @@ def active_killing_confirmation_action(
     if not any(phrase in latest for phrase in (
         "settings seem ok", "settings seem okay", "looks good", "apply them",
         "apply these", "use those settings", "use these settings",
-        "yes set it up", "yes, set it up",
+        "yes set it up", "yes, set it up", "yes please", "proceed",
+        "go ahead",
     )):
-        return None
+        if latest not in {"yes", "ok", "okay"}:
+            return None
     previous = _previous_assistant_message(messages)
     if "active killing" not in previous.lower():
         return None
@@ -2502,12 +2771,26 @@ def active_killing_confirmation_action(
     previous_lower = previous.lower()
     target_control = by_suffix["target_types"]
     if target_control is not None:
-        selected_targets = [
-            str(choice) for choice in (target_control.get("choices") or [])
-            if re.search(
-                rf"\b{re.escape(str(choice).lower())}\b", previous_lower
-            )
-        ]
+        marked_target = re.search(
+            r"target for this run:\s*\*\*([^*]+)\*\*",
+            previous,
+            re.IGNORECASE,
+        )
+        if marked_target:
+            marked = marked_target.group(1).strip().lower()
+            selected_targets = [
+                str(choice) for choice in (target_control.get("choices") or [])
+                if re.search(
+                    rf"(?<!\w){re.escape(str(choice).lower())}(?!\w)", marked
+                )
+            ]
+        else:
+            selected_targets = [
+                str(choice) for choice in (target_control.get("choices") or [])
+                if re.search(
+                    rf"\b{re.escape(str(choice).lower())}\b", previous_lower
+                )
+            ]
         if selected_targets:
             expected["target_types"] = selected_targets
 
@@ -2572,12 +2855,18 @@ def active_killing_confirmation_action(
         target_control.get("value") if target_control else []
     )
     target_text = ", ".join(str(value) for value in targets) or "the selected targets"
+    scope_text = (
+        "This is one independent target run; configure the other target in a "
+        "separate run if you want to avoid a pooled result."
+        if len(targets) == 1 else
+        "Selecting multiple targets produces each independent target output and an "
+        "additional pooled analysis."
+    )
     return {
         "text": (
             "I am proposing the complete agreed Active Killing setup in one batch, "
             f"for effector cells against **{target_text}**. BEHAV3D will run each "
-            "selected target independently and also create a combined analysis when "
-            "more than one target is selected. The setup is not ready until every "
+            f"selected target independently. {scope_text} The setup is not ready until every "
             "action card below has been applied; after that the live readiness state "
             "will confirm it."
         ),
@@ -2604,6 +2893,45 @@ def active_killing_readiness_summary(
         or {}
     )
     issues = list(state.get("setup_issues") or [])
+    setup_text = _active_killing_user_text(messages)
+    if _one_cell_death_requirement(setup_text):
+        anchor = _active_killing_anchor(messages) or 0
+        assistant_text = " ".join(
+            str(message.get("content") or "").lower()
+            for message in messages[anchor:]
+            if message.get("role") == "assistant"
+        )
+        explicit_user_threshold = bool(re.search(
+            r"absolute (?:signal-increase )?threshold[^\d]{0,30}"
+            r"\d+(?:\.\d+)?\s*(?:dead[- ]mask |dead )?(?:pixels|voxels)",
+            setup_text,
+            re.IGNORECASE,
+        ))
+        calibrated = "one-cell calibration" in assistant_text or explicit_user_threshold
+        try:
+            positive_threshold = float(state.get("absolute_threshold") or 0) > 0
+        except (TypeError, ValueError):
+            positive_threshold = False
+        if not (
+            calibrated
+            and state.get("uses_absolute_threshold")
+            and str(state.get("death_signal") or "").lower() == "dead-mask pixel count"
+            and positive_threshold
+        ):
+            issues.append(
+                "The requirement that at least one cell dies has not yet been "
+                "translated into a calibrated positive dead-mask pixel increase."
+            )
+    if (
+        any(phrase in setup_text.lower() for phrase in (
+            "independently", "separately", "no combined", "without combined",
+        ))
+        and len(state.get("target_cell_types") or []) > 1
+    ):
+        issues.append(
+            "Independent-only comparison requires one target per run; multiple "
+            "selected targets would also create a pooled analysis."
+        )
     if issues:
         return (
             "Active Killing is **not ready yet**. "
@@ -2612,91 +2940,199 @@ def active_killing_readiness_summary(
             "contain every required value."
         )
     targets = ", ".join(state.get("target_cell_types") or []) or "none"
+    observation = state.get("observation_window")
+    observation_unit = "timepoint" if observation == 1 else "timepoints"
+    minimum_contact = state.get("minimum_contact_duration")
+    contact_unit = "timepoint" if minimum_contact == 1 else "timepoints"
     return (
         "Active Killing is **ready** in the live controls: effector "
         f"**{state.get('effector_cell_type')}**, targets **{targets}**, observation "
-        f"window **{state.get('observation_window')} timepoints**, and minimum "
-        f"contact **{state.get('minimum_contact_duration')} timepoints**. "
-        "When multiple targets are selected, BEHAV3D produces independent target "
-        "analyses and a combined analysis."
+        f"window **{observation} {observation_unit}**, and minimum "
+        f"contact **{minimum_contact} {contact_unit}**. "
+        + (
+            "This is one independent target run."
+            if len(state.get("target_cell_types") or []) == 1 else
+            "Multiple targets will produce independent outputs plus an additional "
+            "pooled analysis."
+        )
     )
 
 
 def active_killing_action(context: dict, messages: list[dict]) -> dict | None:
-    """Build the standard Active Killing proposal from target and cadence."""
+    """Build an Active Killing proposal from natural setup language and history."""
+    latest = _latest_user_message(messages)
+    latest_lower = " ".join(latest.lower().split())
+    if any(phrase in latest_lower for phrase in (
+        "is it set", "is it ready", "ready now", "setup complete",
+    )):
+        return None
+    setup_text = _active_killing_user_text(messages)
+    if not setup_text:
+        return None
+    setup_lower = setup_text.lower()
+    setup_request = any(term in setup_lower for term in (
+        "set up", "setup", "configure", "compare", "find out", "analyse",
+        "analyze", "active killing",
+    ))
     if context.get("current_step") != "feature_extraction":
-        return None
-    latest = next((
-        str(message.get("content") or "")
-        for message in reversed(messages)
-        if message.get("role") == "user"
-    ), "")
-    text = latest.lower()
-    if "configure active killing" not in text:
-        return None
-    target_match = re.search(
-        r"\bagainst\s+([a-z0-9_ ,&/-]+?)(?:\s+only)?(?:[.;]|\s+within\b)",
-        text,
-    )
-    window_match = re.search(r"\bwithin\s+(\d+(?:\.\d+)?)\s+minutes?\b", text)
-    if target_match is None or window_match is None:
-        return None
-    target_text = target_match.group(1).strip()
-    duration_minutes = float(window_match.group(1))
+        if not setup_request:
+            return None
+        return {
+            "text": (
+                "Opening **Active Killing** in Feature Extraction, where its "
+                "contact-associated signal settings are configured."
+            ),
+            "calls": [{
+                "name": "open_analysis_view",
+                "arguments": {"view": "active_killing"},
+            }],
+        }
 
-    records = (context.get("metadata", {}) or {}).get("records", []) or []
-    record = records[0] if records else {}
-    try:
-        interval = float(record["time_interval"])
-    except (KeyError, TypeError, ValueError):
-        return None
-    unit = str(record.get("time_unit") or "").strip().lower()
-    if unit.startswith("s"):
-        interval_minutes = interval / 60
-    elif unit.startswith("m"):
-        interval_minutes = interval
-    elif unit.startswith("h"):
-        interval_minutes = interval * 60
-    else:
-        return None
-    window = duration_minutes / interval_minutes
-    if abs(window - round(window)) > 1e-9:
-        return None
-    window = int(round(window))
-
-    controls = (context.get("ui_state", {}) or {}).get("controls", []) or []
-    by_id = {
-        str(control.get("id") or ""): control
-        for control in controls
-        if control.get("visible", True) and control.get("enabled", True)
-    }
-    target_control = by_id.get("features.active_killing.target_types", {})
+    by_id = _visible_control_map(context)
+    target_control = by_id.get("features.active_killing.target_types")
+    if target_control is None:
+        return {
+            "text": (
+                "Opening the **Active Killing** panel so I can read and edit its "
+                "live controls."
+            ),
+            "calls": [{
+                "name": "open_analysis_view",
+                "arguments": {"view": "active_killing"},
+            }],
+        }
     target_choices = [str(value) for value in (target_control.get("choices") or [])]
     targets = [
         choice for choice in target_choices
-        if re.search(rf"\b{re.escape(choice.lower())}\b", target_text)
+        if re.search(rf"(?<!\w){re.escape(choice.lower())}(?!\w)", setup_lower)
     ]
+    if not targets and not target_choices:
+        target_match = re.search(
+            r"\bagainst\s+([a-z0-9_ ,&/-]+?)(?:\s+only\b|[.;]|\s+within\b)",
+            setup_lower,
+        )
+        if target_match:
+            targets = [
+                value.strip()
+                for value in re.split(
+                    r"\s*(?:,|&|\band\b)\s*", target_match.group(1)
+                )
+                if value.strip()
+            ]
     if not targets:
-        targets = [
-            value.strip()
-            for value in re.split(r"\s*(?:,|&|\band\b)\s*", target_text)
-            if value.strip()
-        ]
-    absolute_threshold = _number_from_proposal(latest, (
-        r"absolute (?:signal-increase )?threshold[^\d]{0,30}"
-        r"(\d+(?:\.\d+)?)\s*(?:dead[- ]mask |dead )?(?:pixels|voxels)",
-    ))
-    if absolute_threshold is None or absolute_threshold <= 0:
         return {
             "text": (
-                f"The timing converts to **{window} timepoints** at {interval:g} "
-                f"{record.get('time_unit') or ''} per frame. Before I propose the "
-                "complete Active Killing setup, I still need one value: the positive "
-                "minimum dead-mask pixel increase for the absolute threshold. I will "
-                "not enable absolute-threshold mode while that value remains 0."
+                "Which contacted target population should this Active Killing run "
+                "evaluate? Choose one of the target names shown in the live panel."
             ),
             "calls": [],
         }
+
+    independent_only = any(phrase in setup_lower for phrase in (
+        "independently", "separately", "no combined", "without combined",
+        "independent only", "independent-only",
+    ))
+    include_pooled = any(phrase in setup_lower for phrase in (
+        "include combined", "include the combined", "include pooled",
+        "include the pooled", "combined too", "pooled too", "as well as combined",
+    ))
+    if len(targets) > 1 and not independent_only and not include_pooled:
+        return {
+            "text": (
+                f"I found multiple targets: **{', '.join(targets)}**. Do you want "
+                "**one target per run for independent-only results**, or should I "
+                "select them together to produce each independent output **plus an "
+                "additional pooled analysis**?"
+            ),
+            "calls": [],
+        }
+    if len(targets) > 1 and independent_only:
+        latest_targets = [
+            choice for choice in targets
+            if re.search(rf"(?<!\w){re.escape(choice.lower())}(?!\w)", latest_lower)
+        ]
+        if len(latest_targets) != 1:
+            return {
+                "text": (
+                    "I will keep the runs independent. Which target should I "
+                    f"configure first: **{'** or **'.join(targets)}**?"
+                ),
+                "calls": [],
+            }
+        targets = latest_targets
+
+    duration_minutes = _active_killing_duration_minutes(setup_text)
+    if duration_minutes is None:
+        return {
+            "text": (
+                "How long after contact should the target's signal be checked? Give "
+                "the expected delay in minutes; I will convert it using the loaded "
+                "frame interval."
+            ),
+            "calls": [],
+        }
+    interval_info = _active_killing_interval_minutes(context)
+    if interval_info is None:
+        return {
+            "text": (
+                "I cannot convert that delay reliably because the loaded samples do "
+                "not have one consistent, valid time interval and unit. Confirm the "
+                "acquisition cadence before I change the observation window."
+            ),
+            "calls": [],
+        }
+    interval_minutes, interval_label = interval_info
+    exact_window = duration_minutes / interval_minutes
+    window = max(1, int(math.ceil(exact_window - 1e-12)))
+
+    absolute_threshold = _number_from_proposal(setup_text, (
+        r"absolute (?:signal-increase )?threshold[^\d]{0,30}"
+        r"(\d+(?:\.\d+)?)\s*(?:dead[- ]mask |dead )?(?:pixels|voxels)",
+        r"minimum (?:dead[- ]mask )?(?:pixel|voxel) increase[^\d]{0,20}"
+        r"(\d+(?:\.\d+)?)",
+    ))
+    calibration_text = ""
+    if absolute_threshold is None and _one_cell_death_requirement(setup_text):
+        estimate = _one_cell_threshold_estimate(context, setup_text)
+        if estimate is None:
+            return {
+                "text": (
+                    "Your requirement that at least one cell dies belongs to the "
+                    "Active Killing **signal-increase threshold**, not Minimum contact "
+                    "duration. I need one consistent XY pixel size, and preferably Z "
+                    "spacing, to translate a cell-sized death signal into pixels."
+                ),
+                "calls": [],
+            }
+        absolute_threshold, basis = estimate
+        calibration_text = (
+            f" **One-cell calibration:** using {basis}, one fully stained cell is "
+            f"approximately **{absolute_threshold:g} dead-mask pixels/voxels**. This "
+            "is a starting estimate and must be checked against a trusted death-mask "
+            "preview because partial staining changes the count."
+        )
+    if absolute_threshold is None or absolute_threshold <= 0:
+        return {
+            "text": (
+                f"The {duration_minutes:g}-minute delay converts to **{window} "
+                f"timepoints** at {interval_label} per frame. I still need the "
+                "positive dead-mask pixel increase that should count as a killing "
+                "event; it is separate from the contact-distance threshold."
+            ),
+            "calls": [],
+        }
+
+    minimum_contact = _number_from_proposal(setup_text, (
+        r"(?:minimum|min\.?|at least)\s+contact(?: duration)?[^\d]{0,25}"
+        r"(\d+(?:\.\d+)?)\s*(?:timepoints?|frames?|tp)\b",
+    ))
+    if minimum_contact is None:
+        contact_control = by_id.get("features.active_killing.minimum_contact_duration")
+        minimum_contact = (
+            contact_control.get("value") if contact_control is not None else 1
+        )
+    minimum_contact = max(1, int(round(float(minimum_contact or 1))))
+
     expected = {
         "features.active_killing.target_types": targets,
         "features.active_killing.observation_window": window,
@@ -2704,17 +3140,39 @@ def active_killing_action(context: dict, messages: list[dict]) -> dict | None:
         "features.active_killing.use_absolute_threshold": True,
         "features.active_killing.absolute_threshold": absolute_threshold,
     }
+    if "features.active_killing.minimum_contact_duration" in by_id:
+        expected["features.active_killing.minimum_contact_duration"] = minimum_contact
     if not set(expected).issubset(by_id):
         return None
+    rounding_text = ""
+    if abs(exact_window - round(exact_window)) > 1e-9:
+        rounding_text = (
+            f" I rounded up from {exact_window:.2f} frames so the window does not end "
+            "before the stated delay."
+        )
+    scope_text = (
+        "This configures one independent target run and does not request a pooled result."
+        if len(targets) == 1 and independent_only else
+        "Selecting these targets together will create each independent output plus an "
+        "additional pooled analysis."
+        if len(targets) > 1 else
+        "This is one independent target run."
+    )
+    contact_unit = "timepoint" if minimum_contact == 1 else "timepoints"
     return {
         "text": (
-            f"Based on {duration_minutes:g} minutes at {interval:g} "
-            f"{record.get('time_unit') or ''} per frame, I’m proposing an Observation "
-            f"window of {window} timepoints, target{'s' if len(targets) != 1 else ''} "
-            f"{', '.join(targets)}, Dead-mask pixel count, and an absolute threshold "
-            f"of {absolute_threshold:g}. BEHAV3D runs every selected target "
-            "independently and adds a combined analysis when multiple targets are "
-            "selected. These changes still require your confirmation in the action cards."
+            "**Active Killing proposal**\n\n"
+            "I am proposing these values from the stated targets and timing:\n"
+            f"- Target for this run: **{', '.join(targets)}**\n"
+            f"- Observation window: **{window} timepoints** "
+            f"({duration_minutes:g} minutes at {interval_label} per frame)\n"
+            "- Signal: **Dead-mask pixel count**\n"
+            f"- Absolute signal-increase threshold: **{absolute_threshold:g} "
+            "dead-mask pixels/voxels**\n"
+            f"- Minimum contact duration: **{minimum_contact} {contact_unit}**; this means "
+            "contact must last that many frames and does not mean that many cells die.\n\n"
+            f"{scope_text}{rounding_text}{calibration_text} The action cards below "
+            "require your confirmation."
         ),
         "calls": [
             {
@@ -2802,57 +3260,6 @@ def merged_probability_watershed_guidance(
         f"distinct seeds. Keep it at least as high as the Mask threshold (**{mask}**) "
         "and watch for missing cells. If threshold tuning is not enough, add more "
         "background annotations at touching-cell boundaries and retrain."
-    )
-
-
-def safety_profile_summary(context: dict, messages: list[dict]) -> str | None:
-    """Summarize a saved safety definition without claiming it was applied."""
-    if context.get("current_step") != "analysis":
-        return None
-    latest = next((
-        str(message.get("content") or "")
-        for message in reversed(messages)
-        if message.get("role") == "user"
-    ), "")
-    request = latest.lower()
-    if "safety comparison" not in request or "active killing" not in request:
-        return None
-    notes = " ".join(
-        str(note.get("text") or "")
-        for note in ((context.get("experiment_reference") or {}).get("notes") or [])
-    )
-    notes_lower = notes.lower()
-    required = ("multi-organoid safety profiling", "27t", "mdo", "1.5", "5 frames")
-    if not all(term in notes_lower for term in required):
-        return None
-
-    records = (context.get("metadata", {}) or {}).get("records", []) or []
-    record = records[0] if records else {}
-    interval = record.get("time_interval")
-    unit = str(record.get("time_unit") or "")
-    window_text = "5 frames"
-    try:
-        if unit.lower().startswith("m"):
-            window_text += f" ({float(interval) * 5:g} minutes)"
-    except (TypeError, ValueError):
-        pass
-    result_note = (
-        "No Active Killing result is listed in the live context, so this describes "
-        "the study definition, not a completed analysis."
-        if not (context.get("results") or [])
-        else "Interpret any discovered result against this saved study definition."
-    )
-    return (
-        "**Safety comparison:** TEG cells are the immune effector; tumor 27T and "
-        "healthy MDO organoids are the two target types. Compare TEG→27T with "
-        "TEG→MDO within the same combined wells, where dose, timing, and imaging "
-        "conditions are shared. With one control well per type and two combined "
-        "wells, the reference says the comparison is descriptive/exploratory.\n\n"
-        "**Active Killing definition:** The experiment reference defines an event "
-        "as a contact-associated relative rise in dead-mask percentage to at least "
-        f"1.5× baseline within {window_text}, after at least one frame of contact. "
-        "If you run the module, select both 27T and MDO: BEHAV3D creates an "
-        f"independent analysis for each target plus a combined analysis. {result_note}"
     )
 
 
@@ -3019,6 +3426,12 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "- Treat exact numeric recommendations as unsupported unless they come from a deterministic "
         "calculation using live metadata, an explicit user measurement, or a documented current value. "
         "Label calculated values as starting points and do not invent typical ranges.\n"
+        "- Base recommendations on measurable image and behavior properties, not biological names. "
+        "Describe object size, shape stability, overlap, displacement per frame, density, touching/merging, "
+        "and signal persistence first. A biological name may appear only as a clearly optional example; "
+        "it must never trigger a method, preset, threshold, or canned answer. Fast and slow are relative "
+        "to frame cadence: ask whether the object still overlaps itself in consecutive frames or request "
+        "a measured one-frame displacement.\n"
         "- Field names in LIVE CONTEXT are internal only. In every visible response say 'XY pixel "
         "size' instead of pixel_distance_xy, 'timepoint' instead of position_t, and 'sample' "
         "instead of sample_name. Say 'dead-mask percentage', 'mean dead-dye intensity', "
@@ -3039,13 +3452,6 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "facts and configured populations, README notes for study intent and operational definitions, YAML "
         "for saved settings, and discovered output files for execution evidence. When sources disagree, "
         "state the discrepancy and prefer live metadata until the researcher confirms a correction.\n"
-        "- HISTORICAL REFERENCE PROFILES are examples from other experiments, not presets. Use them only "
-        "when the researcher asks for an example, precedent, or previous configuration. Name the profile, "
-        "compare resolution, cadence, object scale, motion, signal quality, and method with the current "
-        "experiment, and explain what measurement or preview is needed to adapt it. Never issue a form "
-        "action from a historical value alone, never call it typical, and never silently copy a value "
-        "because a cell-type label looks similar. Legacy configuration labels or units must be mapped to "
-        "the current live control before any later proposal.\n"
         "- A saved configuration records intended settings, including disabled or unused defaults; it is "
         "not proof that segmentation, feature extraction, Active Killing, HMM, invasiveness, or another "
         "module actually ran. Claim an output is available only when LIVE CONTEXT lists the corresponding "
@@ -3058,6 +3464,18 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "not invent a metadata, dimension-order, or file-path cause.\n"
         "- Ask at most one focused question when an answer is genuinely needed. Do not manufacture a "
         "step-by-step interview for a simple question.\n"
+        "- Make responses easy to scan. Lead with the direct answer or status. For setup, "
+        "troubleshooting, and recommendations, use short Markdown sections such as **Status**, "
+        "**Next action**, and **Why** only when they help; use numbered steps for a sequence and "
+        "bullets for alternatives. Keep paragraphs to at most three sentences, bold the one action "
+        "the researcher should take next, and do not bury that action in background detail.\n"
+        "- The live current_step is authoritative for ambiguous button labels and short follow-ups. "
+        "Never answer a Tracking method request with Segmentation methods, even if older messages or "
+        "a stale session intent refer to Segmentation.\n"
+        "- Death, contact, and threshold language can refer to different modules. If the wording does not "
+        "distinguish population signal over time, contact counts, contact-associated attribution, object "
+        "signal classification, or contact distance, ask one short routing question. Never let the word "
+        "'contact' alone turn an Active Killing request into contact-distance guidance.\n"
         "- Treat every value inferred from filenames, naming conventions, defaults, or biological "
         "expectations as an assumption. State the proposed inference plainly and ask the researcher "
         "to confirm it before emitting any edit action. Prefer an unresolved question over silently "
@@ -3088,6 +3506,12 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "metadata actions until the researcher explicitly chooses. Ask this only for an explicit metadata "
         "creation/editing request; never override an informational or analysis question merely because it "
         "mentions organoid lines.\n"
+        "- In Metadata, a processing population is an object or signal distinguishable in the images that "
+        "needs its own masks and track IDs. Line records biological identity/source and is mandatory; "
+        "Condition records treatment or experimental state and is optional. Multicolor means one dense "
+        "biological population was deliberately split across colors for separate segmentation/tracking and "
+        "later recombination; every color must share the same population, line, and condition. Never use "
+        "Multicolor for different populations, lines, conditions, bleed-through, or generic multichannel data.\n"
         "- Metadata Well and the line for every configured population in every sample are mandatory. "
         "Population condition is optional. If there are no physical well identifiers, propose one "
         "deterministic shared value such as '1' and ask for confirmation. Before filling population "
@@ -3135,7 +3559,7 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "which cell signal is visible in each channel. Fluorophore names such as GFP/RFP are not needed: "
         "do not ask for them or include them in examples, and never infer target channels or absence of "
         "bleed-through from a filename. Ask the researcher for a simple map such as "
-        "'Channel 0: T cells; Channel 1: 27T; Channel 2: 27T and MDO; Channel 3: dead signal'. Read any "
+        "'Channel 0: population A; Channel 1: population B; Channel 2: both; Channel 3: switch-on signal'. Read any "
         "dead-channel number already present in metadata instead of asking for it again, and flag a "
         "conflict if the user's latest map disagrees with metadata.\n"
         "- APOC has separate Image Channel Inputs checkboxes for every trained cell-type model. Select "
@@ -3184,10 +3608,14 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "is a generic guide/review request and the conversation does not yet establish movement for the "
         "active structure, ask only how far it moves or whether it remains overlapping between frames, then "
         "stop. Do not list, assess, or recommend any named tracking method and do not describe the current "
-        "selection as reasonable before that answer. Once motion is known, if the structure is slow, "
-        "non-dividing, non-touching, and stays spatially overlapping, recommend Propagation. For a "
-        "genuinely static object whose reporter flickers or disappears, recommend Reporter Propagation and "
-        "warn that real motion or shape change invalidates it. For motile cells, btrack is the routine default. "
+        "selection as reasonable before that answer. Once motion and topology are known: use Fragmentation "
+        "Tracking for overlapping, shape-stable objects whose segments may fragment but do not merge across "
+        "disconnected regions; use Bounded Propagation for overlapping/touching objects when a track ID must "
+        "never span disconnected regions; use btrack when consecutive detections no longer overlap. For a "
+        "genuinely static object whose reporter flickers or disappears, use Reporter Propagation and warn "
+        "that real motion or shape change invalidates it. Reporter flicker and static position are both "
+        "required. If a flickering target moves, prefer a constitutive channel for tracking and extract the "
+        "reporter as an intensity feature, or use permissive segmentation plus a moving-object tracker. "
         "Do not suggest LAP or TrackPy unless there is a concrete, explainable reason to prefer one.\n"
         "- Before recommending a tracking distance, read Time interval and Time unit from every metadata "
         "record. Convert any stated speed to displacement per frame; for example, 60 um/min at 15 seconds "
@@ -3201,27 +3629,35 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "Start with false-positive, initialization, termination, and linking hypotheses. Ask for the maximum "
         "spatial gap and missing-frame gap before calibrating Distance and Time thresholds; do not present "
         "disabled defaults as recommendations. Change btrack Step size only for an out-of-memory error, "
-        "lowering it to reduce RAM. When multiple organoid types exist, "
-        "recommend tracking all organoid types together with Propagation.\n"
+        "lowering it to reduce RAM. For divisions enable branching; for objects entering or leaving the "
+        "field of view retain initialization and termination hypotheses. If multiple distinguishable "
+        "multicellular-structure populations coexist, track them together with Fragmentation Tracking when "
+        "one shared overlap-based run is intended, while preserving origin labels.\n"
         "- In Feature Extraction, recommend Morphology only when shape is biologically relevant and Movement "
         "for motility. Read required_choices on every feature-group control before recommending a removal. "
-        "Intensity and Contact are required for every cell type, Movement is required for immune/other cells, "
+        "Intensity and Contact are required for every cell type, Movement is required for the UI's "
+        "immune/other categories, "
         "and Death is required when a dead channel is configured. Intensity includes mean dead-dye and other "
-        "channel-intensity measurements, so never suggest dropping it from a T-cell population with a dead "
+        "channel-intensity measurements, so never suggest dropping it from a population with a configured "
         "channel. Contact distance 0 means strict touching; larger values mean proximity, and any change "
         "requires feature extraction to be run again. A positive contact distance equal to the XY pixel "
         "size permits a one-XY-pixel gap; it is not strict touching and is not a voxel diagonal.\n"
         "- In Active Killing, the target selector may contain multiple target types. One run automatically "
-        "produces an independent analysis for each selected target and an additional combined analysis when "
-        "more than one is selected; never tell the user to configure separate UI runs. Derive Observation "
+        "produces an independent analysis for each selected target and an additional pooled analysis when "
+        "more than one is selected. When the researcher asks for a target comparison, ask whether they want "
+        "independent-only runs or the independent outputs plus that pooled result. For independent-only "
+        "results, configure one target per run and ask which target to start with. Derive Observation "
         "window and Minimum contact "
         "duration from the biological timescale and metadata time interval. Prefer dead-mask pixel count with "
         "an absolute threshold by default; calibrate that threshold from cell size and XY pixel size. Do not "
         "reuse a 20-30 pixel example blindly. Use relative multipliers only in the limited baseline contexts "
-        "described in the guidance. In study-design explanations, call the immune cell the effector and the "
-        "organoid or cell being contacted the target; never describe an immune effector such as TEG as a "
-        "target. With one immune type and two organoid types, say one effector type and two target types. "
-        "An accepted multi-parameter setup must propose every agreed value in the same response: targets, "
+        "described in the guidance. In study-design explanations, call the contacting object the effector "
+        "and the contacted object carrying the measured signal the target, but only after the researcher or "
+        "experiment reference establishes those roles. Never infer them from biological names or UI categories. "
+        "A statement that at least one cell dies defines the required death-signal increase, not a one-frame "
+        "Minimum contact duration. Preserve it across follow-up turns and calibrate a dead-mask pixel-count "
+        "threshold from cell size and live XY/Z sampling before calling the setup ready. An accepted "
+        "multi-parameter setup must propose every agreed value in the same response: targets, "
         "death signal, threshold mode and value, observation window, and minimum contact duration. Never "
         "apply only the mode checkbox while leaving an agreed absolute threshold at 0. The dependent "
         "threshold controls remain editable when inactive; read their active flag rather than omitting them. "
@@ -3243,8 +3679,9 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "tell the researcher which cell type is selected, and interpret every contact/death group from that "
         "selected cell's perspective. A population named in a contact group is the population the selected "
         "cell touches; it is not evidence that the named population is selected. "
-        "use fixed state count, keep Start offset at 1, use Window size 5 by default or 1 for single-frame "
-        "events, and usually match Smooth window to Window size. Log-scale only inspected skewed features, do "
+        "Use fixed state count, keep Start offset at 1, and derive Window and Smooth windows from the event "
+        "duration and metadata cadence. Whenever a value is expressed in frames, also state its physical "
+        "duration. Use Window size 1 only for genuinely single-frame events. Log-scale only inspected skewed features, do "
         "not routinely percentile-clip, and explain that binary groups are applied after the HMM. When the "
         "researcher asks for movement-only states or asks whether movement features are complete, enumerate "
         "all movement choices from both the live Timepoint features and Additional window features controls. "
@@ -3442,13 +3879,15 @@ def deterministic_turn_response(
     context: dict, messages: list[dict], tools: list[dict],
 ) -> dict | None:
     """Resolve feedback-critical turns before invoking the language model."""
+    clarification = analysis_intent_clarification(context, messages)
+    if clarification:
+        return {"text": clarification, "calls": []}
     deterministic_action = (
         metadata_absence_action(context, messages)
         or metadata_persistence_action(context, messages)
         or metadata_time_conversion_action(context, messages)
         or metadata_pixel_size_action(context, messages)
         or analysis_navigation_action(context, messages)
-        or historical_reference_guidance(context, messages)
         or apoc_feature_preset_action(context, messages)
         or segmentation_minimum_size_action(context, messages)
         or tracking_radius_action(context, messages)
@@ -3466,13 +3905,14 @@ def deterministic_turn_response(
         return deterministic_action
 
     preflight_question = (
-        metadata_channel_mapping_guidance(context, messages)
+        tool_overview_guidance(context, messages)
+        or metadata_taxonomy_guidance(context, messages)
+        or metadata_channel_mapping_guidance(context, messages)
         or result_opening_correction(context, messages)
         or analysis_choice_summary(context, messages)
         or organoid_processing_question(context, messages)
         or metadata_identifier_confirmation_question(context, messages)
         or metadata_completion_summary(context, messages)
-        or safety_profile_summary(context, messages)
         or active_killing_readiness_summary(context, messages)
         or feature_group_requirement_guidance(context, messages)
         or hmm_setup_guidance(context, messages)

@@ -597,7 +597,7 @@ class CellTypeTrackingPanel(QWidget):
         method_layout.setContentsMargins(6, 4, 6, 4)
         self.combo_method = QComboBox()
         self.combo_method.addItems([
-            "LAP (laptrack)", "TrackPy", "Propagation",
+            "LAP (laptrack)", "TrackPy", "Fragmentation Tracking",
             "Bounded Propagation",
             "Reporter Propagation",
             "btrack (Bayesian)", "Import tracking",
@@ -618,11 +618,11 @@ class CellTypeTrackingPanel(QWidget):
             "TrackPy — Crocker-Grier style nearest-neighbour linker with "
             "an adaptive search range; simple and fast, no merge/split "
             "support.\n\n"
-            "Propagation — no tunable parameters; identifies objects by "
+            "Fragmentation Tracking — no tunable parameters; identifies objects by "
             "spatial overlap/propagation instead of frame-to-frame "
             "linking cost.\n\n"
-            "Bounded Propagation — same watershed propagation "
-            "as Propagation, but a track ID can never span more than one "
+            "Bounded Propagation — the same watershed propagation "
+            "as Fragmentation Tracking, but a track ID can never span more than one "
             "physically disconnected region. Before watershed runs, the "
             "current frame's mask is split into its own connected regions "
             "and every existing track picks whichever region its previous "
@@ -852,7 +852,7 @@ class CellTypeTrackingPanel(QWidget):
             self.check_all_together_prop.setChecked(False)  # False: we are in individual mode
             self.check_all_together_prop.setToolTip(
                 "When checked, all organoid types are tracked simultaneously\n"
-                "using Propagation, collapsing all organoid tabs into one.\n"
+                "using Fragmentation Tracking, collapsing all organoid tabs into one.\n"
                 "This is the default behaviour when multiple organoid types exist."
             )
             def _on_check_all(checked, _self=self):
@@ -861,7 +861,7 @@ class CellTypeTrackingPanel(QWidget):
             self.check_all_together_prop.toggled.connect(_on_check_all)
             prop_lay.addWidget(self.check_all_together_prop)
 
-        prop_notice = QLabel("No tunable parameters for\nPropagation tracking method.")
+        prop_notice = QLabel("No tunable parameters for\nFragmentation Tracking.")
         prop_notice.setWordWrap(True)
         prop_notice.setAlignment(Qt.AlignCenter)
         prop_notice.setStyleSheet("color: #666; font-style: italic; padding: 10px;")
@@ -879,7 +879,7 @@ class CellTypeTrackingPanel(QWidget):
         bp_form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
 
         bp_info = QLabel(
-            "Same as Propagation, but a track ID can never span more than "
+            "Same as Fragmentation Tracking, but a track ID can never span more than "
             "one disconnected region. Each region of the current frame's "
             "mask is claimed by whichever existing track overlaps it most, "
             "before watershed runs; a region no track claims becomes a new "
@@ -1801,7 +1801,7 @@ class AllOrganoidsPropagationPanel(QWidget):
         method_layout = QHBoxLayout()
         method_layout.setContentsMargins(6, 4, 6, 4)
         method_layout.addWidget(QLabel("Method:"))
-        method_label = QLabel("Propagation")
+        method_label = QLabel("Fragmentation Tracking")
         method_label.setStyleSheet("font-weight: bold;")
         method_layout.addWidget(method_label)
         method_layout.addStretch()
@@ -1810,7 +1810,7 @@ class AllOrganoidsPropagationPanel(QWidget):
 
         # ── Warning banner ────────────────────────────────────────────
         warning = QLabel(
-            "⚠️  Propagation tracking will be applied to ALL organoid types simultaneously. "
+            "⚠️  Fragmentation Tracking will be applied to ALL organoid types simultaneously. "
             "To run individual tracking, uncheck 'Track all organoids together'"
         )
         warning.setWordWrap(True)
@@ -1821,20 +1821,20 @@ class AllOrganoidsPropagationPanel(QWidget):
         layout.addWidget(warning)
 
         # ── Propagation parameters group ──────────────────────────────
-        prop_group = QGroupBox("Propagation Parameters")
+        prop_group = QGroupBox("Fragmentation Tracking")
         prop_lay = QVBoxLayout(prop_group)
         prop_lay.setSpacing(6)
 
         self.check_all_together = QCheckBox("Track all organoids together")
         self.check_all_together.setChecked(True)
         self.check_all_together.setToolTip(
-            "When checked, all organoid types are tracked simultaneously using Propagation.\n"
+            "When checked, all organoid types are tracked simultaneously using Fragmentation Tracking.\n"
             "Uncheck to configure and run tracking independently per organoid type."
         )
         self.check_all_together.toggled.connect(self._on_toggled)
         prop_lay.addWidget(self.check_all_together)
 
-        notice = QLabel("No additional tunable parameters for Propagation tracking.")
+        notice = QLabel("No additional tunable parameters for Fragmentation Tracking.")
         notice.setWordWrap(True)
         notice.setStyleSheet("color: #666; font-style: italic; padding: 2px 0;")
         prop_lay.addWidget(notice)
@@ -1894,7 +1894,7 @@ class AllOrganoidsPropagationPanel(QWidget):
 
         types_str = ", ".join(self.organoid_types)
         self.btn_run.setText("\u23f3 Running\u2026")
-        self.log(f"\u25b6 Propagation tracking \u2014 all organoids: {types_str}\u2026")
+        self.log(f"\u25b6 Fragmentation Tracking \u2014 all organoids: {types_str}\u2026")
 
         out_dir_str = str(out_path.expanduser())
         first_ct = self.organoid_types[0]

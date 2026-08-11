@@ -1058,6 +1058,7 @@ class DeathDynamicsTab(QWidget):
             "interaction": {self.targets_group, self.ia_group},
             "invasiveness": {self.inv_group},
         }.get(analysis_id, set())
+        self._focused_analysis_id = analysis_id
         for group in (self.targets_group, self.dd_group, self.ia_group, self.inv_group):
             group.setVisible(group in visible)
         self.run_all_container.setVisible(False)

@@ -896,7 +896,13 @@ def _step_readiness(main_widget, ctx: dict) -> dict:
         False)
 
     steps = {
-        "data_preparation": {"ready": True, "blockers": []},
+        "data_preparation": {
+            "ready": md_loaded and out_set,
+            "blockers": [
+                ("metadata not loaded" if not md_loaded else None),
+                ("output directory not set" if not out_set else None),
+            ],
+        },
         "visualization": {
             "ready": md_loaded,
             "blockers": [] if md_loaded else ["metadata not loaded"],
@@ -1169,7 +1175,9 @@ def _analysis_state(main_widget) -> dict:
     outer_tabs = getattr(analysis, "inner_tabs", None)
     outer_index = _safe(outer_tabs.currentIndex, 1) if outer_tabs is not None else 1
     if outer_index != 1:
-        return {"view": "death_dynamics"}
+        death_tab = getattr(analysis, "death_dynamics_tab", None)
+        focused = str(getattr(death_tab, "_focused_analysis_id", "") or "")
+        return {"view": focused or "death_dynamics"}
     stack = getattr(single, "_stack", None)
     if stack is not None and _safe(stack.currentIndex, 0) == 0:
         view = "single_cell_overview"

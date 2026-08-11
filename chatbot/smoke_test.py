@@ -608,6 +608,22 @@ def _tracking_which_method_case() -> dict:
     }
 
 
+def _tracking_stale_segmentation_intent_case() -> dict:
+    return {
+        "name": "tracking_ignores_stale_segmentation_intent",
+        "messages": [
+            {"role": "user", "content": "The segmented masks overlap."},
+            {"role": "assistant", "content": "That affects segmentation."},
+            {"role": "user", "content": "Which method?"},
+        ],
+        "context": _context(
+            "tracking", [], active_cell_type="tcell",
+            assistant_session={"intent": "compare_segmentation_methods"},
+        ),
+        "check": _check_tracking_which_method,
+    }
+
+
 def _btrack_step2_enable_case() -> dict:
     controls = [
         _control(
@@ -931,21 +947,25 @@ def _tracking_guide_case() -> dict:
 
 def _stationary_tracking_case() -> dict:
     controls = [_control(
-        "tracking.collagen.method", "collagen: Tracking method", "LAP (laptrack)",
+        "tracking.structure_A.method", "structure A: Tracking method", "LAP (laptrack)",
         choices=[
-            "LAP (laptrack)", "TrackPy", "Propagation",
+            "LAP (laptrack)", "TrackPy", "Fragmentation Tracking",
+            "Bounded Propagation",
             "Reporter Propagation", "btrack (Bayesian)",
         ],
-        cell_type="collagen",
+        cell_type="structure_A",
     )]
     return {
-        "name": "stationary_uses_propagation",
+        "name": "overlapping_structure_uses_fragmentation_tracking",
         "messages": [
             {"role": "user", "content": "Guide tracking"},
-            {"role": "assistant", "content": "How much does collagen move between frames?"},
-            {"role": "user", "content": "Collagen stays stationary and overlaps between frames."},
+            {"role": "assistant", "content": "Does the structure overlap itself between frames?"},
+            {"role": "user", "content": (
+                "It stays stationary and overlaps. Its masks can fragment but they "
+                "do not join across disconnected regions."
+            )},
         ],
-        "context": _context("tracking", controls, active_cell_type="collagen"),
+        "context": _context("tracking", controls, active_cell_type="structure_A"),
         "check": _check_stationary_tracking,
     }
 
@@ -1095,6 +1115,156 @@ def _active_killing_case() -> dict:
             feature_extraction={"active_killing_open": True},
         ),
         "check": _check_active_killing,
+    }
+
+
+def _ambiguous_killing_threshold_case() -> dict:
+    return {
+        "name": "ambiguous_killing_threshold_asks_which_parameter",
+        "messages": [{
+            "role": "user",
+            "content": "What threshold should I use for killing after contact?",
+        }],
+        "context": _context("feature_extraction", [], active_cell_type="tcell"),
+        "check": _check_ambiguous_killing_threshold,
+    }
+
+
+def _ambiguous_contact_analysis_case() -> dict:
+    return {
+        "name": "ambiguous_contact_question_asks_which_analysis",
+        "messages": [{
+            "role": "user",
+            "content": "I want to look at contact between my populations.",
+        }],
+        "context": _context("analysis", [], analysis={"view": "death_dynamics"}),
+        "check": _check_ambiguous_contact_analysis,
+    }
+
+
+def _general_tool_overview_case() -> dict:
+    return {
+        "name": "tool_overview_is_general_3d_time_lapse",
+        "messages": [{"role": "user", "content": "How can I use this tool?"}],
+        "context": _context("data_preparation", []),
+        "check": _check_general_tool_overview,
+    }
+
+
+def _active_killing_feedback_case() -> dict:
+    controls = [
+        _control(
+            "features.active_killing.target_types",
+            "Active Killing: Target cell type",
+            ["27T", "MDO"],
+            choices=["27T", "MDO"],
+            method="Active Killing",
+            cell_type="T cells",
+        ),
+        _control(
+            "features.active_killing.observation_window",
+            "Active Killing: Observation window",
+            5,
+            unit="timepoints",
+            method="Active Killing",
+            cell_type="T cells",
+        ),
+        _control(
+            "features.active_killing.death_signal",
+            "Active Killing: Death or reporter signal",
+            "Dead-mask percentage",
+            choices=[
+                "Dead-mask percentage", "Mean dead-dye intensity",
+                "Dead-mask pixel count",
+            ],
+            method="Active Killing",
+            cell_type="T cells",
+        ),
+        _control(
+            "features.active_killing.use_absolute_threshold",
+            "Active Killing: Use an absolute signal-increase threshold",
+            False,
+            method="Active Killing",
+            cell_type="T cells",
+        ),
+        _control(
+            "features.active_killing.absolute_threshold",
+            "Active Killing: Absolute signal-increase threshold",
+            0.0,
+            unit="pixels",
+            method="Active Killing",
+            cell_type="T cells",
+            active=False,
+        ),
+        _control(
+            "features.active_killing.minimum_contact_duration",
+            "Active Killing: Minimum contact duration",
+            1,
+            unit="timepoints",
+            method="Active Killing",
+            cell_type="T cells",
+        ),
+    ]
+    request = (
+        "Set up the analysis to compare the rate of cells actively killing MDO "
+        "versus 27T. Targets die around 30 minutes after the initial contact, and "
+        "I want to know if at least one cell dies after contact."
+    )
+    metadata = {
+        "loaded": True,
+        "records": [{
+            "sample_name": "Movie1",
+            "pixel_distance_xy": 1.7,
+            "pixel_distance_z": 4.0,
+            "time_interval": 2,
+            "time_unit": "min",
+        }],
+        "validation": [],
+    }
+    return {
+        "name": "active_killing_feedback_preserves_all_constraints",
+        "messages": [
+            {"role": "user", "content": request},
+            {"role": "assistant", "content": (
+                "I found multiple targets. Do you want independent-only runs or "
+                "independent outputs plus an additional pooled analysis?"
+            )},
+            {"role": "user", "content": "Run them independently; start with MDO."},
+        ],
+        "context": _context(
+            "feature_extraction", controls, metadata=metadata,
+            active_cell_type="T cells",
+            feature_extraction={"active_killing_open": True},
+        ),
+        "check": _check_active_killing_feedback,
+    }
+
+
+def _active_killing_one_cell_not_ready_case() -> dict:
+    return {
+        "name": "active_killing_one_cell_requirement_blocks_readiness",
+        "messages": [
+            {"role": "user", "content": (
+                "Set up Active Killing. I need at least one cell to die after contact."
+            )},
+            {"role": "assistant", "content": "I changed the observation window."},
+            {"role": "user", "content": "Is it ready?"},
+        ],
+        "context": _context(
+            "feature_extraction", [], active_cell_type="T cells",
+            feature_extraction={"active_killing": {
+                "setup_ready": True,
+                "setup_issues": [],
+                "effector_cell_type": "T cells",
+                "target_cell_types": ["MDO"],
+                "observation_window": 15,
+                "death_signal": "Dead-mask percentage",
+                "uses_absolute_threshold": False,
+                "absolute_threshold": 0,
+                "minimum_contact_duration": 1,
+            }},
+        ),
+        "check": _check_active_killing_one_cell_not_ready,
     }
 
 
@@ -1574,114 +1744,6 @@ def _safety_profiling_context_case() -> dict:
     }
 
 
-def _historical_btrack_examples_case() -> dict:
-    controls = [
-        _control(
-            "tracking.tcell.btrack.maximum_search_radius",
-            "tcell: Maximum search radius", 25,
-            method="btrack", cell_type="tcell", unit="um",
-        ),
-        _control(
-            "tracking.tcell.btrack.distance_threshold",
-            "tcell: Distance threshold", 30,
-            method="btrack", cell_type="tcell", unit="um",
-        ),
-        _control(
-            "tracking.tcell.btrack.time_threshold",
-            "tcell: Time threshold", 2,
-            method="btrack", cell_type="tcell", unit="frames",
-        ),
-    ]
-    return {
-        "name": "historical_btrack_values_are_examples_only",
-        "messages": [{
-            "role": "user",
-            "content": (
-                "Do you have example values from a previous experiment for btrack "
-                "on T cells? Can I copy them into this experiment?"
-            ),
-        }],
-        "context": _context(
-            "tracking", controls, active_cell_type="tcell",
-            metadata={
-                "loaded": True,
-                "records": [{
-                    "sample_name": "Current01",
-                    "pixel_distance_xy": 0.6,
-                    "pixel_distance_z": 2.0,
-                    "time_interval": 30,
-                    "time_unit": "s",
-                }],
-                "cell_types": {"immune": ["tcell"]},
-                "validation": [],
-            },
-            tracking={"method": "btrack"},
-        ),
-        "check": _check_historical_btrack_examples,
-    }
-
-
-def _historical_calcium_example_case() -> dict:
-    return {
-        "name": "historical_calcium_profile_explains_reporter_propagation",
-        "messages": [{
-            "role": "user",
-            "content": (
-                "Was there a previous experiment with near-static calcium reporter "
-                "cells? What method and example values did it use?"
-            ),
-        }],
-        "context": _context(
-            "tracking", [], active_cell_type="islets",
-            metadata={
-                "loaded": True,
-                "records": [{
-                    "sample_name": "NewCalcium",
-                    "pixel_distance_xy": 0.5,
-                    "pixel_distance_z": 2.5,
-                    "time_interval": 10,
-                    "time_unit": "s",
-                }],
-                "cell_types": {"other": ["islets"]},
-                "validation": [],
-            },
-        ),
-        "check": _check_historical_calcium_example,
-    }
-
-
-def _historical_microglia_example_case() -> dict:
-    return {
-        "name": "historical_microglia_exp91_preserves_sources_and_caveats",
-        "messages": [{
-            "role": "user",
-            "content": (
-                "What design and settings were used in the previous microglia "
-                "Exp91 experiment?"
-            ),
-        }],
-        "context": _context(
-            "analysis", [], active_cell_type="tcell",
-            metadata={
-                "loaded": True,
-                "records": [{
-                    "sample_name": "CurrentMicroglia",
-                    "pixel_distance_xy": 0.8,
-                    "pixel_distance_z": 2.0,
-                    "time_interval": 3,
-                    "time_unit": "min",
-                }],
-                "cell_types": {
-                    "organoid": ["organoid"],
-                    "immune": ["microglia", "tcell"],
-                },
-                "validation": [],
-            },
-        ),
-        "check": _check_historical_microglia_example,
-    }
-
-
 def _experiment_reference_metadata_conflict_case() -> dict:
     reference = {
         "notes": [{
@@ -1736,6 +1798,61 @@ def _organoid_line_grouping_case() -> dict:
             metadata_builder={"open": False, "sample_forms_created": False},
         ),
         "check": _check_organoid_line_grouping,
+    }
+
+
+def _metadata_taxonomy_case() -> dict:
+    return {
+        "name": "metadata_population_line_condition_are_distinct",
+        "messages": [{
+            "role": "user",
+            "content": "What is the difference between cell types, lines and conditions?",
+        }],
+        "context": _context("data_preparation", []),
+        "check": _check_metadata_taxonomy,
+    }
+
+
+def _multicolor_definition_case() -> dict:
+    return {
+        "name": "multicolor_is_one_density_split_population",
+        "messages": [{
+            "role": "user",
+            "content": "When should I use the Multicolor option?",
+        }],
+        "context": _context("data_preparation", []),
+        "check": _check_multicolor_definition,
+    }
+
+
+def _bounded_tracking_case() -> dict:
+    return {
+        "name": "bounded_tracking_is_selected_from_topology",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "My large plastic cells still overlap between frames, but touching "
+                "masks can join and one track ID must not spread across disconnected "
+                "regions. Which tracking method fits?"
+            ),
+        }],
+        "context": _context("tracking", [], active_cell_type="population_A"),
+        "check": _check_bounded_tracking,
+    }
+
+
+def _name_neutral_tracking_case() -> dict:
+    return {
+        "name": "biological_name_does_not_select_historical_settings",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "I have microglia. Which tracking settings should I use for this "
+                "new experiment?"
+            ),
+        }],
+        "context": _context("tracking", [], active_cell_type="microglia"),
+        "check": _check_name_neutral_tracking,
     }
 
 
@@ -1839,6 +1956,8 @@ def _metadata_completion_case() -> dict:
         }],
         "context": _context(
             "data_preparation", [],
+            output_dir="/tmp/behav3d-output",
+            output_dir_set=True,
             metadata={
                 "loaded": True,
                 "record_source": "metadata_builder_draft",
@@ -1854,6 +1973,20 @@ def _metadata_completion_case() -> dict:
             },
         ),
         "check": _check_metadata_completion,
+    }
+
+
+def _data_setup_requires_output_directory_case() -> dict:
+    return {
+        "name": "data_setup_requires_output_directory",
+        "messages": [{"role": "user", "content": "Check what's missing"}],
+        "context": _context(
+            "data_preparation", [],
+            output_dir="",
+            output_dir_set=False,
+            assistant_session={"intent": "check_data_setup"},
+        ),
+        "check": _check_data_setup_requires_output_directory,
     }
 
 
@@ -2039,6 +2172,20 @@ def _check_metadata_completion(result: dict) -> list[str]:
             errors.append(f"missing completeness detail: {phrase}")
     if _tool_calls(result, "save_metadata"):
         errors.append("offered save despite mandatory validation errors")
+    return errors
+
+
+def _check_data_setup_requires_output_directory(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    if "output directory" not in text:
+        errors.append("did not report the missing Output directory")
+    if "next action" not in text:
+        errors.append("did not make the required action scannable")
+    if "ready for processing" in text or "good to go" in text:
+        errors.append("claimed Data Preparation was ready without an Output directory")
+    if result["calls"]:
+        errors.append("changed a field without user confirmation")
     return errors
 
 
@@ -2643,12 +2790,12 @@ def _check_stationary_tracking(result: dict) -> list[str]:
     text = result["text"].lower()
     method_calls = _tool_calls(result, "set_ui_value")
     proposed = any(
-        call.get("control_id") == "tracking.collagen.method"
-        and str(call.get("value", "")).lower().startswith("propagation")
+        call.get("control_id") == "tracking.structure_A.method"
+        and str(call.get("value", "")).lower().startswith("fragmentation")
         for call in method_calls
     )
-    if "propagation" not in text and not proposed:
-        return ["did not recommend Propagation for stationary collagen"]
+    if "fragmentation tracking" not in text and not proposed:
+        return ["did not recommend Fragmentation Tracking from overlap behavior"]
     return []
 
 
@@ -2730,6 +2877,88 @@ def _check_active_killing(result: dict) -> list[str]:
     return errors
 
 
+def _check_ambiguous_killing_threshold(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in ("signal increase", "active killing", "contact distance", "feature extraction"):
+        if phrase not in text:
+            errors.append(f"missing threshold clarification: {phrase}")
+    if "0 µm means strict" in text:
+        errors.append("silently routed the ambiguous request to contact distance")
+    if result["calls"]:
+        errors.append("navigated or changed a value before the user chose a threshold")
+    return errors
+
+
+def _check_ambiguous_contact_analysis(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "interaction analysis", "contact-based grouping",
+        "contact state-shift analysis", "contact distance",
+    ):
+        if phrase not in text:
+            errors.append(f"missing contact-analysis clarification: {phrase}")
+    if result["calls"]:
+        errors.append("opened a panel before the user selected the contact question")
+    return errors
+
+
+def _check_general_tool_overview(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "3d fluorescence time-lapse imaging", "segment", "track", "extract",
+    ):
+        if phrase not in text:
+            errors.append(f"missing general tool overview detail: {phrase}")
+    for forbidden in ("co-culture", "organoid", "immune cells"):
+        if forbidden in text:
+            errors.append(f"tool overview defaulted to a specific assay: {forbidden}")
+    return errors
+
+
+def _check_active_killing_feedback(result: dict) -> list[str]:
+    changed = _changed_values(result)
+    expected = {
+        "features.active_killing.target_types": ["MDO"],
+        "features.active_killing.observation_window": 15,
+        "features.active_killing.death_signal": "Dead-mask pixel count",
+        "features.active_killing.use_absolute_threshold": True,
+        "features.active_killing.absolute_threshold": 45,
+        "features.active_killing.minimum_contact_duration": 1,
+    }
+    errors = []
+    for control_id, value in expected.items():
+        if changed.get(control_id) != value:
+            errors.append(
+                f"{control_id} was {changed.get(control_id)!r}, expected {value!r}"
+            )
+    text = result["text"].lower()
+    for phrase in (
+        "one-cell calibration", "30 minutes", "15 timepoints",
+        "does not mean that many cells die", "independent target run",
+    ):
+        if phrase not in text:
+            errors.append(f"lost Active Killing constraint: {phrase}")
+    if "contact distance 0" in text:
+        errors.append("returned unrelated contact-distance guidance")
+    return errors
+
+
+def _check_active_killing_one_cell_not_ready(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in ("not ready yet", "at least one cell dies", "dead-mask pixel increase"):
+        if phrase not in text:
+            errors.append(f"missing unresolved readiness requirement: {phrase}")
+    if "active killing is **ready**" in text:
+        errors.append("claimed readiness before calibrating the one-cell requirement")
+    if result["calls"]:
+        errors.append("changed the setup during a readiness check")
+    return errors
+
+
 def _check_feature_group_dead_dye(result: dict) -> list[str]:
     text = result["text"].lower()
     errors = []
@@ -2766,7 +2995,7 @@ def _check_active_killing_complete_acceptance(result: dict) -> list[str]:
     for phrase in (
         "complete agreed active killing setup",
         "independently",
-        "combined analysis",
+        "pooled analysis",
         "not ready until every action card",
     ):
         if phrase not in text:
@@ -2958,66 +3187,6 @@ def _check_safety_profiling_context(result: dict) -> list[str]:
     return errors
 
 
-def _check_historical_btrack_examples(result: dict) -> list[str]:
-    text = result["text"].lower()
-    errors = []
-    for phrase in ("ivm", "cd4", "12", "10", "100"):
-        if phrase not in text:
-            errors.append(f"missing historical btrack context: {phrase}")
-    if not any(phrase in text for phrase in (
-        "not a default", "not defaults", "do not copy", "shouldn't copy",
-        "cannot copy", "historical example",
-    )):
-        errors.append("presented historical btrack values as reusable defaults")
-    if not (
-        any(term in text for term in ("per-frame", "per frame", "displacement"))
-        and any(term in text for term in ("gap", "preview", "measure"))
-    ):
-        errors.append("did not explain how to calibrate the current experiment")
-    if result["calls"]:
-        errors.append("attempted to apply historical btrack values")
-    return errors
-
-
-def _check_historical_calcium_example(result: dict) -> list[str]:
-    text = result["text"].lower()
-    errors = []
-    for phrase in (
-        "reporter propagation", "0.33", "2", "5", "32", "100", "10%",
-    ):
-        if phrase not in text:
-            errors.append(f"missing calcium reference detail: {phrase}")
-    if not all(term in text for term in ("cellpose", "import")):
-        errors.append("omitted the external Cellpose-SAM import workflow")
-    if not any(term in text for term in (
-        "historical", "example", "not a default", "not universal",
-    )):
-        errors.append("did not label calcium settings as historical examples")
-    if result["calls"]:
-        errors.append("attempted to apply the calcium reference settings")
-    return errors
-
-
-def _check_historical_microglia_example(result: dict) -> list[str]:
-    text = result["text"].lower()
-    errors = []
-    for phrase in (
-        "exp91", "eight wells", "1.77 µm", "120-second", "none_none",
-        "apoc probability map + watershed", "maximum search radius 150",
-        "absolute increase of 30", "start offset", "yaml", "readme", "n=1",
-        "historical values, not defaults",
-    ):
-        if phrase not in text:
-            errors.append(f"missing Exp91 reference detail: {phrase}")
-    if not all(value in text for value in ("0", "1")):
-        errors.append("did not preserve both sides of the Start offset conflict")
-    if not any(term in text for term in ("descriptive", "exploratory")):
-        errors.append("omitted the unreplicated-design interpretation caveat")
-    if result["calls"]:
-        errors.append("attempted to apply historical Exp91 values")
-    return errors
-
-
 def _check_experiment_reference_metadata_conflict(result: dict) -> list[str]:
     text = result["text"].lower()
     errors = []
@@ -3038,11 +3207,72 @@ def _check_experiment_reference_metadata_conflict(result: dict) -> list[str]:
     return errors
 
 
+def _check_metadata_taxonomy(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "distinguished in the images", "segmentation and track ids",
+        "biological identity", "treatment or experimental state",
+    ):
+        if phrase not in text:
+            errors.append(f"metadata taxonomy omitted {phrase!r}")
+    if result["calls"]:
+        errors.append("metadata taxonomy explanation attempted a form edit")
+    return errors
+
+
+def _check_multicolor_definition(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "one biological population", "same population, line, and condition",
+        "not a correction for bleed-through", "acquisition-design choice",
+    ):
+        if phrase not in text:
+            errors.append(f"multicolor explanation omitted {phrase!r}")
+    if result["calls"]:
+        errors.append("multicolor explanation attempted a form edit")
+    return errors
+
+
+def _check_bounded_tracking(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    if "bounded propagation" not in text:
+        errors.append("did not recommend Bounded Propagation from topology evidence")
+    if not any(term in text for term in ("connected region", "disconnected region")):
+        errors.append("did not explain the connected-region constraint")
+    if result["calls"]:
+        errors.append("changed tracking settings without a user fill request")
+    return errors
+
+
+def _check_name_neutral_tracking(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    if not any(term in text for term in (
+        "consecutive frame", "overlap", "one-frame displacement", "how far",
+    )):
+        errors.append("did not ask for image-behavior evidence")
+    for forbidden in (
+        "exp91", "m21", "m23", "1.77", "maximum search radius 150",
+        "30 dead-mask",
+    ):
+        if forbidden in text:
+            errors.append(f"leaked historical project-specific value {forbidden!r}")
+    if result["calls"]:
+        errors.append("changed settings from a biological name alone")
+    return errors
+
+
 SCENARIOS = [
+    _metadata_taxonomy_case,
+    _multicolor_definition_case,
     _organoid_line_grouping_case,
     _metadata_identifier_confirmation_case,
     _metadata_time_conversion_case,
     _metadata_completion_case,
+    _data_setup_requires_output_directory_case,
     _metadata_save_case,
     _choose_analysis_case,
     _analysis_question_on_metadata_tab_case,
@@ -3065,6 +3295,9 @@ SCENARIOS = [
     _apoc_mdo_feature_recommendation_case,
     _apoc_fill_organoid_features_case,
     _tracking_which_method_case,
+    _tracking_stale_segmentation_intent_case,
+    _bounded_tracking_case,
+    _name_neutral_tracking_case,
     _btrack_step2_enable_case,
     _btrack_step2_tune_case,
     _segmentation_minimum_size_case,
@@ -3080,7 +3313,12 @@ SCENARIOS = [
     _tracking_radius_case,
     _filtering_case,
     _reporter_propagation_case,
+    _ambiguous_killing_threshold_case,
+    _ambiguous_contact_analysis_case,
+    _general_tool_overview_case,
     _active_killing_case,
+    _active_killing_feedback_case,
+    _active_killing_one_cell_not_ready_case,
     _feature_group_dead_dye_case,
     _active_killing_complete_acceptance_case,
     _hmm_movement_options_case,
@@ -3094,9 +3332,6 @@ SCENARIOS = [
     _trajectory_linkage_case,
     _functional_experiment_context_case,
     _safety_profiling_context_case,
-    _historical_btrack_examples_case,
-    _historical_calcium_example_case,
-    _historical_microglia_example_case,
     _experiment_reference_metadata_conflict_case,
 ]
 
