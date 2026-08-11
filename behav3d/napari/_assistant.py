@@ -23,7 +23,7 @@ from typing import Optional
 from qtpy.QtCore import Qt, QThread, QTimer, Signal
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
-    QPlainTextEdit, QProgressBar, QTextBrowser, QFrame, QSizePolicy,
+    QPlainTextEdit, QProgressBar, QTextBrowser, QFrame, QSizePolicy, QScrollArea,
 )
 
 from behav3d.napari._assistant_context import build_context, context_summary_line
@@ -48,6 +48,29 @@ _METADATA_FIELD_DEFAULTS = {
     "time_interval": 1.0,
     "time_unit": "s",
 }
+
+
+def _pending_action_identity(action: ProposedAction) -> tuple | None:
+    """Return the target represented by a replaceable pending action card."""
+    data = action.data or {}
+    kind = str(action.kind or "")
+    if kind == "set_ui_value" and data.get("control_id"):
+        return kind, str(data["control_id"])
+    if kind == "set_parameter" and data.get("key"):
+        return kind, str(data["key"])
+    if kind == "fill_metadata_builder" and data.get("field"):
+        return (
+            kind,
+            str(data["field"]),
+            int(data.get("index", 0)),
+            str(data.get("cell_type") or ""),
+        )
+    if kind in {
+        "bulk_fill_metadata", "save_metadata", "load_metadata",
+        "select_segmentation_method",
+    }:
+        return (kind,)
+    return None
 
 _CHAT_ROLE_COLORS = {
     "assistant": "#30363b",
@@ -308,6 +331,13 @@ class _ActionCard(QFrame):
         title.setStyleSheet("color:#e0f0ff; font-size:11px;")
         lay.addWidget(title)
 
+        impact_message = str(action.data.get("impact_message") or "").strip()
+        if impact_message:
+            impact = QLabel(impact_message)
+            impact.setWordWrap(True)
+            impact.setStyleSheet("color:#b9c7d0; font-size:10px;")
+            lay.addWidget(impact)
+
         if not action.ok:
             warn = QLabel(action.message)
             warn.setWordWrap(True)
@@ -350,6 +380,7 @@ class AssistantDock(QWidget):
         self._md_queue: list[dict] = []
         self._md_phase: str | None = None
         self._current_intent: str = "free_form"
+        self._conversation_generation = 0
         self._request_active = False
         self._request_outcome = "idle"
         self._status_info: dict = {
@@ -421,7 +452,9 @@ class AssistantDock(QWidget):
         self.context_bar.setWordWrap(True)
         context_row.addWidget(self.context_bar, stretch=1)
         self.btn_new_chat = QPushButton("New chat")
-        self.btn_new_chat.setToolTip("Clear this conversation and start again")
+        self.btn_new_chat.setToolTip(
+            "Clear this conversation and all pending changes, even while a response loads"
+        )
         self.btn_new_chat.setStyleSheet("padding:7px 9px; font-size:11px;")
         self.btn_new_chat.clicked.connect(self._reset_conversation)
         context_row.addWidget(self.btn_new_chat)
@@ -458,11 +491,36 @@ class AssistantDock(QWidget):
         root.addWidget(self.transcript, stretch=1)
 
         # --- proposed-action tray ----------------------------------------
+        self.action_tray_panel = QWidget()
+        action_panel_layout = QVBoxLayout(self.action_tray_panel)
+        action_panel_layout.setContentsMargins(0, 0, 0, 0)
+        action_panel_layout.setSpacing(4)
+        action_header = QHBoxLayout()
+        action_header.setContentsMargins(2, 0, 0, 0)
+        action_label = QLabel("Proposed changes")
+        action_label.setStyleSheet("color:#b8c6ce; font-size:10px; font-weight:600;")
+        action_header.addWidget(action_label)
+        action_header.addStretch(1)
+        self.btn_clear_actions = QPushButton("Dismiss all")
+        self.btn_clear_actions.setToolTip("Discard every pending proposed change")
+        self.btn_clear_actions.setStyleSheet("padding:3px 6px; font-size:10px;")
+        self.btn_clear_actions.clicked.connect(self._clear_action_cards)
+        action_header.addWidget(self.btn_clear_actions)
+        action_panel_layout.addLayout(action_header)
+
+        self.action_scroll = QScrollArea()
+        self.action_scroll.setWidgetResizable(True)
+        self.action_scroll.setFrameShape(QFrame.NoFrame)
+        self.action_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.action_scroll.setMaximumHeight(180)
         self.action_tray = QWidget()
         self.action_tray_layout = QVBoxLayout(self.action_tray)
         self.action_tray_layout.setContentsMargins(0, 0, 0, 0)
         self.action_tray_layout.setSpacing(4)
-        root.addWidget(self.action_tray)
+        self.action_scroll.setWidget(self.action_tray)
+        action_panel_layout.addWidget(self.action_scroll)
+        self.action_tray_panel.setVisible(False)
+        root.addWidget(self.action_tray_panel)
 
         # --- quick actions (rebuilt on tab switch) ------------------------
         self.quick_widget = QWidget()
@@ -659,8 +717,11 @@ class AssistantDock(QWidget):
 
     def _reset_conversation(self):
         """Clear conversation and pending proposals while preserving live app state."""
-        if self._request_active:
-            return
+        # Invalidate callbacks from an in-flight worker. The thread may finish in
+        # the background, but it can no longer repopulate this fresh conversation.
+        self._conversation_generation += 1
+        self._set_busy(False)
+        self._request_outcome = "idle"
         self._history = []
         self._md_log = []
         self._streaming_text = None
@@ -671,11 +732,7 @@ class AssistantDock(QWidget):
         self._current_intent = "free_form"
         self._render_timer.stop()
         self.input.clear()
-        for i in reversed(range(self.action_tray_layout.count())):
-            widget = self.action_tray_layout.itemAt(i).widget()
-            if widget is not None:
-                widget.setParent(None)
-                widget.deleteLater()
+        self._clear_action_cards()
         self._greet()
         self.refresh_context_bar()
         try:
@@ -847,15 +904,36 @@ class AssistantDock(QWidget):
         messages = [{"role": "system", "content": _SYSTEM_PRIMER}] + self._history
         worker = ChatWorker(messages=messages, context=ctx, tools=TOOL_SCHEMA)
         thread = QThread()
+        generation = self._conversation_generation
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.token.connect(self._on_token)
-        worker.tool_calls.connect(self._on_tool_calls)
-        worker.status.connect(self._on_worker_status)
-        worker.degraded.connect(self._on_degraded)
-        worker.error.connect(self._on_error)
+        worker.token.connect(
+            lambda chunk, g=generation: self._dispatch_request_signal(g, self._on_token, chunk)
+        )
+        worker.tool_calls.connect(
+            lambda calls, g=generation: self._dispatch_request_signal(
+                g, self._on_tool_calls, calls
+            )
+        )
+        worker.status.connect(
+            lambda info, g=generation: self._dispatch_request_signal(
+                g, self._on_worker_status, info
+            )
+        )
+        worker.degraded.connect(
+            lambda text, g=generation: self._dispatch_request_signal(
+                g, self._on_degraded, text
+            )
+        )
+        worker.error.connect(
+            lambda message, g=generation: self._dispatch_request_signal(
+                g, self._on_error, message
+            )
+        )
         worker.finished.connect(thread.quit)
-        worker.finished.connect(self._on_finished)
+        worker.finished.connect(
+            lambda g=generation: self._dispatch_request_signal(g, self._on_finished)
+        )
         thread.finished.connect(lambda: self._cleanup_thread(thread, worker))
         self._threads.append((thread, worker))
         thread.start()
@@ -863,7 +941,8 @@ class AssistantDock(QWidget):
     def _set_busy(self, busy: bool):
         self._request_active = bool(busy)
         self.btn_send.setEnabled(not busy)
-        self.btn_new_chat.setEnabled(not busy)
+        # Reset must remain available when a response stalls or is still streaming.
+        self.btn_new_chat.setEnabled(True)
         self.thinking_progress.setVisible(bool(busy))
         if busy:
             self._recovery_timer.stop()
@@ -891,6 +970,10 @@ class AssistantDock(QWidget):
     # ------------------------------------------------------------------
     # Worker signal handlers
     # ------------------------------------------------------------------
+    def _dispatch_request_signal(self, generation: int, callback, *args):
+        if generation == self._conversation_generation:
+            callback(*args)
+
     def _on_worker_status(self, info: dict):
         level = (info or {}).get("level")
         if level in {"offline", "error"}:
@@ -1047,7 +1130,7 @@ class AssistantDock(QWidget):
         return message
 
     def _should_auto_apply(self, action: ProposedAction) -> bool:
-        """Auto-apply by default; only show a confirm card if a value is already set."""
+        """Auto-apply read-only navigation and previews, never value mutations."""
         if not action.ok:
             return False
 
@@ -1064,14 +1147,7 @@ class AssistantDock(QWidget):
             return False  # one confirmation covers the complete multi-field change
 
         if action.kind == "select_segmentation_method":
-            # Apply only when it changes the current selection.
-            seg = getattr(self.main_widget, "segmentation_tab", None)
-            combo = getattr(seg, "method_combo", None) if seg is not None else None
-            if combo is None:
-                return False
-            cur = combo.currentText()
-            val = str(action.data.get("value", "")).strip()
-            return not (cur == val or cur.startswith(val) or (val and val in cur))
+            return False
 
         if action.kind == "fill_metadata_builder":
             field = action.data.get("field")
@@ -1084,30 +1160,10 @@ class AssistantDock(QWidget):
             return False
 
         if action.kind == "set_parameter":
-            try:
-                from behav3d.napari._assistant_actions import get_by_dotted
-                from behav3d.napari._assistant_schema import flatten_config_to_cards
-                key = action.data.get("key")
-                params = getattr(
-                    self.main_widget.data_prep_tab, "behav3d_parameters", {})
-                current = get_by_dotted(params, key, _UNSET)
-                if current is _UNSET:
-                    return True  # never been set
-                for card in flatten_config_to_cards():
-                    if card["key"] == key:
-                        return current == card["default"]
-            except Exception:
-                pass
-            return True
+            return False
 
         if action.kind == "set_ui_value":
-            control_id = str(action.data.get("control_id") or "")
-            if control_id.startswith(("metadata.", "data.")):
-                return False
-            old = action.data.get("old_value")
-            # Empty text fields can be filled immediately. Existing values require
-            # the explicit Apply change card.
-            return old is None or (isinstance(old, str) and not old.strip())
+            return False
 
         if action.kind in (
             "show_track_length_distribution", "open_result", "recommend_edt",
@@ -1121,7 +1177,7 @@ class AssistantDock(QWidget):
         if action.kind in ("save_metadata", "load_metadata"):
             return False
 
-        return True  # unknown action kind: auto-apply
+        return False
 
     def _is_silent_auto_apply(self, action: ProposedAction) -> bool:
         """True when the action auto-applies but should NOT count as a new user answer.
@@ -1180,14 +1236,72 @@ class AssistantDock(QWidget):
     # Proposed-action tray
     # ------------------------------------------------------------------
     def _add_action_card(self, action: ProposedAction):
+        dp = getattr(self.main_widget, "data_prep_tab", None)
+        has_sample_forms = bool(getattr(dp, "_sample_forms", []) or [])
+        structural_control_ids = {
+            "metadata.number_of_samples",
+            "metadata.number_of_organoid_types",
+            "metadata.number_of_immune_types",
+            "metadata.number_of_other_types",
+            "metadata.include_dead_channel",
+        }
+        structural_builder_fields = {
+            "n_samples", "n_organoids", "n_immune", "n_other", "include_dead",
+            "organoid_name", "immune_name", "other_name", "immune_multicolor",
+            "immune_multicolor_channels",
+        }
+        if has_sample_forms and (
+            (
+                action.kind == "set_ui_value"
+                and action.data.get("control_id") in structural_control_ids
+            )
+            or (
+                action.kind == "fill_metadata_builder"
+                and action.data.get("field") in structural_builder_fields
+            )
+        ):
+            action.data["impact_message"] = (
+                "Applying this also rebuilds the dependent sample forms and "
+                "preserves compatible values already entered."
+            )
+        identity = _pending_action_identity(action)
+        if identity is not None:
+            for index in reversed(range(self.action_tray_layout.count())):
+                existing = self.action_tray_layout.itemAt(index).widget()
+                if (
+                    isinstance(existing, _ActionCard)
+                    and _pending_action_identity(existing.action) == identity
+                ):
+                    self._remove_card(existing)
         card = _ActionCard(action)
         card.confirmed.connect(self._apply_action)
         card.dismissed.connect(lambda a, c=card: self._remove_card(c))
         self.action_tray_layout.addWidget(card)
+        self._update_action_tray_visibility()
+        QTimer.singleShot(
+            0,
+            lambda: self.action_scroll.verticalScrollBar().setValue(
+                self.action_scroll.verticalScrollBar().maximum()
+            ),
+        )
 
     def _remove_card(self, card: _ActionCard):
+        self.action_tray_layout.removeWidget(card)
         card.setParent(None)
         card.deleteLater()
+        self._update_action_tray_visibility()
+
+    def _clear_action_cards(self):
+        while self.action_tray_layout.count():
+            item = self.action_tray_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        self._update_action_tray_visibility()
+
+    def _update_action_tray_visibility(self):
+        self.action_tray_panel.setVisible(self.action_tray_layout.count() > 0)
 
     def _append_action_result(self, markdown: str):
         """Display a deterministic action result and retain it for follow-ups."""
@@ -1213,7 +1327,13 @@ class AssistantDock(QWidget):
                     "here yet — it'll be used when you reach that part of the pipeline.*"
                 )
             else:
-                self._append_md(f"Filled in: {action.preview}")
+                message = f"Filled in: {action.preview}"
+                if action.data.get("reconciled_sample_forms"):
+                    message += (
+                        "\n\nDependent sample forms were updated; compatible "
+                        "existing values were preserved."
+                    )
+                self._append_md(message)
             self.refresh_context_bar()
         else:
             self._append_md(f"Could not apply: {action.preview}")
