@@ -51,6 +51,10 @@ The painting convention (`0` = eraser, `1` = background, `2` = foreground) and l
 
 ### 2 · Fine-tune Segmentation Parameters (Optional) — per cell type
 
+```{seealso}
+**These instance post-processing parameters are explained once, centrally — read them there.** What each control does (EDT threshold, Mask/Seed threshold, Min size, Opening, Fill holes): [Instance post-processing parameters](./index.md#instance-post-processing-parameters). What to change when the result looks wrong: [Tuning (failure mode → fix)](./index.md#instance-post-processing-tuning). Starting points for large vs small objects: [Advice: large vs small objects](./index.md#advice-large-vs-small-objects). The table below just lists this method's defaults.
+```
+
 This section appears once metadata is loaded. One group-box per cell type is generated, with category-dependent defaults:
 
 | Parameter | What it does | Default for organoids | Default for immune cells | Default for "other" |
@@ -62,7 +66,7 @@ This section appears once metadata is loaded. One group-box per cell type is gen
 
 The **Workers** spinbox (above the per-cell-type group-boxes) controls how many CPU processes are spawned for batch inference. It is capped at one less than your CPU core count.
 
-A **Test Segmentation Parameters** button at the bottom of this section runs the current parameters on the currently displayed timepoint and adds the result as a temporary Labels layer — useful for iterating on EDT / opening / fill-holes without committing to a batch run.
+A **Test Segmentation Parameters** button at the bottom of this section runs the current parameters on the currently displayed timepoint and adds the result as a temporary Labels layer — useful for iterating on EDT / opening / fill-holes without committing to a batch run ([what each parameter does](./index.md#instance-post-processing-parameters)).
 
 ### 3 · Batch Segmentation
 

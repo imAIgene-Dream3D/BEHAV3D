@@ -35,7 +35,7 @@ A full session usually goes like this:
 5. **Paint a few foreground and background pixels** on the Labels layer for each cell type — see [Labeling foreground and background](./index.md#labeling-foreground-and-background) for the painting convention and labeling tips.
 6. **Go to the per cell-type tab** (one tab per cell type at the top of the training area) and review the per-type controls: `Image Channel Inputs`, `Feature Preset` / `Tune Features`, and Random Forest parameters. Defaults are sensible; the most common manual change is unchecking irrelevant channels in `Image Channel Inputs`.
 7. **Click `▶ Train current tab`** to fit the classifier for the active cell type, or **`▶▶ Train ALL classifiers`** to train every cell type at once. Use **`⬇ Apply config to all tabs`** beforehand if you want one tab's feature/RF settings copied to the others, and **`Save User Labels`** to persist the labels you painted.
-8. For non-Direct strategies, instance-segmentation parameters (EDT / mask & seed thresholds / opening / min size) are exposed in the per-tab **Instance Segmentation Preview** group before you train, adjust these to control how the classifier output is turned into instances. After training the per-tab preview will be updated (usually automatically); you can also click **Run instance segmentation** in a cell-type tab to re-run the classifier + post-processing preview on the current timepoint without retraining.
+8. For non-Direct strategies, instance-segmentation parameters (EDT / mask & seed thresholds / opening / min size) are exposed in the per-tab **Instance Segmentation Preview** group before you train, adjust these to control how the classifier output is turned into instances ([what each one does](./index.md#instance-post-processing-parameters)). After training the per-tab preview will be updated (usually automatically); you can also click **Run instance segmentation** in a cell-type tab to re-run the classifier + post-processing preview on the current timepoint without retraining.
 9. **Inspect the result.** If touching cells are merged, single cells split, or noise appears, see [Tuning the parameters](#tuning-the-parameters) and adjust the per-tab segmentation parameters. Note: **APOC (Direct Instance Segmentation)** uses classifier-produced instance labels as-is, so if you need splitting or cleanup, switch to a Mask/Probability + Watershed strategy.
 10. **Scroll to  Batch segmentation section** → pick timepoint range and workers → click **▶ Run APOC Batch Segmentation** for an immediate run, or **+🛒** to queue.
 
@@ -68,7 +68,13 @@ A tab is created for each cell type detected in the metadata. Each tab exposes:
 | **Trees** | 100 | Number of decision trees in the random forest (range 10–1000, step 10). |
 | **Show classifier statistics** | — | After training, displays the classifier's feature-importance distribution, useful for spotting under- or over-fitting and identifying uninformative features you can disable to speed up future runs. |
 
-When the strategy includes a watershed post-processing, an **Instance Segmentation Preview** group also appears. Parameter meanings and tuning are documented once in [Instance post-processing parameters](./index.md#instance-post-processing-parameters); which ones are shown, and their APOC defaults, are:
+When the strategy includes a watershed post-processing, an **Instance Segmentation Preview** group also appears.
+
+```{seealso}
+**These instance post-processing parameters are explained once, centrally — read them there.** What each control does (EDT threshold, Mask/Seed threshold, Min size, Opening, Fill holes): [Instance post-processing parameters](./index.md#instance-post-processing-parameters). What to change when the result looks wrong: [Tuning (failure mode → fix)](./index.md#instance-post-processing-tuning). Starting points for large vs small objects: [Advice: large vs small objects](./index.md#advice-large-vs-small-objects). The table below just lists which controls each strategy shows and their APOC defaults.
+```
+
+Which ones are shown, and their APOC defaults, are:
 
 | Strategy | Parameters shown (with APOC defaults) |
 |---|---|

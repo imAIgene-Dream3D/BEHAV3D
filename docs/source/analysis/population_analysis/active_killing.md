@@ -14,31 +14,29 @@ Nothing in the calculation depends on the population being immune. The prefix is
 
 ## How it works in plain terms
 
-For each contact event, the detector looks at every target the effector actually touched, independently, anchored at the moment contact started:
+First the detector finds **contact events**: continuous stretches where the effector is touching at least one target. An event has to last at least the **minimum contact duration** to be considered at all.
 
-> *From the start of contact to N timepoints later, does the signal on this specific target rise enough to count as killing?*
+Then, **at every timepoint of that contact** — not just once at the start — it asks the same question of every target the effector is touching:
 
-Whichever touched target clears its own threshold by the largest margin is reported as the event's target. There is no sample-wide or cross-target averaging involved — each target is judged only against its own signal.
+> *From this timepoint to N timepoints later, does the signal on this specific target rise enough to count as killing?*
 
-If yes (and contact lasted long enough), the whole observed contact duration is flagged `is_active_killing = True`.
+Each touched target is judged only against **its own** signal — there is no sample-wide or cross-target averaging. At each timepoint, whichever touched target clears its own threshold by the largest margin is reported as that timepoint's target.
 
-```{note}
-**Caveat:** when several effectors contact the same target at once, all of them may be flagged as active killers for that event, even if only one actually did the killing — the detector attributes a signal rise to every qualifying contact, not to a single culprit.
-```
+Because every contact timepoint is scored independently with its own forward-looking window, **one contact can be flagged as killing at some timepoints and not others** — the verdict is per timepoint, not a single label stamped across the whole event.
 
 ### The killing rule (how it is computed)
 
-Each touched target is judged **only against its own signal**, anchored at the timepoint the contact **started** ($t_c$) — there is no background rate and no averaging across targets or across the sample. Let $W$ be the observation window and $D$ the chosen signal column. For one touched target:
+Fix one touched target and one contact timepoint $t$. Let $W$ be the observation window and $D$ the chosen signal column. The detector reads that target's own signal at $t$ and again $W$ frames later — there is no background rate and no averaging across targets or across the sample:
 
 $$
-D_{\text{start}} = D(t_c)
+D_{\text{start}} = D(t)
 \qquad
-D_{\text{end}} = D(t_c + W)
+D_{\text{end}} = D(t + W)
 \qquad
 \Delta D = D_{\text{end}} - D_{\text{start}}
 $$
 
-If the track ends before $t_c + W$, $D_{\text{end}}$ is read at the target's last available timepoint. The increase $\Delta D$ is compared to a threshold $\theta$ set by the mode:
+If the target's track ends before $t + W$, $D_{\text{end}}$ is read at its last available timepoint (no extrapolation). The rise $\Delta D$ is compared to a threshold $\theta$ set by the mode:
 
 $$
 \theta =
@@ -48,7 +46,7 @@ D_{\text{start}} \times (m - 1) & \text{(multiplier mode)}
 \end{cases}
 $$
 
-Multiplier mode is therefore equivalent to requiring $D_{\text{end}} > D_{\text{start}} \times m$ — the signal must grow past $m\times$ its value at contact start. A baseline of exactly $D_{\text{start}} = 0$ is replaced by $0.1$ so the threshold isn't trivially zero. The target is flagged as killed when
+Multiplier mode is therefore equivalent to requiring $D_{\text{end}} > D_{\text{start}} \times m$ — the signal must grow past $m\times$ its value **at that timepoint**. A baseline of exactly $D_{\text{start}} = 0$ is replaced by $0.1$ so the threshold isn't trivially zero. The target is flagged as killed at $t$ when
 
 $$
 \Delta D > \theta
@@ -56,19 +54,19 @@ $$
 \text{killing\_efficiency} = \frac{\Delta D}{\theta}
 $$
 
-Every touched target is scored this way, and the one with the **highest** `killing_efficiency` is reported as the event's target (`targeted_track_id`, set only when it is actually flagged as killed). That single per-event verdict is then written onto **every** timepoint of the observed contact, and the event is only counted once the contact has lasted at least the **minimum contact duration**.
+This is repeated for **every touched target at every timepoint of the contact**. At each timepoint the target with the **highest** `killing_efficiency` is reported as that timepoint's target (`targeted_track_id`, set only when it is actually flagged as killed), so the reported target can change from one timepoint to the next. The whole event is kept only once the contact has lasted at least the **minimum contact duration**.
 
 ## Parameters
 
 | Control | Default | Range | Meaning |
 |---|---|---|---|
 | **Immune cell type** | first immune type | dropdown | Which effector tracks to analyse. Immune (`im_`) types only — see the note above. |
-| **Observation window** | 5 | 1 – 100 timepoints | How many frames after contact starts to measure the signal rise on each touched target. |
+| **Observation window** | 5 | 1 – 100 timepoints | How many frames after **each contact timepoint** to look for the signal rise on each touched target. It is applied at every timepoint of the contact, not only at the start. |
 | **Death signal column** | `percentage_dead_mask` | dropdown of `percentage_dead_mask`, `mean_dead_dye`, `nr_dead_mask_pixels` | Which target column is read as the signal. If your `dead_channel` carries a reporter other than a death dye, this is that reporter's column. |
-| **Killing threshold multiplier** | 1.5 | 0.1 – 20.0 | If absolute mode is off: a target's signal must reach at least `signal_at_contact_start × multiplier` by the end of the window to count as killing. Scales with each target's own starting signal (a signal of exactly 0 is treated as 0.1 to avoid a trivial threshold). |
+| **Killing threshold multiplier** | 1.5 | 0.1 – 20.0 | If absolute mode is off: a target's signal must reach at least `signal_at_this_timepoint × multiplier` by the end of the window to count as killing. Scales with each target's own signal at the timepoint being scored (a signal of exactly 0 is treated as 0.1 to avoid a trivial threshold). |
 | **Use absolute threshold instead of multiplier** | OFF | checkbox | When on, the multiplier is replaced by a fixed value (next field). Recommended together with `nr_dead_mask_pixels`, since a flat pixel-count cutoff is easier to reason about than one on a fraction/intensity scale. |
-| **Absolute threshold** | 0.0 | 0.0 – 10000.0 | Fixed minimum signal increase (only used when "Use absolute threshold" is on). |
-| **Min contact duration** | 1 | 1 – 50 timepoints | Minimum consecutive timepoints an effector must be in contact with the same target before a killing event can be counted. |
+| **Absolute threshold** | 0.0 | adapts to the death signal column | Fixed minimum signal increase (only used when "Use absolute threshold" is on). The spinbox range/step follow the selected column — a 0–1 fraction for `percentage_dead_mask`, raw counts/intensity for the others. |
+| **Min contact duration** | 1 | 1 – 50 timepoints | Minimum consecutive timepoints an effector must stay in contact with **any** target before the contact event qualifies. (A contact event is continuous contact with any target; the touched target may change within it.) |
 | **Top-N killers to display** | 5 | 1 – 50 | Used by the preview button below. |
 
 ## Choosing the window and threshold
