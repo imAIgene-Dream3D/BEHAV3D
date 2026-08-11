@@ -552,7 +552,7 @@ def analysis_choice_summary(context: dict, messages: list[dict]) -> str | None:
             "How much of each immune cell surface engages an organoid? Use "
             "**Invasiveness Analysis** after extracting invasiveness features.",
             "Do sustained-contact tracks occupy different trajectory clusters, or do "
-            "cell states change after contact? Use **Contact-Based Grouping** and "
+            "cell states change after contact? Use **Contact analysis** and "
             "**Contact State-Shift Analysis** under State Trajectory.",
         ])
     if has_immune:
@@ -597,7 +597,7 @@ def analysis_choice_summary(context: dict, messages: list[dict]) -> str | None:
         "each timepoint. |\n"
         "| **State Trajectory** | Which whole-track behavioral programs occur and how "
         "their proportions differ by condition. |\n"
-        "| **Contact-Based Grouping** | Whether State Trajectory clusters differ "
+        "| **Contact analysis** | Whether State Trajectory clusters differ "
         "between tracks with and without a sustained contact bout. |\n"
         "| **Contact State-Shift Analysis** | Whether behavioral-state composition "
         "changes before versus after contact, compared with matched no-contact tracks. |\n"
@@ -3257,7 +3257,7 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "manually edited outside BEHAV3D.\n"
         "- For State Trajectory, Trajectory size cannot exceed the Filtering trim. Average linkage is the "
         "default, Complete is a reasonable comparison, and Single performs poorly. Original BEHAV3D mode is "
-        "deprecated. Categorical DTW supports Contact-Based Grouping for sustained-contact versus no-contact "
+        "deprecated. Categorical DTW supports Contact analysis for sustained-contact versus no-contact "
         "tracks and Contact State-Shift Analysis for before/after-contact state composition; the latter also "
         "requires Behavioral State results. Do not claim these current contact analyses are unavailable or "
         "known to produce empty output.\n"
@@ -3579,6 +3579,8 @@ if modal is not None:
     @modal.asgi_app()
     def web():
         import os
+        import time
+        import uuid
         from fastapi import FastAPI, Request
         from fastapi.responses import StreamingResponse
         from openai import OpenAI
@@ -3597,14 +3599,57 @@ if modal is not None:
         # The older `deepseek-chat` alias also maps to it but is being deprecated.
         # `deepseek-v4-pro` is the stronger/pricier option. Override via DEEPSEEK_MODEL.
         deepseek_model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
-        client = OpenAI(base_url=DEEPSEEK_BASE_URL,
-                        api_key=os.environ.get("DEEPSEEK_API_KEY", ""))
+        client = OpenAI(
+            base_url=DEEPSEEK_BASE_URL,
+            api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
+            timeout=60.0,
+            max_retries=1,
+        )
 
         @api.get("/health")
-        def health():
-            return {"ok": True, "chunks": len(index.chunks), "model": deepseek_model,
-                    "control_contract_version": CONTROL_CONTRACT_VERSION,
-                    "knowledge_version": KNOWLEDGE_VERSION}
+        def health(probe_provider: bool = False):
+            retrieval_status = "ready" if len(index.chunks) else "empty"
+            provider = {"status": "not_checked"}
+            if probe_provider:
+                started = time.monotonic()
+                try:
+                    client.with_options(timeout=20.0, max_retries=0).chat.completions.create(
+                        model=deepseek_model,
+                        messages=[{
+                            "role": "user",
+                            "content": "Reply with OK.",
+                        }],
+                        temperature=0,
+                        max_tokens=1,
+                        stream=False,
+                    )
+                    provider = {
+                        "status": "online",
+                        "latency_ms": round((time.monotonic() - started) * 1000),
+                    }
+                except Exception as error:
+                    error_type = type(error).__name__
+                    print(f"DeepSeek health probe failed ({error_type}): {error}")
+                    provider = {
+                        "status": "error",
+                        "error_type": error_type,
+                        "latency_ms": round((time.monotonic() - started) * 1000),
+                    }
+
+            return {
+                "ok": retrieval_status == "ready" and provider["status"] != "error",
+                "service": {"name": "modal", "status": "online"},
+                "retrieval": {
+                    "status": retrieval_status,
+                    "chunks": len(index.chunks),
+                },
+                "provider": provider,
+                # Preserve the original top-level health contract for existing clients.
+                "chunks": len(index.chunks),
+                "model": deepseek_model,
+                "control_contract_version": CONTROL_CONTRACT_VERSION,
+                "knowledge_version": KNOWLEDGE_VERSION,
+            }
 
         @api.post("/chat")
         async def chat(request: Request):
@@ -3612,21 +3657,36 @@ if modal is not None:
             messages = body.get("messages", [])
             context = body.get("context", {})
             tools = tools_for_context(body.get("tools", []), context)
+            request_id = uuid.uuid4().hex[:12]
+            request_started = time.monotonic()
+
+            def sse(obj):
+                payload = dict(obj)
+                payload.setdefault("request_id", request_id)
+                payload.setdefault(
+                    "elapsed_ms", round((time.monotonic() - request_started) * 1000)
+                )
+                return "data: " + json.dumps(payload) + "\n\n"
 
             deterministic = deterministic_turn_response(
                 context, messages, tools
             )
             if deterministic:
                 def deterministic_action_stream():
-                    yield "data: " + json.dumps({
-                        "type": "token", "text": deterministic["text"],
-                    }) + "\n\n"
+                    yield sse({
+                        "type": "status",
+                        "level": "working",
+                        "stage": "local_guidance",
+                        "component": "modal",
+                        "message": "Using the current BEHAV3D state...",
+                    })
+                    yield sse({"type": "token", "text": deterministic["text"]})
                     if deterministic.get("calls"):
-                        yield "data: " + json.dumps({
+                        yield sse({
                             "type": "tool_calls",
                             "calls": deterministic["calls"],
-                        }) + "\n\n"
-                    yield "data: " + json.dumps({"type": "done"}) + "\n\n"
+                        })
+                    yield sse({"type": "done"})
 
                 return StreamingResponse(
                     deterministic_action_stream(), media_type="text/event-stream"
@@ -3637,34 +3697,62 @@ if modal is not None:
             force_bulk = should_force_bulk_metadata(context, user_msg, tools)
             if force_bulk:
                 tools = [tool for tool in tools if tool.get("name") == "bulk_fill_metadata"]
-            query = f"{context.get('current_step','')} {user_msg}"
-            try:
-                retrieved = index.search(embedder.encode([query])[0], k=6)
-            except Exception:
-                retrieved = []
-
-            intent = (context.get("assistant_session", {}) or {}).get("intent")
-            deterministic = select_guidance_cards(context, user_msg, intent)
-            retrieved = deterministic + retrieved
-
-            system = build_system_prompt(context, retrieved, tools)
-            convo = [{"role": "system", "content": system}]
-            convo += [m for m in messages if m.get("role") != "system"]
-            control_ids = [item.get("id") for item in
-                           (context.get("ui_state", {}) or {}).get("controls", [])
-                           if item.get("id") and item.get("enabled") and item.get("visible")]
-            oai_tools = to_openai_tools(tools, key_enum=control_ids)
-            tool_choice, thinking_override = model_tool_policy(
-                force_bulk, bool(oai_tools)
-            )
-
-            def sse(obj):
-                return "data: " + json.dumps(obj) + "\n\n"
 
             def event_stream():
                 content = ""
                 visible_buffer = ""
                 tool_frags = []
+                yield sse({
+                    "type": "status",
+                    "level": "working",
+                    "stage": "retrieval",
+                    "component": "retrieval",
+                    "message": "Checking BEHAV3D guidance for this question...",
+                })
+
+                query = f"{context.get('current_step','')} {user_msg}"
+                try:
+                    retrieved = index.search(embedder.encode([query])[0], k=6)
+                except Exception as error:
+                    print(f"RAG retrieval failed for {request_id} ({type(error).__name__}): {error}")
+                    retrieved = []
+                    yield sse({
+                        "type": "status",
+                        "level": "degraded",
+                        "stage": "retrieval",
+                        "component": "retrieval",
+                        "code": "retrieval_unavailable",
+                        "message": (
+                            "The BEHAV3D guidance search is unavailable; continuing with "
+                            "built-in guidance."
+                        ),
+                    })
+
+                intent = (context.get("assistant_session", {}) or {}).get("intent")
+                guidance_cards = select_guidance_cards(context, user_msg, intent)
+                retrieved = guidance_cards + retrieved
+                system = build_system_prompt(context, retrieved, tools)
+                convo = [{"role": "system", "content": system}]
+                convo += [m for m in messages if m.get("role") != "system"]
+                control_ids = [
+                    item.get("id")
+                    for item in (context.get("ui_state", {}) or {}).get("controls", [])
+                    if item.get("id") and item.get("enabled") and item.get("visible")
+                ]
+                oai_tools = to_openai_tools(tools, key_enum=control_ids)
+                tool_choice, thinking_override = model_tool_policy(
+                    force_bulk, bool(oai_tools)
+                )
+
+                yield sse({
+                    "type": "status",
+                    "level": "working",
+                    "stage": "provider",
+                    "component": "deepseek",
+                    "message": "Waiting for response...",
+                })
+                provider_started = time.monotonic()
+                response_started = False
                 try:
                     request_options = {
                         "model": deepseek_model,
@@ -3681,6 +3769,18 @@ if modal is not None:
                         **request_options
                     )
                     for chunk in stream:
+                        if not response_started:
+                            response_started = True
+                            yield sse({
+                                "type": "status",
+                                "level": "working",
+                                "stage": "streaming",
+                                "component": "deepseek",
+                                "message": "Receiving response...",
+                                "provider_latency_ms": round(
+                                    (time.monotonic() - provider_started) * 1000
+                                ),
+                            })
                         delta = chunk.choices[0].delta
                         if getattr(delta, "content", None):
                             content += delta.content
@@ -3698,7 +3798,22 @@ if modal is not None:
                                 "arguments": getattr(fn, "arguments", None) if fn else None,
                             })
                 except Exception as e:
-                    yield sse({"type": "error", "message": f"DeepSeek API error: {e}"})
+                    error_type = type(e).__name__
+                    is_timeout = "timeout" in error_type.lower()
+                    print(f"DeepSeek request failed for {request_id} ({error_type}): {e}")
+                    yield sse({
+                        "type": "error",
+                        "stage": "provider",
+                        "component": "deepseek",
+                        "code": "deepseek_timeout" if is_timeout else "provider_error",
+                        "error_type": error_type,
+                        "retryable": True,
+                        "message": (
+                            "DeepSeek timed out before completing the response. Modal is online."
+                            if is_timeout else
+                            "DeepSeek could not generate a response. Modal is online."
+                        ),
+                    })
                     yield sse({"type": "done"})
                     return
 

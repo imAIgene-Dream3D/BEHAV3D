@@ -10,6 +10,16 @@ from pathlib import Path
 from tqdm import tqdm
 import shutil
 
+def _watershed_from_markers(mask, markers, dilation_nr_pixels=2):
+    """Two-pass watershed propagation: seed the raw mask, then close small
+    gaps by re-seeding a dilated mask with the first pass's result.
+    """
+    new_seg = watershed(mask, markers=markers, mask=mask)
+    mask_dilated = dilate_mask(mask, nr_pixels=dilation_nr_pixels)
+    new_seg = watershed(mask_dilated, markers=new_seg, mask=mask_dilated)
+    new_seg[mask==0]=0
+    return new_seg
+
 def _run_single_timepoint_propagation(
     t_seg,
     seg_prev_tp,
@@ -19,11 +29,7 @@ def _run_single_timepoint_propagation(
 
     mask = t_seg != 0
     seg_prev_tp[mask==0]=0
-    # seeds = keep_largest_connected_components(seeds)
-    new_seg = watershed(mask, markers = seg_prev_tp, mask=mask)
-    mask_dilated = dilate_mask(mask, nr_pixels=dilation_nr_pixels)
-    new_seg = watershed(mask_dilated, markers = new_seg, mask=mask_dilated)
-    new_seg[mask==0]=0
+    new_seg = _watershed_from_markers(mask, seg_prev_tp, dilation_nr_pixels)
     new_seg = segment_size_filter(new_seg, size_min=segment_size_min)
     return(new_seg)
 

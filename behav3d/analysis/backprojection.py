@@ -225,6 +225,110 @@ def _build_summary_lookup(lookup_df, track_col, value_col, background_value=0):
     }
 
 
+def filter_track_image_to_ids(track_img, track_ids):
+    """Zero out every label id in ``track_img`` that isn't in ``track_ids``.
+
+    Pixel labels are always the original segmentation ids, so callers that
+    only know post-split ``TrackID`` values should pass ``original_TrackID``
+    (when present) instead — see the same convention in
+    ``backproject_feature_at_timepoint`` and ``backproject_columns``.
+    Works for both in-memory numpy arrays and lazy dask arrays.
+    """
+    track_ids = np.asarray(list(track_ids), dtype=np.int64)
+    if hasattr(track_img, "chunks"):
+        return da.where(da.isin(track_img, track_ids), track_img, 0)
+    return np.where(np.isin(track_img, track_ids), track_img, 0)
+
+
+def backproject_feature_at_timepoint(
+    labels_frame,
+    df_features,
+    feature_col,
+    track_col="TrackID",
+    background_value=0,
+):
+    """
+    Map a single feature column onto a single already-sliced label frame
+    (2D or 3D) for one timepoint.
+
+    ``df_features`` must already be filtered to the single sample and
+    timepoint the frame represents (one row per track at most is assumed;
+    if duplicates exist the last row wins, matching ``_build_summary_lookup``).
+
+    Mirrors ``backproject_columns``'s track/label-id convention: whenever
+    ``original_TrackID`` is present in ``df_features`` it is used instead
+    of ``track_col`` to key the pixel lookup, because track-splitting
+    during filtering reassigns ``TrackID`` per chunk while pixel labels in
+    the segmentation image always carry the original, pre-split id.
+
+    Parameters
+    ----------
+    labels_frame : np.ndarray
+        Single-timepoint label array, any shape (2D XY or 3D ZYX).
+    df_features : pandas.DataFrame
+        Feature rows for this sample/timepoint. Must contain `track_col`
+        (or `original_TrackID`) and `feature_col`.
+    feature_col : str
+        Numeric (or numeric-coercible) column to backproject.
+    track_col : str
+        Column to use as the label id, unless `original_TrackID` is present.
+    background_value : int
+        Fill value for label==0 / unmatched pixels.
+
+    Returns
+    -------
+    mapped_frame : np.ndarray
+        Same shape as `labels_frame`, feature values written at label
+        positions, `background_value` elsewhere. dtype chosen by
+        `_infer_backprojection_dtype`.
+    ids_with_value : np.ndarray[int64]
+        Sorted label ids that had a valid (non-NaN, numeric) feature value
+        in `df_features`. Callers can use
+        ``np.isin(label_view, ids_with_value)`` to distinguish "no feature
+        row for this track at this timepoint" pixels from legitimate
+        `background_value`/zero feature values.
+
+    Raises
+    ------
+    ValueError
+        If `feature_col` (or the resolved track column) is missing, or if
+        `feature_col` cannot be coerced to numeric (propagated from
+        `_prepare_feature_series`).
+    """
+    if "original_TrackID" in df_features.columns:
+        track_col = "original_TrackID"
+    if track_col not in df_features.columns:
+        raise ValueError(f"Track id column '{track_col}' not found in feature dataframe.")
+    if feature_col not in df_features.columns:
+        raise ValueError(f"Feature column '{feature_col}' not found in feature dataframe.")
+
+    labels_frame = np.asarray(labels_frame)
+    lookup_payload = _build_summary_lookup(
+        lookup_df=df_features[[track_col, feature_col]].copy(),
+        track_col=track_col,
+        value_col=feature_col,
+        background_value=background_value,
+    )
+    out_dtype = np.dtype(lookup_payload["dtype"])
+    frame_lookup = lookup_payload["frame_lookup"].get(-1)
+
+    if frame_lookup is None or frame_lookup["ids"].size == 0:
+        return (
+            np.full(labels_frame.shape, background_value, dtype=out_dtype),
+            np.array([], dtype=np.int64),
+        )
+
+    mapped_frame = _map_labels_frame(
+        labels_t=labels_frame,
+        ids=frame_lookup["ids"],
+        values=frame_lookup["values"],
+        out_dtype=out_dtype,
+        background_value=background_value,
+        max_label=frame_lookup["max_label"],
+    )
+    return mapped_frame, frame_lookup["ids"]
+
+
 def _build_timepoint_lookup(lookup_df, track_col, time_col, value_col, background_value=0):
     values = _prepare_feature_series(lookup_df, value_col)
     work = lookup_df[[track_col, time_col]].copy()

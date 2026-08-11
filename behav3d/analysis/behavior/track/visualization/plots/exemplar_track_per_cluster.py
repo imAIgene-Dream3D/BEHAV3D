@@ -144,8 +144,8 @@ def plot_tracks_bars_on_ax(
 ):
     """
     If x_mode="relative": each track is mapped to [0, rel_max] where rel_max is auto-chosen:
-      - default: 100
-      - if timepoints look discrete and track is short: rel_max = (n_timepoints - 1)
+      - if timepoints look discrete (integer-like): rel_max = (n_timepoints - 1)
+      - otherwise (continuous time values): rel_max = 100
 
     ``window_key`` (when present on both ``chosen_df`` and ``adata_full.obs``) is
     included in the track identity key so that, when tracks were split into
@@ -180,14 +180,14 @@ def plot_tracks_bars_on_ax(
 
     # Auto rel_max helper (per track)
     def _auto_rel_max(tvals: np.ndarray) -> float:
-        # If integer-like timepoints and short track, use n-1; else use 100
+        # If integer-like timepoints, use the track's true length (n-1); else use 100.
         if len(tvals) <= 1:
             return 1.0
         # integer-like check (within tolerance)
         int_like = np.all(np.isclose(tvals, np.round(tvals), atol=1e-6))
-        if int_like and len(tvals) <= 120:   # heuristic: "short" discrete tracks
+        if int_like:
             return float(len(tvals) - 1)
-        return 100.0
+        return 100.0  # fallback for genuinely non-discrete/continuous time values
 
     if x_mode == "relative":
         # compute per-track relative x with per-track rel_max

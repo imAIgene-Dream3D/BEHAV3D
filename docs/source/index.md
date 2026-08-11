@@ -51,11 +51,11 @@ Launch the plugin, take the 5-minute tour, learn the dock widget layout.
 Visualization, the Processing Queue, and the canonical output folder layout — concepts that span every step.
 ::::
 
-::::{grid-item-card} 🔬 Preprocessing
-:link: preprocessing/index
+::::{grid-item-card} 📋 Data Preparation
+:link: data_preparation
 :link-type: doc
 
-Data preparation: building the metadata table, setting up the output folder, converting raw images to Zarr for fast access.
+Building the metadata table, declaring your cell types, setting up the output folder, and converting raw images to Zarr for fast access.
 ::::
 
 ::::{grid-item-card} ⚙️ Processing
@@ -102,7 +102,7 @@ plugin_essentials/index
 :caption: Pipeline
 :maxdepth: 3
 
-preprocessing/index
+data_preparation
 processing/index
 analysis/index
 ```

@@ -37,7 +37,7 @@ from qtpy.QtGui import QDesktopServices
 
 from behav3d.napari._pdf_view import open_pdf_in_napari
 from behav3d.napari._results_panel import ResultsPanel
-from behav3d.core.qt_help import make_help_row, HelpButton
+from behav3d.core.qt_help import make_help_row, HelpButton, reset_scroll_on_page_change
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -249,6 +249,99 @@ class CollapsibleSection(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Dual-list group selector
+# ═══════════════════════════════════════════════════════════════════════════
+class DualListGroupSelector(QWidget):
+    """Three list boxes with move buttons, for building two custom groups (e.g. merging
+    condition levels into a "Group 1" and "Group 2" side) plus a "Don't use" bucket for
+    levels to leave out of the analysis entirely, out of a flat list of string items.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(2)
+
+        cols = QHBoxLayout()
+        cols.setSpacing(4)
+        outer.addLayout(cols)
+
+        self.list_left = QListWidget()
+        self.list_left.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.list_right = QListWidget()
+        self.list_right.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.list_excluded = QListWidget()
+        self.list_excluded.setSelectionMode(QAbstractItemView.ExtendedSelection)
+
+        cols.addLayout(self._build_column(
+            "Group 1", self.list_left,
+            [("→ Group 2", self.list_right), ("→ Don't use", self.list_excluded)],
+        ))
+        cols.addLayout(self._build_column(
+            "Group 2", self.list_right,
+            [("← Group 1", self.list_left), ("→ Don't use", self.list_excluded)],
+        ))
+        cols.addLayout(self._build_column(
+            "Don't use", self.list_excluded,
+            [("← Group 1", self.list_left), ("← Group 2", self.list_right)],
+        ))
+
+    def _build_column(self, title: str, list_widget: QListWidget, move_targets):
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        label = QLabel(title)
+        label.setStyleSheet("font-weight: bold; font-size: 11px;")
+        col.addWidget(label)
+        col.addWidget(list_widget, stretch=1)
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(2)
+        for text, dst in move_targets:
+            btn = QPushButton(text)
+            btn.setStyleSheet("QPushButton { font-size: 10px; padding: 2px 4px; }")
+            btn.clicked.connect(
+                lambda _checked=False, src=list_widget, d=dst: self._move(src, d)
+            )
+            btn_row.addWidget(btn)
+        col.addLayout(btn_row)
+        return col
+
+    @staticmethod
+    def _move(src, dst):
+        for item in src.selectedItems():
+            src.takeItem(src.row(item))
+            dst.addItem(item.text())
+
+    def set_items(self, items: Iterable[str]):
+        """Repopulate with `items`, keeping any current group/exclusion membership for
+        items still present, and putting brand-new items in "Group 1"."""
+        prev_right = set(self.right_items())
+        prev_excluded = set(self.excluded_items())
+        self.list_left.clear()
+        self.list_right.clear()
+        self.list_excluded.clear()
+        for item in items:
+            if item in prev_excluded:
+                self.list_excluded.addItem(item)
+            elif item in prev_right:
+                self.list_right.addItem(item)
+            else:
+                self.list_left.addItem(item)
+
+    def left_items(self) -> list[str]:
+        return [self.list_left.item(i).text() for i in range(self.list_left.count())]
+
+    def right_items(self) -> list[str]:
+        return [self.list_right.item(i).text() for i in range(self.list_right.count())]
+
+    def excluded_items(self) -> list[str]:
+        return [self.list_excluded.item(i).text() for i in range(self.list_excluded.count())]
+
+    def is_configured(self) -> bool:
+        return self.list_left.count() > 0 and self.list_right.count() > 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Death Dynamics sub-tab
 # ═══════════════════════════════════════════════════════════════════════════
 class DeathDynamicsTab(QWidget):
@@ -383,6 +476,7 @@ class DeathDynamicsTab(QWidget):
         form_outer.addWidget(scroll)
         self._form_scroll = scroll
         self._stack.addWidget(form_page)
+        reset_scroll_on_page_change(self._stack)
 
         content = QWidget()
         layout = QVBoxLayout(content)
@@ -2250,6 +2344,13 @@ class DeathDynamicsTab(QWidget):
 # ═══════════════════════════════════════════════════════════════════════════
 from behav3d.napari._single_cell import SingleCellTab  # noqa: E402  (re-exported)
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Feature Backprojection sub-tab — real implementation imported from
+# _feature_backprojection.py (imported after SingleCellTab/CollapsibleSection
+# above so its own imports resolve cleanly).
+# ═══════════════════════════════════════════════════════════════════════════
+from behav3d.napari._feature_backprojection import FeatureBackprojectionTab  # noqa: E402  (re-exported)
+
 
 # NOTE: ResultsPanel used to be defined here; it now lives in
 # behav3d/napari/_results_panel.py so the Filtering and Feature
@@ -2350,6 +2451,11 @@ class AnalysisTab(QWidget):
         self.inner_tabs = QTabWidget()
         self.splitter.addWidget(self.inner_tabs)
 
+        self.feature_backprojection_tab = FeatureBackprojectionTab(
+            viewer=viewer, metadata_loader=metadata_loader, parent=self
+        )
+        self.inner_tabs.addTab(self.feature_backprojection_tab, "🔬 Feature Backprojection")
+
         self.death_dynamics_tab = DeathDynamicsTab(
             viewer=viewer, metadata_loader=metadata_loader, parent=self
         )
@@ -2359,6 +2465,7 @@ class AnalysisTab(QWidget):
             viewer=viewer, metadata_loader=metadata_loader, parent=self
         )
         self.inner_tabs.addTab(self.single_cell_tab, "🧬 Single Cell")
+        reset_scroll_on_page_change(self.inner_tabs)
 
         self.results_panel = ResultsPanel(
             viewer=viewer, metadata_loader=metadata_loader, parent=self
@@ -2378,6 +2485,7 @@ class AnalysisTab(QWidget):
         )
 
         self.stack.addWidget(self.main_content)
+        reset_scroll_on_page_change(self.stack)
 
         # Wire metadata signal and initialise the visible page.
         if metadata_loader is not None and hasattr(
@@ -2404,6 +2512,8 @@ class AnalysisTab(QWidget):
 
     def _on_metadata_updated(self, *_):
         """Cascade metadata updates to inner tabs and results panel."""
+        if hasattr(self, "feature_backprojection_tab"):
+            self.feature_backprojection_tab._on_metadata_updated()
         if hasattr(self, "death_dynamics_tab"):
             self.death_dynamics_tab._on_metadata_updated()
         if hasattr(self, "single_cell_tab"):

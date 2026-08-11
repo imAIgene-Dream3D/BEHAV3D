@@ -27,8 +27,11 @@ from qtpy.QtWidgets import (
     QComboBox,
     QScrollArea,
     QApplication,
+    QStackedWidget,
+    QTabWidget,
 )
 from qtpy.QtCore import Qt
+from typing import Union
 
 
 class HelpButton(QPushButton):
@@ -123,4 +126,32 @@ def disable_spinbox_wheel_scroll() -> None:
     _wheel_scroll_disabled = True
 
 
-__all__ = ["HelpButton", "make_help_row", "disable_spinbox_wheel_scroll"]
+def reset_scroll_on_page_change(container: Union[QStackedWidget, QTabWidget]) -> None:
+    """Scroll any ``QScrollArea`` inside a page back to the top whenever
+    ``container`` (a ``QStackedWidget`` or ``QTabWidget``) switches to it.
+
+    Qt keeps each page's scroll position between visits since the page
+    widgets are never recreated, only hidden/shown. Without this, a page
+    left scrolled down (e.g. a settings form) can appear empty the next
+    time it's shown, because the visible viewport lands mid-content
+    instead of at the top.
+    """
+    def _reset(index: int) -> None:
+        page = container.widget(index)
+        if page is None:
+            return
+        scrolls = page.findChildren(QScrollArea)
+        if isinstance(page, QScrollArea):
+            scrolls = [page, *scrolls]
+        for scroll in scrolls:
+            scroll.verticalScrollBar().setValue(0)
+
+    container.currentChanged.connect(_reset)
+
+
+__all__ = [
+    "HelpButton",
+    "make_help_row",
+    "disable_spinbox_wheel_scroll",
+    "reset_scroll_on_page_change",
+]

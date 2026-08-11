@@ -24,7 +24,12 @@ from behav3d.core.metadata import (
     detect_other_cell_types_from_metadata,
 )
 from behav3d.core.utils import expand_column_patterns
-from behav3d.widgets.utils import PathPicker, behav3d_calculated_features, spinning_loader
+from behav3d.widgets.utils import (
+    PathPicker,
+    behav3d_calculated_features,
+    excluded_non_behavior_columns,
+    spinning_loader,
+)
 
 
 def normalize_binary_value(value, tol=1e-9):
@@ -102,6 +107,40 @@ def detect_binary_columns_from_csv(csv_path, cols, chunksize=50000):
     )
 
 
+def detect_non_numeric_columns_from_csv(csv_path, cols, chunksize=50000):
+    """Value-based detection of columns unsuitable as continuous HMM features.
+
+    A column is flagged if any non-NA value fails to parse as a finite float --
+    e.g. free-text/categorical labels ("um", "27t") or comma-separated contact-ID
+    lists ("45,46"). Such object-dtype columns silently poison the HMM
+    observation matrix's dtype when selected as a feature: pandas keeps the
+    column as ``object`` even after numeric coercion, so ``adata.X`` ends up
+    object-dtype and anndata's h5ad writer -- assuming an object array must be
+    strings -- crashes with "Can't implicitly convert non-string objects to
+    strings" the moment it hits the actual float values. These columns must be
+    excluded before they are ever offered as selectable timepoint features.
+    """
+    if csv_path is None or len(cols) == 0:
+        return []
+
+    invalid = {str(c): False for c in cols}
+    try:
+        for chunk in pd.read_csv(csv_path, usecols=cols, chunksize=chunksize, low_memory=False):
+            for col in cols:
+                key = str(col)
+                if invalid[key]:
+                    continue
+                series = chunk[col].dropna()
+                if len(series) == 0:
+                    continue
+                if pd.to_numeric(series, errors="coerce").isna().any():
+                    invalid[key] = True
+    except Exception:
+        return []
+
+    return sorted([c for c in cols if invalid[str(c)]])
+
+
 def _winfo(prefix, message):
     print(f"[{prefix}] INFO {message}")
 
@@ -142,6 +181,7 @@ class BaseStateClassificationPanel:
         self._full_name_boxes = {}
         self._full_select_boxes = {}
         self._binary_detection_cache = None
+        self._cfg_loaded_cell_type = None
 
         self._descriptive_feature_options = (
             "mean",
@@ -758,48 +798,9 @@ class BaseStateClassificationPanel:
         return binary_cols
 
     def _excluded_non_behavior_columns(self, cols):
-        col_set = {str(c) for c in cols}
-        excluded = {
-            "sample_name",
-            "TrackID",
-            "sub_TrackID",
-            "position_t",
-            "position_x",
-            "position_y",
-            "position_z",
-            "segment_id",
-            "lineage_id",
-            "frame",
-            "t",
-            "interpolated",
-            "exp_nr",
-            "well",
-            "origin_cell_type",
-            "origin_TrackID",
-        }
-
         md = getattr(self.metadata_loader, "metadata", None)
-        if isinstance(md, pd.DataFrame):
-            excluded.update({str(c) for c in md.columns})
-
-        for c in col_set:
-            lc = str(c).lower()
-            if lc.endswith("_line_condition"):
-                excluded.add(c)
-            if lc.endswith("_tracks_csv_path"):
-                excluded.add(c)
-            if lc.endswith("_segments_image_path"):
-                excluded.add(c)
-            if lc.endswith("_tracks_image_path"):
-                excluded.add(c)
-            if lc.endswith("_raw_image_path"):
-                excluded.add(c)
-            if lc.endswith("_dead_mask_path"):
-                excluded.add(c)
-            if lc.startswith("channel_") and lc.endswith("_label"):
-                excluded.add(c)
-
-        return excluded.intersection(col_set)
+        metadata = md if isinstance(md, pd.DataFrame) else None
+        return excluded_non_behavior_columns(cols, metadata=metadata)
 
     def _panel_cfg(self):
         params = getattr(self.metadata_loader, "behav3d_parameters", None)
@@ -902,19 +903,29 @@ class BaseStateClassificationPanel:
 
         excluded = self._excluded_non_behavior_columns(cols)
         usable_cols = [c for c in cols if c not in excluded]
+
+        # Columns that can't be parsed as continuous numbers (e.g. "touching_27ts"
+        # holding comma-separated contact-ID lists, or unit/label columns) must not
+        # be offered as selectable HMM features -- picking one silently breaks the
+        # .h5ad write later on. Binary detection below still runs over the full
+        # usable_cols so 0/1 and true/false columns keep working as before.
+        csv_path = self._resolve_track_features_csv()
+        non_numeric_cols = set(detect_non_numeric_columns_from_csv(csv_path, usable_cols))
+        feature_usable_cols = [c for c in usable_cols if c not in non_numeric_cols]
+
         base_groups = deepcopy(behav3d_calculated_features)
         matched = set()
         grouped = {}
         for group_name, patterns in base_groups.items():
             vals = []
             for pat in patterns:
-                vals.extend(expand_column_patterns(pat, usable_cols))
-            clean_vals = sorted({x for x in vals if x in usable_cols})
+                vals.extend(expand_column_patterns(pat, feature_usable_cols))
+            clean_vals = sorted({x for x in vals if x in feature_usable_cols})
             if len(clean_vals) > 0:
                 grouped[group_name] = clean_vals
                 matched.update(clean_vals)
 
-        other = sorted([c for c in usable_cols if c not in matched])
+        other = sorted([c for c in feature_usable_cols if c not in matched])
         if len(other) > 0:
             grouped["other"] = other
 
@@ -924,7 +935,7 @@ class BaseStateClassificationPanel:
         if len(preselected) == 0:
             # fallback to basic sensible defaults when present
             for f in ["speed", "elongation", "sphericity", "extent", "solidity"]:
-                if f in usable_cols:
+                if f in feature_usable_cols:
                     preselected.add(f)
 
         children = []
@@ -976,13 +987,13 @@ class BaseStateClassificationPanel:
             for idx, title in enumerate(titles):
                 fg_acc.set_title(idx, title)
             self.feature_groups_status.value = (
-                f"<b>Available features:</b> {len(usable_cols)} usable columns "
-                f"(excluded metadata/technical: {len(excluded)})"
+                f"<b>Available features:</b> {len(feature_usable_cols)} usable columns "
+                f"(excluded metadata/technical: {len(excluded)}, "
+                f"non-numeric: {len(non_numeric_cols)})"
             )
             self.feature_groups_box.children = [fg_acc]
         self._update_selected_features_box()
 
-        csv_path = self._resolve_track_features_csv()
         binary_input_cols = [c for c in usable_cols if c not in {"interpolated"}]
         binary_candidates = self._detect_binary_columns_from_csv(
             csv_path=csv_path,
@@ -1196,7 +1207,10 @@ class BaseStateClassificationPanel:
             self.cell_type_dd.value = self.cell_type_dd.options[0]
 
         self._refresh_apply_default_paths()
-        self._apply_cfg_defaults()
+        current_cell_type = self._current_cell_type()
+        if current_cell_type != self._cfg_loaded_cell_type:
+            self._apply_cfg_defaults()
+            self._cfg_loaded_cell_type = current_cell_type
         self._load_columns()
         self._build_feature_groups()
         self._load_existing_model_if_available()

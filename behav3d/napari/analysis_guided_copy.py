@@ -199,20 +199,42 @@ STATE_REPORTS_ENTRY = {
     "color": "#4a90d9",
     "show_explainer": False,
     "what_does": (
-        "State composition, state transition, and condition comparison "
-        "reports are all built from the behavioral states you classified in "
-        "Step 2 — pick which one(s) you need."
+        "Diagnostics, state composition, state transition, and condition "
+        "comparison reports are all built from the behavioral states you "
+        "classified in Step 2 — pick which one(s) you need."
     ),
     "concept": None,
     "what_get": (
-        "A choice of report PDFs: state composition, state transitions, "
-        "and/or a two-condition statistical comparison."
+        "A choice of report PDFs: clustering diagnostics, state composition, "
+        "state transitions, and/or a two-condition statistical comparison."
     ),
     "decide": [],
     "start_label": "Generate analysis and plots  ▸",
     "seed": (
         "Explain what reports are available after BEHAV3D behavioral state "
         "classification and when to use each one."
+    ),
+}
+
+STATE_DIAGNOSTICS = {
+    "id": "state_diagnostics",
+    "title": "Diagnostic",
+    "subtitle": "How well-separated are your behavioral states?",
+    "color": "#4a90d9",
+    "what_does": (
+        "Runs quality-control diagnostics on the HMM behavioral-state "
+        "clustering (state means, transitions, feature distributions), so "
+        "you can judge whether the states are well separated."
+    ),
+    "concept": None,
+    "what_get": "Diagnostic PDF(s) with state means, transitions, and feature distributions.",
+    "decide": [],
+    "has_params": False,
+    "start_label": "Generate Diagnostics plots  ▸",
+    "seed": (
+        "Explain the BEHAV3D behavioral-state HMM diagnostics: what the "
+        "state-means, transition, and feature-distribution plots tell you "
+        "about clustering quality."
     ),
 }
 
@@ -413,7 +435,7 @@ TRACK_COMPARISON_REPORT = {
 
 TRACK_CONTACT_GROUPING = {
     "id": "track_contact",
-    "title": "Contact-based Grouping",
+    "title": "Contact analysis",
     "subtitle": "Do tracks with a sustained contact behave differently?",
     "color": "#c98a2c",
     "what_does": (
@@ -438,9 +460,9 @@ TRACK_CONTACT_GROUPING = {
     ],
     "has_params": True,
     "seed": (
-        "Explain the BEHAV3D Contact-based Grouping analysis: how the "
-        "contact/no-contact split works and how to choose the minimum bout "
-        "length."
+        "Explain the BEHAV3D Contact analysis (contact-based grouping): how "
+        "the contact/no-contact split works and how to choose the minimum "
+        "bout length."
     ),
 }
 
@@ -472,7 +494,7 @@ TRACK_EXEMPLAR_TRACKS = {
 
 # Level-1 pipeline lists, in display order (matches existing widget order).
 STATE_REPORT_PIPELINES = [
-    STATE_COMPOSITION_REPORT, STATE_TRANSITION_REPORT, STATE_COMPARISON_REPORT,
+    STATE_DIAGNOSTICS, STATE_COMPOSITION_REPORT, STATE_TRANSITION_REPORT, STATE_COMPARISON_REPORT,
 ]
 TRACK_PLOT_PIPELINES = [
     TRACK_DIAGNOSTICS, TRACK_PROPORTIONS, TRACK_WINDOW_TRANSITIONS, TRACK_COMPARISON_REPORT,

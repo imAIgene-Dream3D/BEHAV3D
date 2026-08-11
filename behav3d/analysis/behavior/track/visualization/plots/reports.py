@@ -95,15 +95,23 @@ from behav3d.analysis.behavior.general.visualization.plots.proportion_bars impor
     _chunk_list,
     _wrap_row_label,
 )
-from behav3d.analysis.behavior.general.visualization.plots.feature_violin import (
-    plot_feature_violin_by_group,
+from behav3d.analysis.behavior.general.visualization.plots.feature_box import (
+    plot_feature_box_by_group,
 )
 from behav3d.analysis.behavior.track.contact_grouping import (
     compute_track_contact_features,
     merge_track_contact_features_into_obs,
+    compute_track_contact_target_class_features,
+    merge_track_target_class_group_into_obs,
+    contact_col_target_cell_type,
     _contact_group_col_name,
     _contact_mean_col_name,
     _contact_max_bout_col_name,
+    _contact_class_mean_col_name,
+    _contact_class_max_bout_col_name,
+    _contact_target_class_group_col_name,
+    _NO_CONTACT_LABEL,
+    _MULTIPLE_CLASSES_LABEL,
 )
 from behav3d.analysis.behavior.state.visualization.plots.state_composition import (
     _compute_relative_matrices_by_sample,
@@ -637,15 +645,25 @@ def _save_contact_cluster_stack_grid_page(
     group_y,
     class_order,
     csv_dir,
+    group_x_levels_map=None,
+    group_y_levels_map=None,
+    stack_order=None,
+    stack_colors=None,
+    title_prefix="Contact-Group Composition",
     dpi=300,
     verbose=False,
 ):
-    """Add the `class_col`-on-x-axis contact/no_contact stacked-bar grid page(s) to `pdf`,
-    faceted by `group_x`/`group_y` as a true 2D grid; `extra_group_cols` ("group per page")
-    paginate into separate grid pages instead of adding a third grid dimension.
+    """Add the `class_col`-on-x-axis stacked-bar grid page(s) to `pdf` — stacked by `group_col`'s
+    levels (`stack_order`/`stack_colors`, defaulting to the binary contact/no_contact convention
+    when not given) — faceted by `group_x`/`group_y` as a true 2D grid; `extra_group_cols` ("group
+    per page") paginate into separate grid pages instead of adding a third grid dimension.
 
     Skipped entirely (returns ``n_pages=0``) when none of `group_x`/`group_y`/`extra_group_cols`
     are set, matching the plain per-sample contact-rate page which is always produced separately.
+
+    ``group_x_levels_map``/``group_y_levels_map`` : dict[str, str], optional
+        Maps raw ``group_x``/``group_y`` levels to merged group labels — when given, that axis
+        is pooled into the merged labels instead of showing one facet per raw level.
     """
     obs_cols = list(adata_tracks.obs.columns)
     extra_group_cols = [c for c in (extra_group_cols or []) if c in obs_cols]
@@ -656,8 +674,13 @@ def _save_contact_cluster_stack_grid_page(
             print("  Note: no group_x/group_y/extra_group_cols set — skipping cluster-stack grid page.")
         return {"n_pages": 0, "csv_path": None}
 
-    stack_order = list(_CONTACT_STACK_ORDER)
-    stack_colors = _normalize_label_color_map(stack_order, colors=_CONTACT_STACK_COLORS, cmap_name="tab10")
+    if stack_order is None:
+        stack_order = list(_CONTACT_STACK_ORDER)
+        default_stack_colors = _CONTACT_STACK_COLORS
+    else:
+        stack_order = [str(s) for s in stack_order]
+        default_stack_colors = stack_colors
+    stack_colors = _normalize_label_color_map(stack_order, colors=default_stack_colors, cmap_name="tab10")
 
     needed_cols = [class_col, group_col] + list(dict.fromkeys(grid_axis_cols + extra_group_cols))
     plot_df = adata_tracks.obs[needed_cols].copy()
@@ -665,6 +688,15 @@ def _save_contact_cluster_stack_grid_page(
     plot_df[group_col] = plot_df[group_col].astype("string").fillna("(unknown)").astype(str)
     for gc in dict.fromkeys(grid_axis_cols + extra_group_cols):
         plot_df[gc] = plot_df[gc].astype("string").fillna("(unknown)").astype(str)
+        if gc == group_x and group_x_levels_map:
+            plot_df[gc] = plot_df[gc].map(group_x_levels_map)
+        elif gc == group_y and group_y_levels_map:
+            plot_df[gc] = plot_df[gc].map(group_y_levels_map)
+    if grid_axis_cols and (group_x_levels_map or group_y_levels_map):
+        # A level_map applies only to whichever raw levels are still present - map() leaves
+        # anything outside the mapping as NaN, so drop those rows here rather than let them
+        # silently poison the facet grid.
+        plot_df = plot_df.dropna(subset=grid_axis_cols)
 
     if extra_group_cols:
         page_labels = _make_group_label(plot_df, extra_group_cols)
@@ -709,7 +741,7 @@ def _save_contact_cluster_stack_grid_page(
                 if (group_x and group_y and group_x in grid_axis_cols and group_y in grid_axis_cols)
                 else None
             )
-            title = f"Contact-Group Composition by {class_col}"
+            title = f"{title_prefix} by {class_col}"
             if extra_group_cols:
                 title = f"{title} — {', '.join(extra_group_cols)}: {page_key}"
             fig = _plot_page_class_stack_grid(
@@ -734,7 +766,7 @@ def _save_contact_cluster_stack_grid_page(
                     row[f"{group_col}={stack_val}"] = float(props.loc[cls, stack_val]) if cls in props.index else 0.0
                 long_rows.append(row)
 
-            title = f"Contact-Group Composition by {class_col}"
+            title = f"{title_prefix} by {class_col}"
             if extra_group_cols:
                 title = f"{title} — {', '.join(extra_group_cols)}: {page_key}"
             fig = _plot_single_class_stack_panel(
@@ -748,7 +780,8 @@ def _save_contact_cluster_stack_grid_page(
     csv_path = None
     if long_rows:
         class_token = _sanitize_filename_token(class_col, fallback="ClusterID")
-        csv_path = Path(csv_dir) / f"contact_cluster_stack_grid_{class_token}.csv"
+        group_token = _sanitize_filename_token(group_col, fallback="group")
+        csv_path = Path(csv_dir) / f"contact_cluster_stack_grid_{class_token}_by_{group_token}.csv"
         pd.DataFrame(long_rows).to_csv(csv_path, index=False)
 
     return {"n_pages": n_pages, "csv_path": str(csv_path) if csv_path is not None else None}
@@ -793,6 +826,8 @@ def save_track_class_proportions_by_sample_plot(
     group_cols=None,
     group_x=None,
     group_y=None,
+    group_x_levels_map=None,
+    group_y_levels_map=None,
     grid_ncols=3,
     dpi=300,
     cmap_name="tab20",
@@ -809,6 +844,12 @@ def save_track_class_proportions_by_sample_plot(
     plus optional grouped grid pages (1-2 effective group columns: true 2D grid;
     3+: flat grid). ``group_x``/``group_y`` explicitly pick the 2D grid's axes;
     ``group_cols`` is the "group per page" column list (unaffected in meaning).
+
+    ``group_x_levels_map``/``group_y_levels_map`` : dict[str, str], optional
+        Maps raw ``group_x``/``group_y`` levels to merged group labels (same semantics
+        as ``condition_groups`` in ``compute_condition_diff_stats_pairwise``) - when
+        given, that axis is pooled into the merged labels instead of showing one panel
+        per raw level. Rows whose raw level isn't in the mapping are dropped.
 
     If ``tmin_col``/``tmax_col`` (each track's active timepoint window) are present
     in ``adata_tracks.obs``, this also adds track-class proportions *over time*:
@@ -867,6 +908,16 @@ def save_track_class_proportions_by_sample_plot(
     )
     for gc in valid_group_cols:
         plot_df[gc] = plot_df[gc].astype("string").fillna("(unknown)").astype(str)
+        if gc == group_x and group_x_levels_map:
+            plot_df[gc] = plot_df[gc].map(group_x_levels_map)
+        elif gc == group_y and group_y_levels_map:
+            plot_df[gc] = plot_df[gc].map(group_y_levels_map)
+    # NB: rows whose group_x/group_y level isn't in a level map become NaN in that
+    # gc column here, but are deliberately *not* dropped from `plot_df` itself - the
+    # ungrouped per-sample proportions below must still include every sample/class
+    # row regardless of group-col mapping. Only the grouped-view block further down
+    # (guarded by `if valid_group_cols:`) drops those NaN rows, via its own filtered
+    # copy, since a merged/unmapped level only makes the *grouped* panels ambiguous.
 
     if len(plot_df) == 0:
         raise ValueError("No rows available to plot track class proportions.")
@@ -929,14 +980,17 @@ def save_track_class_proportions_by_sample_plot(
             plt.close(fig)
 
         if valid_group_cols:
+            # See the note above `if len(plot_df) == 0` - only the grouped view drops
+            # rows whose group_x/group_y level fell outside a level map.
+            grouped_plot_df = plot_df.dropna(subset=valid_group_cols)
             proportions_by_group, counts_by_group, _n_by_group = _compute_grouped_class_proportions(
-                plot_df, group_cols=valid_group_cols, class_col=class_col, class_order=class_order,
+                grouped_plot_df, group_cols=valid_group_cols, class_col=class_col, class_order=class_order,
             )
             group_label_title = ", ".join(valid_group_cols)
             unique_vals_per_col = {}
             if len(valid_group_cols) in (1, 2):
                 for col in valid_group_cols:
-                    unique_vals_per_col[col] = sorted(plot_df[col].astype(str).dropna().unique().tolist())
+                    unique_vals_per_col[col] = sorted(grouped_plot_df[col].astype(str).dropna().unique().tolist())
 
             if len(valid_group_cols) in (1, 2):
                 fig_rel = _plot_page_grouped_class_proportions_2d_grid(
@@ -1001,6 +1055,10 @@ def save_track_class_proportions_by_sample_plot(
             )
             for gc in valid_group_cols:
                 time_plot_df[gc] = time_plot_df[gc].astype("string").fillna("(unknown)").astype(str)
+                if gc == group_x and group_x_levels_map:
+                    time_plot_df[gc] = time_plot_df[gc].map(group_x_levels_map)
+                elif gc == group_y and group_y_levels_map:
+                    time_plot_df[gc] = time_plot_df[gc].map(group_y_levels_map)
 
             expanded_df = _expand_track_windows_to_timepoints(
                 time_plot_df, time_col=time_col, tmin_col=tmin_col, tmax_col=tmax_col,
@@ -1044,8 +1102,14 @@ def save_track_class_proportions_by_sample_plot(
                 ])
 
                 if valid_group_cols:
+                    # Same rationale as `grouped_plot_df` above - only the grouped
+                    # (over-time) view drops rows whose group_x/group_y level fell
+                    # outside a level map; relative_by_sample_time/overall_by_sample_time
+                    # above are unaffected since they were already computed from the
+                    # unfiltered expanded_df.
+                    grouped_expanded_df = expanded_df.dropna(subset=valid_group_cols)
                     relative_by_group_time, overall_by_group_time = _compute_grouped_relative_matrices(
-                        expanded_df, group_cols=valid_group_cols, time_col=time_col,
+                        grouped_expanded_df, group_cols=valid_group_cols, time_col=time_col,
                         state_col=class_col, state_order=class_order,
                     )
                     time_group_label_title = ", ".join(valid_group_cols)
@@ -1053,7 +1117,7 @@ def save_track_class_proportions_by_sample_plot(
                     if len(valid_group_cols) in (1, 2):
                         for col in valid_group_cols:
                             time_unique_vals_per_col[col] = sorted(
-                                expanded_df[col].astype(str).dropna().unique().tolist()
+                                grouped_expanded_df[col].astype(str).dropna().unique().tolist()
                             )
 
                     if len(valid_group_cols) in (1, 2):
@@ -1099,7 +1163,9 @@ def save_track_class_proportions_by_sample_plot(
                             plt.close(fig_gt)
 
                     time_group_label_lookup = (
-                        expanded_df.assign(_group_label=_make_group_label(expanded_df, valid_group_cols).values)
+                        grouped_expanded_df.assign(
+                            _group_label=_make_group_label(grouped_expanded_df, valid_group_cols).values
+                        )
                         .drop_duplicates(subset=["_group_label"])
                         .set_index("_group_label")[valid_group_cols]
                     )
@@ -1146,6 +1212,9 @@ def save_track_condition_comparison_report(
     group_cols=None,
     group_x=None,
     group_y=None,
+    group_x_levels_map=None,
+    group_y_levels_map=None,
+    condition_groups=None,
     class_order=None,
     class_colors=None,
     verbose=False,
@@ -1170,6 +1239,10 @@ def save_track_condition_comparison_report(
     If ``pdf_pages`` (an open ``PdfPages``) is given, the figure is appended to it instead of
     being written to its own PDF file. ``csv_dir`` overrides where the CSV is written (defaults
     to ``out_dir``).
+
+    ``group_x_levels_map``/``group_y_levels_map`` : dict[str, str], optional
+        Maps raw ``group_x``/``group_y`` levels to merged group labels — when given, that axis
+        is pooled into the merged labels instead of showing one row/column per raw level.
     """
     obs = adata_tracks.obs
     extra_group_cols = [c for c in (group_cols or []) if c in obs.columns]
@@ -1186,6 +1259,15 @@ def save_track_condition_comparison_report(
     df[condition_col] = df[condition_col].astype(str)
     for gc in valid_group_cols:
         df[gc] = df[gc].astype(str)
+        if gc == group_x and group_x_levels_map:
+            df[gc] = df[gc].map(group_x_levels_map)
+        elif gc == group_y and group_y_levels_map:
+            df[gc] = df[gc].map(group_y_levels_map)
+    if grid_axis_cols and (group_x_levels_map or group_y_levels_map):
+        # A level_map applies only to whichever raw levels are still present - map() leaves
+        # anything outside the mapping as NaN, so drop those rows rather than let them
+        # silently poison the grouped comparison.
+        df = df.dropna(subset=grid_axis_cols)
     if len(df) == 0:
         raise ValueError("No valid rows remain after filtering NaNs in required columns.")
 
@@ -1197,13 +1279,24 @@ def save_track_condition_comparison_report(
         resolved_class_order, _get_classification_state_order(adata_tracks, class_col)
     )
 
-    proportions_by_sample, _, _ = _compute_grouped_class_proportions(
-        df, group_cols=[sample_col], class_col=class_col, class_order=resolved_class_order,
-    )
-    per_sample_df = pd.DataFrame(proportions_by_sample).T.reindex(columns=resolved_class_order, fill_value=0.0)
+    # The unit compared below is (sample, condition_col level), not the sample alone.
+    # condition_col is usually constant within a sample (e.g. a per-well treatment), in which
+    # case this is a no-op relabeling. But for a contact/no_contact style grouping, condition_col
+    # is a per-track tag that varies *within* a sample. Collapsing straight to one row per sample
+    # would arbitrarily keep whichever level happened to appear first and silently leave a single
+    # degenerate condition level with zero pairs left to compare (empty report). Using this
+    # composite unit lets a sample that contains multiple condition levels contribute one row per
+    # level. Mirrors the same fix in state_composition.save_state_condition_comparison_report.
+    unit_col = "__comparison_unit__"
+    df[unit_col] = df[sample_col] + " | " + df[condition_col]
 
-    metadata_cols = [sample_col, condition_col] + valid_group_cols
-    sample_metadata = df[metadata_cols].drop_duplicates(subset=[sample_col]).set_index(sample_col)
+    proportions_by_unit, _, _ = _compute_grouped_class_proportions(
+        df, group_cols=[unit_col], class_col=class_col, class_order=resolved_class_order,
+    )
+    per_sample_df = pd.DataFrame(proportions_by_unit).T.reindex(columns=resolved_class_order, fill_value=0.0)
+
+    metadata_cols = [unit_col, condition_col] + valid_group_cols
+    sample_metadata = df[metadata_cols].drop_duplicates(subset=[unit_col]).set_index(unit_col)
 
     resolved_colors = dict(class_colors) if class_colors else _get_classification_state_colors(adata_tracks, class_col)
     resolved_colors = _normalize_label_color_map(resolved_class_order, colors=resolved_colors, cmap_name="tab20")
@@ -1218,7 +1311,7 @@ def save_track_condition_comparison_report(
 
     title = f"{class_col} — {condition_col} pairwise comparison"
     n_condition_levels = sample_metadata[condition_col].astype(str).nunique()
-    use_2d_grid = bool(group_x) and bool(group_y) and n_condition_levels == 2
+    use_2d_grid = bool(group_x) and bool(group_y) and n_condition_levels == 2 and not condition_groups
 
     if use_2d_grid:
         result = plot_condition_diff_grid_2d(
@@ -1241,6 +1334,7 @@ def save_track_condition_comparison_report(
             class_order=resolved_class_order,
             condition_col=condition_col,
             group_cols=valid_group_cols,
+            condition_groups=condition_groups,
         )
         result = plot_condition_diff_grid(
             diff_stats_by_group,
@@ -1270,6 +1364,14 @@ def save_track_contact_group_analysis(
     extra_group_cols=None,
     group_x=None,
     group_y=None,
+    group_x_levels_map=None,
+    group_y_levels_map=None,
+    target_class_lookup=None,
+    touching_col=None,
+    time_varying=True,
+    target_class_order=None,
+    target_class_colors=None,
+    target_cell_type_label=None,
     verbose=False,
 ):
     """Group classified tracks by whether they had a sufficiently long contiguous bout of
@@ -1284,6 +1386,25 @@ def save_track_contact_group_analysis(
        `group_x` × `group_y` 2D grid (since the comparison is always binary, both axes are free
        to be real grid axes); `extra_group_cols` paginate into separate grid pages.
     4. Violin plots of mean contact fraction and max contact-bout length per cluster.
+
+    All 4 sections above are always produced, unchanged, regardless of the options below.
+
+    If ``target_class_lookup`` is given (a "touched target TrackID -> class" lookup from
+    ``contact_grouping.build_target_class_lookup_from_state_adata`` /
+    ``build_target_class_lookup_from_track_adata`` — pass the matching ``touching_col`` name, i.e.
+    ``contact_grouping.touching_column_name(target_cell_type)``, and set ``time_varying=True`` for
+    a state-classification lookup or ``False`` for a track-classification one), three more pages
+    are appended after the four above:
+
+    5. Violin plots of per-target-class mean contact fraction and max sustained contact-bout
+       length (one row per ``(track, target_class)`` actually touched — a track touching 2 classes
+       contributes to both).
+    6. A `class_col`-on-x-axis composition grid, stacked by target-class group (``no_contact`` /
+       each touched target class / ``"Multiple classes"`` for tracks that touched >= 2 distinct
+       target classes).
+    7. A condition-comparison report (Welch's t-test, pairwise across all target-class-group
+       levels) analogous to section 3, but keyed on the target-class-group instead of plain
+       contact/no_contact.
 
     Returns a dict of all output artifact paths.
     """
@@ -1309,6 +1430,44 @@ def save_track_contact_group_analysis(
         n_contact = int((adata_tracks.obs[group_col] == "contact").sum())
         n_total = len(adata_tracks.obs)
         print(f"Contact grouping on '{contact_col}' (min_bout_length={min_bout_length}): {n_contact}/{n_total} tracks labeled 'contact'.")
+
+    use_target_class = target_class_lookup is not None
+    target_group_col = None
+    target_class_mean_col = None
+    target_class_max_bout_col = None
+    resolved_target_class_order = []
+    long_target_df = None
+    if use_target_class:
+        if touching_col is None:
+            raise ValueError("touching_col is required when target_class_lookup is given.")
+        long_target_df, target_group_df = compute_track_contact_target_class_features(
+            df_timepoints,
+            adata_tracks,
+            target_class_lookup,
+            contact_col=contact_col,
+            touching_col=touching_col,
+            time_varying=bool(time_varying),
+            contact_group_col=group_col,
+            verbose=verbose,
+        )
+        merge_track_target_class_group_into_obs(adata_tracks, target_group_df, contact_col=contact_col)
+        target_group_col = _contact_target_class_group_col_name(contact_col)
+        target_class_mean_col = _contact_class_mean_col_name(contact_col)
+        target_class_max_bout_col = _contact_class_max_bout_col_name(contact_col)
+        target_cell_type_label = target_cell_type_label or contact_col_target_cell_type(contact_col)
+
+        touched_classes = sorted(
+            long_target_df["target_class"].dropna().astype(str).unique().tolist(), key=_mixed_label_sort_key,
+        )
+        resolved_target_class_order = (
+            [str(c) for c in target_class_order] if target_class_order is not None else touched_classes
+        )
+        if bool(verbose):
+            n_multi = int((target_group_df[target_group_col] == _MULTIPLE_CLASSES_LABEL).sum())
+            print(
+                f"Target-class attribution on '{contact_col}': {len(resolved_target_class_order)} touched "
+                f"class(es), {n_multi} track(s) bucketed as '{_MULTIPLE_CLASSES_LABEL}'."
+            )
 
     # Own subfolder, named after the raw contact column (e.g. "macrophage_contact"), holding a
     # single combined report PDF and a "csv" subfolder for all underlying CSVs.
@@ -1347,6 +1506,8 @@ def save_track_contact_group_analysis(
             extra_group_cols=extra_group_cols,
             group_x=group_x,
             group_y=group_y,
+            group_x_levels_map=group_x_levels_map,
+            group_y_levels_map=group_y_levels_map,
             class_order=resolved_class_order,
             csv_dir=csv_dir,
             verbose=verbose,
@@ -1360,6 +1521,8 @@ def save_track_contact_group_analysis(
             condition_col=group_col,
             group_x=group_x,
             group_y=group_y,
+            group_x_levels_map=group_x_levels_map,
+            group_y_levels_map=group_y_levels_map,
             group_cols=list(extra_group_cols),
             class_order=resolved_class_order,
             class_colors=class_colors,
@@ -1368,7 +1531,7 @@ def save_track_contact_group_analysis(
             csv_dir=csv_dir,
         )
 
-        fig = plot_feature_violin_by_group(
+        fig = plot_feature_box_by_group(
             obs, mean_col, class_col,
             group_order=resolved_class_order, colors=resolved_colors,
             ylabel=f"Mean fraction of timepoints in contact ({contact_col})",
@@ -1377,7 +1540,7 @@ def save_track_contact_group_analysis(
         pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
 
-        fig = plot_feature_violin_by_group(
+        fig = plot_feature_box_by_group(
             obs, max_bout_col, class_col,
             group_order=resolved_class_order, colors=resolved_colors,
             ylabel=f"Longest contiguous contact bout, timepoints ({contact_col})",
@@ -1386,16 +1549,89 @@ def save_track_contact_group_analysis(
         pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
 
+        target_class_composition_grid = {"n_pages": 0, "csv_path": None}
+        target_class_comparison = None
+        if use_target_class:
+            resolved_target_class_colors = _normalize_label_color_map(
+                resolved_target_class_order, colors=target_class_colors, cmap_name="tab20",
+            )
+            target_stack_order = [_NO_CONTACT_LABEL] + resolved_target_class_order + [_MULTIPLE_CLASSES_LABEL]
+            target_stack_colors = {_NO_CONTACT_LABEL: _CONTACT_STACK_COLORS[_NO_CONTACT_LABEL]}
+            target_stack_colors.update(resolved_target_class_colors)
+            target_stack_colors[_MULTIPLE_CLASSES_LABEL] = "#4C4C4C"
+
+            long_flat = long_target_df.reset_index()
+            fig = plot_feature_box_by_group(
+                long_flat, target_class_mean_col, "target_class",
+                group_order=resolved_target_class_order, colors=resolved_target_class_colors,
+                ylabel=f"Mean fraction of timepoints in contact ({contact_col})",
+                title=f"Mean contact fraction by {target_cell_type_label} class",
+            )
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+
+            fig = plot_feature_box_by_group(
+                long_flat, target_class_max_bout_col, "target_class",
+                group_order=resolved_target_class_order, colors=resolved_target_class_colors,
+                ylabel=f"Longest sustained contact bout, timepoints ({contact_col})",
+                title=f"Max sustained contact-bout length by {target_cell_type_label} class",
+            )
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+
+            target_class_composition_grid = _save_contact_cluster_stack_grid_page(
+                pdf,
+                adata_tracks,
+                class_col=class_col,
+                group_col=target_group_col,
+                extra_group_cols=extra_group_cols,
+                group_x=group_x,
+                group_y=group_y,
+                group_x_levels_map=group_x_levels_map,
+                group_y_levels_map=group_y_levels_map,
+                class_order=resolved_class_order,
+                csv_dir=csv_dir,
+                stack_order=target_stack_order,
+                stack_colors=target_stack_colors,
+                title_prefix=f"{target_cell_type_label}-Class Composition",
+                verbose=verbose,
+            )
+
+            target_class_comparison = save_track_condition_comparison_report(
+                adata_tracks,
+                out_dir,
+                sample_col=sample_col,
+                class_col=class_col,
+                condition_col=target_group_col,
+                group_x=group_x,
+                group_y=group_y,
+                group_x_levels_map=group_x_levels_map,
+                group_y_levels_map=group_y_levels_map,
+                group_cols=list(extra_group_cols),
+                class_order=resolved_class_order,
+                class_colors=class_colors,
+                verbose=verbose,
+                pdf_pages=pdf,
+                csv_dir=csv_dir,
+            )
+            target_class_comparison["pdf_path"] = str(pdf_path)
+
     # The per-plot helpers above report their own nominal (standalone) pdf paths; since they all
     # actually wrote into the single combined `pdf_path` here, point their "pdf_path" entries at
     # that combined file instead so downstream consumers reference something that exists on disk.
     contact_rate_by_cluster["pdf_path"] = str(pdf_path)
     condition_comparison["pdf_path"] = str(pdf_path)
 
+    target_class_long_features_csv = None
+    if use_target_class:
+        contact_token = _sanitize_filename_token(contact_col, fallback="contact")
+        target_class_long_features_csv = csv_dir / f"target_class_features_{contact_token}.csv"
+        long_target_df.reset_index().to_csv(target_class_long_features_csv, index=False)
+
     if bool(verbose):
         print(f"Saved contact-group analysis bundle for '{contact_col}' to: {pdf_path}")
 
-    return {
+    result = {
         "contact_col": str(contact_col),
         "min_bout_length": int(min_bout_length),
         "group_col": group_col,
@@ -1407,7 +1643,17 @@ def save_track_contact_group_analysis(
         "condition_comparison": condition_comparison,
         "mean_fraction_violin_pdf": str(pdf_path),
         "max_bout_length_violin_pdf": str(pdf_path),
+        "use_target_class": use_target_class,
     }
+    if use_target_class:
+        result["target_class_analysis"] = {
+            "target_class_group_col": target_group_col,
+            "touched_classes": resolved_target_class_order,
+            "long_features_csv": str(target_class_long_features_csv),
+            "composition_grid": target_class_composition_grid,
+            "comparison": target_class_comparison,
+        }
+    return result
 
 
 def generate_track_clustering_report_pdfs(
@@ -1450,7 +1696,19 @@ def generate_track_clustering_report_pdfs(
     if "X_umap" not in adata_tracks.obsm:
         sc.tl.umap(adata_tracks, random_state=0)
 
-    sc.tl.dendrogram(adata_tracks, groupby=cluster_key)
+    # Correlation/dendrogram is undefined (NaN) when the track representation
+    # collapses to a single dimension or a cluster has a zero-variance mean
+    # (e.g. a singleton cluster), which makes scanpy/scipy raise a symmetry
+    # error. Guard it the same way behav3d/analysis/behavior/state/classification.py
+    # does, and degrade gracefully instead of failing the whole report.
+    dendrogram_key = f"dendrogram_{cluster_key}"
+    dendrogram_arg = False
+    if adata_tracks.n_obs > 0 and len(resolved_order) > 1:
+        try:
+            sc.tl.dendrogram(adata_tracks, groupby=cluster_key)
+            dendrogram_arg = dendrogram_key
+        except Exception:
+            dendrogram_arg = False
 
     suffix = str(filename_suffix).strip()
     diagnostics_pdf = Path(
@@ -1460,12 +1718,16 @@ def generate_track_clustering_report_pdfs(
     diagnostics_started = _vstart(verbose, "trajectory-clustering", "write clustering diagnostics PDF")
 
     with PdfPages(diagnostics_pdf) as pdf:
-        fig, (ax_umap, ax_corr) = plt.subplots(
-            1,
-            2,
-            figsize=(14.5, 8.5),
-            gridspec_kw={"width_ratios": [1.25, 0.75]},
-        )
+        if dendrogram_arg:
+            fig, (ax_umap, ax_corr) = plt.subplots(
+                1,
+                2,
+                figsize=(14.5, 8.5),
+                gridspec_kw={"width_ratios": [1.25, 0.75]},
+            )
+        else:
+            fig, ax_umap = plt.subplots(1, 1, figsize=(10, 8.5))
+
         sc.pl.umap(
             adata_tracks,
             color=cluster_key,
@@ -1477,24 +1739,39 @@ def generate_track_clustering_report_pdfs(
         )
         ax_umap.set_aspect("equal", adjustable="box")
 
-        sc.pl.correlation_matrix(
-            adata_tracks,
-            groupby=cluster_key,
-            show_correlation_numbers=True,
-            ax=ax_corr,
-            show=False,
-        )
-        ax_corr.set_title("Cluster correlations", fontsize=10)
-        fig.suptitle("Track clustering diagnostics | UMAP + Correlation", fontsize=12, fontweight="bold", y=0.995)
-        fig.tight_layout(rect=[0, 0, 1, 0.96])
-        umap_bbox = ax_umap.get_position().frozen()
-        bbox = ax_corr.get_position()
-        extra_gap = 0.03
-        new_x = min(0.98 - bbox.width, bbox.x0 + extra_gap)
-        height_shrink = 0.5
-        new_h = bbox.height * height_shrink
-        ax_corr.set_position([new_x, bbox.y0 + (bbox.height - new_h) / 2, bbox.width, new_h])
-        ax_umap.set_position(umap_bbox)
+        if dendrogram_arg:
+            sc.pl.correlation_matrix(
+                adata_tracks,
+                groupby=cluster_key,
+                show_correlation_numbers=True,
+                ax=ax_corr,
+                show=False,
+            )
+            ax_corr.set_title("Cluster correlations", fontsize=10)
+            fig.suptitle(
+                "Track clustering diagnostics | UMAP + Correlation", fontsize=12, fontweight="bold", y=0.995
+            )
+            fig.tight_layout(rect=[0, 0, 1, 0.96])
+            umap_bbox = ax_umap.get_position().frozen()
+            bbox = ax_corr.get_position()
+            extra_gap = 0.03
+            new_x = min(0.98 - bbox.width, bbox.x0 + extra_gap)
+            height_shrink = 0.5
+            new_h = bbox.height * height_shrink
+            ax_corr.set_position([new_x, bbox.y0 + (bbox.height - new_h) / 2, bbox.width, new_h])
+            ax_umap.set_position(umap_bbox)
+        else:
+            fig.suptitle("Track clustering diagnostics | UMAP", fontsize=12, fontweight="bold", y=0.995)
+            fig.text(
+                0.5,
+                0.02,
+                "Correlation matrix/dendrogram unavailable for this clustering "
+                "(degenerate representation or a cluster with a single track).",
+                ha="center",
+                fontsize=8,
+                style="italic",
+            )
+            fig.tight_layout(rect=[0, 0.04, 1, 0.96])
         pdf.savefig(fig, dpi=int(plot_dpi), bbox_inches="tight")
         plt.close(fig)
 
@@ -1505,7 +1782,7 @@ def generate_track_clustering_report_pdfs(
             standard_scale="var",
             figsize=heatmap_figsize,
             swap_axes=True,
-            dendrogram=True,
+            dendrogram=dendrogram_arg,
             show_gene_labels=True,
             show=False,
         )
@@ -1522,7 +1799,7 @@ def generate_track_clustering_report_pdfs(
             standard_scale="var",
             figsize=matrixplot_figsize,
             swap_axes=True,
-            dendrogram=True,
+            dendrogram=dendrogram_arg,
             show=False,
         )
         fig = plt.gcf()

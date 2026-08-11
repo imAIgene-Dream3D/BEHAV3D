@@ -196,6 +196,12 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 
 
+class WorkerOutOfMemoryError(RuntimeError):
+    """Raised when a worker process crashes, most likely due to running out
+    of memory. Always propagates as a hard failure — a silently skipped
+    sample would produce an incomplete/incorrect combined result."""
+
+
 def _run_parallel_with_fallback(fn, args_list, n_workers, use_processes=True):
     """
     Run fn over args_list in parallel with n_workers.
@@ -210,7 +216,7 @@ def _run_parallel_with_fallback(fn, args_list, n_workers, use_processes=True):
             with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as ex:
                 return list(tqdm(ex.map(fn, args_list), total=len(args_list)))
         except BrokenProcessPool:
-            raise RuntimeError(
+            raise WorkerOutOfMemoryError(
                 f"Worker processes crashed while using {n_workers} workers "
                 f"(likely out of memory). Please lower the number of workers "
                 f"and try again."
@@ -359,6 +365,7 @@ def rerun_death_classification(
     cell_type,
     new_threshold,
     threshold_column="percentage_dead_mask",
+    propagate=True,
 ):
     """Re-apply :func:`calculate_death` to an existing combined feature CSV
     with a new ``dead_mask_percentage_threshold``.
@@ -386,6 +393,11 @@ def rerun_death_classification(
     threshold_column : str, optional
         Column in the combined CSV used by :func:`calculate_death`.
         Defaults to ``"percentage_dead_mask"``.
+    propagate : bool, optional
+        Forwarded to :func:`calculate_death`. When ``True`` (default),
+        once a track crosses the threshold it stays 'dead' for the rest of
+        the track. When ``False``, only the timepoints currently at/above
+        threshold are marked 'dead'.
 
     Returns
     -------
@@ -432,6 +444,7 @@ def rerun_death_classification(
         df,
         threshold=float(new_threshold),
         threshold_column=threshold_column,
+        propagate=propagate,
     )
     df.to_csv(combined_csv, index=False)
     print(f"Re-wrote {combined_csv} with updated 'dead' column.")
@@ -446,6 +459,7 @@ def run_feature_extraction(
     features_choice=["movement", "intensity", "morphology", "contact", "death"],
     imaris=False,
     dead_mask_percentage_threshold=None,
+    propagate_dead_signal=True,
     contact_threshold=None,
     rolling_meanspeed_window=10,
     overwrite=False,
@@ -776,7 +790,12 @@ def run_feature_extraction(
                 # Calculate death features if threshold specified and dead_channel exists
                 if dead_mask_percentage_threshold is not None and dead_channel is not None and pd.notna(dead_channel):
                     print(f"{get_current_time()} - Calculating cell death based on dead_mask_percentage_threshold {dead_mask_percentage_threshold}")
-                    df_tracks = calculate_death(df_tracks, threshold=dead_mask_percentage_threshold, threshold_column="percentage_dead_mask")
+                    df_tracks = calculate_death(
+                        df_tracks,
+                        threshold=dead_mask_percentage_threshold,
+                        threshold_column="percentage_dead_mask",
+                        propagate=propagate_dead_signal,
+                    )
                 
             # if "contact" in features_choice:    
             #     # Calculate active contact for ALL cell types that have touching columns
@@ -806,6 +825,15 @@ def run_feature_extraction(
             h,m,s = format_time(start_time, end_time)
             print(f"###### DONE - elapsed time: {h}:{m:02}:{s:02}\n")
 
+        except (WorkerOutOfMemoryError, MemoryError) as exc:
+            raise WorkerOutOfMemoryError(
+                f"Feature extraction ran out of memory while processing sample "
+                f"'{sample_name}' ({cell_type}). Aborting the run instead of "
+                f"skipping this sample, since a skipped sample would silently "
+                f"produce an incomplete/incorrect combined result. Lower "
+                f"n_workers and re-run (already-completed samples/feature "
+                f"groups will be reused from cache)."
+            ) from exc
         except Exception:
             traceback.print_exc()
             print(f"⚠️  Error processing {cell_type} for sample {sample_name} – skipping to next sample.\n")
@@ -814,6 +842,21 @@ def run_feature_extraction(
     feature_outdir.mkdir(parents=True, exist_ok=True)
     all_tracks_out_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features.csv")
     df_all_tracks.to_csv(all_tracks_out_path, index=False)
+
+    stale_steps = []
+    filtered_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features_filtered.csv")
+    if filtered_path.exists():
+        stale_steps.append("Filtering")
+    active_killing_dir = Path(analysis_outdir, "active_killing")
+    if active_killing_dir.exists() and any(active_killing_dir.rglob(f"BEHAV3D_{cell_type}_advanced_track_features.csv")):
+        stale_steps.append("Active Killing")
+    if stale_steps:
+        print(
+            f"{get_current_time()} - WARNING: Feature Extraction for '{cell_type}' was just rerun. "
+            f"Existing {' and '.join(stale_steps)} results for this cell type were computed from the "
+            f"previous track features and are now stale. Re-run {' and then '.join(stale_steps)} to refresh them."
+        )
+
     if progress_cb is not None:
         try:
             progress_cb(_total_samples, _total_samples, f"{cell_type} done")
@@ -1280,11 +1323,10 @@ def calculate_imaris_track_features(
 def calculate_death(
     df_tracks,
     threshold,
-    threshold_column="mean_dead_dye"
+    threshold_column="mean_dead_dye",
+    propagate=True,
     ):
     # print(f"- Calculating cell death based on defined dead_dye_threshold {dead_dye_threshold}")
-    df_tracks["dead"] = False
-
     # ``threshold`` is always on the same scale as ``threshold_column``.
     # For ``percentage_dead_mask`` that means a fraction (0.0-1.0), matching
     # how that column is computed (mean of a 0/1 mask). Callers (napari's
@@ -1292,13 +1334,25 @@ def calculate_death(
     # already convert the percent-scale UI value to a fraction before it
     # reaches this function - do not convert again here.
 
+    if not propagate:
+        # Pointwise / non-sticky: a timepoint is 'dead' only while its own
+        # value is at/above threshold. The track can go back to 'alive' at a
+        # later timepoint if the signal drops again. This is appropriate for
+        # cell types (e.g. immune/T cells) that can transiently pick up dead
+        # dye signal - for example while killing a dying organoid - without
+        # actually dying themselves.
+        df_tracks["dead"] = df_tracks[threshold_column] >= threshold
+        return df_tracks
+
+    df_tracks["dead"] = False
+
     # For any cell crossing the dead_dye_threshold, set the cell to dead. Any timepoint after this timepoint are
     # Also set to dead, even if the mean dead dye intensity goes under the threshold again
     for track_id in df_tracks["TrackID"].unique():
         track_df = df_tracks[df_tracks["TrackID"] == track_id]
         track_df_reset = track_df.reset_index(drop=True)
         threshold_indices = track_df_reset.reset_index(drop=True)[track_df_reset[threshold_column] >= threshold].index
-        
+
         if not threshold_indices.empty:
             first_threshold_index = threshold_indices.min()
             df_tracks.loc[track_df.index[first_threshold_index:], "dead"] = True
