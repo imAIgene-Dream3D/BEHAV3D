@@ -896,7 +896,13 @@ def _step_readiness(main_widget, ctx: dict) -> dict:
         False)
 
     steps = {
-        "data_preparation": {"ready": True, "blockers": []},
+        "data_preparation": {
+            "ready": md_loaded and out_set,
+            "blockers": [
+                ("metadata not loaded" if not md_loaded else None),
+                ("output directory not set" if not out_set else None),
+            ],
+        },
         "visualization": {
             "ready": md_loaded,
             "blockers": [] if md_loaded else ["metadata not loaded"],

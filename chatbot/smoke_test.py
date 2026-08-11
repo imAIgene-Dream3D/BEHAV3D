@@ -608,6 +608,22 @@ def _tracking_which_method_case() -> dict:
     }
 
 
+def _tracking_stale_segmentation_intent_case() -> dict:
+    return {
+        "name": "tracking_ignores_stale_segmentation_intent",
+        "messages": [
+            {"role": "user", "content": "The segmented masks overlap."},
+            {"role": "assistant", "content": "That affects segmentation."},
+            {"role": "user", "content": "Which method?"},
+        ],
+        "context": _context(
+            "tracking", [], active_cell_type="tcell",
+            assistant_session={"intent": "compare_segmentation_methods"},
+        ),
+        "check": _check_tracking_which_method,
+    }
+
+
 def _btrack_step2_enable_case() -> dict:
     controls = [
         _control(
@@ -1940,6 +1956,8 @@ def _metadata_completion_case() -> dict:
         }],
         "context": _context(
             "data_preparation", [],
+            output_dir="/tmp/behav3d-output",
+            output_dir_set=True,
             metadata={
                 "loaded": True,
                 "record_source": "metadata_builder_draft",
@@ -1955,6 +1973,20 @@ def _metadata_completion_case() -> dict:
             },
         ),
         "check": _check_metadata_completion,
+    }
+
+
+def _data_setup_requires_output_directory_case() -> dict:
+    return {
+        "name": "data_setup_requires_output_directory",
+        "messages": [{"role": "user", "content": "Check what's missing"}],
+        "context": _context(
+            "data_preparation", [],
+            output_dir="",
+            output_dir_set=False,
+            assistant_session={"intent": "check_data_setup"},
+        ),
+        "check": _check_data_setup_requires_output_directory,
     }
 
 
@@ -2140,6 +2172,20 @@ def _check_metadata_completion(result: dict) -> list[str]:
             errors.append(f"missing completeness detail: {phrase}")
     if _tool_calls(result, "save_metadata"):
         errors.append("offered save despite mandatory validation errors")
+    return errors
+
+
+def _check_data_setup_requires_output_directory(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    if "output directory" not in text:
+        errors.append("did not report the missing Output directory")
+    if "next action" not in text:
+        errors.append("did not make the required action scannable")
+    if "ready for processing" in text or "good to go" in text:
+        errors.append("claimed Data Preparation was ready without an Output directory")
+    if result["calls"]:
+        errors.append("changed a field without user confirmation")
     return errors
 
 
@@ -3226,6 +3272,7 @@ SCENARIOS = [
     _metadata_identifier_confirmation_case,
     _metadata_time_conversion_case,
     _metadata_completion_case,
+    _data_setup_requires_output_directory_case,
     _metadata_save_case,
     _choose_analysis_case,
     _analysis_question_on_metadata_tab_case,
@@ -3248,6 +3295,7 @@ SCENARIOS = [
     _apoc_mdo_feature_recommendation_case,
     _apoc_fill_organoid_features_case,
     _tracking_which_method_case,
+    _tracking_stale_segmentation_intent_case,
     _bounded_tracking_case,
     _name_neutral_tracking_case,
     _btrack_step2_enable_case,
