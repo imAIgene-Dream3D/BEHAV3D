@@ -931,21 +931,25 @@ def _tracking_guide_case() -> dict:
 
 def _stationary_tracking_case() -> dict:
     controls = [_control(
-        "tracking.collagen.method", "collagen: Tracking method", "LAP (laptrack)",
+        "tracking.structure_A.method", "structure A: Tracking method", "LAP (laptrack)",
         choices=[
-            "LAP (laptrack)", "TrackPy", "Propagation",
+            "LAP (laptrack)", "TrackPy", "Fragmentation Tracking",
+            "Bounded Propagation",
             "Reporter Propagation", "btrack (Bayesian)",
         ],
-        cell_type="collagen",
+        cell_type="structure_A",
     )]
     return {
-        "name": "stationary_uses_propagation",
+        "name": "overlapping_structure_uses_fragmentation_tracking",
         "messages": [
             {"role": "user", "content": "Guide tracking"},
-            {"role": "assistant", "content": "How much does collagen move between frames?"},
-            {"role": "user", "content": "Collagen stays stationary and overlaps between frames."},
+            {"role": "assistant", "content": "Does the structure overlap itself between frames?"},
+            {"role": "user", "content": (
+                "It stays stationary and overlaps. Its masks can fragment but they "
+                "do not join across disconnected regions."
+            )},
         ],
-        "context": _context("tracking", controls, active_cell_type="collagen"),
+        "context": _context("tracking", controls, active_cell_type="structure_A"),
         "check": _check_stationary_tracking,
     }
 
@@ -1574,114 +1578,6 @@ def _safety_profiling_context_case() -> dict:
     }
 
 
-def _historical_btrack_examples_case() -> dict:
-    controls = [
-        _control(
-            "tracking.tcell.btrack.maximum_search_radius",
-            "tcell: Maximum search radius", 25,
-            method="btrack", cell_type="tcell", unit="um",
-        ),
-        _control(
-            "tracking.tcell.btrack.distance_threshold",
-            "tcell: Distance threshold", 30,
-            method="btrack", cell_type="tcell", unit="um",
-        ),
-        _control(
-            "tracking.tcell.btrack.time_threshold",
-            "tcell: Time threshold", 2,
-            method="btrack", cell_type="tcell", unit="frames",
-        ),
-    ]
-    return {
-        "name": "historical_btrack_values_are_examples_only",
-        "messages": [{
-            "role": "user",
-            "content": (
-                "Do you have example values from a previous experiment for btrack "
-                "on T cells? Can I copy them into this experiment?"
-            ),
-        }],
-        "context": _context(
-            "tracking", controls, active_cell_type="tcell",
-            metadata={
-                "loaded": True,
-                "records": [{
-                    "sample_name": "Current01",
-                    "pixel_distance_xy": 0.6,
-                    "pixel_distance_z": 2.0,
-                    "time_interval": 30,
-                    "time_unit": "s",
-                }],
-                "cell_types": {"immune": ["tcell"]},
-                "validation": [],
-            },
-            tracking={"method": "btrack"},
-        ),
-        "check": _check_historical_btrack_examples,
-    }
-
-
-def _historical_calcium_example_case() -> dict:
-    return {
-        "name": "historical_calcium_profile_explains_reporter_propagation",
-        "messages": [{
-            "role": "user",
-            "content": (
-                "Was there a previous experiment with near-static calcium reporter "
-                "cells? What method and example values did it use?"
-            ),
-        }],
-        "context": _context(
-            "tracking", [], active_cell_type="islets",
-            metadata={
-                "loaded": True,
-                "records": [{
-                    "sample_name": "NewCalcium",
-                    "pixel_distance_xy": 0.5,
-                    "pixel_distance_z": 2.5,
-                    "time_interval": 10,
-                    "time_unit": "s",
-                }],
-                "cell_types": {"other": ["islets"]},
-                "validation": [],
-            },
-        ),
-        "check": _check_historical_calcium_example,
-    }
-
-
-def _historical_microglia_example_case() -> dict:
-    return {
-        "name": "historical_microglia_exp91_preserves_sources_and_caveats",
-        "messages": [{
-            "role": "user",
-            "content": (
-                "What design and settings were used in the previous microglia "
-                "Exp91 experiment?"
-            ),
-        }],
-        "context": _context(
-            "analysis", [], active_cell_type="tcell",
-            metadata={
-                "loaded": True,
-                "records": [{
-                    "sample_name": "CurrentMicroglia",
-                    "pixel_distance_xy": 0.8,
-                    "pixel_distance_z": 2.0,
-                    "time_interval": 3,
-                    "time_unit": "min",
-                }],
-                "cell_types": {
-                    "organoid": ["organoid"],
-                    "immune": ["microglia", "tcell"],
-                },
-                "validation": [],
-            },
-        ),
-        "check": _check_historical_microglia_example,
-    }
-
-
 def _experiment_reference_metadata_conflict_case() -> dict:
     reference = {
         "notes": [{
@@ -1736,6 +1632,61 @@ def _organoid_line_grouping_case() -> dict:
             metadata_builder={"open": False, "sample_forms_created": False},
         ),
         "check": _check_organoid_line_grouping,
+    }
+
+
+def _metadata_taxonomy_case() -> dict:
+    return {
+        "name": "metadata_population_line_condition_are_distinct",
+        "messages": [{
+            "role": "user",
+            "content": "What is the difference between cell types, lines and conditions?",
+        }],
+        "context": _context("data_preparation", []),
+        "check": _check_metadata_taxonomy,
+    }
+
+
+def _multicolor_definition_case() -> dict:
+    return {
+        "name": "multicolor_is_one_density_split_population",
+        "messages": [{
+            "role": "user",
+            "content": "When should I use the Multicolor option?",
+        }],
+        "context": _context("data_preparation", []),
+        "check": _check_multicolor_definition,
+    }
+
+
+def _bounded_tracking_case() -> dict:
+    return {
+        "name": "bounded_tracking_is_selected_from_topology",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "My large plastic cells still overlap between frames, but touching "
+                "masks can join and one track ID must not spread across disconnected "
+                "regions. Which tracking method fits?"
+            ),
+        }],
+        "context": _context("tracking", [], active_cell_type="population_A"),
+        "check": _check_bounded_tracking,
+    }
+
+
+def _name_neutral_tracking_case() -> dict:
+    return {
+        "name": "biological_name_does_not_select_historical_settings",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "I have microglia. Which tracking settings should I use for this "
+                "new experiment?"
+            ),
+        }],
+        "context": _context("tracking", [], active_cell_type="microglia"),
+        "check": _check_name_neutral_tracking,
     }
 
 
@@ -2643,12 +2594,12 @@ def _check_stationary_tracking(result: dict) -> list[str]:
     text = result["text"].lower()
     method_calls = _tool_calls(result, "set_ui_value")
     proposed = any(
-        call.get("control_id") == "tracking.collagen.method"
-        and str(call.get("value", "")).lower().startswith("propagation")
+        call.get("control_id") == "tracking.structure_A.method"
+        and str(call.get("value", "")).lower().startswith("fragmentation")
         for call in method_calls
     )
-    if "propagation" not in text and not proposed:
-        return ["did not recommend Propagation for stationary collagen"]
+    if "fragmentation tracking" not in text and not proposed:
+        return ["did not recommend Fragmentation Tracking from overlap behavior"]
     return []
 
 
@@ -2958,66 +2909,6 @@ def _check_safety_profiling_context(result: dict) -> list[str]:
     return errors
 
 
-def _check_historical_btrack_examples(result: dict) -> list[str]:
-    text = result["text"].lower()
-    errors = []
-    for phrase in ("ivm", "cd4", "12", "10", "100"):
-        if phrase not in text:
-            errors.append(f"missing historical btrack context: {phrase}")
-    if not any(phrase in text for phrase in (
-        "not a default", "not defaults", "do not copy", "shouldn't copy",
-        "cannot copy", "historical example",
-    )):
-        errors.append("presented historical btrack values as reusable defaults")
-    if not (
-        any(term in text for term in ("per-frame", "per frame", "displacement"))
-        and any(term in text for term in ("gap", "preview", "measure"))
-    ):
-        errors.append("did not explain how to calibrate the current experiment")
-    if result["calls"]:
-        errors.append("attempted to apply historical btrack values")
-    return errors
-
-
-def _check_historical_calcium_example(result: dict) -> list[str]:
-    text = result["text"].lower()
-    errors = []
-    for phrase in (
-        "reporter propagation", "0.33", "2", "5", "32", "100", "10%",
-    ):
-        if phrase not in text:
-            errors.append(f"missing calcium reference detail: {phrase}")
-    if not all(term in text for term in ("cellpose", "import")):
-        errors.append("omitted the external Cellpose-SAM import workflow")
-    if not any(term in text for term in (
-        "historical", "example", "not a default", "not universal",
-    )):
-        errors.append("did not label calcium settings as historical examples")
-    if result["calls"]:
-        errors.append("attempted to apply the calcium reference settings")
-    return errors
-
-
-def _check_historical_microglia_example(result: dict) -> list[str]:
-    text = result["text"].lower()
-    errors = []
-    for phrase in (
-        "exp91", "eight wells", "1.77 µm", "120-second", "none_none",
-        "apoc probability map + watershed", "maximum search radius 150",
-        "absolute increase of 30", "start offset", "yaml", "readme", "n=1",
-        "historical values, not defaults",
-    ):
-        if phrase not in text:
-            errors.append(f"missing Exp91 reference detail: {phrase}")
-    if not all(value in text for value in ("0", "1")):
-        errors.append("did not preserve both sides of the Start offset conflict")
-    if not any(term in text for term in ("descriptive", "exploratory")):
-        errors.append("omitted the unreplicated-design interpretation caveat")
-    if result["calls"]:
-        errors.append("attempted to apply historical Exp91 values")
-    return errors
-
-
 def _check_experiment_reference_metadata_conflict(result: dict) -> list[str]:
     text = result["text"].lower()
     errors = []
@@ -3038,7 +2929,67 @@ def _check_experiment_reference_metadata_conflict(result: dict) -> list[str]:
     return errors
 
 
+def _check_metadata_taxonomy(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "distinguished in the images", "segmentation and track ids",
+        "biological identity", "treatment or experimental state",
+    ):
+        if phrase not in text:
+            errors.append(f"metadata taxonomy omitted {phrase!r}")
+    if result["calls"]:
+        errors.append("metadata taxonomy explanation attempted a form edit")
+    return errors
+
+
+def _check_multicolor_definition(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    for phrase in (
+        "one biological population", "same population, line, and condition",
+        "not a correction for bleed-through", "acquisition-design choice",
+    ):
+        if phrase not in text:
+            errors.append(f"multicolor explanation omitted {phrase!r}")
+    if result["calls"]:
+        errors.append("multicolor explanation attempted a form edit")
+    return errors
+
+
+def _check_bounded_tracking(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    if "bounded propagation" not in text:
+        errors.append("did not recommend Bounded Propagation from topology evidence")
+    if not any(term in text for term in ("connected region", "disconnected region")):
+        errors.append("did not explain the connected-region constraint")
+    if result["calls"]:
+        errors.append("changed tracking settings without a user fill request")
+    return errors
+
+
+def _check_name_neutral_tracking(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    if not any(term in text for term in (
+        "consecutive frame", "overlap", "one-frame displacement", "how far",
+    )):
+        errors.append("did not ask for image-behavior evidence")
+    for forbidden in (
+        "exp91", "m21", "m23", "1.77", "maximum search radius 150",
+        "30 dead-mask",
+    ):
+        if forbidden in text:
+            errors.append(f"leaked historical project-specific value {forbidden!r}")
+    if result["calls"]:
+        errors.append("changed settings from a biological name alone")
+    return errors
+
+
 SCENARIOS = [
+    _metadata_taxonomy_case,
+    _multicolor_definition_case,
     _organoid_line_grouping_case,
     _metadata_identifier_confirmation_case,
     _metadata_time_conversion_case,
@@ -3065,6 +3016,8 @@ SCENARIOS = [
     _apoc_mdo_feature_recommendation_case,
     _apoc_fill_organoid_features_case,
     _tracking_which_method_case,
+    _bounded_tracking_case,
+    _name_neutral_tracking_case,
     _btrack_step2_enable_case,
     _btrack_step2_tune_case,
     _segmentation_minimum_size_case,
@@ -3094,9 +3047,6 @@ SCENARIOS = [
     _trajectory_linkage_case,
     _functional_experiment_context_case,
     _safety_profiling_context_case,
-    _historical_btrack_examples_case,
-    _historical_calcium_example_case,
-    _historical_microglia_example_case,
     _experiment_reference_metadata_conflict_case,
 ]
 

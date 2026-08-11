@@ -38,7 +38,7 @@ Workflow:
 
    A **population** is something you can tell apart in the imaging data, and which therefore needs its own segmentation model and its own track IDs. Count one here for each such entity — that is all this number controls.
 
-   **Line** and **Condition** are free-text labels you fill in per sample, later in the sample forms. They are not visible in the image; only you know them. The two behave identically and can be used interchangeably — put a cell line in one and a treatment in the other, or simply `line1` / `line2` in whichever fits. BEHAV3D merges them into a single `_line_condition` column and uses it to split visualisations and comparisons. Line is required; Condition is optional.
+   **Line** and **Condition** are free-text labels you fill in per sample, later in the sample forms. They are not visible in the image; only you know them. Use Line for biological identity/source and Condition for treatment or experimental state. BEHAV3D merges them into a single `_line_condition` column for visualisations and comparisons. Line is required; Condition is optional.
 
    So do **not** add a population because one well was treated differently, or because it holds a different subclone that looks identical on screen. That is the same population with a different Line or Condition.
 
@@ -94,11 +94,11 @@ BEHAV3D EXPLORER uses a **dynamic, prefixed** schema: instead of hard-coded `tce
 
 | Prefix | Category |
 |---|---|
-| `or_` | Organoid-like (large, roughly spherical, slow-moving) |
-| `im_` | Immune (small, fast-moving) |
-| `ot_` | Other (any cell that doesn't fit the above) |
+| `or_` | Multicellular-structure category in the UI |
+| `im_` | Immune-category processing population in the UI |
+| `ot_` | Other processing population |
 
-Within a category you can have **multiple** named cell types — `or_organoid1`, `or_organoid2`, `im_tcell`, `im_macrophage`, `ot_endothelial`, etc.
+Within a category you can have **multiple** researcher-defined processing populations, such as `or_structureA`, `or_structureB`, `im_populationA`, or `ot_populationB`.
 
 ### Required columns (every row, every sample)
 
@@ -143,7 +143,7 @@ To plug in pre-existing results from outside BEHAV3D EXPLORER, first write the p
 
 ### Which channel is used for segmentation?
 
-Your raw image often has **several fluorescence channels** (e.g. organoid, T cell, dead). The metadata tells BEHAV3D EXPLORER *which cell types exist* and where the files live, but it does **not** record which channel index to use when you train a pixel classifier, paint labels, or run Cellpose.
+Your raw image often has **several fluorescence channels** for different populations or signals. The metadata tells BEHAV3D EXPLORER *which processing populations exist* and where the files live, but it does **not** record which channel index to use when you train a pixel classifier, paint labels, or run Cellpose.
 
 That choice is made later, in the **Segmentation** tab of the same plugin, and it depends on the method.
 
@@ -151,7 +151,7 @@ The **only** channel number that belongs in the metadata CSV is `dead_channel` (
 
 ### Multicolor cell types
 
-Use multicolor when the **same biological cell type appears in more than one fluorescent channel** of the same image — sub-clones of one population, each tagged with a different fluorophore (for example T cells split across RFP, GFP and YFP). Biologically they are all the same population; only the label differs.
+Use multicolor only when the **same biological population was deliberately split across more than one fluorescent color** in the same image. Biologically and experimentally they are one population; only the acquisition label differs.
 
 The usual reason to do this is **to reduce the apparent density of a crowded population**. Splitting one dense population across three colours makes each colour sparser, so segmentation separates objects more reliably and tracking has fewer ambiguous links. Because the channels are merged back together after tracking, you get that benefit without losing the population.
 
@@ -160,7 +160,7 @@ The usual reason to do this is **to reduce the apparent density of a crowded pop
 1. In the cell-type naming section, tick **Multicolor** next to the immune name.
 2. Set `N` = number of colors (or color combinations) used for that cell type (typically 2 or 3).
 3. Click *Configure Cell Types*. The Builder now creates **`N` separate cell-type entries** in the metadata, named `{base}_1_multicolor`, `{base}_2_multicolor`, …, `{base}_N_multicolor`. Each one gets its own per-cell-type columns (`im_{base}_n_multicolor_line_condition`, `…_segments_image_path`, `…_tracks_image_path`, `…_tracks_csv_path`).
-4. In each sample form, fill in **Line** and **Condition** for every multicolor channel. Normally these are the same across colours, because the colours are the same biology. Only use different values when the colours mark sub-populations that you still want processed as one cell type — if they are genuinely different biology, declare them as separate cell types instead (see the tip below).
+4. In each sample form, fill in the same **Line** and **Condition** for every multicolor channel. Different values mean the colors do not represent one Multicolor population and should be declared separately.
 
 **What happens downstream:**
 
@@ -169,29 +169,29 @@ The usual reason to do this is **to reduce the apparent density of a crowded pop
 - Feature Extraction, Filtering and the rest of the analysis pipeline operate on the merged `{base}_merged` output, not on the individual `_multicolor` entries.
 
 ```{tip}
-Multicolor is only meaningful when the channels really belong to the *same* cell type. If you have two genuinely different cell types (e.g. T cells + macrophages), declare them as two separate immune cell types instead — that way they keep independent track IDs and features all the way through.
+Multicolor is only meaningful when the channels belong to the *same* biological population, line, and condition. If colors identify different populations, identities, or treatments, declare them separately so they keep independent track IDs and features.
 ```
 
 ### Examples
 
-**A minimal example (no multicolor)** — one organoid type and one T-cell type, each on a single channel.
+**A minimal example (no multicolor)** — one structure population and one single-cell population, each on a single channel.
 
-| sample_name | exp_nr | well | raw_image_path | pixel_distance_xy | pixel_distance_z | distance_unit | time_interval | time_unit | or_organoid_line_condition | im_tcell_line_condition |
+| sample_name | exp_nr | well | raw_image_path | pixel_distance_xy | pixel_distance_z | distance_unit | time_interval | time_unit | or_structure_line_condition | im_singlecells_line_condition |
 |---|---|---|---|---|---|---|---|---|---|---|
 | Sample_A1 | 1 | A1 | D:/data/exp1/A1.czi | 0.5 | 2.0 | μm | 1.0 | m | lineA_untreated | lineA_activated |
 | Sample_A2 | 1 | A2 | D:/data/exp1/A2.czi | 0.5 | 2.0 | μm | 1.0 | m | lineA_untreated | lineB_activated |
 
-(Optional `or_organoid_segments_image_path` etc. columns omitted because we'll segment from scratch.)
+(Optional per-population segmentation and track path columns are omitted because this example starts from raw images.)
 
-**A multicolor example** — same organoid type, plus one immune population split across 2 fluorescent channels (for example T cells in red and green) with a dead-stain channel. Only the columns that are different from the example above are shown:
+**A multicolor example** — the same structure population plus one single-cell population deliberately split across two fluorescent colors, with a switch-on signal channel. Only the columns that differ from the example above are shown:
 
-| sample_name | … | dead_channel | or_organoid_line_condition | im_tcell_1_multicolor_line_condition | im_tcell_2_multicolor_line_condition |
+| sample_name | … | dead_channel | or_structure_line_condition | im_singlecells_1_multicolor_line_condition | im_singlecells_2_multicolor_line_condition |
 |---|---|---|---|---|---|
-| Sample_A1 | … | 3 | lineA_untreated | colour1 | colour2 |
-| Sample_A2 | … | 3 | lineA_untreated | colour1 | colour2 |
+| Sample_A1 | … | 3 | lineA_untreated | lineA_treated | lineA_treated |
+| Sample_A2 | … | 3 | lineA_untreated | lineB_treated | lineB_treated |
 
-- The Builder created **two** T-cell entries: `tcell_1_multicolor` and `tcell_2_multicolor`. Each one is segmented and tracked independently.
-- After the merge step, an additional `tcell_merged_segments_image_path` (and `_tracks_image_path`, `_tracks_csv_path`) column will be added automatically. These are the columns the rest of the pipeline consumes.
+- The Builder created **two** color entries for the same population. Each one is segmented and tracked independently before recombination.
+- After the merge step, an additional `singlecells_merged_segments_image_path` (and matching track paths) is added automatically. The rest of the pipeline consumes the merged output.
 
 ## Combining multiple experiments
 

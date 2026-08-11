@@ -32,17 +32,12 @@ Special cases:
 
 Each cell type is tracked with one of the following methods, picked from the method dropdown in its sub-tab:
 
-```{important}
-**Fragmentation tracking** is the method previously called **Propagation**. The method
-dropdown still reads *Propagation* until the interface is updated; the documentation uses
-the new name throughout. *Reporter Propagation* is a separate method and keeps its name.
-```
-
 | Method | What it does |
 |---|---|
 | **LAP (laptrack)** | Linear Assignment Problem tracking: links detections frame-to-frame by solving a global optimization on the centroid-distance cost matrix, with gap closing and optional merge/split events. See [LAP](lap). |
 | **TrackPy** | Crocker-Grier style nearest-neighbour linker with adaptive search radius and memory-based gap recovery. Simpler/faster alternative to LAP for sparser data. See [TrackPy](trackpy). |
 | **Fragmentation tracking** | Propagates the previous timepoint's labels onto the current timepoint's mask by spatial overlap (watershed-based, not centroid distance). No tunable parameters. Handles objects that stay put and change only by fragmenting. See [Fragmentation tracking](fragmentation_tracking). |
+| **Bounded Propagation** | Uses overlap-based watershed propagation while preventing one track ID from spanning disconnected regions. Useful when touching or joined masks can otherwise spread an ID across separate objects. See [Bounded Propagation](bounded_propagation). |
 | **Reporter Propagation** | Pools all segments across the whole movie, groups spatially-overlapping ones regardless of time, and stamps each group's single largest detection onto every timepoint. For near-static objects whose segmentation flickers on and off. See [Reporter Propagation](reporter_propagation). |
 | **btrack (Bayesian)** | Bayesian tracker with a Kalman-filter motion model, optionally followed by a global hypothesis optimiser. See [btrack](btrack). |
 | **Import tracking** | Validates and re-chunks an externally-produced tracked zarr / TIFF into BEHAV3D EXPLORER's canonical layout. See [Import tracking](import). |
@@ -51,10 +46,9 @@ the new name throughout. *Reporter Propagation* is a separate method and keeps i
 **Pick the method from what you measure, not from the cell type.** Between two
 consecutive frames, does an object still overlap where it was?
 
-- **Large overlap** → a propagation-family method. This covers multicellular structures
-  that barely move (organoids, spheroids), and also large, morphologically plastic cells
-  — for example macrophages or microglia — whose changing protrusions fragment their
-  masks and defeat centroid-based linking.
+- **Large overlap** → a propagation-family method. Use Fragmentation Tracking when
+  fragmentation is the main issue; use Bounded Propagation when touching or joined masks
+  could make one ID span disconnected regions.
 - **Little or no overlap** (the object moves about one cell diameter or more between
   frames) → **btrack**.
 
@@ -136,6 +130,7 @@ Full step-by-step instructions, all six tools, and tips: **[Manual editing of tr
 lap
 trackpy
 fragmentation_tracking
+bounded_propagation
 reporter_propagation
 btrack
 import
