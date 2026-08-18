@@ -1447,9 +1447,40 @@ class TrackedSegmentEditor(QWidget):
         layer = self.viewer.layers[self.layer_name]
         try:
             layer.data = self._build_dask_with_dirty_frames()
+            # napari 0.5 skips re-slicing the current frame when an edit does
+            # not change a label's spatial footprint — the case for Swap, which
+            # only exchanges two ID values in place.  Force the async slicer to
+            # re-request the displayed frame (same technique as _on_save's
+            # step-bounce), but only when that frame actually changed.
+            self._force_current_reslice(frames)
             layer.refresh()
         except Exception:
             traceback.print_exc()
+
+    def _force_current_reslice(self, frames: Optional[List[int]] = None) -> None:
+        """Nudge napari's async slicer to re-fetch the current timepoint.
+
+        Reassigning ``layer.data`` and calling ``refresh()`` repaints edits
+        that grow/shrink a label, but napari 0.5 can skip the repaint for a
+        pure value remap (e.g. Swap) where the occupied voxels are unchanged.
+        A one-frame step-bounce on the time axis makes the slicer issue a fresh
+        slice request, exactly like the save path.  When ``frames`` is given,
+        the bounce is skipped unless the currently displayed frame is among the
+        changed frames, so out-of-view edits cost nothing.
+        """
+        try:
+            axis = 0
+            T = int(self.buffer.shape[0])
+            if T < 2:
+                return
+            t_now = int(self.viewer.dims.current_step[axis])
+            if frames is not None and t_now not in {int(f) for f in frames}:
+                return
+            t_other = (t_now + 1) % T
+            self.viewer.dims.set_current_step(axis, t_other)
+            self.viewer.dims.set_current_step(axis, t_now)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Selection / interactions
