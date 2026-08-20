@@ -61,6 +61,27 @@ from behav3d.napari._background_runner import (
 # inside _on_load_training_clicked using actual pixel sizes from metadata,
 # so training and batch inference use the same physical-unit sigma values.
 
+
+def _notify_metadata_refresh(metadata_loader, log_fn=None, context="segmentation"):
+    """Ask the Data Preparation tab to reload metadata.csv and re-broadcast it.
+
+    Every segmentation backend writes its new ``*_segments_path`` columns to
+    the metadata CSV, but nothing told the other tabs about it — the
+    Visualization tab kept the frame it was handed at load time, so results
+    only appeared after a manual "Load Metadata".  Calling this at the end of
+    each run closes that gap.  A ``metadata_loader`` without the method (the
+    notebook widget layer) is silently ignored.
+    """
+    refresh = getattr(metadata_loader, "refresh_metadata_after_processing", None)
+    if refresh is None:
+        return
+    try:
+        refresh(context)
+    except Exception as e:  # never let a refresh failure break a finished run
+        if log_fn is not None:
+            log_fn(f"⚠️ Could not refresh metadata after {context}: {e}")
+
+
 class SegmentationTab(QWidget):
     def __init__(self, viewer: napari.Viewer, metadata_loader):
         super().__init__()
@@ -1363,6 +1384,7 @@ class PixelClassifierWidget(QWidget):
                 except Exception as e:
                     self.log(f"  Warning: Could not save metadata CSV: {e}")
             self.log("Batch segmentation finished successfully!")
+            _notify_metadata_refresh(self.metadata_loader, self.log, "segmentation")
 
         if block:
             try:
@@ -2982,6 +3004,7 @@ class CellposeWidget(QWidget):
             else:
                 self.log(f"Cellpose finished for all {n_proc} samples.")
             self.log("Metadata updated.")
+            _notify_metadata_refresh(self.metadata_loader, self.log, "segmentation")
 
         if block:
             try:
@@ -3093,6 +3116,7 @@ class CellposeWidget(QWidget):
                 updated_metadata.to_csv(csv_path, index=False)
             n_proc = len(summary["processed"])
             self.log(f"Otsu dead mask finished: {n_proc} samples processed.")
+            _notify_metadata_refresh(self.metadata_loader, self.log, "dead-mask segmentation")
 
         if block:
             try:
@@ -4470,6 +4494,7 @@ class CellposeSAMWidget(QWidget):
             else:
                 self.log(f"Cellpose-SAM finished: {n_proc} processed.")
             self.log("Metadata updated.")
+            _notify_metadata_refresh(self.metadata_loader, self.log, "segmentation")
 
         if block:
             try:
@@ -5279,6 +5304,12 @@ class ImportWidget(QWidget):
                                     f"The metadata CSV has been updated:\n{csv_path}")
         if refresh_ui:
             self._rebuild_table()
+            # Only on the final (UI-refreshing) save — the per-row calls made
+            # while converting a whole batch would otherwise re-read the CSV
+            # and rebuild every tab once per row.
+            _notify_metadata_refresh(
+                self.metadata_loader, self.log, "segmentation import"
+            )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -7631,6 +7662,7 @@ class APOCWidget(QWidget):
                         except Exception as e:
                             self.log(f"Warning: Could not save metadata: {e}")
                 self.log("✅ APOC batch segmentation finished!")
+                _notify_metadata_refresh(self.metadata_loader, self.log, "segmentation")
                 if interactive:
                     self._prompt_visualize_after_apoc_segmentation()
 
@@ -8715,6 +8747,7 @@ class ConvPaintWidget(QWidget):
                         except Exception as e:
                             self.log(f"Warning: Could not save metadata: {e}")
                 self.log("✅ ConvPaint batch segmentation finished!")
+                _notify_metadata_refresh(self.metadata_loader, self.log, "segmentation")
                 if interactive:
                     self._prompt_visualize_after_segmentation()
 

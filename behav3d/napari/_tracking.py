@@ -1723,7 +1723,8 @@ class CellTypeTrackingPanel(QWidget):
             )
             if res == QMessageBox.Yes:
                 self._switch_to_viz_and_show_tracks()
-            # Emit tracking completion signal for metadata refresh
+            # Refresh metadata last: this rebuilds the tracking tabs and
+            # discards this panel, so nothing may touch ``self`` after it.
             if self.on_tracking_complete is not None:
                 self.on_tracking_complete()
 
@@ -1780,7 +1781,8 @@ class AllOrganoidsPropagationPanel(QWidget):
     """
 
     def __init__(self, organoid_types, metadata_loader, log_callback,
-                 viewer, toggle_callback, parent=None, tab_progress_row=None):
+                 viewer, toggle_callback, parent=None, tab_progress_row=None,
+                 on_tracking_complete_callback=None):
         super().__init__(parent)
         self.organoid_types = list(organoid_types)
         self.metadata_loader = metadata_loader
@@ -1788,6 +1790,7 @@ class AllOrganoidsPropagationPanel(QWidget):
         self.viewer = viewer
         self._toggle_callback = toggle_callback
         self.tab_progress_row = tab_progress_row
+        self.on_tracking_complete = on_tracking_complete_callback
         self._bg = BackgroundOperation(self)
         self._build_ui()
 
@@ -1929,6 +1932,10 @@ class AllOrganoidsPropagationPanel(QWidget):
             )
             if res == QMessageBox.Yes:
                 self._switch_to_viz()
+            # Refresh metadata last: this rebuilds the tracking tabs and
+            # discards this panel, so nothing may touch ``self`` after it.
+            if self.on_tracking_complete is not None:
+                self.on_tracking_complete()
 
         def _on_failed(err: str):
             self.log(f"\u274c Error during all-organoids tracking: {err}")
@@ -2146,6 +2153,8 @@ class MulticolorTrackingPanel(QWidget):
             )
             if res == QMessageBox.Yes:
                 inner._switch_to_viz_and_show_tracks()
+            # Refresh metadata last: this rebuilds the tracking tabs and
+            # discards this panel, so nothing may touch ``self`` after it.
             if self.on_tracking_complete is not None:
                 self.on_tracking_complete()
 
@@ -2471,6 +2480,7 @@ class TrackingTab(QWidget):
                 viewer=self.viewer,
                 toggle_callback=self._on_all_organoids_toggled,
                 tab_progress_row=self.progress_row,
+                on_tracking_complete_callback=self.tracking_completed.emit,
             )
             self.cell_tabs.addTab(self._all_organoids_panel, "🟣 All Organoids")
         else:
@@ -2811,11 +2821,13 @@ class TrackingTab(QWidget):
         if block:
             try:
                 result = _do_batch(progress_cb=None)
+                # Emit tracking completion signal for metadata refresh — must
+                # happen before the Visualization-tab prompt so that tab loads
+                # the refreshed metadata rather than its stale copy.
+                self.tracking_completed.emit()
                 if interactive:
                     self._prompt_switch_to_viz_after_batch()
                 fire_extra_callback(extra_callbacks, "on_done", result)
-                # Emit tracking completion signal for metadata refresh
-                self.tracking_completed.emit()
             except Exception as e:
                 traceback.print_exc()
                 self._log(f"\u274c Batch tracking error: {e}")
@@ -2823,11 +2835,12 @@ class TrackingTab(QWidget):
             return
 
         def _on_done(result):
+            # Emit tracking completion signal for metadata refresh before the
+            # Visualization-tab prompt (see the blocking branch above).
+            self.tracking_completed.emit()
             if interactive:
                 self._prompt_switch_to_viz_after_batch()
             fire_extra_callback(extra_callbacks, "on_done", result)
-            # Emit tracking completion signal for metadata refresh
-            self.tracking_completed.emit()
 
         def _on_failed(err: str):
             self._log(f"\u274c Batch tracking error: {err}")

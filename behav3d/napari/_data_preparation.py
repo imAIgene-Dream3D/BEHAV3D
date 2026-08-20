@@ -1417,22 +1417,46 @@ class DataPreparationTab(QWidget):
         # Emit signal for other tabs
         self.metadata_loaded.emit(self.metadata)
 
-    def _on_tracking_completed(self):
-        """Reload metadata after tracking completes to reflect new tracking outputs."""
-        csv_path = self.behav3d_parameters.get("paths", {}).get("metadata_csv", "")
+    def refresh_metadata_after_processing(self, context: str = "processing") -> bool:
+        """Reload metadata.csv from disk and re-broadcast it to every tab.
+
+        Processing tabs (Segmentation, Tracking) write new segment/track
+        columns straight to the metadata CSV.  Without this refresh the
+        Visualization tab keeps the stale frame it received at load time and
+        the user has to press "Load Metadata" by hand before the new results
+        show up.  Every run-completion hook calls this instead.
+
+        Returns ``True`` when the reload succeeded and ``metadata_loaded``
+        was emitted.
+        """
+        csv_path = (self.behav3d_parameters.get("paths", {}) or {}).get("metadata_csv", "")
+        if not csv_path:
+            csv_path = getattr(self, "_loaded_csv_path", "") or ""
         if not csv_path or not Path(csv_path).exists():
-            self._log("⚠️ Metadata file not found after tracking — cannot refresh.")
-            return
-        
+            self._log(f"⚠️ Metadata file not found after {context} — cannot refresh.")
+            return False
+
         try:
             # Reload metadata from disk
             self.metadata = load_behav3d_metadata(csv_path)
-            self._log("✅ Metadata refreshed after tracking completion")
-            
-            # Emit signal to update all tabs with new metadata
-            self.metadata_loaded.emit(self.metadata)
         except Exception as e:
-            self._log(f"❌ Error refreshing metadata after tracking: {e}")
+            self._log(f"❌ Error refreshing metadata after {context}: {e}")
+            return False
+
+        self._loaded_csv_path = csv_path
+        try:
+            self._populate_metadata_overview()
+        except Exception:
+            pass
+        self._log(f"✅ Metadata refreshed after {context}")
+
+        # Emit signal to update all tabs with new metadata
+        self.metadata_loaded.emit(self.metadata)
+        return True
+
+    def _on_tracking_completed(self):
+        """Reload metadata after tracking completes to reflect new tracking outputs."""
+        self.refresh_metadata_after_processing("tracking")
 
     # ══════════════════════════════════════════════════════════════════════
     # Section 4 – Metadata Overview
