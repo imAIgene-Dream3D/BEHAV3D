@@ -4124,6 +4124,11 @@ class TrackClassificationSubTab(QWidget):
 
         self._plots_stack.setCurrentIndex(0)
         plotting_lay.addWidget(self._plots_stack)
+        # Kept as an attribute so `_check_prerequisites` can disable *only* this
+        # plotting page (Steps 3/4 create-plots) when state adata is missing,
+        # without disabling the whole `_subtab_stack` — which would also grey out
+        # page 0's Step 1 (grp1) and its "Run Original BEHAV3D DTW" button.
+        self._plotting_page = plotting_page
         self._subtab_stack.addWidget(plotting_page)  # outer page 1
         reset_scroll_on_page_change(self._subtab_stack)
 
@@ -4290,8 +4295,12 @@ class TrackClassificationSubTab(QWidget):
             self.warning_label.show()
 
             # Step 1 stays available, but lock into 'original DTW' mode.
+            # NB: disable only the plotting page, not the whole `_subtab_stack`
+            # — grp1 lives on page 0 of that stack, so disabling the stack would
+            # also grey out Step 1's "Run Original BEHAV3D DTW" button despite
+            # the setEnabled(True) above.
             self.grp1.setEnabled(True)
-            for grp in [self.grp2, self.grp3, self._subtab_stack, self.grp_bp]:
+            for grp in [self.grp2, self.grp3, self._plotting_page, self.grp_bp]:
                 grp.setEnabled(False)
 
             # Force 'use original' on and prevent the user from unchecking it.
@@ -4305,7 +4314,7 @@ class TrackClassificationSubTab(QWidget):
             return False
         else:
             self.warning_label.hide()
-            for grp in [self.grp1, self.grp2, self.grp3, self._subtab_stack, self.grp_bp]:
+            for grp in [self.grp1, self.grp2, self.grp3, self._plotting_page, self.grp_bp]:
                 grp.setEnabled(True)
 
             # Only revert to standard mode if the checkbox was previously force-locked
