@@ -2185,6 +2185,24 @@ def _choose_analysis_case() -> dict:
     }
 
 
+def _interaction_plot_interpretation_case() -> dict:
+    return {
+        "name": "interaction_plot_question_stays_in_context",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "In the Interaction Overview plots, what does each plot represent? "
+                "In particular, what is the meaning of the plot showing interactions/"
+                "active killing/dead-alive targets?"
+            ),
+        }],
+        "context": _context(
+            "analysis", [], analysis={"view": "interaction"},
+        ),
+        "check": _check_interaction_plot_interpretation,
+    }
+
+
 def _analysis_question_on_metadata_tab_case() -> dict:
     return {
         "name": "analysis_question_is_not_hijacked_by_metadata_clarification",
@@ -2349,6 +2367,21 @@ def _check_choose_analysis(result: dict) -> list[str]:
             errors.append(f"did not ground the recommendation in metadata: {phrase}")
     if result["calls"]:
         errors.append("Choose analysis navigated instead of explaining options")
+    return errors
+
+
+def _check_interaction_plot_interpretation(result: dict) -> list[str]:
+    text = result["text"].lower()
+    errors = []
+    if result["calls"]:
+        errors.append("treated an interpretation question as a UI operation")
+    if "opening active killing" in text:
+        errors.append("announced navigation instead of explaining the plot")
+    for phrase in ("contact event", "active killing", "dead", "alive"):
+        if phrase not in text:
+            errors.append(f"missing Interaction Overview explanation: {phrase}")
+    if not any(term in text for term in ("percentage", "percent", "%")):
+        errors.append("did not explain the Active Killing efficiency percentage")
     return errors
 
 
@@ -3485,6 +3518,7 @@ SCENARIOS = [
     _data_setup_requires_output_directory_case,
     _metadata_save_case,
     _choose_analysis_case,
+    _interaction_plot_interpretation_case,
     _analysis_question_on_metadata_tab_case,
     _metadata_not_added_case,
     _open_death_dynamics_case,

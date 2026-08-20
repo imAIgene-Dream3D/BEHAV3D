@@ -876,6 +876,84 @@ def test_analysis_clarification_selection_opens_the_specific_panel():
     }]
 
 
+def test_analysis_plot_interpretation_does_not_navigate_or_start_setup():
+    import app
+
+    messages = [{"role": "user", "content": (
+        "In the Interaction Overview plots, what does each plot represent? "
+        "In particular, what is the meaning of interactions/active killing/"
+        "dead-alive targets?"
+    )}]
+    context = {
+        "current_step": "analysis",
+        "analysis": {"view": "interaction"},
+    }
+    assert app._is_informational_analysis_request(messages)
+    assert app.analysis_navigation_action(context, messages) is None
+    assert app.active_killing_action(context, messages) is None
+    assert app.deterministic_turn_response(
+        context,
+        messages,
+        [{"name": "open_analysis_view"}],
+    ) is None
+
+    show_meaning = [{
+        "role": "user", "content": "Show me what Active Killing means here."
+    }]
+    assert app.analysis_navigation_action(context, show_meaning) is None
+    assert app.active_killing_action(context, show_meaning) is None
+
+    spanish = [{"role": "user", "content": (
+        "¿Qué representa el gráfico de interactions/active killing y targets "
+        "muertos o vivos?"
+    )}]
+    assert app._is_informational_analysis_request(spanish)
+    assert app.analysis_navigation_action(context, spanish) is None
+    assert app.active_killing_action(context, spanish) is None
+
+
+def test_informational_active_killing_turn_does_not_anchor_later_chatter():
+    import app
+
+    messages = [
+        {"role": "user", "content": "What does the Active Killing plot mean?"},
+        {"role": "assistant", "content": "It summarizes contact-associated events."},
+        {"role": "user", "content": "Thanks, that helps."},
+    ]
+    assert app.active_killing_action(
+        {"current_step": "analysis"}, messages,
+    ) is None
+
+    topic_only = [{"role": "user", "content": (
+        "This report relates interactions and Active Killing across conditions."
+    )}]
+    assert app.active_killing_action(
+        {"current_step": "analysis"}, topic_only,
+    ) is None
+
+
+def test_explicit_active_killing_operations_still_route():
+    import app
+
+    navigation = app.analysis_navigation_action(
+        {"current_step": "analysis", "analysis": {"view": "interaction"}},
+        [{"role": "user", "content": "Open Active Killing."}],
+    )
+    assert navigation["calls"] == [{
+        "name": "open_analysis_view",
+        "arguments": {"view": "active_killing"},
+    }]
+
+    setup = app.active_killing_action(
+        {"current_step": "analysis"},
+        [{"role": "user", "content": "Configure Active Killing for me."}],
+    )
+    assert setup["calls"] == [{
+        "name": "open_analysis_view",
+        "arguments": {"view": "active_killing"},
+    }]
+
+
 def test_tool_overview_is_general_3d_time_lapse_guidance():
     import app
 
@@ -3930,7 +4008,7 @@ def test_feedback_guidance_fixtures():
 
     fixture = Path(__file__).parent / "fixtures" / "assistant_feedback_transcripts.json"
     cases = json.loads(fixture.read_text(encoding="utf-8"))
-    assert KNOWLEDGE_VERSION == "2026.08.11.6"
+    assert KNOWLEDGE_VERSION == "2026.08.20.1"
     for case in cases:
         cards = select_guidance_cards(
             {"current_step": case["step"]}, case["user"], case.get("intent"))

@@ -162,6 +162,52 @@ def _normalized_user_message(messages: list[dict]) -> str:
     return " ".join(_latest_user_message(messages).lower().split())
 
 
+def _is_informational_analysis_request(messages: list[dict]) -> bool:
+    """Keep plot/result interpretation separate from UI operation intent."""
+    latest = _normalized_user_message(messages)
+    if not latest:
+        return False
+
+    explanation = bool(re.search(
+        r"\b(?:what|why|how|where)\b|"
+        r"\b(?:explain|meaning|mean|represent|interpret|understand|describe)\w*\b|"
+        r"\b(?:que|qué)\s+(?:es|significa|representa)\b|"
+        r"\b(?:como|cómo)\s+(?:se\s+)?interpret\w*\b|"
+        r"\b(?:explica|significado|interpretaci[oó]n)\w*\b",
+        latest,
+    ))
+    output_topic = bool(re.search(
+        r"\b(?:plots?|graphs?|figures?|charts?|results?|outputs?|dashboards?|"
+        r"legends?|axes?|curves?|heatmaps?|tables?|gr[aá]fic[ao]s?|resultados?|"
+        r"salidas?|figuras?|tablas?)\b",
+        latest,
+    ))
+    explicit_operation = bool(re.search(
+        r"\b(?:open|navigate|switch|run|execute|configure|setup|set up|apply)\b|"
+        r"\b(?:go|take)\s+(?:me\s+)?to\b|"
+        r"\b(?:abre|abrir|navega|ve|ll[eé]vame|ejecuta|ejecutar|configura|"
+        r"configurar)\b",
+        latest,
+    ))
+
+    # Questions remain informational even when they ask how to run/configure a
+    # module. Output nouns alone are informational unless paired with a direct
+    # operation such as "open" or "run".
+    return explanation or (output_topic and not explicit_operation)
+
+
+def _is_explicit_active_killing_operation(text: str) -> bool:
+    """Require an operation verb before starting deterministic setup state."""
+    normalized = " ".join(str(text or "").lower().split())
+    if "active killing" not in normalized and "actively killing" not in normalized:
+        return False
+    return bool(re.search(
+        r"\b(?:set up|setup|configure|start|run|execute|open|apply|"
+        r"analyze|analyse)\b",
+        normalized,
+    ))
+
+
 def _asks_general_analysis_question(messages: list[dict]) -> bool:
     """Recognize an analysis overview without stealing requests for one view."""
     latest = _normalized_user_message(messages)
@@ -841,6 +887,8 @@ def analysis_choice_summary(context: dict, messages: list[dict]) -> str | None:
 
 def analysis_navigation_action(context: dict, messages: list[dict]) -> dict | None:
     """Open a named Analysis view directly and avoid generic-tab navigation loops."""
+    if _is_informational_analysis_request(messages):
+        return None
     latest = " ".join(_latest_user_message(messages).lower().split())
     previous = _previous_assistant_message(messages).lower()
     answering_clarification = (
@@ -2769,22 +2817,20 @@ def _number_from_proposal(text: str, patterns: tuple[str, ...]) -> float | None:
 
 def _active_killing_anchor(messages: list[dict]) -> int | None:
     """Locate the start of the latest explicit Active Killing setup thread."""
-    candidates = []
     explicit_setups = []
     for index, message in enumerate(messages):
         if message.get("role") != "user":
             continue
         text = str(message.get("content") or "")
-        if _analysis_intent_route([{"role": "user", "content": text}]) == "active_killing":
-            candidates.append(index)
-            lowered = text.lower()
-            if any(term in lowered for term in (
-                "set up", "setup", "configure", "start a new active killing",
-            )):
-                explicit_setups.append(index)
-    if not candidates:
-        return None
-    return explicit_setups[-1] if explicit_setups else candidates[0]
+        turn = [{"role": "user", "content": text}]
+        if _is_informational_analysis_request(turn):
+            continue
+        if (
+            _analysis_intent_route(turn) == "active_killing"
+            and _is_explicit_active_killing_operation(text)
+        ):
+            explicit_setups.append(index)
+    return explicit_setups[-1] if explicit_setups else None
 
 
 def _active_killing_user_text(messages: list[dict]) -> str:
@@ -3116,6 +3162,8 @@ def active_killing_readiness_summary(
 
 def active_killing_action(context: dict, messages: list[dict]) -> dict | None:
     """Build an Active Killing proposal from natural setup language and history."""
+    if _is_informational_analysis_request(messages):
+        return None
     latest = _latest_user_message(messages)
     latest_lower = " ".join(latest.lower().split())
     if any(phrase in latest_lower for phrase in (
@@ -3679,6 +3727,10 @@ def build_system_prompt(context: dict, retrieved: list[dict], tools: list[dict])
         "result. Clearly distinguish 'configured', 'described in the reference', and 'result found'.\n"
         "- Separate informational, planning, execution, and troubleshooting requests. Missing "
         "prerequisites block execution only; they do not block explanations or planning.\n"
+        "- A module name inside a question about a plot, result, output, meaning, or interpretation is "
+        "topic context, not an operation request. Answer the question in place and emit no navigation or "
+        "configuration call. Open a module only when the researcher explicitly asks to open, navigate, "
+        "switch, run, or configure it; phrases such as 'show me what this means' remain informational.\n"
         "- Treat CURRENT LOG errors as evidence and offer hypotheses to check. Do not claim a cause "
         "without evidence. If the user reports a failed or stalled operation and CURRENT LOG has no "
         "explicit error, ask them to copy and paste the latest error lines from the on-screen Log; do "
