@@ -249,6 +249,13 @@ not just a topic word: mentioning an organoid line in an analysis question, for
 example, is not a metadata-building request. Put broad informational answers
 before setup clarifications when both could match.
 
+Module names are also topic words, not commands. Questions about the meaning of
+a plot, result, output, legend, or relationship must stay in the current view and
+reach the explanatory model path without tool calls. Deterministic navigation or
+configuration requires an explicit operational request such as `open`, `navigate`,
+`run`, or `configure`. Keep this distinction in a shared intent helper so each
+module-specific handler cannot independently reintroduce keyword routing.
+
 When analysis vocabularies overlap, update `_analysis_intent_route()` rather than
 adding another broad trigger to a downstream handler. Specific discriminators
 such as time course, attribution, counting, or physical distance should route

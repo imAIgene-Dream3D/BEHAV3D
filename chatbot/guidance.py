@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 
-KNOWLEDGE_VERSION = "2026.08.11.6"
+KNOWLEDGE_VERSION = "2026.08.20.1"
 
 
 GUIDANCE_CARDS = {
@@ -278,7 +278,15 @@ GUIDANCE_CARDS = {
         "can separate target signal states; its overview window looks back before the transition, and an "
         "optional time range can restrict the experiment. For invasiveness, keep both the per-timepoint "
         "trace and a per-movie summary: Mean averages timepoints, while AUC integrates the trace and "
-        "normalizes by elapsed time."
+        "normalizes by elapsed time. In the Interaction Overview output, the cumulative-interaction "
+        "violin shows the distribution across individual targets, split by target fate when a validated "
+        "switch-on signal is available. The cumulative-to-transition curve includes only targets that "
+        "switch state and aligns their mean cumulative contacts to the transition time, with the band "
+        "showing the standard error. In the Interaction--Active Killing dashboard, the left panel shows "
+        "one point per contact event and its duration; color distinguishes events with and without a "
+        "validated contact-associated target-signal rise. The right panel reports the percentage of "
+        "contact events classified that way for each target group and fate. 'Dead' and 'alive' labels "
+        "are biological only when the configured signal has been validated as death."
     ),
     "hmm": (
         "For Behavioral State, always read and state the live selected cell type before giving setup or "
