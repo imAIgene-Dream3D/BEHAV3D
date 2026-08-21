@@ -62,6 +62,28 @@ from behav3d.napari._background_runner import (
 # so training and batch inference use the same physical-unit sigma values.
 
 
+def _segmentation_output_path(output_dir, sample_name, cell_type):
+    """Where APOC/ConvPaint write the output for ``cell_type`` of a sample.
+
+    The ``dead`` cell type is written as ``<sn>_mask_dead.zarr`` by both
+    backends; every other cell type gets ``<sn>_<ct>_segments.zarr``.  Using
+    the wrong name here makes existence checks silently miss dead masks, so
+    the overwrite prompt never fires.
+    """
+    fname = (
+        f"{sample_name}_mask_dead.zarr" if cell_type == "dead"
+        else f"{sample_name}_{cell_type}_segments.zarr"
+    )
+    return Path(output_dir) / "images" / sample_name / fname
+
+
+def _segmentation_output_label(cell_type, sample_name):
+    """Human-readable entry for the overwrite prompt listing."""
+    if cell_type == "dead":
+        return f"dead mask for {sample_name}"
+    return f"{cell_type} segments for {sample_name}"
+
+
 def _notify_metadata_refresh(metadata_loader, log_fn=None, context="segmentation"):
     """Ask the Data Preparation tab to reload metadata.csv and re-broadcast it.
 
@@ -3095,10 +3117,7 @@ class CellposeWidget(QWidget):
             timepoint_range = (self.spin_t_start.value(), self.spin_t_end.value())
 
         if not overwrite_existing:
-            self.log(
-                "\u26a0\ufe0f Backend does not yet support partial skipping; "
-                "existing dead masks will be overwritten."
-            )
+            self.log("Samples with an existing dead mask will be skipped.")
 
         def _do_otsu(progress_cb=None):
             return run_otsu_threshold_segmentation_from_zarr(
@@ -3106,6 +3125,7 @@ class CellposeWidget(QWidget):
                 metadata=self.metadata_loader.metadata,
                 timepoint_range=timepoint_range,
                 progress_cb=progress_cb,
+                overwrite=overwrite_existing,
             )
 
         def _apply_otsu(result):
@@ -5587,10 +5607,9 @@ class APOCWidget(QWidget):
         w_form.addRow("Workers:", self.spin_workers)
         batch_lay.addLayout(w_form)
 
-        # Overwrite checkbox
-        self.check_overwrite = QCheckBox("Overwrite existing results")
-        self.check_overwrite.setChecked(False)
-        batch_lay.addWidget(self.check_overwrite)
+        # Overwrite is decided by the Run confirmation dialog (interactive) or
+        # by the queue's skip_existing setting -- no redundant checkbox.
+        self._overwrite_existing = False
 
         # Run button
         self.btn_run_segmentation = QPushButton("▶ Run APOC Batch Segmentation")
@@ -7082,7 +7101,7 @@ class APOCWidget(QWidget):
             "strategy_name": strategy,
             "gpu_device_name": self._selected_gpu_device_name(),
             "force_cpu": self.btn_force_cpu.isChecked() if hasattr(self, 'btn_force_cpu') else False,
-            "overwrite": self.check_overwrite.isChecked(),
+            "overwrite": self._overwrite_existing,
             "workers": self.spin_workers.value(),
             "process_all": self.check_process_all.isChecked(),
             "t_start": self.spin_t_start.value(),
@@ -7377,12 +7396,13 @@ class APOCWidget(QWidget):
 
         output_dir = Path(self.metadata_loader.output_dir)
 
-        # Check for pre-existing segments and prompt
+        # Check for pre-existing segments and prompt.  The dead cell type is
+        # stored as ``<sn>_mask_dead.zarr``, not ``<sn>_dead_segments.zarr``.
         sample_names = md['sample_name'].unique()
         existing = [
-            f"{ct} segments for {sn}"
+            _segmentation_output_label(ct, sn)
             for sn in sample_names
-            if (output_dir / "images" / sn / f"{sn}_{ct}_segments.zarr").exists()
+            if _segmentation_output_path(output_dir, sn, ct).exists()
         ]
 
         overwrite = False
@@ -7399,14 +7419,14 @@ class APOCWidget(QWidget):
 
         # Run segmentation for this cell type only.  Use the background
         # path (``block=False``) so napari remains interactive.
-        orig_overwrite = self.check_overwrite.isChecked()
-        self.check_overwrite.setChecked(overwrite)
+        orig_overwrite = self._overwrite_existing
+        self._overwrite_existing = overwrite
         try:
             self._on_run_segmentation(
                 interactive=True, only_cell_types=[ct], block=False,
             )
         finally:
-            self.check_overwrite.setChecked(orig_overwrite)
+            self._overwrite_existing = orig_overwrite
 
     def _update_global_run_btn_label(self, tab_index):
         """Update the global Run button label to reflect the active cell-type tab."""
@@ -7541,9 +7561,8 @@ class APOCWidget(QWidget):
                 existing = []
                 for sn in md["sample_name"].unique():
                     for ct in check_cts:
-                        seg_path = output_dir / "images" / sn / f"{sn}_{ct}_segments.zarr"
-                        if seg_path.exists():
-                            existing.append(f"{ct} segments for {sn}")
+                        if _segmentation_output_path(output_dir, sn, ct).exists():
+                            existing.append(_segmentation_output_label(ct, sn))
                 if existing:
                     from behav3d.napari._overwrite_prompt import prompt_overwrite_batch
                     choice = prompt_overwrite_batch(
@@ -7555,7 +7574,7 @@ class APOCWidget(QWidget):
                         self.log("APOC segmentation cancelled.")
                         fire_extra_callback(extra_callbacks, "on_failed", "cancelled")
                         return
-                    self.check_overwrite.setChecked(choice == "overwrite")
+                    self._overwrite_existing = (choice == "overwrite")
 
             # Timepoint range
             if only_cell_types is not None and hasattr(self, 'check_limit_timerange_ct'):
@@ -7632,7 +7651,7 @@ class APOCWidget(QWidget):
                 strat_summary = ", ".join(f"{k}:{v[:4]}" for k, v in per_ct_strategies.items())
                 self.log(f"  Advanced strategies: {strat_summary}")
 
-            overwrite_val = self.check_overwrite.isChecked()
+            overwrite_val = self._overwrite_existing
             n_workers_val = self.spin_workers.value()
             gpu_device_val = self._selected_gpu_device_name()
 
@@ -7887,9 +7906,9 @@ class ConvPaintWidget(QWidget):
         w_form.addRow("Workers:", self.spin_workers)
         batch_lay.addLayout(w_form)
 
-        self.check_overwrite = QCheckBox("Overwrite existing results")
-        self.check_overwrite.setChecked(False)
-        batch_lay.addWidget(self.check_overwrite)
+        # Overwrite is decided by the Run confirmation dialog (interactive) or
+        # by the queue's skip_existing setting -- no redundant checkbox.
+        self._overwrite_existing = False
 
         self.btn_run_segmentation = QPushButton("▶ Run ConvPaint Batch Segmentation")
         self.btn_run_segmentation.setStyleSheet(
@@ -8536,7 +8555,7 @@ class ConvPaintWidget(QWidget):
             "strategy_index": all_strats.index(strategy) if strategy in all_strats else 0,
             "strategy_name": strategy,
             "device": self._selected_device(),
-            "overwrite": self.check_overwrite.isChecked(),
+            "overwrite": self._overwrite_existing,
             "workers": self.spin_workers.value(),
             "process_all": self.check_process_all.isChecked(),
             "t_start": self.spin_t_start.value(),
@@ -8637,9 +8656,8 @@ class ConvPaintWidget(QWidget):
                 existing = []
                 for sn in md["sample_name"].unique():
                     for ct in check_cts:
-                        seg_path = output_dir / "images" / sn / f"{sn}_{ct}_segments.zarr"
-                        if seg_path.exists():
-                            existing.append(f"{ct} segments for {sn}")
+                        if _segmentation_output_path(output_dir, sn, ct).exists():
+                            existing.append(_segmentation_output_label(ct, sn))
                 if existing:
                     from behav3d.napari._overwrite_prompt import prompt_overwrite_batch
                     choice = prompt_overwrite_batch(
@@ -8651,7 +8669,7 @@ class ConvPaintWidget(QWidget):
                         self.log("ConvPaint segmentation cancelled.")
                         fire_extra_callback(extra_callbacks, "on_failed", "cancelled")
                         return
-                    self.check_overwrite.setChecked(choice == "overwrite")
+                    self._overwrite_existing = (choice == "overwrite")
 
             # Quick preflight: a unified ConvPaint model must exist.
             from behav3d.preprocessing.segmentation.convpaint_label_map import (
@@ -8719,7 +8737,7 @@ class ConvPaintWidget(QWidget):
 
             convpaint_config["convpaint_device"] = self._selected_device()
 
-            overwrite_val = self.check_overwrite.isChecked()
+            overwrite_val = self._overwrite_existing
             n_workers_val = self.spin_workers.value()
 
             def _do_convpaint(progress_cb=None):

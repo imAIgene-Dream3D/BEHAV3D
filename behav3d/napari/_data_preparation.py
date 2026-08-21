@@ -305,6 +305,8 @@ class DataPreparationTab(QWidget):
         self._edit_mode: bool = False          # True when editing loaded metadata
         self._loaded_csv_path: str = ""        # CSV path of last loaded metadata
         self._metadata_builder_dirty: bool = False
+        # Session-level opt-out for the numeric sample-name warning.
+        self._skip_numeric_name_warning: bool = False
 
         # Build UI --------------------------------------------------------
         scroll = QScrollArea(self)
@@ -620,19 +622,62 @@ class DataPreparationTab(QWidget):
 
     @staticmethod
     def _ensure_sample_prefix(name: str) -> str:
-        """Guarantee a sample name starts with ``S``.
+        """Prefix ``S_`` onto *purely numeric* sample names.
 
-        Purely numeric sample names (e.g. ``"12"``) cause downstream problems
-        in the pipeline (they get parsed as integers when read back from CSV,
-        break path/column construction, etc.). Prepending ``S`` forces a
-        non-numeric name. An empty entry is left empty so required-field
-        validation still fires, and a name that already starts with ``S`` is
-        returned unchanged so repeated edits/saves never stack extra prefixes.
+        Numeric sample names (e.g. ``"12"`` or ``"2.5"``) cause downstream
+        problems in the pipeline: they get parsed as numbers when read back
+        from CSV, which breaks path/column construction. Anything that is not
+        convertible to a number is left exactly as the user typed it. An empty
+        entry is left empty so required-field validation still fires, and the
+        result of this function is itself non-numeric, so repeated
+        edits/saves never stack extra prefixes.
         """
         name = name.strip().strip('"').strip("'")
-        if not name or name.startswith("S"):
+        if not name:
             return name
-        return "S" + name
+        try:
+            float(name)
+        except ValueError:
+            return name
+        return "S_" + name
+
+    def _warn_numeric_sample_name(self, original: str, new: str) -> None:
+        """Tell the user a numeric sample name was prefixed with ``S_``.
+
+        Honours a session-level opt-out (``_skip_numeric_name_warning``) set
+        via the dialog's "Don't show this again" checkbox; the flag resets on
+        the next napari start.
+        """
+        if self._skip_numeric_name_warning:
+            return
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Numeric sample name")
+        box.setIcon(QMessageBox.Information)
+        box.setText(
+            f"Sample name '{original}' is numeric and was renamed to '{new}'.\n\n"
+            "Purely numeric sample names break parts of the pipeline (they are "
+            "read back from the metadata CSV as numbers), so 'S_' is added "
+            "automatically. Non-numeric names are never modified."
+        )
+        box.setStandardButtons(QMessageBox.Ok)
+
+        optout = QCheckBox("Don't show this again")
+        box.setCheckBox(optout)
+
+        box.exec_()
+        if optout.isChecked():
+            self._skip_numeric_name_warning = True
+
+    def _apply_sample_prefix(self, widget) -> None:
+        """Normalise a sample-name field in place, warning if it changed."""
+        original = widget.text()
+        normalised = self._ensure_sample_prefix(original)
+        if normalised == original:
+            return
+        widget.setText(normalised)
+        if normalised != original.strip().strip('"').strip("'"):
+            self._warn_numeric_sample_name(original.strip(), normalised)
 
     def _create_sample_form(self, idx: int, org_names, imm_names, oth_names, include_dead) -> dict:
         grp = QGroupBox(f"Sample {idx + 1}")
@@ -647,13 +692,14 @@ class DataPreparationTab(QWidget):
         fields["sample_name"] = QLineEdit()
         fields["sample_name"].setPlaceholderText("e.g. Sample001")
         fields["sample_name"].setToolTip(
-            "Sample names are automatically prefixed with 'S' so they are never "
-            "purely numeric (numeric names break parts of the pipeline)."
+            "Purely numeric sample names are automatically prefixed with 'S_' "
+            "(numeric names break parts of the pipeline). Any other name is "
+            "left exactly as typed."
         )
-        # Apply the 'S' prefix as soon as the user leaves the field so the
+        # Apply the 'S_' prefix as soon as the user leaves the field so the
         # change is visible in the form, not only in the saved CSV.
         fields["sample_name"].editingFinished.connect(
-            lambda w=fields["sample_name"]: w.setText(self._ensure_sample_prefix(w.text()))
+            lambda w=fields["sample_name"]: self._apply_sample_prefix(w)
         )
         layout.addRow("Name*:", fields["sample_name"])
 
@@ -1223,7 +1269,10 @@ class DataPreparationTab(QWidget):
                 if isinstance(w, QLineEdit):
                     val = w.text().strip().strip('"').strip("'")
                     if k == "sample_name":
-                        val = self._ensure_sample_prefix(val)
+                        prefixed = self._ensure_sample_prefix(val)
+                        if prefixed != val:
+                            self._warn_numeric_sample_name(val, prefixed)
+                        val = prefixed
                     row[k] = val
                 elif isinstance(w, QComboBox):
                     row[k] = w.currentText()

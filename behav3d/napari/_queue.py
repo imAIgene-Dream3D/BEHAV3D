@@ -1871,9 +1871,8 @@ class ProcessingQueuePanel(QWidget):
                     apoc_widget.spin_t_start.setValue(int(p.get("t_start", 0)))
                 if hasattr(apoc_widget, "spin_t_end"):
                     apoc_widget.spin_t_end.setValue(int(p.get("t_end", 100)))
-        if hasattr(apoc_widget, "check_overwrite"):
-            # skip_existing overrides any stored overwrite flag.
-            apoc_widget.check_overwrite.setChecked(not skip_existing)
+        # skip_existing overrides any stored overwrite flag.
+        apoc_widget._overwrite_existing = not skip_existing
 
         apoc_widget._on_run_segmentation(
             interactive=False, block=False, extra_callbacks=extra_callbacks,
@@ -1974,8 +1973,7 @@ class ProcessingQueuePanel(QWidget):
                     convpaint_widget.spin_t_start.setValue(int(p.get("t_start", 0)))
                 if hasattr(convpaint_widget, "spin_t_end"):
                     convpaint_widget.spin_t_end.setValue(int(p.get("t_end", 100)))
-        if hasattr(convpaint_widget, "check_overwrite"):
-            convpaint_widget.check_overwrite.setChecked(not skip_existing)
+        convpaint_widget._overwrite_existing = not skip_existing
 
         convpaint_widget._on_run_segmentation(
             interactive=False, block=False, extra_callbacks=extra_callbacks,
