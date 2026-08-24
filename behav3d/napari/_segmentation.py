@@ -84,6 +84,47 @@ def _segmentation_output_label(cell_type, sample_name):
     return f"{cell_type} segments for {sample_name}"
 
 
+def _segmentation_output_entries(output_dir, sample_names, cell_types):
+    """List the existing APOC/ConvPaint outputs, each with how complete it is.
+
+    "Already exists" is not the same as "already finished": a run killed by a power
+    cut, or a sub-range run, leaves an array that is real but partial. The progress
+    journal beside each array knows the difference, so the prompt can say which is
+    which instead of making the user guess.
+
+    Returns ``(items, any_incomplete)``. *items* are prompt lines like
+    ``"tcell segments for S2 - INCOMPLETE (47/120)"``; *any_incomplete* drives the
+    Skip button's label.
+    """
+    from behav3d.preprocessing.segmentation.segment_journal import (
+        describe_state, journal_state,
+    )
+
+    items = []
+    any_incomplete = False
+    for sn in sample_names:
+        for ct in cell_types:
+            path = _segmentation_output_path(output_dir, sn, ct)
+            state, n_done, t_total = journal_state(path)
+            if state == "missing":
+                continue
+            if state == "partial":
+                any_incomplete = True
+            items.append(
+                f"{_segmentation_output_label(ct, sn)} — "
+                f"{describe_state(state, n_done, t_total)}"
+            )
+    return items, any_incomplete
+
+
+#: Extra line shown under the listing when something in it is resumable, so the
+#: Skip button's new name is self-explanatory.
+_RESUME_HINT = (
+    "Skip & Resume keeps completed timepoints and finishes the incomplete ones.\n"
+    "What do you want to do?"
+)
+
+
 def _notify_metadata_refresh(metadata_loader, log_fn=None, context="segmentation"):
     """Ask the Data Preparation tab to reload metadata.csv and re-broadcast it.
 
@@ -7399,11 +7440,9 @@ class APOCWidget(QWidget):
         # Check for pre-existing segments and prompt.  The dead cell type is
         # stored as ``<sn>_mask_dead.zarr``, not ``<sn>_dead_segments.zarr``.
         sample_names = md['sample_name'].unique()
-        existing = [
-            _segmentation_output_label(ct, sn)
-            for sn in sample_names
-            if _segmentation_output_path(output_dir, sn, ct).exists()
-        ]
+        existing, any_incomplete = _segmentation_output_entries(
+            output_dir, sample_names, [ct],
+        )
 
         overwrite = False
         if existing:
@@ -7412,6 +7451,8 @@ class APOCWidget(QWidget):
                 self,
                 f"Run {ct.capitalize()} Segmentation",
                 existing,
+                skip_label="Skip & Resume" if any_incomplete else "Skip",
+                body_suffix=_RESUME_HINT if any_incomplete else "What do you want to do?",
             )
             if choice == "cancel":
                 return
@@ -7558,17 +7599,17 @@ class APOCWidget(QWidget):
             # prompt in ``_on_global_run_instance``) ----------------------
             if interactive and only_cell_types is None:
                 check_cts = list(self.all_cell_types or [])
-                existing = []
-                for sn in md["sample_name"].unique():
-                    for ct in check_cts:
-                        if _segmentation_output_path(output_dir, sn, ct).exists():
-                            existing.append(_segmentation_output_label(ct, sn))
+                existing, any_incomplete = _segmentation_output_entries(
+                    output_dir, md["sample_name"].unique(), check_cts,
+                )
                 if existing:
                     from behav3d.napari._overwrite_prompt import prompt_overwrite_batch
                     choice = prompt_overwrite_batch(
                         self,
                         "Overwrite Existing APOC Segmentations?",
                         existing,
+                        skip_label="Skip & Resume" if any_incomplete else "Skip Existing",
+                        body_suffix=_RESUME_HINT if any_incomplete else "What do you want to do?",
                     )
                     if choice == "cancel":
                         self.log("APOC segmentation cancelled.")
@@ -8653,17 +8694,17 @@ class ConvPaintWidget(QWidget):
             # ---- Overwrite check (batch only) ---------------------------
             if interactive and only_cell_types is None:
                 check_cts = list(self.all_cell_types or [])
-                existing = []
-                for sn in md["sample_name"].unique():
-                    for ct in check_cts:
-                        if _segmentation_output_path(output_dir, sn, ct).exists():
-                            existing.append(_segmentation_output_label(ct, sn))
+                existing, any_incomplete = _segmentation_output_entries(
+                    output_dir, md["sample_name"].unique(), check_cts,
+                )
                 if existing:
                     from behav3d.napari._overwrite_prompt import prompt_overwrite_batch
                     choice = prompt_overwrite_batch(
                         self,
                         "Overwrite Existing ConvPaint Segmentations?",
                         existing,
+                        skip_label="Skip & Resume" if any_incomplete else "Skip Existing",
+                        body_suffix=_RESUME_HINT if any_incomplete else "What do you want to do?",
                     )
                     if choice == "cancel":
                         self.log("ConvPaint segmentation cancelled.")

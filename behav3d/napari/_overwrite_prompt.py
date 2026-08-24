@@ -110,18 +110,23 @@ def prompt_overwrite_single(
     title: str,
     items: Sequence[str],
     *,
+    skip_label: str = "Skip",
+    body_suffix: str = "What do you want to do?",
     extra_buttons: Optional[Iterable[Tuple[str, str, QMessageBox.ButtonRole]]] = None,
 ) -> str:
     """Convenience wrapper for single-cell-type runs.
 
-    Uses ``"Overwrite"`` and ``"Skip"`` labels.
+    Uses ``"Overwrite"`` and ``"Skip"`` labels. Callers that can tell some of the
+    listed outputs are incomplete pass ``skip_label="Skip & Resume"``, so the button
+    says what it will actually do.
     """
     return prompt_overwrite(
         parent,
         title,
         items,
         overwrite_label="Overwrite",
-        skip_label="Skip",
+        skip_label=skip_label,
+        body_suffix=body_suffix,
         extra_buttons=extra_buttons,
     )
 
@@ -131,17 +136,24 @@ def prompt_overwrite_batch(
     title: str,
     items: Sequence[str],
     *,
+    skip_label: str = "Skip Existing",
+    body_prefix: str = "The following data already exists:",
+    body_suffix: str = "What do you want to do?",
     extra_buttons: Optional[Iterable[Tuple[str, str, QMessageBox.ButtonRole]]] = None,
 ) -> str:
     """Convenience wrapper for batch (multi-cell-type) runs.
 
-    Uses ``"Overwrite All"`` and ``"Skip Existing"`` labels.
+    Uses ``"Overwrite All"`` and ``"Skip Existing"`` labels. Callers that can tell
+    some of the listed outputs are incomplete pass ``skip_label="Skip & Resume"``,
+    so the button says what it will actually do.
     """
     return prompt_overwrite(
         parent,
         title,
         items,
         overwrite_label="Overwrite All",
-        skip_label="Skip Existing",
+        skip_label=skip_label,
+        body_prefix=body_prefix,
+        body_suffix=body_suffix,
         extra_buttons=extra_buttons,
     )
