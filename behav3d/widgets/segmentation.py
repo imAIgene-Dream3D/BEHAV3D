@@ -1304,6 +1304,44 @@ class PixelClassifierPanel:
                 self.out.clear_output()
                 print("Training finished.")
 
+    def _print_output_completeness(self, output_dir, only_cell_types=None):
+        """Report how complete each existing segmentation output is, before running.
+
+        The napari plugin asks this question in its overwrite dialog; the notebook
+        widget has only a checkbox, so the same information is printed instead.
+        "Already exists" is not the same as "already finished" - an interrupted run
+        leaves a real but partial array, and only the progress journal knows which
+        is which.
+        """
+        from behav3d.preprocessing.segmentation.segment_journal import (
+            describe_state, journal_state,
+        )
+
+        md = self.metadata_loader.metadata
+        if md is None:
+            return
+        cts = list(only_cell_types) if only_cell_types else list(
+            self.organoid_types + self.immune_types + self.other_types
+        )
+        rows = []
+        for sn in md["sample_name"].unique():
+            for ct in cts:
+                path = Path(output_dir) / "images" / sn / f"{sn}_{ct}_segments.zarr"
+                state, n_done, t_total = journal_state(path)
+                if state == "missing":
+                    continue
+                rows.append(f"  - {ct} segments for {sn}: {describe_state(state, n_done, t_total)}")
+        if not rows:
+            return
+        print("Existing outputs:")
+        for row in rows:
+            print(row)
+        if not self.overwrite_existing.value:
+            print(
+                "  ('Overwrite existing' is off: complete outputs are skipped and "
+                "incomplete ones are resumed.)"
+            )
+
     def _on_apply_clicked(self, _, only_segment=False, target_cell_type=None):
         self._lock(True)
         with self.out:
@@ -1320,6 +1358,8 @@ class PixelClassifierPanel:
                 clf_immune_paths = {ct: str(self.clf_paths[ct].value) for ct in self.immune_types if ct in self.clf_paths and self.clf_paths[ct].value} if self.manual_clf_paths.value else None
                 clf_other_paths = {ct: str(self.clf_paths[ct].value) for ct in self.other_types if ct in self.clf_paths and self.clf_paths[ct].value} if self.manual_clf_paths.value else None
                 clf_death_path = str(self.clf_death_path.value) if (self.manual_clf_paths.value and self.has_death and self.clf_death_path.value) else None
+
+                self._print_output_completeness(odir, only_cell_types)
 
                 self.spinner_apply.layout.display = None
                 

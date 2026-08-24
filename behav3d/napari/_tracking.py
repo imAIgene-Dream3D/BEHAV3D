@@ -1723,7 +1723,8 @@ class CellTypeTrackingPanel(QWidget):
             )
             if res == QMessageBox.Yes:
                 self._switch_to_viz_and_show_tracks()
-            # Emit tracking completion signal for metadata refresh
+            # Refresh metadata last: this rebuilds the tracking tabs and
+            # discards this panel, so nothing may touch ``self`` after it.
             if self.on_tracking_complete is not None:
                 self.on_tracking_complete()
 
@@ -1780,7 +1781,8 @@ class AllOrganoidsPropagationPanel(QWidget):
     """
 
     def __init__(self, organoid_types, metadata_loader, log_callback,
-                 viewer, toggle_callback, parent=None, tab_progress_row=None):
+                 viewer, toggle_callback, parent=None, tab_progress_row=None,
+                 on_tracking_complete_callback=None):
         super().__init__(parent)
         self.organoid_types = list(organoid_types)
         self.metadata_loader = metadata_loader
@@ -1788,6 +1790,7 @@ class AllOrganoidsPropagationPanel(QWidget):
         self.viewer = viewer
         self._toggle_callback = toggle_callback
         self.tab_progress_row = tab_progress_row
+        self.on_tracking_complete = on_tracking_complete_callback
         self._bg = BackgroundOperation(self)
         self._build_ui()
 
@@ -1929,6 +1932,10 @@ class AllOrganoidsPropagationPanel(QWidget):
             )
             if res == QMessageBox.Yes:
                 self._switch_to_viz()
+            # Refresh metadata last: this rebuilds the tracking tabs and
+            # discards this panel, so nothing may touch ``self`` after it.
+            if self.on_tracking_complete is not None:
+                self.on_tracking_complete()
 
         def _on_failed(err: str):
             self.log(f"\u274c Error during all-organoids tracking: {err}")
@@ -1972,7 +1979,8 @@ class MulticolorTrackingPanel(QWidget):
 
     def __init__(self, base_name: str, channel_types: list, category: str,
                  metadata_loader, log_callback=None, viewer=None, parent=None,
-                 tab_progress_row=None, switch_to_data_prep_edit_callback=None):
+                 tab_progress_row=None, on_tracking_complete_callback=None,
+                 switch_to_data_prep_edit_callback=None):
         super().__init__(parent)
         self.base_name = base_name
         self.channel_types = sorted(channel_types)
@@ -1981,6 +1989,7 @@ class MulticolorTrackingPanel(QWidget):
         self.log = log_callback or print
         self.viewer = viewer
         self.tab_progress_row = tab_progress_row
+        self.on_tracking_complete = on_tracking_complete_callback
 
         # Inner panel drives the shared parameter UI; keyed to first channel
         # so saved config is stored/loaded under that channel name.
@@ -2036,6 +2045,35 @@ class MulticolorTrackingPanel(QWidget):
         # ── Shared parameters (inner CellTypeTrackingPanel) ───────────
         layout.addWidget(self._inner_panel)
 
+        # The inner panel ships its own single-channel Run button.  Running
+        # only the first channel would leave the remaining channels untracked
+        # and never produce the merged output, so the button is retargeted at
+        # the whole group (all channels + merge).
+        btn = self._inner_panel.btn_run
+        btn.setText(
+            f"▶  Run {self.base_name.capitalize()} Multicolor Tracking  "
+            f"({len(self.channel_types)} channels + merge)"
+        )
+        group_tip = (
+            "Tracks " + ", ".join(self.channel_types)
+            + f" with the shared parameters above, then merges them into {merged_name}."
+        )
+        btn.setToolTip(group_tip)
+        try:
+            btn.clicked.disconnect(self._inner_panel._on_run_clicked)
+        except (TypeError, RuntimeError):
+            pass
+        btn.clicked.connect(self._on_run_clicked)
+
+        # The inner panel resets the tooltip whenever the method changes;
+        # restore the group wording afterwards (it stays cleared for the
+        # not-yet-available methods, which disable the button).
+        def _restore_group_tooltip(_idx=None):
+            if btn.isEnabled():
+                btn.setToolTip(group_tip)
+        self._restore_group_tooltip = _restore_group_tooltip
+        self._inner_panel.combo_method.currentIndexChanged.connect(_restore_group_tooltip)
+
     # ------------------------------------------------------------------
     def _persist(self):
         """Persist shared parameters for all channels."""
@@ -2054,6 +2092,86 @@ class MulticolorTrackingPanel(QWidget):
             except Exception as e:
                 self.log(f"Warning: Could not save parameters: {e}")
 
+    def _on_run_clicked(self):
+        """Run tracking for every channel of this multicolor group + merge.
+
+        Mirrors :meth:`CellTypeTrackingPanel._on_run_clicked` but operates on
+        the whole channel family: the shared parameters are persisted for all
+        channels, existing outputs for every channel *and* the merged type are
+        checked in a single overwrite prompt, and the background worker runs
+        :meth:`run_tracking` (per-channel tracking followed by the merge).
+        """
+        inner = self._inner_panel
+        if inner._bg.is_running():
+            self.log("⚠️ A tracking run is already in progress for this panel.")
+            return
+
+        self._persist()
+        merged_name = f"{self.base_name}_merged"
+        method = inner._get_method_key()
+        self.log(
+            f"Running {method.upper()} tracking for multicolor group "
+            f"{self.base_name}: {', '.join(self.channel_types)} → {merged_name}"
+        )
+
+        # One prompt covering every channel plus the merged output.
+        existing = inner._check_existing_tracking(
+            list(self.channel_types) + [merged_name]
+        )
+        if existing:
+            from behav3d.napari._overwrite_prompt import prompt_overwrite_single
+            choice = prompt_overwrite_single(
+                self,
+                "Overwrite Existing Tracking?",
+                existing,
+            )
+            if choice != "overwrite":
+                self.log(f"Multicolor tracking for {self.base_name} cancelled.")
+                return
+        overwrite = True
+
+        # Snapshot Qt widget values now — the worker must not touch them.
+        params = inner.collect_runtime_params()
+
+        def _do_tracking(progress_cb=None):
+            return self.run_tracking(
+                overwrite=overwrite, params=params, progress_cb=progress_cb,
+            )
+
+        def _on_done(_new_md):
+            self.log(
+                f"✅ {self.base_name} multicolor tracking finished "
+                f"({len(self.channel_types)} channels merged → {merged_name})."
+            )
+            res = QMessageBox.question(
+                self, "Tracking Finished",
+                f"Multicolor tracking for {self.base_name} finished!\n\n"
+                f"Channels tracked: {', '.join(self.channel_types)}\n"
+                f"Merged output: {merged_name}\n\n"
+                "Do you want to switch to the Visualization Tab and see the tracks?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if res == QMessageBox.Yes:
+                inner._switch_to_viz_and_show_tracks()
+            # Refresh metadata last: this rebuilds the tracking tabs and
+            # discards this panel, so nothing may touch ``self`` after it.
+            if self.on_tracking_complete is not None:
+                self.on_tracking_complete()
+
+        def _on_failed(err: str):
+            self.log(f"Error during multicolor tracking: {err}")
+
+        inner._bg.run(
+            fn=_do_tracking,
+            desc=f"Tracking {self.base_name} (multicolor)…",
+            progress_row=self.tab_progress_row,
+            buttons=[inner.btn_run],
+            viewer=self.viewer,
+            on_done=_on_done,
+            on_failed=_on_failed,
+        )
+
+    # ------------------------------------------------------------------
     def run_tracking(self, overwrite: bool = False, params: dict = None,
                      progress_cb=None):
         """Track each channel then merge into ``<base_name>_merged``.
@@ -2362,6 +2480,7 @@ class TrackingTab(QWidget):
                 viewer=self.viewer,
                 toggle_callback=self._on_all_organoids_toggled,
                 tab_progress_row=self.progress_row,
+                on_tracking_complete_callback=self.tracking_completed.emit,
             )
             self.cell_tabs.addTab(self._all_organoids_panel, "🟣 All Organoids")
         else:
@@ -2387,6 +2506,7 @@ class TrackingTab(QWidget):
                 metadata_loader=self.metadata_loader,
                 log_callback=self._log, viewer=self.viewer,
                 tab_progress_row=self.progress_row,
+                on_tracking_complete_callback=self.tracking_completed.emit,
                 switch_to_data_prep_edit_callback=self._switch_to_data_prep_edit,
             )
             self._multicolor_panels[base] = panel
@@ -2414,6 +2534,7 @@ class TrackingTab(QWidget):
                 metadata_loader=self.metadata_loader,
                 log_callback=self._log, viewer=self.viewer,
                 tab_progress_row=self.progress_row,
+                on_tracking_complete_callback=self.tracking_completed.emit,
                 switch_to_data_prep_edit_callback=self._switch_to_data_prep_edit,
             )
             self._multicolor_panels[base] = panel
@@ -2441,6 +2562,7 @@ class TrackingTab(QWidget):
                 metadata_loader=self.metadata_loader,
                 log_callback=self._log, viewer=self.viewer,
                 tab_progress_row=self.progress_row,
+                on_tracking_complete_callback=self.tracking_completed.emit,
                 switch_to_data_prep_edit_callback=self._switch_to_data_prep_edit,
             )
             self._multicolor_panels[base] = panel
@@ -2699,11 +2821,13 @@ class TrackingTab(QWidget):
         if block:
             try:
                 result = _do_batch(progress_cb=None)
+                # Emit tracking completion signal for metadata refresh — must
+                # happen before the Visualization-tab prompt so that tab loads
+                # the refreshed metadata rather than its stale copy.
+                self.tracking_completed.emit()
                 if interactive:
                     self._prompt_switch_to_viz_after_batch()
                 fire_extra_callback(extra_callbacks, "on_done", result)
-                # Emit tracking completion signal for metadata refresh
-                self.tracking_completed.emit()
             except Exception as e:
                 traceback.print_exc()
                 self._log(f"\u274c Batch tracking error: {e}")
@@ -2711,11 +2835,12 @@ class TrackingTab(QWidget):
             return
 
         def _on_done(result):
+            # Emit tracking completion signal for metadata refresh before the
+            # Visualization-tab prompt (see the blocking branch above).
+            self.tracking_completed.emit()
             if interactive:
                 self._prompt_switch_to_viz_after_batch()
             fire_extra_callback(extra_callbacks, "on_done", result)
-            # Emit tracking completion signal for metadata refresh
-            self.tracking_completed.emit()
 
         def _on_failed(err: str):
             self._log(f"\u274c Batch tracking error: {err}")
