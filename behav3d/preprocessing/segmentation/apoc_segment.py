@@ -283,11 +283,17 @@ def _cfg_val(cfg, ct, key, default):
     while the notebook widget (``behav3d/widgets/segmentation.py``) writes the
     unprefixed ``{ct}_{key}`` into its own ``pixel_classifier`` config. Prefer
     the prefixed key and fall back to the unprefixed one so both stay correct.
+
+    A key that is *present but* ``None`` counts as missing: the GUI tab's
+    ``get_config()`` emits every post-processing key on every tab, filling in
+    ``None`` for the widgets its own strategy never created (an EDT/Watershed
+    tab still reports ``peak_min_ratio: None``). Those nulls must not shadow
+    the default, or the ``float()``/``int()`` casts downstream crash.
     """
-    prefixed = f"apoc_{ct}_{key}"
-    if prefixed in cfg:
-        return cfg[prefixed]
-    return cfg.get(f"{ct}_{key}", default)
+    val = cfg.get(f"apoc_{ct}_{key}")
+    if val is None:
+        val = cfg.get(f"{ct}_{key}")
+    return default if val is None else val
 
 
 # ---------------------------------------------------------------------------
