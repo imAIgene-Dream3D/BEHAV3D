@@ -8,7 +8,7 @@ from behav3d.napari._widgets import (
     resolve_external_path,
 )
 from behav3d.core.qt_help import reset_scroll_on_page_change
-from behav3d.napari._preview_dims import disconnect_all_preview_dims_listeners
+from behav3d.napari._preview_dims import disconnect_all_preview_dims_listeners, clear_viewer_layers
 import yaml
 from magicgui.widgets import create_widget
 from qtpy.QtWidgets import (
@@ -1593,7 +1593,7 @@ class PixelClassifierWidget(QWidget):
                     load_existing = True
 
             disconnect_all_preview_dims_listeners(self.viewer)
-            self.viewer.layers.clear() # Clear after prompting, to avoid removing if cancel
+            clear_viewer_layers(self.viewer) # Clear after prompting, to avoid removing if cancel
 
             if load_existing:
                 # --- FAST PATH: load from cached zarr files ---
@@ -4248,7 +4248,7 @@ class CellposeSAMWidget(QWidget):
             # single timepoint, so with nothing else in the viewer there is no
             # time slider left to imply "every timepoint got segmented".
             disconnect_all_preview_dims_listeners(self.viewer)
-            self.viewer.layers.clear()
+            clear_viewer_layers(self.viewer)
             self._preview_labels = {}
             self._preview_sizes = {}
             self._preview_key = (sample_name, timepoint, tuple(cell_types))
@@ -5823,43 +5823,6 @@ class APOCWidget(QWidget):
         else:
             self.log("APOC training controls locked. Load training data to enable classifier training.")
 
-    def _channel_index_from_name(self, channel_name):
-        text = str(channel_name or "")
-        import re
-        match = re.search(r"\((\d+)\)", text)
-        if match:
-            return int(match.group(1))
-        match = re.search(r"(?:^|\b)(?:channel|ch)\s*(\d+)(?:\b|$)", text, flags=re.IGNORECASE)
-        if match:
-            return int(match.group(1))
-        nums = re.findall(r"\d+", text)
-        if nums:
-            return int(nums[-1])
-        return None
-
-    def _restore_tab_channels_fallback(self, tab, configured_channels):
-        configured = [str(name) for name in (configured_channels or []) if str(name).strip()]
-        exact = set(configured)
-        configured_idx = {
-            idx for idx in (self._channel_index_from_name(name) for name in configured)
-            if idx is not None
-        }
-
-        any_checked = False
-        for cb in getattr(tab, "channel_checkboxes", []):
-            checked = cb.text() in exact
-            if not checked and configured_idx:
-                current_idx = self._channel_index_from_name(cb.text())
-                checked = current_idx in configured_idx if current_idx is not None else False
-            cb.setChecked(checked)
-            any_checked = any_checked or checked
-
-        if hasattr(tab, "_default_channel_names"):
-            if any_checked:
-                tab._default_channel_names = [cb.text() for cb in getattr(tab, "channel_checkboxes", []) if cb.isChecked()]
-            else:
-                tab._default_channel_names = list(configured)
-
     def _extract_tab_config(self, apoc_params, ct):
         prefix = f"apoc_{ct}_"
         cfg = {}
@@ -5871,9 +5834,10 @@ class APOCWidget(QWidget):
     def _on_training_channels_refreshed(self, ct):
         """Slot: APOCTrainingWidget rebuilt the channel checkboxes for *ct*.
 
-        Restores saved channel selections from the persisted tab config and
-        re-wires the organoid-mirroring signal handlers. Used instead of
-        monkey-patching ``tab.refresh_channel_checkboxes``.
+        Nothing is restored here. The tab owns its channel selection and
+        re-applies it during the rebuild; re-applying the YAML value on top
+        would override the trained classifier's own channel metadata, which
+        is the higher-precedence source (see ``CellTypeTab.__init__``).
         """
         if self._training_widget is None:
             return
@@ -5884,13 +5848,6 @@ class APOCWidget(QWidget):
         can_train = bool(self._is_session_active)
         for cb in getattr(tab, "channel_checkboxes", []):
             cb.setEnabled(can_train)
-        cfg = getattr(tab, "_saved_config_for_restore", None)
-        if not (isinstance(cfg, dict) and cfg.get("channels")):
-            # Stash is empty or has no channel selection — read from live YAML.
-            live_params = self.metadata_loader.behav3d_parameters.get("apoc", {})
-            cfg = self._extract_tab_config(live_params, ct) or {}
-        if isinstance(cfg, dict) and cfg.get("channels"):
-            self._restore_tab_channels_fallback(tab, cfg.get("channels", []))
         # Channel checkboxes are recreated by refresh; re-wire sync handlers.
         self._wire_organoid_tab_sync_signals(ct, tab, include_channels=True, include_rf=False)
         self._wire_non_organoid_tab_channel_signals(ct, tab)
@@ -5904,9 +5861,11 @@ class APOCWidget(QWidget):
 
         for ct, tab in tw.tabs.items():
             cfg = tab.get_config()
-            if not tab.channel_selection_is_complete():
-                # Channel layers are still loading in — don't overwrite the
-                # saved selection with this partial checkbox state.
+            # Only persist a selection the user actually made. ``get_config``
+            # reports the *effective* channels (all of them when nothing was
+            # chosen), which must never be written back as if it were a
+            # deliberate choice.
+            if tab.configured_channels() is None:
                 cfg.pop("channels", None)
             for k, v in cfg.items():
                 apoc_config[f"apoc_{ct}_{k}"] = v
@@ -5991,15 +5950,14 @@ class APOCWidget(QWidget):
             cfg = self._extract_tab_config(apoc_params, ct)
             if not cfg:
                 continue
-            # Stash so :meth:`_on_training_channels_refreshed` can re-apply
-            # channel selections every time the checkboxes get rebuilt.
-            tab._saved_config_for_restore = dict(cfg)
+            # Channels are resolved once, in ``CellTypeTab.__init__``, where
+            # the trained classifier's own metadata outranks this YAML
+            # value. Re-applying it here would let a stale entry win.
+            cfg.pop("channels", None)
             try:
                 tab.apply_config(cfg)
             except Exception as e:
                 self.log(f"⚠️ Could not restore APOC tab config for '{ct}': {e}")
-            if cfg.get("channels"):
-                self._restore_tab_channels_fallback(tab, cfg.get("channels", []))
 
     def _reorder_apoc_training_layers(self):
         """Enforce grouped training layer order: channels, labels, probabilities, segments."""
@@ -6156,26 +6114,16 @@ class APOCWidget(QWidget):
                     load_existing = True
             # else: no data exists → generate immediately without any dialog
 
-            # Flush current channel selections and tab config to YAML BEFORE
-            # clearing layers, so the subsequent checkbox rebuild can restore
-            # the live UI state rather than a stale one-time stash.
-            current_tab_cfg = self._collect_apoc_tab_config()
-            existing_apoc = self.metadata_loader.behav3d_parameters.get("apoc", {})
-            for key in list(current_tab_cfg.keys()):
-                if key.endswith("_channels") and not current_tab_cfg[key]:
-                    existing_val = existing_apoc.get(key)
-                    if existing_val:
-                        current_tab_cfg[key] = existing_val
-            self._save_apoc_params_to_yaml(updated_apoc_params=current_tab_cfg)
-            # Refresh the per-tab stash from the freshly written YAML so that
-            # _on_training_channels_refreshed re-applies the correct channels.
-            self._restore_training_tab_configs(
-                self.metadata_loader.behav3d_parameters.get("apoc", {})
+            # Flush the current tab config to YAML before clearing layers.
+            # The tabs own their channel selection across the rebuild, so
+            # nothing needs restoring afterwards.
+            self._save_apoc_params_to_yaml(
+                updated_apoc_params=self._collect_apoc_tab_config()
             )
 
             # Clear all viewer layers entirely
             disconnect_all_preview_dims_listeners(self.viewer)
-            self.viewer.layers.clear()
+            clear_viewer_layers(self.viewer)
 
             # Load images
             self.log("Running _load_training_images...")
@@ -7154,6 +7102,11 @@ class APOCWidget(QWidget):
             per_ct_strategies = {}
             for ct, tab in self._training_widget.tabs.items():
                 cfg = tab.get_config()
+                if tab.configured_channels() is None:
+                    # Never configured — let the replaying tab fall back to
+                    # its own default instead of freezing in whatever layers
+                    # happen to be loaded now.
+                    cfg.pop("channels", None)
                 per_ct_params[ct] = cfg
                 per_tab_combo = getattr(tab, "_per_tab_strategy_combo", None)
                 if per_tab_combo is not None:
@@ -7636,29 +7589,14 @@ class APOCWidget(QWidget):
                     return
                 timepoint_range = (t_start, t_end)
 
-            # Collect APOC config from training widget tabs (Qt thread).
-            apoc_config = {}
-            if self._training_widget is not None:
-                for ct, tab in self._training_widget.tabs.items():
-                    cfg = tab.get_config()
-                    for k, v in cfg.items():
-                        apoc_config[f"apoc_{ct}_{k}"] = v
+            # Collect APOC config from the training widget tabs (Qt thread).
+            # Goes through the shared collector so an unchosen "all
+            # channels" state is never written to YAML; the backend then
+            # falls back to each classifier's own header metadata.
+            apoc_config = self._collect_apoc_tab_config()
 
             # Save all parameters safely
             self._save_apoc_params_to_yaml(updated_apoc_params=apoc_config)
-
-            # Fix channel names for apoc_segment.py parser (backend expects 'Ch 0' format)
-            import re
-            for key in list(apoc_config.keys()):
-                if key.endswith("_channels") and isinstance(apoc_config[key], list):
-                    fixed_chans = []
-                    for ch_name in apoc_config[key]:
-                        match = re.search(r'\((\d+)\)', str(ch_name))
-                        if match:
-                            fixed_chans.append(f"Ch {match.group(1)}")
-                        else:
-                            fixed_chans.append(ch_name)
-                    apoc_config[key] = fixed_chans
 
             # GUI-side compatibility preflight: ensure classifier headers can drive predict(image=...).
             incompatible = self._apoc_preflight_classifier_headers(output_dir, md)
@@ -8284,7 +8222,7 @@ class ConvPaintWidget(QWidget):
                     overwrite_images = False
 
             disconnect_all_preview_dims_listeners(self.viewer)
-            self.viewer.layers.clear()
+            clear_viewer_layers(self.viewer)
 
             all_images, pixel_class_outdir, has_death, all_cell_types = _load_training_images(
                 metadata=md,

@@ -63,6 +63,7 @@ from behav3d.napari._background_runner import (
 from behav3d.napari._pdf_view import open_pdf_in_napari
 from behav3d.napari._rename_dialog import RenameClusterDialog
 from behav3d.napari._preview_dims import (
+    clear_viewer_layers,
     disconnect_all_preview_dims_listeners,
     register_preview_dims_listener,
     stop_dim_playback,
@@ -2917,7 +2918,7 @@ class StateClassificationSubTab(QWidget):
             self._teardown_state_bp_preview()
             stop_dim_playback(self.viewer)
             disconnect_all_preview_dims_listeners(self.viewer)
-            self.viewer.layers.clear()
+            clear_viewer_layers(self.viewer)
             saved_channels = (
                 getattr(self.metadata_loader, "behav3d_parameters", {})
                 .get("viewer_display", {})
@@ -6997,7 +6998,7 @@ class TrackClassificationSubTab(QWidget):
             self._teardown_track_bp_preview()
             stop_dim_playback(self.viewer)
             disconnect_all_preview_dims_listeners(self.viewer)
-            self.viewer.layers.clear()
+            clear_viewer_layers(self.viewer)
             saved_channels = (
                 getattr(self.metadata_loader, "behav3d_parameters", {})
                 .get("viewer_display", {})

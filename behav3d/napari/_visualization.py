@@ -46,6 +46,7 @@ from behav3d.core.metadata import (
 )
 from behav3d.core.qt_help import reset_scroll_on_page_change
 from behav3d.napari._preview_dims import (
+    clear_viewer_layers,
     disconnect_all_preview_dims_listeners,
     stop_dim_playback,
 )
@@ -420,7 +421,7 @@ class VisualizationTab(QWidget):
         # those firing reentrantly mid-clear() is what desyncs napari's own
         # vispy canvas bookkeeping and raises a KeyError.
         disconnect_all_preview_dims_listeners(self.viewer)
-        self.viewer.layers.clear()
+        clear_viewer_layers(self.viewer)
 
         output_dir = self.data_prep.output_dir or ""
 
@@ -982,7 +983,7 @@ class VisualizationTab(QWidget):
         stop_dim_playback(self.viewer)
         self._display_save_timer.stop()
         disconnect_all_preview_dims_listeners(self.viewer)
-        self.viewer.layers.clear()
+        clear_viewer_layers(self.viewer)
         saved_channels = (
             self.data_prep.behav3d_parameters
             .get("viewer_display", {})

@@ -17,10 +17,10 @@ from pathlib import Path
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
 
-# Defeat buggy PyOpenCL compiler caching that causes TypeErrors on some systems
-os.environ['PYOPENCL_NO_CACHE'] = '1'
-# Suppress compiler output unless there is an actual error
-os.environ['PYOPENCL_COMPILER_OUTPUT'] = '0'
+# Configure PyOpenCL (cache off, build chatter silenced) before
+# apoc/pyclesperanto_prototype are imported below.
+from behav3d.core.opencl_env import configure_pyopencl
+configure_pyopencl()
 
 import numpy as np
 import pandas as pd
