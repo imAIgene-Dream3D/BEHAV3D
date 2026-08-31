@@ -19,10 +19,17 @@ from qtpy.QtWidgets import (
     QVBoxLayout,
 )
 
-from behav3d.core.qt_help import HelpButton, make_help_row
+from behav3d.core.qt_help import (
+    HelpButton,
+    HelpSection,
+    IllustratedHelpButton,
+    make_help_row,
+)
 
 __all__ = [
     "HelpButton",
+    "HelpSection",
+    "IllustratedHelpButton",
     "make_help_row",
     "LABEL_DIM_ORDER_OPTIONS",
     "browse_file_or_zarr",

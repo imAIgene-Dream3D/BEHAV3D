@@ -38,10 +38,17 @@ Usage, per preview owner:
 Usage, before any bulk layer mutation (``viewer.layers.clear()`` or
 equivalent):
 
-    from behav3d.napari._preview_dims import disconnect_all_preview_dims_listeners
+    from behav3d.napari._preview_dims import (
+        clear_viewer_layers,
+        disconnect_all_preview_dims_listeners,
+    )
 
     disconnect_all_preview_dims_listeners(self.viewer)
-    self.viewer.layers.clear()
+    clear_viewer_layers(self.viewer)
+
+Always clear through ``clear_viewer_layers`` rather than
+``viewer.layers.clear()`` — see that function for why a raising listener
+otherwise leaves the viewer half-cleared.
 """
 from __future__ import annotations
 
@@ -92,6 +99,61 @@ def disconnect_all_preview_dims_listeners(viewer) -> None:
             viewer.dims.events.current_step.disconnect(callback)
         except Exception:
             pass
+
+
+def clear_viewer_layers(viewer, log=None) -> int:
+    """Remove every layer without letting one bad layer abort the rest.
+
+    ``viewer.layers.clear()`` is ``MutableSequence.clear()`` — a bare
+    ``pop()`` loop. napari removes a layer from the list *before* it emits
+    ``removed`` (see ``_evented_list.__delitem__``), so when any listener
+    raises, that layer is already gone but the loop unwinds and every
+    remaining layer stays in the viewer.
+
+    The listener that raises in practice is napari's own
+    ``QtLayerControlsContainer._remove``, which does ``self.widgets[layer]``
+    and throws ``KeyError`` for any layer whose controls widget was never
+    registered (its ``_add`` failed earlier, e.g. behind a swallowed
+    exception). The half-cleared viewer then leaves napari's Qt layer-list
+    model stale, ``LayerDelegate.paint`` raises on every repaint, and
+    raising repeatedly inside Qt's paint path takes the whole process down
+    with an access violation.
+
+    Removing one layer at a time, each guarded, keeps a single problem layer
+    from stopping the teardown. Returns the number of layers left behind.
+    """
+    try:
+        layers = list(viewer.layers)
+    except Exception:
+        return 0
+
+    failed = []
+    for layer in layers:
+        try:
+            viewer.layers.remove(layer)
+        except Exception as exc:
+            # napari pops before it notifies, so the layer is usually already
+            # out of the list and only the notification failed. Keep going.
+            failed.append((getattr(layer, "name", "?"), exc))
+
+    try:
+        remaining = len(viewer.layers)
+    except Exception:
+        remaining = 0
+
+    if failed or remaining:
+        emit = log if callable(log) else print
+        for name, exc in failed:
+            try:
+                emit(f"  Layer '{name}' raised while being removed: {exc}")
+            except Exception:
+                pass
+        if remaining:
+            try:
+                emit(f"  {remaining} layer(s) could not be removed from the viewer.")
+            except Exception:
+                pass
+    return remaining
 
 
 def stop_dim_playback(viewer) -> None:

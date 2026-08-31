@@ -44,6 +44,7 @@ from behav3d.napari._background_runner import (
     fire_extra_callback,
 )
 from behav3d.napari._preview_dims import (
+    clear_viewer_layers,
     disconnect_all_preview_dims_listeners,
     register_preview_dims_listener,
     unregister_preview_dims_listener,
@@ -1258,7 +1259,7 @@ class CellTypeFeaturePanel(QWidget):
         """Disconnect all preview callbacks and reset cached preview state.
 
         Does NOT remove layers — the caller handles that via
-        ``self.viewer.layers.clear()``.
+        ``clear_viewer_layers(self.viewer)``.
         """
         self._disconnect_preview_dead_hover()
         self._disconnect_preview_dims()
@@ -2157,7 +2158,7 @@ class CellTypeFeaturePanel(QWidget):
             from behav3d.napari._visualization import _is_addable_layer_data
             from behav3d.napari._preview_dims import stop_dim_playback
             stop_dim_playback(self.viewer)
-            self.viewer.layers.clear()
+            clear_viewer_layers(self.viewer)
 
             # Raw channels
             if raw_dask is not None:
@@ -3831,7 +3832,7 @@ class FeatureExtractionTab(QWidget):
         for panel in self.panels.values():
             panel._cleanup_preview()
         disconnect_all_preview_dims_listeners(self.viewer)
-        self.viewer.layers.clear()
+        clear_viewer_layers(self.viewer)
         self._log("Cleaned up viewer layers.")
 
         return True

@@ -4,10 +4,10 @@ from pathlib import Path
 import os
 import pandas as pd
 
-# DEFEAT BUGGY PyOpenCL caching (Windows/Python 3.12 bug)
-# MUST BE SET BEFORE pyopencl or apoc ARE IMPORTED
-os.environ['PYOPENCL_NO_CACHE'] = '1'
-os.environ['PYOPENCL_COMPILER_OUTPUT'] = '0'
+# Configure PyOpenCL (cache off, build chatter silenced).
+# MUST RUN BEFORE pyopencl or apoc ARE IMPORTED
+from behav3d.core.opencl_env import configure_pyopencl
+configure_pyopencl()
 import yaml
 import traceback
 from functools import partial

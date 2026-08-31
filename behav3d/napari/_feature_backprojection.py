@@ -38,6 +38,7 @@ from behav3d.core.metadata import resolve_metadata_csv_path
 from behav3d.napari._analysis import _detect_cell_types
 from behav3d.napari._single_cell import _bp_add_raw_channels
 from behav3d.napari._preview_dims import (
+    clear_viewer_layers,
     disconnect_all_preview_dims_listeners,
     register_preview_dims_listener,
     stop_dim_playback,
@@ -392,7 +393,7 @@ class FeatureBackprojectionTab(QWidget):
         self._teardown_preview()
         stop_dim_playback(self.viewer)
         disconnect_all_preview_dims_listeners(self.viewer)
-        self.viewer.layers.clear()
+        clear_viewer_layers(self.viewer)
 
         try:
             raw_img = load_image(raw_path)
