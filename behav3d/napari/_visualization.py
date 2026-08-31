@@ -50,6 +50,7 @@ from behav3d.napari._preview_dims import (
     disconnect_all_preview_dims_listeners,
     stop_dim_playback,
 )
+from behav3d.napari._track_colors import sync_tracks_colors_to_labels
 # Channel colormaps (cycled if there are many channels)
 _CHANNEL_COLORS = ["cyan", "yellow", "green", "red", "blue", "magenta"]
 # Label colormaps per cell-type category
@@ -756,6 +757,15 @@ class VisualizationTab(QWidget):
                     visible=False,
                 )
                 self._log(f"    + Tracks layer: {layer_name}")
+
+                # Color each track the same as its cell's tracked-segments
+                # label, instead of napari's default track_id gradient.
+                seg_layer_name = f"{sample_name} – {name} tracked segments"
+                if seg_layer_name in self.viewer.layers:
+                    sync_tracks_colors_to_labels(
+                        self.viewer.layers[layer_name],
+                        self.viewer.layers[seg_layer_name],
+                    )
             except Exception as e:
                 self._log(f"    ⚠️ Could not load tracks for {name}: {e}")
 

@@ -4,8 +4,8 @@ The second sub-tab of the **📊 Analysis** tab. Where the [Population Analyses]
 
 | Inner sub-tab | What it does | Status |
 |---|---|---|
-| [🔬 State Classification](state_classification.md) | Assigns each cell, at each timepoint, to a recurring **behavioural state** (a motion / intensity / contact "mode") using a Hidden Markov Model. | ✅ Implemented |
-| [🛤️ Track Classification](track_classification.md) | Groups whole **trajectories** into clusters by their behaviour over time (DTW), with cluster renaming, a trainable classifier, and exemplar / diagnostic plots. | ✅ Implemented |
+| [🔬 State Classification](state_classification.md) | Assigns each cell, at each timepoint, to a recurring **behavioural state** (a motion / intensity / contact "mode") using a Hidden Markov Model combined with binary features.  | ✅ Implemented |
+| [🛤️ Track Classification](track_classification.md) | Groups whole cell **trajectories** into clusters by the overall pattern of behavioural states they pass through across the entire movie, with cluster renaming, a trainable classifier, and exemplar / diagnostic plots. | ✅ Implemented |
 
 ## First decide what you are profiling on
 

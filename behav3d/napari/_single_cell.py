@@ -1130,6 +1130,15 @@ class StateClassificationSubTab(QWidget):
             self.spin_state_opacity, "Opacity",
             "Opacity of the colored state overlay layer in napari (10–100%)."
         ))
+
+        self.chk_show_state_trajectories = QCheckBox("Show trajectories")
+        self.chk_show_state_trajectories.setChecked(True)
+        bp_form.addRow("Trajectories:", _make_chk_help_row(
+            self.chk_show_state_trajectories, "Show trajectories",
+            "Overlay each track's full path as a line whose color changes over "
+            "time to match its state at each timepoint. On by default — adds "
+            "one napari Tracks layer per state."
+        ))
         g_view.addLayout(bp_form)
 
         view_row = QHBoxLayout()
@@ -2886,6 +2895,16 @@ class StateClassificationSubTab(QWidget):
             if not out_dir:
                 raise ValueError("No output directory set.")
             adata = sc.read_h5ad(str(state_path))
+            if self.chk_show_state_trajectories.isChecked():
+                try:
+                    from behav3d.analysis.behavior.track.visualization.plots.exemplar_coordinate_utils import (
+                        ensure_exemplar_coordinate_columns,
+                    )
+                    ensure_exemplar_coordinate_columns(
+                        adata, output_dir=out_dir, cell_type=ct, require_pixel_for_video=True,
+                    )
+                except Exception as exc:
+                    self._log(f"⚠️ Could not prepare trajectory positions: {exc}")
             resolved_col = "hmm_intrinsic_behavioral_state_raw" if color_by == "raw_hmm_state" else color_by
             state_col = resolved_col if (resolved_col and resolved_col in adata.obs.columns) else "full_behavioral_cluster"
             obs_samples = adata.obs["sample_name"].astype(str)
@@ -2969,6 +2988,28 @@ class StateClassificationSubTab(QWidget):
             }
             self._refresh_state_bp_layer()
             self._connect_state_bp_dims_listener()
+
+            if self.chk_show_state_trajectories.isChecked():
+                try:
+                    from behav3d.analysis.behavior.track.visualization.backprojection import (
+                        add_track_cluster_trajectory_layers,
+                    )
+                    from behav3d.analysis.behavior.state.visualization.backprojection import (
+                        prepare_state_trajectory_data,
+                    )
+                    trajectory_data = prepare_state_trajectory_data(
+                        sample_adata.obs, state_col=state_col,
+                    )
+                    add_track_cluster_trajectory_layers(
+                        self.viewer,
+                        trajectory_data=trajectory_data,
+                        code_colors=code_colors,
+                        label_map=label_map,
+                        output_col=state_col,
+                        tail_length=int(tracked_img.shape[0]),
+                    )
+                except Exception as exc:
+                    self._log(f"⚠️ Could not add state trajectory layers: {exc}")
 
             mapping_text = _build_state_mapping_text(label_map, code_colors)
             _existing_dock = getattr(self, "_state_mapping_dock", None)
@@ -4196,12 +4237,11 @@ class TrackClassificationSubTab(QWidget):
         ))
 
         self.chk_show_track_trajectories = QCheckBox("Show trajectories")
-        self.chk_show_track_trajectories.setChecked(False)
+        self.chk_show_track_trajectories.setChecked(True)
         tbp_form.addRow("Trajectories:", _make_chk_help_row(
             self.chk_show_track_trajectories, "Show trajectories",
             "Overlay each track's full path as a colored line, matching its class "
-            "color below. Off by default — adds one napari Tracks layer per class "
-            "when enabled."
+            "color below. On by default — adds one napari Tracks layer per class."
         ))
         g_track_view.addLayout(tbp_form)
 
