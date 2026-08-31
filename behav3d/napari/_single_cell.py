@@ -274,6 +274,16 @@ def _make_view_btn() -> QPushButton:
     return btn
 
 
+def _wire_view_btn(btn: QPushButton, handler, kind: str) -> None:
+    """Connect a 👁 button to *handler*, passing the button along.
+
+    The handler needs the button so a multi-result chooser menu can be popped
+    up underneath it; a bare ``QMenu.exec_()`` is equivalent to ``exec_(pos())``
+    and a never-shown menu's ``pos()`` is (0, 0), i.e. the screen corner.
+    """
+    btn.clicked.connect(lambda: handler(kind, btn))
+
+
 def _make_timepoint_time_label() -> QLabel:
     """Return a small muted QLabel for showing a timepoint-window's real-time equivalent."""
     lbl = QLabel("")
@@ -865,23 +875,15 @@ class StateClassificationSubTab(QWidget):
         self.rename_status_lbl.setStyleSheet("color: #999; font-size: 11px;")
         g2.addWidget(self.rename_status_lbl)
 
-        rename_intrinsic_row = QHBoxLayout()
         self.btn_rename_intrinsic = QPushButton("✏  Rename Primary Dynamic State Clusters")
         _style_rename(self.btn_rename_intrinsic)
         self.btn_rename_intrinsic.setEnabled(False)
-        rename_intrinsic_row.addWidget(self.btn_rename_intrinsic, stretch=1)
-        self.btn_view_rename_intrinsic = _make_view_btn()
-        rename_intrinsic_row.addWidget(self.btn_view_rename_intrinsic)
-        g2.addLayout(rename_intrinsic_row)
+        g2.addWidget(self.btn_rename_intrinsic)
 
-        rename_full_row = QHBoxLayout()
         self.btn_rename_full = QPushButton("✏  Rename Full Behavioral Clusters (Binary Groups)")
         _style_rename(self.btn_rename_full)
         self.btn_rename_full.setEnabled(False)
-        rename_full_row.addWidget(self.btn_rename_full, stretch=1)
-        self.btn_view_rename_full = _make_view_btn()
-        rename_full_row.addWidget(self.btn_view_rename_full)
-        g2.addLayout(rename_full_row)
+        g2.addWidget(self.btn_rename_full)
         lay.addWidget(self.grp2)
 
         # ── Step 3: Reports (built directly into per-pipeline group boxes) ──
@@ -1166,17 +1168,17 @@ class StateClassificationSubTab(QWidget):
         self.combo_hmm_n_states_mode.currentTextChanged.connect(self._toggle_n_states_mode)
         self.chk_hmm_sticky.toggled.connect(self._toggle_sticky_hmm)
         self.btn_run_state.clicked.connect(self._on_run_state)
-        self.btn_view_state.clicked.connect(lambda: self._on_view("state_qc"))
+        _wire_view_btn(self.btn_view_state, self._on_view, "state_qc")
         self.btn_rename_intrinsic.clicked.connect(self._on_rename_intrinsic)
         self.btn_rename_full.clicked.connect(self._on_rename_full)
         self.btn_state_diagnostics.clicked.connect(self._on_state_diagnostics)
-        self.btn_view_state_diagnostics.clicked.connect(lambda: self._on_view("state_diagnostics"))
+        _wire_view_btn(self.btn_view_state_diagnostics, self._on_view, "state_diagnostics")
         self.btn_state_composition.clicked.connect(self._on_state_composition)
-        self.btn_view_composition.clicked.connect(lambda: self._on_view("state_composition"))
+        _wire_view_btn(self.btn_view_composition, self._on_view, "state_composition")
         self.btn_state_transition.clicked.connect(self._on_state_transition)
-        self.btn_view_transition.clicked.connect(lambda: self._on_view("state_transition"))
+        _wire_view_btn(self.btn_view_transition, self._on_view, "state_transition")
         self.btn_condition_comparison.clicked.connect(self._on_condition_comparison)
-        self.btn_view_condition_comparison.clicked.connect(lambda: self._on_view("state_condition_comparison"))
+        _wire_view_btn(self.btn_view_condition_comparison, self._on_view, "state_condition_comparison")
         self.btn_browse_hmm.clicked.connect(self._browse_hmm_artifact)
         self.btn_apply_hmm.clicked.connect(self._on_apply_hmm)
         self.btn_show_state_bp.clicked.connect(self._on_show_state_bp)
@@ -1764,6 +1766,23 @@ class StateClassificationSubTab(QWidget):
         od = getattr(self.metadata_loader, "output_dir", None) if self.metadata_loader else None
         return Path(str(od)).expanduser() if od else None
 
+    def _state_run_qc_pdfs(self, ct: str) -> list:
+        """The two QC PDFs written by a State Classification run itself.
+
+        `run_hmm_state_clustering` puts these under the ``raw/`` sub-folder of
+        the QC directory (see `_resolve_hmm_quality_control_outdir`), which is
+        what separates them from the re-generated PDFs that the Step 3
+        "Create Diagnostics" button writes to the QC folder root.
+        """
+        qc_dir = self._state_diagnostics_qc_dir(ct)
+        if not qc_dir:
+            return []
+        raw = qc_dir / "raw"
+        return [
+            ("Clustering diagnostics", raw / "behavioral_clustering_diagnostics.pdf"),
+            ("Feature distributions", raw / "behavioral_clustering_feature_distributions.pdf"),
+        ]
+
     def _state_diagnostics_qc_dir(self, ct: str) -> Optional[Path]:
         """Path to the HMM diagnostics QC folder, without creating it."""
         out = self._out_dir()
@@ -2045,8 +2064,9 @@ class StateClassificationSubTab(QWidget):
             ):
                 btn.setEnabled(False)
             return
-        model_path = self._model_adata_path(ct)
-        self.btn_view_state.setEnabled(bool(model_path and model_path.exists()))
+        self.btn_view_state.setEnabled(
+            any(p.exists() for _lbl, p in self._state_run_qc_pdfs(ct))
+        )
         qc_dir = self._state_diagnostics_qc_dir(ct)
         self.btn_view_state_diagnostics.setEnabled(
             bool(qc_dir and qc_dir.exists() and any(qc_dir.glob("*.pdf")))
@@ -3023,7 +3043,7 @@ class StateClassificationSubTab(QWidget):
 
     # ── View helpers ─────────────────────────────────────────────────────
 
-    def _on_view(self, kind: str):
+    def _on_view(self, kind: str, btn: Optional[QPushButton] = None):
         ct = self._cell_type()
         if not ct:
             return
@@ -3038,15 +3058,17 @@ class StateClassificationSubTab(QWidget):
             for lbl, path in existing:
                 act = menu.addAction(f"👁  {lbl}")
                 act.triggered.connect(lambda _=False, _p=path: self._open_pdf(_p))
-            menu.exec_()
+            if btn is not None:
+                menu.exec_(btn.mapToGlobal(btn.rect().bottomLeft()))
+            else:
+                menu.exec_()
 
     def _get_view_candidates(self, kind: str, ct: str):
         out = self._out_dir()
         if not out:
             return []
         if kind == "state_qc":
-            p = self._model_adata_path(ct)
-            return [(f"Model adata ({ct})", p)] if p else []
+            return self._state_run_qc_pdfs(ct)
         if kind == "state_diagnostics":
             qc_dir = self._state_diagnostics_qc_dir(ct)
             if not qc_dir or not qc_dir.exists():
@@ -3542,8 +3564,6 @@ class TrackClassificationSubTab(QWidget):
         _style_primary(self.btn_run_track)
         run_row.addWidget(self.btn_run_track, stretch=1)
         run_row.addWidget(self.btn_queue_track_cluster)
-        self.btn_view_track = _make_view_btn()
-        run_row.addWidget(self.btn_view_track)
         g1.addLayout(run_row)
 
         lay.addWidget(self.grp1)
@@ -3558,14 +3578,10 @@ class TrackClassificationSubTab(QWidget):
         self.rename_track_status.setWordWrap(True)
         g2.addWidget(self.rename_track_status)
 
-        rename_row = QHBoxLayout()
         self.btn_rename_track = QPushButton("✏  Rename Track Clusters")
         _style_rename(self.btn_rename_track)
         self.btn_rename_track.setEnabled(False)
-        rename_row.addWidget(self.btn_rename_track, stretch=1)
-        self.btn_view_rename_track = _make_view_btn()
-        rename_row.addWidget(self.btn_view_rename_track)
-        g2.addLayout(rename_row)
+        g2.addWidget(self.btn_rename_track)
         lay.addWidget(self.grp2)
 
         # ── Train Track Classifier (last step) ───────────────────────────
@@ -3679,8 +3695,6 @@ class TrackClassificationSubTab(QWidget):
         self.btn_train_track.setEnabled(False)
         train_rf_run_row.addWidget(self.btn_train_track, stretch=1)
         train_rf_run_row.addWidget(self.btn_queue_train_track)
-        self.btn_view_train_track = _make_view_btn()
-        train_rf_run_row.addWidget(self.btn_view_train_track)
         g_train_rf.addLayout(train_rf_run_row)
         g3.addWidget(grp_train_rf)
 
@@ -3715,8 +3729,6 @@ class TrackClassificationSubTab(QWidget):
         self.btn_apply_track.setEnabled(False)
         apply_clf_run_row.addWidget(self.btn_apply_track, stretch=1)
         apply_clf_run_row.addWidget(self.btn_queue_apply_track)
-        self.btn_view_apply_track = _make_view_btn()
-        apply_clf_run_row.addWidget(self.btn_view_apply_track)
         g_apply_clf.addLayout(apply_clf_run_row)
         g3.addWidget(grp_apply_clf)
 
@@ -4227,35 +4239,30 @@ class TrackClassificationSubTab(QWidget):
         self.chk_use_original.toggled.connect(self._on_original_toggled_from_adv)
         self.chk_use_original_top.toggled.connect(self._on_original_toggled_from_top)
         self.btn_run_track.clicked.connect(self._on_run_cluster)
-        self.btn_view_track.clicked.connect(lambda: self._on_view("track_adata"))
         self.btn_rename_track.clicked.connect(self._on_rename_track)
         self.btn_train_track.clicked.connect(self._on_train_track)
-        self.btn_view_train_track.clicked.connect(lambda: self._on_view("track_classifier"))
         self.btn_apply_track.clicked.connect(self._on_apply_track)
-        self.btn_view_apply_track.clicked.connect(lambda: self._on_view("track_applied"))
         self.btn_exemplars.clicked.connect(self._on_exemplars)
-        self.btn_view_exemplars.clicked.connect(lambda: self._on_view("track_exemplars"))
+        _wire_view_btn(self.btn_view_exemplars, self._on_view, "track_exemplars")
         self.btn_diagnostics.clicked.connect(self._on_diagnostics)
-        self.btn_view_diagnostics.clicked.connect(lambda: self._on_view("track_diagnostics"))
+        _wire_view_btn(self.btn_view_diagnostics, self._on_view, "track_diagnostics")
         self.btn_track_proportions.clicked.connect(self._on_track_proportions)
-        self.btn_view_track_proportions.clicked.connect(lambda: self._on_view("track_proportions"))
+        _wire_view_btn(self.btn_view_track_proportions, self._on_view, "track_proportions")
         self.btn_window_transitions.clicked.connect(self._on_window_transitions)
-        self.btn_view_window_transitions.clicked.connect(lambda: self._on_view("window_transitions"))
+        _wire_view_btn(self.btn_view_window_transitions, self._on_view, "window_transitions")
         self.btn_track_condition_comparison.clicked.connect(self._on_track_condition_comparison)
-        self.btn_view_track_condition_comparison.clicked.connect(
-            lambda: self._on_view("track_condition_comparison")
-        )
+        _wire_view_btn(self.btn_view_track_condition_comparison, self._on_view, "track_condition_comparison")
         self.btn_contact_analysis.clicked.connect(self._on_contact_analysis)
-        self.btn_view_contact_analysis.clicked.connect(lambda: self._on_view("contact_analysis"))
+        _wire_view_btn(self.btn_view_contact_analysis, self._on_view, "contact_analysis")
         self.combo_contact_col.currentTextChanged.connect(self._sync_contact_target_class_controls)
         self.chk_use_target_class.stateChanged.connect(self._sync_contact_target_class_controls)
         self.combo_target_class_source.currentTextChanged.connect(self._sync_contact_target_class_controls)
         self.btn_duration_comparison.clicked.connect(self._on_duration_comparison)
-        self.btn_view_duration_comparison.clicked.connect(lambda: self._on_view("contact_duration"))
+        _wire_view_btn(self.btn_view_duration_comparison, self._on_view, "contact_duration")
         self.btn_contact_state_shift.clicked.connect(self._on_contact_state_shift_analysis)
-        self.btn_view_contact_state_shift.clicked.connect(lambda: self._on_view("contact_state_shift"))
+        _wire_view_btn(self.btn_view_contact_state_shift, self._on_view, "contact_state_shift")
         self.btn_track_contact_overview.clicked.connect(self._on_track_contact_overview)
-        self.btn_view_track_contact_overview.clicked.connect(lambda: self._on_view("track_contact_overview"))
+        _wire_view_btn(self.btn_view_track_contact_overview, self._on_view, "track_contact_overview")
         self.btn_browse_pretrained_clf.clicked.connect(self._browse_pretrained_clf)
         self.btn_browse_pretrained_states.clicked.connect(self._browse_pretrained_states)
         self.btn_run_apply_pretrained.clicked.connect(self._on_apply_pretrained)
@@ -4814,15 +4821,6 @@ class TrackClassificationSubTab(QWidget):
             return None
         return out / "analysis" / ct / "behavorial_trajectories" / f"classifier_{ct}.pkl"
 
-    def _track_applied_path(self, ct: str) -> Optional[Path]:
-        out = self._out_dir()
-        if not out:
-            return None
-        return (
-            out / "analysis" / ct / "behavorial_trajectories"
-            / f"BEHAV3D_{ct}_track_clusters.csv"
-        )
-
     def _state_adata_path(self, ct: str) -> Optional[Path]:
         """Path to the behavioral states h5ad produced by State Classification."""
         out = self._out_dir()
@@ -5193,21 +5191,15 @@ class TrackClassificationSubTab(QWidget):
         ct = self._cell_type()
         if not ct:
             for btn in (
-                self.btn_view_track, self.btn_view_train_track,
-                self.btn_view_apply_track, self.btn_view_exemplars,
+                self.btn_view_exemplars,
                 self.btn_view_diagnostics, self.btn_view_track_proportions,
                 self.btn_view_window_transitions,
                 self.btn_view_track_condition_comparison, self.btn_view_contact_analysis,
                 self.btn_view_contact_state_shift, self.btn_view_track_contact_overview,
+                self.btn_view_duration_comparison,
             ):
                 btn.setEnabled(False)
             return
-        adata_path = self._track_adata_path(ct)
-        self.btn_view_track.setEnabled(bool(adata_path and adata_path.exists()))
-        clf_path = self._track_classifier_path(ct)
-        self.btn_view_train_track.setEnabled(bool(clf_path and clf_path.exists()))
-        app_path = self._track_applied_path(ct)
-        self.btn_view_apply_track.setEnabled(bool(app_path and app_path.exists()))
         out = self._out_dir()
         traj_dir = (out / "analysis" / ct / "behavorial_trajectories") if out else None
         self.btn_view_exemplars.setEnabled(
@@ -7139,26 +7131,14 @@ class TrackClassificationSubTab(QWidget):
 
     # ── View helpers ─────────────────────────────────────────────────────
 
-    def _on_view(self, kind: str):
+    def _on_view(self, kind: str, btn: Optional[QPushButton] = None):
         ct = self._cell_type()
         if not ct:
             return
         out = self._out_dir()
         traj_dir = (out / "analysis" / ct / "behavorial_trajectories") if out else None
         candidates = []
-        if kind == "track_adata":
-            p = self._track_adata_path(ct)
-            if p:
-                candidates = [(f"Track adata ({ct})", p)]
-        elif kind == "track_classifier":
-            p = self._track_classifier_path(ct)
-            if p:
-                candidates = [(f"Track classifier ({ct})", p)]
-        elif kind == "track_applied":
-            p = self._track_applied_path(ct)
-            if p:
-                candidates = [(f"Track clusters CSV ({ct})", p)]
-        elif kind == "track_exemplars" and traj_dir:
+        if kind == "track_exemplars" and traj_dir:
             exemplar_dir = traj_dir / "example_tracks"
             candidates = [
                 (f.relative_to(exemplar_dir).as_posix(), f)
@@ -7224,7 +7204,10 @@ class TrackClassificationSubTab(QWidget):
             for lbl, path in existing:
                 act = menu.addAction(f"👁  {lbl}")
                 act.triggered.connect(lambda _=False, _p=path: self._open_result(_p))
-            menu.exec_()
+            if btn is not None:
+                menu.exec_(btn.mapToGlobal(btn.rect().bottomLeft()))
+            else:
+                menu.exec_()
 
     def _open_result(self, path: Path):
         if not path.suffix.lower() == ".pdf":
