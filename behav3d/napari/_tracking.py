@@ -31,6 +31,8 @@ from qtpy.QtCore import Qt, Signal
 from behav3d.napari._widgets import (
     make_help_row,
     HelpButton,
+    HelpSection,
+    IllustratedHelpButton,
     browse_file_or_zarr,
     prompt_axis_order,
     resolve_external_path,
@@ -610,41 +612,65 @@ class CellTypeTrackingPanel(QWidget):
         self.combo_method.setCurrentIndex(idx_map.get(saved_method, 0))
         method_layout.addWidget(QLabel("Method:"))
         method_layout.addWidget(self.combo_method)
-        method_layout.addWidget(HelpButton(
+        # The three propagation variants differ in ways a paragraph describes
+        # poorly, so each carries a schematic instead (behav3d/resources/tracking/).
+        method_layout.addWidget(IllustratedHelpButton(
             "Tracking Method",
-            "LAP (laptrack) — links detections frame-to-frame by solving "
-            "a Linear Assignment Problem on distance costs. Supports gap "
-            "closing, merging and splitting.\n\n"
-            "TrackPy — Crocker-Grier style nearest-neighbour linker with "
-            "an adaptive search range; simple and fast, no merge/split "
-            "support.\n\n"
-            "Fragmentation Tracking — no tunable parameters; identifies objects by "
-            "spatial overlap/propagation instead of frame-to-frame "
-            "linking cost.\n\n"
-            "Bounded Propagation — the same watershed propagation "
-            "as Fragmentation Tracking, but a track ID can never span more than one "
-            "physically disconnected region. Before watershed runs, the "
-            "current frame's mask is split into its own connected regions "
-            "and every existing track picks whichever region its previous "
-            "footprint overlaps most (more than one track can pick the same "
-            "region). A track's seed is discarded outside its chosen region, "
-            "so an uncontested region is simply inherited whole, a region "
-            "multiple tracks chose is still split between them, and any "
-            "region no track chose becomes a new track.\n\n"
-            "Reporter Propagation — for near-static objects whose "
-            "segmentation is unreliable/intermittent over time (flickers "
-            "on and off): pools every segment detected at every timepoint, "
-            "groups together any that spatially overlap each other "
-            "(regardless of how far apart in time), and for each group uses "
-            "the single LARGEST detected instance as that object's mask — "
-            "stamped onto every timepoint of the video unchanged. No frame-"
-            "to-frame linking or gap parameter needed, since grouping is "
-            "purely spatial.\n\n"
-            "btrack (Bayesian) — Kalman-filter based tracker with an "
-            "optional global hypothesis optimizer for resolving merges, "
-            "splits and false positives.\n\n"
-            "Import tracking — load pre-computed track IDs from an "
-            "existing tracks file instead of running a tracker."
+            [
+                HelpSection(
+                    "LAP (laptrack)",
+                    "Links detections frame-to-frame by solving a Linear "
+                    "Assignment Problem on distance costs. Supports gap "
+                    "closing, merging and splitting.",
+                ),
+                HelpSection(
+                    "TrackPy",
+                    "Crocker-Grier style nearest-neighbour linker with an "
+                    "adaptive search range; simple and fast, no merge/split "
+                    "support.",
+                ),
+                HelpSection(
+                    "Fragmentation Tracking",
+                    "No tunable parameters. Objects are identified by spatial "
+                    "overlap between frames rather than a linking cost, so one "
+                    "identity survives fragmentation and fusion — which is what "
+                    "lets death-dye signal be quantified while an organoid "
+                    "breaks apart or merges.",
+                    "tracking/fragmentation_tracking.png",
+                ),
+                HelpSection(
+                    "Bounded Propagation",
+                    "The same overlap propagation, but a track ID can never span "
+                    "more than one physically disconnected region: each frame's "
+                    "mask is split into its connected regions first and every "
+                    "existing track claims whichever region its previous footprint "
+                    "overlaps most. Identities that start out merged are recovered "
+                    "as distinct tracks once the objects separate.",
+                    "tracking/bounded_propagation.png",
+                ),
+                HelpSection(
+                    "Reporter Propagation",
+                    "For near-static objects whose segmentation flickers on and "
+                    "off with a fluctuating reporter. Every segment detected at "
+                    "any timepoint is pooled, spatially overlapping ones are "
+                    "grouped regardless of how far apart in time they are, and "
+                    "the largest instance of each group is stamped onto every "
+                    "timepoint. No linking or gap parameters, since grouping is "
+                    "purely spatial.",
+                    "tracking/reporter_propagation.png",
+                ),
+                HelpSection(
+                    "btrack (Bayesian)",
+                    "Kalman-filter based tracker with an optional global "
+                    "hypothesis optimizer for resolving merges, splits and "
+                    "false positives.",
+                ),
+                HelpSection(
+                    "Import tracking",
+                    "Load pre-computed track IDs from an existing tracks file "
+                    "instead of running a tracker.",
+                ),
+            ],
         ))
         method_layout.addStretch()
         method_group.setLayout(method_layout)
