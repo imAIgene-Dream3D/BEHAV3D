@@ -17,7 +17,7 @@ identically to propagation tracking (watershed of the label mask seeded by
 the previous frame's sub-labels).
 
 Operations that process each timepoint independently (``merge_labels``,
-``delete_label``, ``delete_labels``, ``fill_label``) accept an optional
+``delete_label``, ``delete_labels``, ``fill_holes``) accept an optional
 ``n_workers`` argument and dispatch frames via :class:`ThreadPoolExecutor`
 (numpy/skimage ops release the GIL so true parallel CPU utilisation is
 achieved).  When ``n_workers`` is ``None`` the function uses one worker per
@@ -32,6 +32,7 @@ from functools import partial
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+from scipy import ndimage
 from skimage.filters import threshold_otsu
 from skimage.morphology import binary_erosion
 from skimage.segmentation import expand_labels, watershed
@@ -1220,7 +1221,7 @@ def delete_labels(
     )
 
 
-def fill_label(
+def fill_holes(
     buf,
     label_id: int,
     t_range: Optional[Tuple[int, int]] = None,
@@ -1257,13 +1258,13 @@ def fill_label(
         from scipy.ndimage import binary_fill_holes as _fill_holes
     except ImportError as exc:  # pragma: no cover
         raise ImportError(
-            "fill_label requires scipy.  Install it with: pip install scipy"
+            "fill_holes requires scipy.  Install it with: pip install scipy"
         ) from exc
 
     label_id = int(label_id)
     if t_range is None:
         f, l = lifetime_of(buf, label_id)
-        if f is None:
+        if f is None or l is None:
             raise ValueError(f"label {label_id} not present anywhere in the volume")
         t_range = (f, l)
     t0, t1 = _normalize_t_range(buf, t_range)
@@ -1311,19 +1312,306 @@ def fill_label(
 
     if not _found_any:
         return OpResult(
-            name="fill",
+            name="fill_holes",
             new_frames={},
             affected_labels=[label_id],
             new_labels=[],
-            summary=f"Fill label {label_id}: no frames contained the label",
+            summary=f"Fill holes in label {label_id}: no frames contained the label",
         )
 
     return OpResult(
-        name="fill",
+        name="fill_holes",
         new_frames=new_frames,
         affected_labels=[label_id],
         new_labels=[],
         summary=(
             f"Filled label {label_id}: plugged holes in {len(new_frames)} frame(s)"
         ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fill temporal gaps (interpolation across missing timepoints)
+# ---------------------------------------------------------------------------
+def _bbox_slices(mask: np.ndarray):
+    """Return a tuple of slices for the tight bounding box of ``mask``.
+
+    ``mask`` must contain at least one True voxel.
+    """
+    coords = np.array(np.nonzero(mask))
+    mins = coords.min(axis=1)
+    maxs = coords.max(axis=1) + 1
+    return mins, maxs
+
+
+def _interpolate_mask(
+    mask_before: np.ndarray,
+    mask_after: np.ndarray,
+    num_steps: int,
+) -> List[np.ndarray]:
+    """Interpolate between two binary masks via signed-distance blending.
+
+    Both masks are aligned to a shared, linearly-interpolated centroid and then
+    blended in signed-distance space, so the result is a real shape morph rather
+    than a hard switch between the two endpoints.
+
+    Performance: all geometric work (centroid shift, distance transform, blend)
+    is restricted to a padded bounding box around the union of the two masks.
+    Cells occupy a tiny fraction of a ``Z x Y x X`` volume, so this is typically
+    one to two orders of magnitude faster than operating on the full frame, and
+    the ``> 0`` threshold near the object is unchanged as long as the padding
+    exceeds the centroid displacement plus the number of interpolation steps.
+
+    Returns a list of ``num_steps`` float32 masks (values 0.0 / 1.0), each the
+    same shape as the inputs.
+    """
+    if num_steps <= 0:
+        return []
+
+    full_shape = mask_before.shape
+    union = mask_before | mask_after
+    if not union.any():
+        return [np.zeros(full_shape, dtype=np.float32) for _ in range(num_steps)]
+
+    # Exact-equality fast path — morphing a shape into itself is a no-op.
+    if np.array_equal(mask_before, mask_after):
+        return [mask_before.astype(np.float32) for _ in range(num_steps)]
+
+    com_before = (
+        np.array(ndimage.center_of_mass(mask_before)) if mask_before.any() else None
+    )
+    com_after = (
+        np.array(ndimage.center_of_mass(mask_after)) if mask_after.any() else None
+    )
+
+    # ---- Restrict to a padded bounding box around the union --------------
+    mins, maxs = _bbox_slices(union)
+    if com_before is not None and com_after is not None:
+        shift_pad = int(np.ceil(np.abs(com_after - com_before).max())) + 2
+    else:
+        shift_pad = 2
+    pad = shift_pad + max(1, int(num_steps))
+    lo = np.maximum(mins - pad, 0)
+    hi = np.minimum(maxs + pad, full_shape)
+    sl = tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))
+
+    mb = mask_before[sl]
+    ma = mask_after[sl]
+
+    def signed_distance(mask: np.ndarray) -> np.ndarray:
+        inside = ndimage.distance_transform_edt(mask)
+        outside = ndimage.distance_transform_edt(~mask)
+        return inside - outside
+
+    n = num_steps + 1
+    interpolated: List[np.ndarray] = []
+    for i in range(1, n):
+        alpha = i / n
+        if com_before is not None and com_after is not None:
+            target_com = (1 - alpha) * com_before + alpha * com_after
+            shifted_before = (
+                ndimage.shift(mb.astype(np.float32), target_com - com_before, order=0)
+                >= 0.5
+            )
+            shifted_after = (
+                ndimage.shift(ma.astype(np.float32), target_com - com_after, order=0)
+                >= 0.5
+            )
+        else:
+            shifted_before, shifted_after = mb, ma
+
+        sdf_interp = (1 - alpha) * signed_distance(shifted_before) + alpha * signed_distance(
+            shifted_after
+        )
+        out = np.zeros(full_shape, dtype=np.float32)
+        out[sl] = (sdf_interp > 0).astype(np.float32)
+        interpolated.append(out)
+
+    return interpolated
+
+
+def fill_gaps(
+    buf,
+    label_id: int,
+    t_range: Optional[Tuple[int, int]] = None,
+    max_gap_size: int = 5,
+    n_workers: Optional[int] = None,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+) -> OpResult:
+    """Fill temporal gaps in a label's lifetime via mask interpolation.
+
+    If a label disappears for one or more consecutive frames and then
+    reappears, the missing frames are reconstructed by interpolating the binary
+    mask between the last frame before the gap and the first frame after it (see
+    :func:`_interpolate_mask`).
+
+    Only background voxels (``== 0``) are ever written — other labels are never
+    overwritten.  A gap whose interpolated mask would overlap another label is
+    reported as *conflicted* and left untouched (it usually needs a Split).
+
+    Parameters
+    ----------
+    buf:
+        An :class:`~behav3d.editing.edit_buffer.EditBuffer` instance.
+    label_id:
+        The label whose gaps are to be filled.
+    t_range:
+        Inclusive ``(t_first, t_last)`` range.  Defaults to the label's full
+        lifetime.
+    max_gap_size:
+        Maximum number of missing timepoints to interpolate.  A gap with
+        ``<= max_gap_size`` missing frames is filled; a larger gap is skipped
+        and listed in the summary (a long gap usually indicates a tracking /
+        merge error, not a true short dropout).
+    n_workers:
+        Number of worker threads used to process gaps in parallel.  Defaults to
+        ``os.cpu_count()``.
+    progress_cb:
+        Optional ``(current, total)`` progress callback.
+    """
+    label_id = int(label_id)
+    max_gap_size = max(1, int(max_gap_size))
+
+    if t_range is None:
+        f, l = lifetime_of(buf, label_id)
+        if f is None or l is None:
+            raise ValueError(f"label {label_id} not present anywhere in the volume")
+        t_range = (f, l)
+    t0, t1 = _normalize_t_range(buf, t_range)
+
+    # ---- Pass 1: presence scan (each frame read once, not retained) -----
+    _scan_total = t1 - t0 + 1
+    present: Dict[int, bool] = {}
+    for _i, t in enumerate(range(t0, t1 + 1), start=1):
+        present[t] = bool((buf.peek(t) == label_id).any())
+        if progress_cb:
+            progress_cb(_i, _scan_total + 1)
+
+    # ---- Continuous segments where the label exists --------------------
+    segments: List[Tuple[int, int]] = []
+    seg_start: Optional[int] = None
+    for t in range(t0, t1 + 1):
+        if present[t] and seg_start is None:
+            seg_start = t
+        elif not present[t] and seg_start is not None:
+            segments.append((seg_start, t - 1))
+            seg_start = None
+    if seg_start is not None:
+        segments.append((seg_start, t1))
+
+    if len(segments) < 2:
+        if progress_cb:
+            progress_cb(_scan_total + 1, _scan_total + 1)
+        return OpResult(
+            name="fill_gaps",
+            new_frames={},
+            affected_labels=[label_id],
+            new_labels=[],
+            summary=f"Fill gaps in label {label_id}: no gaps found",
+        )
+
+    # ---- Classify gaps by size ----------------------------------------
+    gaps: List[Tuple[int, int]] = []
+    big_gaps: List[Tuple[int, int]] = []
+    for i in range(len(segments) - 1):
+        gap_start = segments[i][1] + 1
+        gap_end = segments[i + 1][0] - 1
+        if gap_start <= gap_end:
+            if (gap_end - gap_start + 1) > max_gap_size:
+                big_gaps.append((gap_start, gap_end))
+            else:
+                gaps.append((gap_start, gap_end))
+
+    # ---- Read only the frames referenced by fillable gaps -------------
+    needed: set = set()
+    for gap_start, gap_end in gaps:
+        needed.update(range(gap_start - 1, gap_end + 2))
+    frames: Dict[int, np.ndarray] = {t: buf.peek(t) for t in sorted(needed)}
+
+    conflicted_gaps: List[Tuple[int, int]] = []
+
+    def _process_gap(gap: Tuple[int, int]):
+        gap_start, gap_end = gap
+        mask_before = frames[gap_start - 1] == label_id
+        mask_after = frames[gap_end + 1] == label_id
+        num = gap_end - gap_start + 1
+        interpolated = _interpolate_mask(mask_before, mask_after, num)
+        out_frames: Dict[int, np.ndarray] = {}
+        for idx, t in enumerate(range(gap_start, gap_end + 1)):
+            binary = interpolated[idx] >= 0.5
+            frame_t = frames[t]
+            if ((frame_t != 0) & (frame_t != label_id) & binary).any():
+                return gap, "conflict", {}
+            eligible = (frame_t == 0) & binary
+            if eligible.any():
+                out = frame_t.copy()
+                out[eligible] = label_id
+                out_frames[t] = out
+        return gap, "ok", out_frames
+
+    new_frames: Dict[int, np.ndarray] = {}
+    if gaps:
+        _nw = min(
+            max(1, int(n_workers)) if n_workers else (os.cpu_count() or 1),
+            len(gaps),
+        )
+        _done = 0
+        with ThreadPoolExecutor(max_workers=_nw) as ex:
+            for gap, status, out_frames in ex.map(_process_gap, gaps):
+                _done += 1
+                if progress_cb:
+                    progress_cb(
+                        _scan_total + int(_done / max(1, len(gaps))),
+                        _scan_total + 1,
+                    )
+                if status == "conflict":
+                    conflicted_gaps.append(gap)
+                else:
+                    new_frames.update(out_frames)
+    if progress_cb:
+        progress_cb(_scan_total + 1, _scan_total + 1)
+
+    filled_gaps = [
+        g
+        for g in gaps
+        if g not in conflicted_gaps
+        and any(t in new_frames for t in range(g[0], g[1] + 1))
+    ]
+
+    if not new_frames:
+        summary = f"Fill gaps in label {label_id}: "
+        if conflicted_gaps:
+            summary += (
+                f"all gaps conflict with other labels (require split): "
+                f"{conflicted_gaps}"
+            )
+        else:
+            summary += "no gaps to fill"
+        if big_gaps:
+            summary += (
+                f"; gaps larger than {max_gap_size} timepoint(s) skipped: {big_gaps}"
+            )
+        return OpResult(
+            name="fill_gaps",
+            new_frames={},
+            affected_labels=[label_id],
+            new_labels=[],
+            summary=summary,
+        )
+
+    summary = (
+        f"Filled {len(filled_gaps)} gap(s) in label {label_id} "
+        f"across {len(new_frames)} frame(s) via interpolation"
+    )
+    if big_gaps:
+        summary += f"; gaps larger than {max_gap_size} timepoint(s) skipped: {big_gaps}"
+    if conflicted_gaps:
+        summary += f"; conflicts with other labels (require split): {conflicted_gaps}"
+
+    return OpResult(
+        name="fill_gaps",
+        new_frames=new_frames,
+        affected_labels=[label_id],
+        new_labels=[],
+        summary=summary,
     )
