@@ -769,7 +769,7 @@ class CellTypeFeaturePanel(QWidget):
         md = metadata_loader.metadata
         self._has_dead = False
         if md is not None:
-            self._has_dead = (
+            self._has_dead = bool(
                 "dead_channel" in md.columns and md["dead_channel"].notna().any()
             )
 

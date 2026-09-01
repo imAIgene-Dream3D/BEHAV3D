@@ -300,17 +300,32 @@ class SegmentationTab(QWidget):
         self._on_metadata_updated()
 
     def _on_metadata_updated(self):
-        """Trigger updates in sub-widgets."""
-        if hasattr(self, 'pixel_classifier_page'):
-            self.pixel_classifier_page._on_metadata_updated()
-        self.cellpose_page._on_metadata_updated()
-        if hasattr(self, 'cellpose_sam_page'):
-            self.cellpose_sam_page._on_metadata_updated()
-        self.import_page._on_metadata_updated()
-        if hasattr(self, 'apoc_page'):
-            self.apoc_page._on_metadata_updated()
-        if hasattr(self, 'convpaint_page'):
-            self.convpaint_page._on_metadata_updated()
+        """Trigger updates in sub-widgets.
+
+        Each sub-page's refresh is isolated in its own try/except: these
+        pages are otherwise independent, so a bug in one (e.g. a stray
+        numpy.bool_ handed to a Qt setter) must not silently prevent every
+        page after it from ever rebuilding — that previously left the APOC/
+        ConvPaint training panels stuck on their "load metadata" placeholder
+        with no visible error, since a PyQt slot exception only prints to
+        the console rather than the in-app log.
+        """
+        pages = [
+            ('pixel_classifier_page', getattr(self, 'pixel_classifier_page', None)),
+            ('cellpose_page', self.cellpose_page),
+            ('cellpose_sam_page', getattr(self, 'cellpose_sam_page', None)),
+            ('import_page', self.import_page),
+            ('apoc_page', getattr(self, 'apoc_page', None)),
+            ('convpaint_page', getattr(self, 'convpaint_page', None)),
+        ]
+        for name, page in pages:
+            if page is None:
+                continue
+            try:
+                page._on_metadata_updated()
+            except Exception as e:
+                traceback.print_exc()
+                self._log(f"⚠️ {name} failed to refresh after metadata update: {e}")
 
     def _log(self, msg):
         import datetime
@@ -6731,6 +6746,13 @@ class APOCWidget(QWidget):
         # Apply import
         self._training_widget.apply_import(meta, data_by_celltype, cell_type_mapping, source_path=path)
 
+        # Imported training data is usable on its own (training reads
+        # directly from ``_imported_training_data``), so unlock the
+        # feature-selection UI and training controls just like Generate
+        # Training Data does.
+        self._is_session_active = True
+        self._update_training_controls_state()
+
         # Persist import path to YAML
         pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
         pc["apoc_imported_training_path"] = str(path)
@@ -7002,6 +7024,10 @@ class APOCWidget(QWidget):
             self._training_widget.apply_import(
                 meta, data_by_celltype, cell_type_mapping, source_path=saved_path
             )
+            # Restoring a saved import also makes the classifier trainable,
+            # same as a fresh manual import — unlock the UI accordingly.
+            self._is_session_active = True
+            self._update_training_controls_state()
             self._update_import_panel()
             self.log(f"↩ Restored import from {saved_path}")
         except Exception as exc:

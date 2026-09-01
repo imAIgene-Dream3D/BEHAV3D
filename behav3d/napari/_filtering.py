@@ -74,7 +74,9 @@ class CellTypeFilterPanel(QWidget):
         md = metadata_loader.metadata
         self._has_dead = False
         if md is not None:
-            self._has_dead = "dead_channel" in md.columns and md["dead_channel"].notna().any()
+            self._has_dead = bool(
+                "dead_channel" in md.columns and md["dead_channel"].notna().any()
+            )
 
         # Read saved config
         params = self.metadata_loader.behav3d_parameters

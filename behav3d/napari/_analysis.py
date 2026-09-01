@@ -123,7 +123,7 @@ def _detect_cell_types(metadata_loader):
 
 
 def _has_dead_channel(metadata) -> bool:
-    return (
+    return bool(
         metadata is not None
         and "dead_channel" in metadata.columns
         and metadata["dead_channel"].notna().any()
