@@ -5514,6 +5514,9 @@ class TrackClassificationSubTab(QWidget):
             if _traj_dir.exists():
                 rmtree_ignore_missing(_traj_dir)
             from behav3d.analysis.behavior.track.feature_dtw import run_tcell_analysis
+            # contact_cols left as None → the preset auto-detects every raw
+            # `*_contact` column (each organoid and each other cell type) and
+            # uses each as its own scaled DTW feature.
             return run_tcell_analysis(
                 output_dir=str(out) if out else "",
                 cell_type=ct,

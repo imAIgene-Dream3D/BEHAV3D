@@ -23,6 +23,22 @@ from matplotlib.backends.backend_pdf import PdfPages
 import seaborn as sns
 
 
+def _norm_track_id(value) -> str:
+    """Canonical string form of a track id.
+
+    ``contact_events_*.csv`` writes ``target_track_ids`` through a float
+    round-trip, so an id can arrive as ``"1.0"`` while the track-feature
+    tables hold ``"1"``. These are joined as plain strings, so without
+    normalising, every float-formatted id silently fails to match and the
+    row is dropped as ``organoid_type == "unknown"``. Strip the redundant
+    ``.0`` so both sides agree.
+    """
+    s = str(value).strip()
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers: line-condition grouping and absolute analysis-time window.
 #
@@ -2120,7 +2136,7 @@ def _load_active_killing_data(
         for _, row in (
             df_org[["sample_name", "TrackID"]].drop_duplicates().iterrows()
         ):
-            key = (str(row["sample_name"]), str(row["TrackID"]))
+            key = (str(row["sample_name"]), _norm_track_id(row["TrackID"]))
             track_type_map.setdefault(key, org_type)
 
     all_events: list = []
@@ -2184,6 +2200,7 @@ def _load_active_killing_data(
                     df_tp_kill["targeted_track_id"] = (
                         df_tp_kill["targeted_track_id"]
                         .astype(float).astype("Int64").astype(str)
+                        .map(_norm_track_id)
                     )
                     per_target_kill = (
                         df_tp_kill.groupby(
@@ -2199,7 +2216,7 @@ def _load_active_killing_data(
             df_ev["target_track_ids"].astype(str).str.split(",")
         )
         df_ex = df_ev.explode("_targets")
-        df_ex["target_track_id"] = df_ex["_targets"].str.strip()
+        df_ex["target_track_id"] = df_ex["_targets"].map(_norm_track_id)
         df_ex = df_ex[
             df_ex["target_track_id"].ne("")
             & df_ex["target_track_id"].ne("nan")
@@ -2250,7 +2267,7 @@ def _load_active_killing_data(
     ):
         ts = track_summary[["sample_name", "TrackID", "fate"]].copy()
         ts["sample_name"] = ts["sample_name"].astype(str)
-        ts["TrackID"] = ts["TrackID"].astype(str)
+        ts["TrackID"] = ts["TrackID"].map(_norm_track_id)
         df_all["sample_name"] = df_all["sample_name"].astype(str)
         df_all["target_track_id"] = df_all["target_track_id"].astype(str)
         df_all = df_all.merge(

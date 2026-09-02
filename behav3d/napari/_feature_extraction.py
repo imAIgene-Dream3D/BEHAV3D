@@ -2990,6 +2990,13 @@ class ActiveKillingPanel(QWidget):
             "observation_window": int(self.spin_obs_window.value()),
             "death_signal_column": self.death_signal_combo.currentText(),
             "killing_threshold_multiplier": float(self.spin_threshold_mult.value()),
+            # Persist the checkbox state alongside the value. ``_persist()``
+            # merges this dict into the saved config, and the checkbox is
+            # restored from ``use_absolute_threshold`` - so without this key a
+            # stale ``false`` would survive every save and silently switch a
+            # run configured for the absolute threshold back to the relative
+            # multiplier on the next reload.
+            "use_absolute_threshold": self.check_abs_threshold.isChecked(),
             "absolute_killing_threshold": (
                 float(self.spin_abs_threshold.value())
                 if self.check_abs_threshold.isChecked() else None
