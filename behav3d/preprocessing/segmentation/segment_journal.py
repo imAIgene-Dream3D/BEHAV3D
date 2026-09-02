@@ -170,8 +170,15 @@ def journal_complete(journal: Optional[dict], requested_timepoints=None) -> bool
     """True when *journal* vouches for every timepoint that would be written.
 
     With *requested_timepoints* given (an explicit list), every one must be in
-    ``done``. Without it, fall back to "done covers the full T axis" from the
-    recorded shape - the check preflight can make before it knows the range.
+    ``done``. Without it, fall back to "every index ``0..t_total-1`` is present"
+    from the recorded shape - the check preflight can make before it knows the
+    range.
+
+    The fallback checks the actual indices, not just ``len(done) >= t_total``: a
+    malformed journal whose ``done`` carries an out-of-range or spurious value
+    could hit that count while still missing a real frame. In keeping with this
+    module's stance, such a journal must read as *partial* (recompute) and never
+    as *complete* (skip).
 
     A complete array is never resumed into, so a fingerprint disagreement about
     it is moot: nothing new is written, nothing is mixed.
@@ -184,7 +191,9 @@ def journal_complete(journal: Optional[dict], requested_timepoints=None) -> bool
         return all(int(t) in done for t in req)
     shape = journal.get("shape") or []
     t_total = int(shape[0]) if shape else 0
-    return bool(t_total) and len(done) >= t_total
+    if not t_total or len(done) < t_total:
+        return False
+    return all(t in done for t in range(t_total))
 
 
 def journal_state(out_zarr):
@@ -196,9 +205,10 @@ def journal_state(out_zarr):
     Returns ``(state, n_done, t_total)`` where *state* is:
 
     ``"complete"``
-        The journal vouches for every timepoint.
+        The journal vouches for every timepoint index ``0..t_total-1``.
     ``"partial"``
-        An interrupted run, or one whose settings changed part-way through a range.
+        An interrupted run, one whose settings changed part-way through a range,
+        or a journal whose ``done`` does not cleanly cover every index.
     ``"unknown"``
         No usable journal. The array may be perfectly fine - it simply predates this
         bookkeeping, so nothing can be asserted about it.
@@ -214,7 +224,7 @@ def journal_state(out_zarr):
     shape = journal.get("shape") or []
     t_total = int(shape[0]) if shape else 0
     n_done = len(journal.get("done") or ())
-    if t_total and n_done >= t_total:
+    if t_total and journal_complete(journal):
         return ("complete", n_done, t_total)
     return ("partial", n_done, t_total)
 

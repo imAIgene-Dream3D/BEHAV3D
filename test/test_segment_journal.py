@@ -268,6 +268,23 @@ def test_journal_complete_helper():
     assert not journal_complete(None)
 
 
+def test_journal_complete_rejects_a_hole_masked_by_a_stray_index():
+    """A malformed done list with the right length but a real gap reads partial."""
+    j = new_journal("fp1", (4, 1, 2, 2))
+    j["done"] = [0, 1, 2, 9]  # count is 4, but frame 3 was never written
+    assert not journal_complete(j)
+    assert not journal_complete(j, None)
+
+
+def test_journal_state_rejects_a_hole_masked_by_a_stray_index(case_dir):
+    z = case_dir / "a.zarr"
+    _make_zarr(z, shape=(4, 1, 2, 2))
+    j = new_journal("fp1", (4, 1, 2, 2))
+    j["done"] = [0, 1, 2, 9]
+    write_journal(journal_path(z), j)
+    assert journal_state(z)[0] == "partial"
+
+
 def test_plan_overwrite_ignores_the_journal_entirely(case_dir):
     """Overwrite means redo; a stale fingerprint is not an error there."""
     z = case_dir / "a.zarr"
