@@ -17,6 +17,7 @@ from behav3d.preprocessing.segmentation.segment_journal import (
     check_fingerprint,
     describe_state,
     file_fingerprint,
+    journal_complete,
     journal_path,
     journal_state,
     mark_done,
@@ -235,6 +236,38 @@ def test_plan_raises_on_changed_settings(case_dir):
         _plan(z, (4, 1, 2, 2), "fp_new")
 
 
+def test_plan_complete_journal_skips_despite_changed_settings(case_dir):
+    """A finished array is never written into, so a stale fingerprint is moot."""
+    z = case_dir / "a.zarr"
+    _make_zarr(z, shape=(4, 1, 2, 2))
+    write_journal(journal_path(z),
+                  new_journal("fp_old", (4, 1, 2, 2), done=[0, 1, 2, 3]))
+    plan = _plan(z, (4, 1, 2, 2), "fp_new")  # must not raise
+    assert plan.complete
+
+
+def test_plan_partial_requested_range_complete_skips_despite_settings(case_dir):
+    """done covers the *requested* sub-range even though the array is not full."""
+    z = case_dir / "a.zarr"
+    _make_zarr(z, shape=(4, 1, 2, 2))
+    write_journal(journal_path(z),
+                  new_journal("fp_old", (4, 1, 2, 2), done=[0, 1]))
+    plan = _plan(z, (4, 1, 2, 2), "fp_new", timepoint_range=(0, 1),
+                 requested_timepoints=[0, 1])
+    assert plan.complete
+
+
+def test_journal_complete_helper():
+    j = new_journal("fp1", (4, 1, 2, 2), done=[0, 1, 2, 3])
+    assert journal_complete(j)                      # shape fallback
+    assert journal_complete(j, [1, 3])              # explicit subset
+    partial = new_journal("fp1", (4, 1, 2, 2), done=[0, 1])
+    assert not journal_complete(partial)
+    assert journal_complete(partial, [0, 1])
+    assert not journal_complete(partial, [0, 1, 2])
+    assert not journal_complete(None)
+
+
 def test_plan_overwrite_ignores_the_journal_entirely(case_dir):
     """Overwrite means redo; a stale fingerprint is not an error there."""
     z = case_dir / "a.zarr"
@@ -296,6 +329,22 @@ def test_preflight_collects_every_conflict(case_dir):
     msg = str(exc.value)
     assert "a segments for S1" in msg and "b segments for S1" in msg
     assert "Nothing has been modified." in msg
+
+
+def test_preflight_skips_complete_arrays_with_changed_settings(case_dir):
+    """Only the partial array is a real resume; the complete one is just skipped."""
+    entries = []
+    for name, done in (("done", [0, 1, 2, 3]), ("partial", [0])):
+        z = case_dir / f"{name}.zarr"
+        _make_zarr(z, shape=(4, 1, 2, 2))
+        write_journal(journal_path(z), new_journal("fp_old", (4, 1, 2, 2), done=done))
+        entries.append((z, (4, 1, 2, 2), "uint16", "fp_new", f"{name} segments for S1"))
+
+    conflicts = preflight_conflicts(
+        entries, overwrite_existing=False, timepoint_range=None,
+        requested_timepoints=[0, 1, 2, 3],
+    )
+    assert [label for label, _ in conflicts] == ["partial segments for S1"]
 
 
 def test_preflight_is_silent_under_overwrite(case_dir):

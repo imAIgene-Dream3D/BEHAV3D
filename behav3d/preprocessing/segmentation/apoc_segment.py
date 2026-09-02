@@ -296,6 +296,20 @@ def _cfg_val(cfg, ct, key, default):
     return default if val is None else val
 
 
+def _requested_timepoints(n_timepoints, timepoint_range):
+    """Explicit list of global T indices a run will touch.
+
+    ``None`` means the whole stack; a ``range``/``list`` is taken as-is; an
+    ``(start, end)`` tuple is inclusive of *end*.
+    """
+    if timepoint_range is None:
+        return list(range(n_timepoints))
+    if isinstance(timepoint_range, (range, list)):
+        return list(timepoint_range)
+    s, e = timepoint_range
+    return list(range(s, e + 1))
+
+
 # ---------------------------------------------------------------------------
 # Resume fingerprints
 # ---------------------------------------------------------------------------
@@ -473,6 +487,7 @@ def run_apoc_segmentation(
                 shape = (probe.shape[0],) + tuple(probe.shape[2:])
             except Exception:
                 continue  # unreadable input is the main loop's problem to report
+            requested_tps = _requested_timepoints(shape[0], timepoint_range)
             img_dir = output_dir / "images" / sample_name
             entries = []
             for ct in active_cell_types:
@@ -499,6 +514,7 @@ def run_apoc_segmentation(
                 entries,
                 overwrite_existing=overwrite_existing,
                 timepoint_range=timepoint_range,
+                requested_timepoints=requested_tps,
             ))
         raise_for_conflicts(conflicts, "APOC")
 
@@ -528,15 +544,7 @@ def run_apoc_segmentation(
         n_timepoints = img.shape[0]
 
         # Timepoint progress via tqdm (per-sample)
-        if timepoint_range is not None:
-            if isinstance(timepoint_range, (range, list)):
-                t_range = list(timepoint_range)
-            else:
-                # Handle old tuple (start, end)
-                s, e = timepoint_range
-                t_range = list(range(s, e + 1))
-        else:
-            t_range = list(range(n_timepoints))
+        t_range = _requested_timepoints(n_timepoints, timepoint_range)
 
         # Spatial shape for output arrays — needed before the skip decisions, which
         # compare the shape on disk against what this run would write.
@@ -581,6 +589,7 @@ def run_apoc_segmentation(
             )
             mask_complete = only_segment or mask_plans[ct].complete
             if seg_plans[ct].complete and mask_complete:
+                print(f"  ⏭️ {sample_name}/{ct}: already complete — skipping")
                 continue  # nothing left to do for this cell type
             remaining_cts.append(ct)
         active_cts_for_sample = remaining_cts

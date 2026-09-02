@@ -166,6 +166,27 @@ def check_fingerprint(journal: Optional[dict], fingerprint: str, label: str) -> 
     )
 
 
+def journal_complete(journal: Optional[dict], requested_timepoints=None) -> bool:
+    """True when *journal* vouches for every timepoint that would be written.
+
+    With *requested_timepoints* given (an explicit list), every one must be in
+    ``done``. Without it, fall back to "done covers the full T axis" from the
+    recorded shape - the check preflight can make before it knows the range.
+
+    A complete array is never resumed into, so a fingerprint disagreement about
+    it is moot: nothing new is written, nothing is mixed.
+    """
+    if not journal:
+        return False
+    done = {int(t) for t in (journal.get("done") or ())}
+    req = list(requested_timepoints or ())
+    if req:
+        return all(int(t) in done for t in req)
+    shape = journal.get("shape") or []
+    t_total = int(shape[0]) if shape else 0
+    return bool(t_total) and len(done) >= t_total
+
+
 def journal_state(out_zarr):
     """Summarise how complete the array at *out_zarr* is, for the overwrite dialog.
 
@@ -279,9 +300,10 @@ def plan_output(path, shape, dtype, fingerprint: str, label: str, *,
       the range while the journal still claimed them).
     * Under ``overwrite_existing`` the journal is not consulted at all - the user
       asked for a redo, and a fingerprint disagreement is not an error.
-    * Otherwise a fingerprint disagreement *is* an error: resuming would mix frames
-      segmented under two different settings in one array. See
-      :func:`check_fingerprint`.
+    * Otherwise a fingerprint disagreement *is* an error - but only for a
+      **partial** array, the one case a run would actually resume into and so mix
+      frames from two settings. A complete array is skipped whatever its
+      fingerprint says. See :func:`check_fingerprint` and :func:`journal_complete`.
 
     An array with no journal is treated as complete for a full-range run. It may
     well be fine - it simply predates journalling - and recomputing every existing
@@ -293,11 +315,8 @@ def plan_output(path, shape, dtype, fingerprint: str, label: str, *,
     journal = None if recreate else read_journal(journal_path(path))
     legacy = (not recreate) and journal is None and path.exists()
 
-    if journal is not None:
-        if overwrite_existing:
-            journal = None
-        else:
-            check_fingerprint(journal, fingerprint, label)
+    if journal is not None and overwrite_existing:
+        journal = None
 
     done = set(journal.get("done") or ()) if journal else set()
 
@@ -306,16 +325,24 @@ def plan_output(path, shape, dtype, fingerprint: str, label: str, *,
     elif legacy:
         complete = timepoint_range is None
     else:
-        requested = list(requested_timepoints or ())
-        complete = bool(requested) and all(int(t) in done for t in requested)
+        complete = journal_complete(journal, requested_timepoints)
+
+    # A complete array is never written into, so it cannot mix two settings -
+    # skip it without consulting the fingerprint. Only a partial array that this
+    # run would actually resume into needs the settings to still match.
+    if journal is not None and not overwrite_existing and not complete:
+        check_fingerprint(journal, fingerprint, label)
 
     return ArrayPlan(recreate=recreate, done=done, complete=complete, legacy=legacy)
 
 
-def preflight_conflicts(entries, *, overwrite_existing: bool, timepoint_range) -> list:
+def preflight_conflicts(entries, *, overwrite_existing: bool, timepoint_range,
+                        requested_timepoints=None) -> list:
     """Find every array whose journal disagrees with the settings about to be used.
 
     *entries* is an iterable of ``(path, shape, dtype, fingerprint, label)``.
+    *requested_timepoints*, when given, lets an already-complete array be skipped
+    outright: nothing new is written to it, so its fingerprint cannot matter.
 
     :func:`plan_output` raises the moment it meets a mismatch, which mid-batch would
     abort a run after some samples had already been rewritten. A fingerprint depends
@@ -335,6 +362,8 @@ def preflight_conflicts(entries, *, overwrite_existing: bool, timepoint_range) -
         journal = read_journal(journal_path(path))
         if journal is None:
             continue
+        if journal_complete(journal, requested_timepoints):
+            continue  # never resumed into - a fingerprint disagreement is moot
         if journal.get("fingerprint") != fingerprint:
             conflicts.append((label, "settings changed since it was written"))
     return conflicts
