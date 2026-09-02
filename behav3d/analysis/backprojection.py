@@ -193,6 +193,35 @@ def _prepare_feature_series(df, column):
     )
 
 
+def _subset_to_sample(df, sample_name, source_label):
+    """Keep only the rows of ``df`` belonging to ``sample_name``.
+
+    Track ids restart in every sample, so any frame that is about to be keyed by
+    TrackID alone (the label-image filter, and the per-TrackID lookups in
+    ``backproject_columns``) must be narrowed to one sample first. Without this,
+    a track id present in several samples pulled in foreign rows and
+    ``_build_summary_lookup`` -- which keeps the last row per id -- could hand
+    this sample another sample's feature values.
+
+    Frames without a ``sample_name`` column are returned unchanged (with a
+    warning) so older result CSVs still load.
+    """
+    if "sample_name" not in df.columns:
+        print(
+            f"  Warning: {source_label} has no 'sample_name' column; "
+            "cannot restrict it to this sample and TrackIDs shared between "
+            "samples may resolve to the wrong rows."
+        )
+        return df
+    subset = df[df["sample_name"].astype(str) == str(sample_name)]
+    if subset.empty and not df.empty:
+        print(
+            f"  Warning: {source_label} contains no rows for sample "
+            f"'{sample_name}'."
+        )
+    return subset
+
+
 def _build_summary_lookup(lookup_df, track_col, value_col, background_value=0):
     values = _prepare_feature_series(lookup_df, value_col)
     work = lookup_df[[track_col]].copy()
@@ -807,8 +836,13 @@ def backproject_mean_features_behav3d(
     track_img_col = _find_track_image_column(df_sample, cell_type)
     track_img_path = Path(df_sample[track_img_col].values[0])
     
-    # Load clustered data (summarized - one row per track)
+    # Load clustered data (summarized - one row per track). Restrict it to this
+    # sample: everything below keys on TrackID alone, and ids repeat across
+    # samples.
     df_tracks_clustered = pd.read_csv(Path(results_outdir, f"BEHAV3D_{cell_type}_UMAP_clusters.csv"))
+    df_tracks_clustered = _subset_to_sample(
+        df_tracks_clustered, sample_name, "UMAP clusters CSV"
+    )
     
     # Load full track data (time-varying - for napari track positions)
     df_tracks_all_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features.csv")
@@ -989,19 +1023,34 @@ def backproject_time_features_behav3d(
     track_img_col = _find_track_image_column(df_sample, cell_type)
     track_img_path = Path(df_sample[track_img_col].values[0])
     
-    # Load UMAP clusters (to get ClusterID mapping)
+    # Load UMAP clusters (to get ClusterID mapping), restricted to this sample so
+    # TrackIDs shared with other samples cannot leak in through the merge below.
     df_umap_clusters = pd.read_csv(Path(results_outdir, f"BEHAV3D_{cell_type}_UMAP_clusters.csv"))
+    df_umap_clusters = _subset_to_sample(
+        df_umap_clusters, sample_name, "UMAP clusters CSV"
+    )
     
     # Load full track data (time-varying)
     df_tracks_all_path = Path(feature_outdir, f"BEHAV3D_{cell_type}_combined_track_features.csv")
     df_tracks_all = pd.read_csv(df_tracks_all_path)
     df_tracks_all = df_tracks_all[df_tracks_all["sample_name"]==sample_name]
     
-    # Merge ClusterID into time-varying data
+    # Merge ClusterID into time-varying data. Both frames are already narrowed to
+    # this sample; join on sample_name too when it is available so the key stays
+    # the (sample_name, TrackID) pair the rest of the pipeline uses.
+    cluster_merge_keys = [
+        key for key in ("sample_name", "TrackID")
+        if key in df_tracks_all.columns and key in df_umap_clusters.columns
+    ]
+    if "TrackID" not in cluster_merge_keys:
+        raise ValueError(
+            "Cannot attach ClusterID to tracks: 'TrackID' is missing from the "
+            "track features or the UMAP clusters CSV."
+        )
     df_tracks_clustered = pd.merge(
-        df_tracks_all, 
-        df_umap_clusters[["TrackID", "ClusterID"]], 
-        on='TrackID', 
+        df_tracks_all,
+        df_umap_clusters[cluster_merge_keys + ["ClusterID"]],
+        on=cluster_merge_keys,
         how='inner'  # Only keep tracks that have ClusterID
     )
     
