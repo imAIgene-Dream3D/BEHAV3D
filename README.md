@@ -6,7 +6,7 @@ It works with pretty much any 3D microscopy data, for example 3D live co-culture
 
 <p align="center">
   <img src="docs/source/_static/icons/death_dynamics.jpg" width="200" alt="Death dynamics"/>
-  <img src="docs/source/_static/icons/invasion.jpg" width="200" alt="Invasion"/>
+  <img src="docs/source/_static/icons/invasion.jpg" width="100" alt="Invasion"/>
   <img src="docs/source/_static/icons/active_killing.jpg" width="200" alt="Active killing"/>
   <img src="docs/source/_static/icons/single_cell_analysis.jpg" width="200" alt="Single cell analysis"/>
 </p>
@@ -15,7 +15,7 @@ There's no one-size-fits-all solution, so BEHAV3D-Explorer is built as a set of 
 
 📖 [Full wiki](https://imaigene-dream3d.github.io/BEHAV3D/)
 
-![BEHAV3D panel in napari](docs/source/_static/screenshots/dock_widget_overview.png)
+![BEHAV3D panel in napari](docs/source/_static/gif/Github_readme_GUI_intro_v2.gif)
 
 ## Installation (3 steps, no code)
 
@@ -193,8 +193,8 @@ Then open the BEHAV3D plugin from the **Plugins** menu.
 | Column Name                    | Explanation                                                                                         |
 |-------------------------------|-----------------------------------------------------------------------------------------------------|
 | sample_name                   | Name to assign to the sample; used for naming output files/folders.                                |
-| organoid_line                 | Name of organoid cell line used in the experiment (e.g. 10T, 162M, etc.). Analysis visual results will be split on organoid lines                                     |
-| tcell_line                    | Name or type of T cell used (e.g. TEG/CAR-T/etc.). Analysis visual results will be split on tcell lines                                 |
+| organoid_line                 | Name of the multicellular structure line used in the experiment (e.g. `lineA`, `lineB` — a patient-derived organoid line, a spheroid line, etc.). Analysis visual results will be split on organoid lines                                     |
+| tcell_line                    | Name or type of immune population used (e.g. `lineA` — a CAR-T product, an engineered T-cell line, a donor identifier). Analysis visual results will be split on tcell lines                                 |
 | exp_nr                        | Experiment number for tracking and reproducibility.                                                |
 | well                          | Well identifier on the experimental plate (e.g. `well01`).                                          |
 | tcell_channel                 | Index of the fluorescence channel representing T cells in the raw image. (Channel indexing starts at 0)                                      |

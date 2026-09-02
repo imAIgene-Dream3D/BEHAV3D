@@ -31,7 +31,8 @@ from qtpy.QtWidgets import (
 from qtpy.QtCore import Qt
 from qtpy.QtGui import QCursor
 
-from behav3d.core.qt_help import HelpButton, make_help_row
+from behav3d.core.qt_help import HelpButton, make_help_row, reset_scroll_on_page_change
+from behav3d.napari._analysis import CollapsibleSection
 from behav3d.napari._units import UnitGroupManager
 from behav3d.napari._results_panel import (
     ResultsPanel,
@@ -41,6 +42,12 @@ from behav3d.napari._background_runner import (
     BackgroundOperation,
     ProgressBarRow,
     fire_extra_callback,
+)
+from behav3d.napari._preview_dims import (
+    clear_viewer_layers,
+    disconnect_all_preview_dims_listeners,
+    register_preview_dims_listener,
+    unregister_preview_dims_listener,
 )
 
 # Colormaps for raw channel layers (same order as the Visualization tab)
@@ -71,6 +78,14 @@ _ACTIVE_PREVIEW_HOVER: dict = {}
 # keeps firing against layers/arrays that were just cleared/replaced,
 # producing missing or clobbered "Dead/Alive" / "% Dead Mask" layers (or a
 # crash if it reaches for layers mid-teardown).
+#
+# This dict/helper only arbitrates between this *file's own* two preview
+# panels. Every connect/disconnect below also registers/unregisters with
+# ``behav3d.napari._preview_dims``'s viewer-wide registry, so that *other*
+# tabs (Visualization, State/Track Classification, Feature Backprojection)
+# can drop this tab's listener too via ``disconnect_all_preview_dims_listeners``
+# before they bulk-mutate ``viewer.layers`` — the cross-tab version of the
+# same "stale listener fires mid-teardown" hazard described above.
 _ACTIVE_PREVIEW_DIMS: dict = {}
 
 
@@ -754,7 +769,7 @@ class CellTypeFeaturePanel(QWidget):
         md = metadata_loader.metadata
         self._has_dead = False
         if md is not None:
-            self._has_dead = (
+            self._has_dead = bool(
                 "dead_channel" in md.columns and md["dead_channel"].notna().any()
             )
 
@@ -1003,9 +1018,11 @@ class CellTypeFeaturePanel(QWidget):
             "Dead Mask Percentage Threshold",
             "Percentage of dead-mask pixels overlapping a segment's volume\n"
             "required to classify the cell as dead.\n\n"
-            "Classification is sticky: once a track crosses this threshold at\n"
-            "any timepoint, it is marked 'dead' from that timepoint onward for\n"
-            "the rest of the track, even if the percentage later drops again.\n\n"
+            "By default, classification is sticky: once a track crosses this\n"
+            "threshold at any timepoint, it is marked 'dead' from that timepoint\n"
+            "onward for the rest of the track, even if the percentage later\n"
+            "drops again. This can be turned off in Advanced Configuration\n"
+            "below ('Propagate dead signal').\n\n"
             "Set to 0 to skip dead classification.\n"
             "Entered as a percentage here; saved to behav3d_parameters.yml\n"
             "as a fraction (e.g. 3 % is saved as 0.03).",
@@ -1087,11 +1104,35 @@ class CellTypeFeaturePanel(QWidget):
         dead_group.setVisible(self._has_dead)
         self._dead_group = dead_group
 
+        # ── Advanced Configuration (death propagation) ──────────────────────
+        adv_dead_section = CollapsibleSection("⚙ Advanced Configuration", expanded=False)
+        self.check_propagate_dead = QCheckBox("Propagate dead signal")
+        self.check_propagate_dead.setChecked(
+            bool(fcfg.get("propagate_dead_signal", self.category == "organoid"))
+        )
+        adv_dead_row = make_help_row(
+            self.check_propagate_dead,
+            "Propagate Dead Signal",
+            "ON: once a track crosses the dead threshold at any timepoint, it\n"
+            "stays 'dead' for every later timepoint, even if the signal drops\n"
+            "again afterwards. Recommended for organoids - a dead organoid\n"
+            "doesn't come back to life.\n\n"
+            "OFF: only the timepoints where the signal is actually at/above\n"
+            "threshold are marked 'dead'; the track can go back to 'alive'\n"
+            "afterwards. Recommended for immune/other cells, which can\n"
+            "transiently pick up dead dye while killing a dying organoid\n"
+            "without actually dying themselves.",
+        )
+        adv_dead_section.addLayout(adv_dead_row)
+        layout.addWidget(adv_dead_section)
+        adv_dead_section.setVisible(self._has_dead)
+        self._adv_dead_section = adv_dead_section
+
         def _toggle_dead_group(state=None):
             cb = self.feature_checks.get("death")
-            self._dead_group.setVisible(
-                self._has_dead and (cb is not None and cb.isChecked())
-            )
+            visible = self._has_dead and (cb is not None and cb.isChecked())
+            self._dead_group.setVisible(visible)
+            self._adv_dead_section.setVisible(visible)
 
         if "death" in self.feature_checks:
             self.feature_checks["death"].stateChanged.connect(_toggle_dead_group)
@@ -1211,13 +1252,14 @@ class CellTypeFeaturePanel(QWidget):
             pass
         if _ACTIVE_PREVIEW_DIMS.get(id(viewer)) is self._preview_dims_callback:
             _ACTIVE_PREVIEW_DIMS.pop(id(viewer), None)
+        unregister_preview_dims_listener(viewer, self)
         self._preview_dims_callback = None
 
     def _cleanup_preview(self):
         """Disconnect all preview callbacks and reset cached preview state.
 
         Does NOT remove layers — the caller handles that via
-        ``self.viewer.layers.clear()``.
+        ``clear_viewer_layers(self.viewer)``.
         """
         self._disconnect_preview_dead_hover()
         self._disconnect_preview_dims()
@@ -1271,6 +1313,7 @@ class CellTypeFeaturePanel(QWidget):
             viewer.dims.events.current_step.connect(_on_step)
             self._preview_dims_callback = _on_step
             _ACTIVE_PREVIEW_DIMS[id(viewer)] = _on_step
+            register_preview_dims_listener(viewer, self, _on_step)
         except Exception:
             self._preview_dims_callback = None
 
@@ -1591,6 +1634,7 @@ class CellTypeFeaturePanel(QWidget):
             # Persisted/consumed as a fraction (0.0-1.0); ``thr`` is the
             # percent-scale value shown in the spinbox.
             "dead_mask_percentage_threshold": self._threshold_as_fraction(thr) if thr > 0 else None,
+            "propagate_dead_signal": bool(self.check_propagate_dead.isChecked()),
             "n_workers": int(self.spin_workers.value()),
         }
 
@@ -1618,6 +1662,7 @@ class CellTypeFeaturePanel(QWidget):
                 # stored in ``settings``, which is scaled for persistence).
                 if not p._is_organoid and p.spin_dead_threshold is not None:
                     p.spin_dead_threshold.setValue(self._get_threshold())
+                p.check_propagate_dead.setChecked(settings["propagate_dead_signal"])
                 count += 1
         scope = "category" if category_only else "all"
         self.log(f"Applied feature settings to {count} other cell type(s) ({scope}).")
@@ -1746,6 +1791,7 @@ class CellTypeFeaturePanel(QWidget):
                     output_dir=str(Path(self.metadata_loader.output_dir).expanduser()),
                     cell_type=ct,
                     new_threshold=self._threshold_as_fraction(new_thr),
+                    propagate=bool(panel.check_propagate_dead.isChecked()),
                 )
                 panel._persist()
                 self.log(
@@ -1782,6 +1828,7 @@ class CellTypeFeaturePanel(QWidget):
             features_choice=list(params["features_choice"]),
             contact_threshold=float(params["contact_threshold"]),
             dead_mask_percentage_threshold=params["dead_mask_percentage_threshold"],
+            propagate_dead_signal=bool(params.get("propagate_dead_signal", True)),
             n_workers=int(params["n_workers"]),
             overwrite=overwrite,
             progress_cb=progress_cb,
@@ -1798,8 +1845,10 @@ class CellTypeFeaturePanel(QWidget):
         out_dir = str(Path(self.metadata_loader.output_dir).expanduser())
         if params is not None:
             new_thr = params["dead_mask_percentage_threshold"] or 0.0
+            propagate = bool(params.get("propagate_dead_signal", True))
         else:
             new_thr = self._threshold_as_fraction()
+            propagate = bool(self.check_propagate_dead.isChecked())
         if new_thr <= 0:
             self.log(
                 f"\u26a0\ufe0f Skipping death-only re-run for {cell_type}: "
@@ -1810,6 +1859,7 @@ class CellTypeFeaturePanel(QWidget):
             output_dir=out_dir,
             cell_type=cell_type,
             new_threshold=float(new_thr),
+            propagate=propagate,
         )
 
     def _check_existing_features(self, cell_types: list) -> list:
@@ -1915,6 +1965,10 @@ class CellTypeFeaturePanel(QWidget):
 
         def _on_failed(err: str):
             self.log(f"Error during feature extraction: {err}")
+            _QMB.critical(
+                self, "Feature Extraction Error",
+                f"Feature extraction for {cell_type} failed:\n\n{err}",
+            )
             notify_results_changed(self)
 
         self._bg.run(
@@ -2088,22 +2142,23 @@ class CellTypeFeaturePanel(QWidget):
             print(f"[{_ts()}] [Preview] Clearing preview layers...")
             self._cleanup_preview()
             # Always tear down whichever dims listener — this panel's own,
-            # another panel's, or the shared organoid one — is currently
-            # active before clearing layers. A stale listener from whatever
-            # preview was loaded previously would otherwise fire on the
-            # dims-range change caused by clearing/re-adding layers below,
-            # recompute against its now-stale cache, and either write into
-            # layers that were just removed (crash) or silently clobber the
-            # new preview's "Dead/Alive" / "% Dead Mask" layers.
+            # another panel's, the shared organoid one, or a listener left
+            # live by a different tab entirely (State/Track Classification,
+            # Feature Backprojection) — is currently active before clearing
+            # layers. A stale listener from whatever preview was loaded
+            # previously would otherwise fire on the dims-range change
+            # caused by clearing/re-adding layers below, recompute against
+            # its now-stale cache, and either write into layers that were
+            # just removed (crash) or silently clobber the new preview's
+            # "Dead/Alive" / "% Dead Mask" layers.
             _disconnect_any_active_preview_dims(self.viewer)
+            disconnect_all_preview_dims_listeners(self.viewer)
             # Stop any running dims animation before clearing layers so napari
             # doesn't try to use slider widgets it is about to destroy.
-            from behav3d.napari._visualization import (
-                _is_addable_layer_data,
-                _stop_dim_playback,
-            )
-            _stop_dim_playback(self.viewer)
-            self.viewer.layers.clear()
+            from behav3d.napari._visualization import _is_addable_layer_data
+            from behav3d.napari._preview_dims import stop_dim_playback
+            stop_dim_playback(self.viewer)
+            clear_viewer_layers(self.viewer)
 
             # Raw channels
             if raw_dask is not None:
@@ -2521,6 +2576,11 @@ class ActiveKillingPanel(QWidget):
             if md is not None else []
         )
         self._bg = BackgroundOperation(self)
+        # Restore previously-saved settings (if any) from behav3d_parameters.yml
+        # so values survive across napari sessions instead of resetting to
+        # hard-coded defaults every time this panel is (re)built.
+        saved_params = getattr(self.metadata_loader, "behav3d_parameters", None) or {}
+        self._saved_cfg = dict(saved_params.get("active_killing", {}) or {})
         self._init_ui()
 
     # ── UI ──────────────────────────────────────────────────────────────────
@@ -2530,9 +2590,9 @@ class ActiveKillingPanel(QWidget):
         layout.setSpacing(6)
 
         desc = QLabel(
-            "Detects functional killing events by analysing how much the death "
-            "signal in target (organoid) cells increases after immune cell contact, "
-            "relative to the per-sample background death rate.\n"
+            "Detects functional killing events: for each immune\u2013target contact, "
+            "checks whether that target organoid's OWN death signal rises enough "
+            "after contact (vs its signal at contact start) to count as a kill.\n"
             "\u26a0\ufe0f  Run baseline feature extraction for the immune type FIRST."
         )
         desc.setWordWrap(True)
@@ -2562,8 +2622,11 @@ class ActiveKillingPanel(QWidget):
         self.target_list.setMaximumHeight(60)
         if self.target_types:
             self.target_list.addItems(self.target_types)
+            saved_targets = self._saved_cfg.get("target_types")
+            saved_targets = set(saved_targets) if saved_targets else None
             for i in range(self.target_list.count()):
-                self.target_list.item(i).setSelected(True)
+                item = self.target_list.item(i)
+                item.setSelected(item.text() in saved_targets if saved_targets else True)
         else:
             self.target_list.addItem("(no targets detected)")
             self.target_list.setEnabled(False)
@@ -2585,23 +2648,19 @@ class ActiveKillingPanel(QWidget):
 
         self.spin_obs_window = QSpinBox()
         self.spin_obs_window.setRange(1, 100)
-        self.spin_obs_window.setValue(5)
+        self.spin_obs_window.setValue(int(self._saved_cfg.get("observation_window", 5)))
         self.spin_obs_window.setMaximumWidth(70)
         params_form.addRow(
             "Observation window (tp):",
             make_help_row(
                 self.spin_obs_window,
                 "Observation Window",
-                "Number of timepoints after a contact's start timepoint over which\n"
-                "each touched target's death-signal change is measured (signal at\n"
-                "contact_start+window minus signal at contact_start), evaluated\n"
-                "independently per touched target organoid.\n\n"
-                "A contact event is 'active killing' when the best-touched target's\n"
-                "increase exceeds its own killing threshold:\n"
-                "  killing_threshold = signal_at_contact_start x (threshold_multiplier - 1)\n"
-                "  (or the fixed Absolute Threshold, if 'Use absolute threshold' is checked)\n\n"
-                "If the window runs past the end of a timelapse, the last available\n"
-                "frame is used instead of extrapolating.",
+                "How many timepoints after contact starts to measure the touched\n"
+                "target's death-signal rise: its signal at (contact start + window)\n"
+                "minus its signal at contact start. Measured separately for each\n"
+                "touched target organoid.\n\n"
+                "If the window runs past the end of the timelapse, the last\n"
+                "available frame is used (no extrapolation).",
             ),
         )
 
@@ -2609,7 +2668,9 @@ class ActiveKillingPanel(QWidget):
         self.death_signal_combo.addItems(
             ["percentage_dead_mask", "mean_dead_dye", "nr_dead_mask_pixels"]
         )
-        self.death_signal_combo.setCurrentText("percentage_dead_mask")
+        self.death_signal_combo.setCurrentText(
+            self._saved_cfg.get("death_signal_column", "percentage_dead_mask")
+        )
         self.death_signal_combo.setMaximumWidth(220)
         self.death_signal_combo.currentTextChanged.connect(lambda _: self._update_abs_hint())
         params_form.addRow(
@@ -2617,15 +2678,13 @@ class ActiveKillingPanel(QWidget):
             make_help_row(
                 self.death_signal_combo,
                 "Death Signal Column",
-                "Target-cell column used to measure death-signal increase for the\n"
-                "per-contact killing check.\n\n"
-                "  percentage_dead_mask  - fraction of dead-mask pixels in the segment\n"
+                "Which target-cell column is read as the death signal:\n\n"
+                "  percentage_dead_mask  - % of dead-mask pixels in the segment\n"
                 "  mean_dead_dye         - mean dead-dye channel intensity\n"
                 "  nr_dead_mask_pixels   - raw count of dead-mask pixels\n\n"
-                "Changing this changes the units of the Absolute Threshold below, so\n"
-                "re-check that value if you switch. When using an absolute threshold,\n"
-                "nr_dead_mask_pixels is recommended - a flat pixel-count cutoff is\n"
-                "easier to reason about than one on a fraction or intensity scale.",
+                "Switching this changes the units of the Absolute Threshold below,\n"
+                "so re-check that value. For an absolute threshold, nr_dead_mask_pixels\n"
+                "is recommended - a flat pixel count is easiest to reason about.",
             ),
         )
 
@@ -2633,23 +2692,21 @@ class ActiveKillingPanel(QWidget):
         self.spin_threshold_mult.setRange(0.1, 20.0)
         self.spin_threshold_mult.setSingleStep(0.1)
         self.spin_threshold_mult.setDecimals(2)
-        self.spin_threshold_mult.setValue(1.5)
+        self.spin_threshold_mult.setValue(float(self._saved_cfg.get("killing_threshold_multiplier", 1.5)))
         self.spin_threshold_mult.setMaximumWidth(90)
         params_form.addRow(
             "Killing threshold multiplier:",
             make_help_row(
                 self.spin_threshold_mult,
                 "Killing Threshold Multiplier",
-                "Multiplier applied to a touched target organoid's OWN death signal\n"
-                "at the moment contact starts (no sample-wide or cross-organoid\n"
-                "averaging is involved).\n\n"
-                "A contact event is classified as 'active killing' for a target when:\n"
-                "  signal_at_contact_start+window >= signal_at_contact_start x multiplier\n\n"
-                "Default: 1.5  (signal must at least reach 150% of its value at the\n"
-                "moment of contact, by the end of the observation window).\n\n"
-                "If the signal is exactly 0 at contact start, 0.1 is substituted so the\n"
-                "threshold isn't trivially 0 (which would flag any nonzero signal as\n"
-                "active killing).\n\n"
+                "Sets the kill threshold as a multiple of each touched target's OWN\n"
+                "death signal at contact start (no sample-wide or cross-organoid\n"
+                "averaging).\n\n"
+                "Active killing when, by the end of the observation window, the\n"
+                "target's signal exceeds  signal_at_contact_start x multiplier.\n\n"
+                "Default 1.5  ->  signal must grow past 150% of its value at contact.\n\n"
+                "If the signal is exactly 0 at contact start, 0.1 is used in its place\n"
+                "so the threshold isn't trivially 0 (which would flag any rise).\n\n"
                 "Ignored when 'Use absolute threshold' is checked.",
             ),
         )
@@ -2660,14 +2717,14 @@ class ActiveKillingPanel(QWidget):
         abs_threshold_row.addWidget(self.check_abs_threshold)
         abs_threshold_row.addWidget(HelpButton(
             "Use Absolute Threshold",
-            "When checked, active killing is decided using the fixed 'Absolute "
-            "threshold' value below instead of the multiplier-based threshold\n"
-            "(signal_at_contact_start x multiplier).\n\n"
-            "Useful when touched organoids tend to start near-zero death signal, "
-            "which makes the multiplier-based threshold overly sensitive to small "
-            "absolute changes.\n\n"
-            "When unchecked, the 'Absolute threshold' field is disabled and the "
-            "Killing Threshold Multiplier is used instead.",
+            "Decide killing with the fixed 'Absolute threshold' below instead of "
+            "the multiplier (signal_at_contact_start x multiplier).\n\n"
+            "Best when targets tend to start near-zero death signal, where the "
+            "multiplier becomes over-sensitive to tiny changes.\n\n"
+            "Generally recommended with 2 or more target lines that have different "
+            "baseline death rates - there the multiplier's fold-change is unfair.\n\n"
+            "Unchecked = the Killing Threshold Multiplier is used and this field "
+            "is disabled.",
         ))
         abs_threshold_row.addStretch()
         params_form.addRow("", abs_threshold_row)
@@ -2679,9 +2736,9 @@ class ActiveKillingPanel(QWidget):
         params_form.addRow("", self.abs_hint_label)
 
         self.spin_abs_threshold = QDoubleSpinBox()
-        self.spin_abs_threshold.setRange(0.0, 100.0)
-        self.spin_abs_threshold.setSingleStep(0.01)
-        self.spin_abs_threshold.setDecimals(4)
+        # Range/decimals/step are set per selected death signal column in
+        # _update_abs_hint (percentage_dead_mask is a 0.0-1.0 fraction, the
+        # others are unbounded-ish raw counts/intensities).
         self.spin_abs_threshold.setValue(0.0)
         self.spin_abs_threshold.setMaximumWidth(100)
         self.spin_abs_threshold.setEnabled(False)
@@ -2690,22 +2747,19 @@ class ActiveKillingPanel(QWidget):
             make_help_row(
                 self.spin_abs_threshold,
                 "Absolute Killing Threshold",
-                "Fixed minimum death-signal increase (in the units of the Death\n"
-                "Signal Column, from contact start to the end of the Observation\n"
-                "Window) required to classify a contact event as active killing.\n\n"
-                "Only used when 'Use absolute threshold' is checked; it then\n"
-                "replaces the multiplier-based threshold entirely.\n\n"
-                "Useful when touched organoids tend to start near-zero death "
-                "signal, which makes the multiplier-based threshold unreliable.\n\n"
-                "Recommended: use this together with the nr_dead_mask_pixels death "
-                "signal column - a flat pixel-count cutoff is easier to reason "
-                "about than one on a fraction or intensity scale.",
+                "Fixed minimum death-signal rise (in the Death Signal Column's\n"
+                "units, from contact start to the end of the observation window)\n"
+                "needed to count as a kill.\n\n"
+                "Only used when 'Use absolute threshold' is checked; it then fully\n"
+                "replaces the multiplier.\n\n"
+                "Best for targets that start near-zero death signal. Tip: pair with\n"
+                "nr_dead_mask_pixels - a flat pixel count is easiest to set.",
             ),
         )
 
         self.spin_min_contact = QSpinBox()
         self.spin_min_contact.setRange(1, 50)
-        self.spin_min_contact.setValue(1)
+        self.spin_min_contact.setValue(int(self._saved_cfg.get("min_contact_duration", 1)))
         self.spin_min_contact.setMaximumWidth(70)
         params_form.addRow(
             "Min contact duration (tp):",
@@ -2798,6 +2852,14 @@ class ActiveKillingPanel(QWidget):
         layout.addLayout(action_row)
         layout.addStretch()
 
+        # Restore the absolute-threshold checkbox/value last, since toggling it
+        # depends on self.spin_abs_threshold / self.spin_threshold_mult / the
+        # death-signal column above already existing.
+        self.check_abs_threshold.setChecked(bool(self._saved_cfg.get("use_absolute_threshold", False)))
+        saved_abs = self._saved_cfg.get("absolute_killing_threshold")
+        if saved_abs is not None:
+            self.spin_abs_threshold.setValue(min(float(saved_abs), self.spin_abs_threshold.maximum()))
+
         self._validate()
         self._update_abs_hint()
 
@@ -2809,9 +2871,31 @@ class ActiveKillingPanel(QWidget):
         self._update_abs_hint()
 
     def _update_abs_hint(self):
-        """Show a non-blocking recommendation to use nr_dead_mask_pixels with an absolute threshold."""
+        """Keep the Absolute threshold spinbox's range/step matched to the selected
+        death signal's units, and show a non-blocking recommendation to use
+        nr_dead_mask_pixels with an absolute threshold."""
         using_absolute = self.check_abs_threshold.isChecked()
-        wrong_column = self.death_signal_combo.currentText() != "nr_dead_mask_pixels"
+        column = self.death_signal_combo.currentText()
+
+        old_value = self.spin_abs_threshold.value()
+        if column == "percentage_dead_mask":
+            # percentage_dead_mask is a fraction (0.0-1.0), not a 0-100 percent -
+            # see calculate_death()'s scale note in timepoint_features.py.
+            self.spin_abs_threshold.setRange(0.0, 1.0)
+            self.spin_abs_threshold.setDecimals(4)
+            self.spin_abs_threshold.setSingleStep(0.001)
+        elif column == "nr_dead_mask_pixels":
+            # Raw pixel count - integer valued, can be large for 3D segments.
+            self.spin_abs_threshold.setRange(0.0, 100000.0)
+            self.spin_abs_threshold.setDecimals(0)
+            self.spin_abs_threshold.setSingleStep(1)
+        else:  # mean_dead_dye - raw intensity, scale depends on image bit depth
+            self.spin_abs_threshold.setRange(0.0, 100000.0)
+            self.spin_abs_threshold.setDecimals(4)
+            self.spin_abs_threshold.setSingleStep(0.01)
+        self.spin_abs_threshold.setValue(min(old_value, self.spin_abs_threshold.maximum()))
+
+        wrong_column = column != "nr_dead_mask_pixels"
         if using_absolute and wrong_column:
             self.abs_hint_label.setText(
                 "💡 Recommended: use nr_dead_mask_pixels as the death signal when using "
@@ -2861,6 +2945,7 @@ class ActiveKillingPanel(QWidget):
         self._validate()
         if not self.btn_run.isEnabled():
             return
+        self._persist()
         self._queue_callback()
 
     def _validate(self):
@@ -2906,6 +2991,13 @@ class ActiveKillingPanel(QWidget):
             "observation_window": int(self.spin_obs_window.value()),
             "death_signal_column": self.death_signal_combo.currentText(),
             "killing_threshold_multiplier": float(self.spin_threshold_mult.value()),
+            # Persist the checkbox state alongside the value. ``_persist()``
+            # merges this dict into the saved config, and the checkbox is
+            # restored from ``use_absolute_threshold`` - so without this key a
+            # stale ``false`` would survive every save and silently switch a
+            # run configured for the absolute threshold back to the relative
+            # multiplier on the next reload.
+            "use_absolute_threshold": self.check_abs_threshold.isChecked(),
             "absolute_killing_threshold": (
                 float(self.spin_abs_threshold.value())
                 if self.check_abs_threshold.isChecked() else None
@@ -2913,6 +3005,24 @@ class ActiveKillingPanel(QWidget):
             "min_contact_duration": int(self.spin_min_contact.value()),
             "target_types": self._get_selected_targets()
         }
+
+    def _persist(self):
+        """Write the current Active Killing settings into behav3d_parameters
+        and save to YAML, so they survive across napari sessions."""
+        params = self.metadata_loader.behav3d_parameters
+        if params is None:
+            return
+        params.setdefault("active_killing", {}).update(self._collect_params())
+        self._saved_cfg = dict(params["active_killing"])
+
+        out_dir = self.metadata_loader.output_dir
+        if out_dir:
+            params_path = Path(out_dir) / "behav3d_parameters.yml"
+            try:
+                with open(params_path, "w") as f:
+                    yaml.safe_dump(params, f, sort_keys=False)
+            except Exception as e:
+                self.log(f"Warning: Could not save Active Killing parameters: {e}")
 
     def refresh_immune_types(self, immune_types: list):
         """Update the dropdown when metadata is reloaded."""
@@ -2943,6 +3053,8 @@ class ActiveKillingPanel(QWidget):
 
         from behav3d.features.advanced_timepoint_features import run_active_killing_analysis
 
+        # Persist + snapshot widget state before running.
+        self._persist()
         immune = self._get_immune_type()
         targets = self._get_selected_targets()
         params = self._collect_params()
@@ -2974,32 +3086,43 @@ class ActiveKillingPanel(QWidget):
                     output_subfolder=subfolder
                 )
 
+            plot_jobs = []
             df_killing, df_summary, stats = None, None, None
             for t in targets:
                 self.log(f"--- Running independent analysis for target: {t} ---")
                 df_killing, df_summary, stats = run_for_targets([t], t)
+                plot_jobs.append((t, df_killing))
 
             if len(targets) > 1:
                 self.log("--- Running combined analysis for all selected targets ---")
                 combined_subfolder = "combined"
                 df_killing, df_summary, stats = run_for_targets(targets, combined_subfolder)
+                plot_jobs.append((combined_subfolder, df_killing))
             else:
                 combined_subfolder = targets[0]
 
-            return (df_killing, df_summary, stats, combined_subfolder)
+            return (plot_jobs, stats, combined_subfolder)
 
         def _on_done(result):
-            df_killing, _df_summary, stats, subfolder = result
+            plot_jobs, stats, subfolder = result
+            for job_subfolder, job_df_killing in plot_jobs:
+                job_results_dir = self._active_killing_dir(immune) / job_subfolder
+                self._save_plots(job_df_killing, immune, job_results_dir)
             results_dir = self._active_killing_dir(immune) / subfolder
-            self._save_plots(df_killing, immune, results_dir)
             n_active = int(stats.get("total_active_killing_timepoints", 0))
             rate = stats.get("overall_killing_rate", 0.0)
+            stale_filtered = stats.get("filtering_needs_rerun_for") or []
             self.log(
                 f"\u2705 Active Killing Analysis complete \u2014 "
                 f"{n_active} active killing timepoints ({rate:.1%} of contact timepoints)."
             )
+            if stale_filtered:
+                self.log(
+                    f"\u26a0\ufe0f Re-run Filtering for {', '.join(stale_filtered)} \u2014 its filtered CSV "
+                    "was built before this run and doesn't include these results yet."
+                )
             self.btn_run.setText("\u25b6  Run Active Killing Analysis")
-            self._offer_open_folder(results_dir)
+            self._offer_open_folder(results_dir, stale_filtered_cell_types=stale_filtered)
 
         def _on_failed(err: str):
             self.log(f"\u274c Active Killing Analysis error: {err}")
@@ -3194,24 +3317,31 @@ class ActiveKillingPanel(QWidget):
             for t in targets:
                 self.log(f"--- Running independent analysis for target: {t} ---")
                 df_killing, df_summary, stats = run_for_targets([t], t)
+                self._save_plots(df_killing, immune, self._active_killing_dir(immune) / t)
 
             if len(targets) > 1:
                 self.log("--- Running combined analysis for all selected targets ---")
                 combined_subfolder = "combined"
                 df_killing, df_summary, stats = run_for_targets(targets, combined_subfolder)
+                self._save_plots(df_killing, immune, self._active_killing_dir(immune) / combined_subfolder)
             else:
                 combined_subfolder = targets[0]
-            
+
             results_dir = self._active_killing_dir(immune) / combined_subfolder
-            self._save_plots(df_killing, immune, results_dir)
             n_active = int(stats.get("total_active_killing_timepoints", 0))
             rate = stats.get("overall_killing_rate", 0.0)
+            stale_filtered = stats.get("filtering_needs_rerun_for") or []
             self.log(
                 f"✅ Active Killing Analysis complete — "
                 f"{n_active} active killing timepoints ({rate:.1%} of contact timepoints)."
             )
+            if stale_filtered:
+                self.log(
+                    f"⚠️ Re-run Filtering for {', '.join(stale_filtered)} — its filtered CSV "
+                    "was built before this run and doesn't include these results yet."
+                )
             if interactive:
-                self._offer_open_folder(results_dir)
+                self._offer_open_folder(results_dir, stale_filtered_cell_types=stale_filtered)
             fire_extra_callback(extra_callbacks, "on_done", (df_killing, df_summary, stats, combined_subfolder))
         except Exception as e:
             import traceback as _tb
@@ -3226,15 +3356,28 @@ class ActiveKillingPanel(QWidget):
             notify_results_changed(self)
 
     # ── Folder open popup ──────────────────────────────────────────────────────
-    def _offer_open_folder(self, results_dir: Path):
-        """Show a modal dialog offering to open the output folder in the OS file manager."""
+    def _offer_open_folder(self, results_dir: Path, stale_filtered_cell_types=None):
+        """Show a modal dialog offering to open the output folder in the OS file manager.
+
+        Active Killing always reads the unfiltered track features, so any
+        filtered CSV for ``stale_filtered_cell_types`` was built before this
+        run and doesn't include these results yet -- surface that here so
+        the reminder isn't buried in the log.
+        """
         box = QMessageBox(self)
         box.setWindowTitle("Active Killing Analysis Complete")
-        box.setText(
+        text = (
             "\u2705  Active Killing Analysis finished!\n\n"
             f"Outputs saved to:\n{results_dir}\n\n"
-            "Open output folder in file manager?"
         )
+        if stale_filtered_cell_types:
+            text += (
+                "\u26a0\ufe0f Re-run Filtering for "
+                f"{', '.join(sorted(stale_filtered_cell_types))} \u2014 its filtered CSV "
+                "was built before this run and doesn't include these results yet.\n\n"
+            )
+        text += "Open output folder in file manager?"
+        box.setText(text)
         btn_open = box.addButton("Open Folder", QMessageBox.AcceptRole)
         box.addButton("Close", QMessageBox.RejectRole)
         box.exec_()
@@ -3546,6 +3689,7 @@ class FeatureExtractionTab(QWidget):
         self.cell_tabs = QTabWidget()
         self.cell_tabs.setTabPosition(QTabWidget.West)
         layout.addWidget(self.cell_tabs)
+        reset_scroll_on_page_change(self.cell_tabs)
 
         # ── Global Run + Queue ─────────────────────────────────────────────
         self.btn_run_batch = QPushButton(
@@ -3694,7 +3838,8 @@ class FeatureExtractionTab(QWidget):
         })
         for panel in self.panels.values():
             panel._cleanup_preview()
-        self.viewer.layers.clear()
+        disconnect_all_preview_dims_listeners(self.viewer)
+        clear_viewer_layers(self.viewer)
         self._log("Cleaned up viewer layers.")
 
         return True
@@ -3851,6 +3996,7 @@ class FeatureExtractionTab(QWidget):
             pass
         if _ACTIVE_PREVIEW_DIMS.get(id(viewer)) is self._org_preview_dims_callback:
             _ACTIVE_PREVIEW_DIMS.pop(id(viewer), None)
+        unregister_preview_dims_listener(viewer, self)
         self._org_preview_dims_callback = None
 
     def _connect_org_preview_dims(self):
@@ -3878,6 +4024,7 @@ class FeatureExtractionTab(QWidget):
             viewer.dims.events.current_step.connect(_on_step)
             self._org_preview_dims_callback = _on_step
             _ACTIVE_PREVIEW_DIMS[id(viewer)] = _on_step
+            register_preview_dims_listener(viewer, self, _on_step)
         except Exception:
             self._org_preview_dims_callback = None
 
@@ -4247,6 +4394,10 @@ class FeatureExtractionTab(QWidget):
 
         def _on_failed(err: str):
             self._log(f"❌ Batch feature extraction error: {err}")
+            _QMB.critical(
+                self, "Batch Feature Extraction Error",
+                f"Batch feature extraction failed:\n\n{err}",
+            )
             try:
                 self.results_panel.refresh()
             except Exception:

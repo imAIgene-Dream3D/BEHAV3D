@@ -104,21 +104,27 @@ The client sends:
 `POST /chat` returns an SSE stream containing newline-delimited JSON events:
 
 ```text
+{"type":"status","stage":"retrieval","component":"retrieval","message":"...","request_id":"..."}
+{"type":"status","stage":"provider","component":"deepseek","message":"...","request_id":"..."}
 {"type":"token","text":"..."}
 {"type":"tool_calls","calls":[{"name":"set_ui_value","arguments":{...}}]}
 {"type":"done"}
 ```
 
 Failures use `{"type":"error","message":"..."}` followed by `done`.
-`GET /health` reports the active model, RAG chunk count, control contract
-version, and knowledge version.
+All events include a short `request_id` and elapsed server time. `GET /health`
+is a cheap Modal and RAG check that reports the active model, chunk count,
+control contract version, and knowledge version. `GET
+/health?probe_provider=true` also sends a one-token request to DeepSeek and
+returns its status and latency. Use the provider probe interactively or during
+diagnosis, not as a high-frequency monitor.
 
 ## Component map
 
 | File | Responsibility | Change it when |
 |---|---|---|
 | `behav3d/napari/_assistant.py` | Chat UI, quick buttons, local metadata wizard, history, streaming, action cards, no-op handling, and apply/confirm policy. | Changing the chat experience or how validated actions are presented/applied. |
-| `behav3d/napari/_assistant_client.py` | Endpoint configuration, background HTTP/SSE worker, and offline fallback. | Changing transport, timeouts, authentication, or degraded behavior. |
+| `behav3d/napari/_assistant_client.py` | Endpoint configuration, background HTTP/SSE and health workers, classified failures, automatic retry, and offline fallback. | Changing transport, timeouts, health checks, authentication, or degraded behavior. |
 | `behav3d/napari/_assistant_context.py` | Defensive serialization of live BEHAV3D state and experiment references. | The assistant needs to read a new piece of UI, metadata, log, result, or experiment state. |
 | `behav3d/napari/_assistant_controls.py` | Live editable-control registry, getters, setters, units, choices, visibility, and persistence callbacks. | The assistant should be able to inspect or edit a real UI control. |
 | `behav3d/napari/_assistant_actions.py` | Tool schemas, tool-call validation, `ProposedAction`, and action application. | Adding a new action or changing how an action is validated/applied. |
@@ -196,8 +202,11 @@ For experiment interpretation, use this precedence:
 3. saved YAML configuration for intended settings;
 4. discovered result files for evidence that a step actually ran.
 
-A saved configuration is not execution evidence. Historical reference profiles
-are examples only and must never generate an edit action by themselves.
+A saved configuration is not execution evidence. A biological name is never a
+method or value selector. Default guidance is expressed in measurable properties
+such as object size, overlap, one-frame displacement, topology, cadence, and signal
+persistence. Dataset-specific notes are used only when they are present in the live
+experiment reference for the current dataset.
 
 ### Guidance and RAG
 
@@ -221,13 +230,16 @@ which service version they are testing.
 
 The order in `POST /chat` is intentional:
 
-1. **Deterministic actions** return calculated text and optional tool calls.
+1. **Intent clarification** catches overlapping analysis language before any
+   keyword handler can route it. Ambiguous death, contact, killing, and threshold
+   requests get one short choice between the relevant researcher-facing analyses.
+2. **Deterministic actions** return calculated text and optional tool calls.
    Examples include metadata conversions, analysis navigation, EDT/minimum-size
    calculations, tracking radius, and Active Killing settings.
-2. **Preflight guards** return one focused question or a scoped explanation when
+3. **Preflight guards** return one focused question or a scoped explanation when
    required evidence is missing. Examples include unknown channel mapping,
    segmentation signal quality, tracking motion, and missing log evidence.
-3. **Model path** retrieves guidance, builds the prompt, calls DeepSeek, and
+4. **Model path** retrieves guidance, builds the prompt, calls DeepSeek, and
    streams text plus native tool calls.
 
 Within the deterministic and preflight chains, the first non-`None` handler
@@ -236,6 +248,20 @@ with neighboring handlers. A preflight handler must require explicit task intent
 not just a topic word: mentioning an organoid line in an analysis question, for
 example, is not a metadata-building request. Put broad informational answers
 before setup clarifications when both could match.
+
+Module names are also topic words, not commands. Questions about the meaning of
+a plot, result, output, legend, or relationship must stay in the current view and
+reach the explanatory model path without tool calls. Deterministic navigation or
+configuration requires an explicit operational request such as `open`, `navigate`,
+`run`, or `configure`. Keep this distinction in a shared intent helper so each
+module-specific handler cannot independently reintroduce keyword routing.
+
+When analysis vocabularies overlap, update `_analysis_intent_route()` rather than
+adding another broad trigger to a downstream handler. Specific discriminators
+such as time course, attribution, counting, or physical distance should route
+directly; unresolved overlap should return a clarification from
+`analysis_intent_clarification()`. The downstream handler must still validate the
+live step, controls, units, and prerequisites.
 
 Keep deterministic response templates experiment-neutral. They may repeat names
 found in live metadata or an explicitly matched experiment reference, but must not
@@ -295,16 +321,20 @@ several widgets, create a file, or invoke an existing application workflow.
 - Bump `KNOWLEDGE_VERSION`, rebuild the index when indexed sources changed, and
   rerun API scenarios.
 
-### Add an experiment reference
+### Add experiment-specific context
 
-Add reviewed, provenance-labelled examples to
-`docs/source/assistant/reference_experiment_profiles.md`. If local experiment
-README or YAML formats need new parsing, update
+Do not add named experiments or saved numeric settings to default guidance or RAG.
+`docs/source/assistant/reference_experiment_profiles.md` is a generalized phenotype
+guide despite its legacy filename. Add reusable scientific rules there only when
+they are phrased in measurable image/behavior properties.
+
+If local experiment README or YAML formats need new parsing, update
 `_experiment_reference_context()` and `_compact_experiment_config()`.
 
 Keep paths, large feature arrays, and irrelevant defaults out of model context.
-The assistant may compare a historical profile with the current experiment, but
-must ask for current measurements before proposing an edit.
+The assistant may use a reference supplied for the current dataset, but must ask
+for current measurements before proposing an edit when the reference does not
+establish them.
 
 ### Change the chat UI or quick buttons
 
@@ -335,7 +365,7 @@ Before merging an assistant change, verify:
   not a plausible guess.
 - Exact values come from live data, explicit user input, or a labelled
   deterministic calculation.
-- Historical values are named examples and do not trigger actions.
+- Biological names and unrelated historical values do not trigger answers or actions.
 - The model does not claim a configured step ran without a corresponding result.
 - Visible text uses UI labels rather than variable, control, or tool names.
 - Same-value and already-open actions do not loop.
@@ -356,6 +386,43 @@ The client reads `napari/assistant_config.json`, which is gitignored. Start from
 
 `BEHAV3D_ASSISTANT_ENDPOINT` overrides the file. The timeout is split into a
 10-second connection timeout and the configured read timeout.
+
+## Runtime status and recovery
+
+The chat dock keeps a persistent service-status row above the transcript. It
+shows the current stage and elapsed time instead of a generic loading state:
+
+| UI status | What has been confirmed |
+|---|---|
+| `Connecting to Modal` | The client is opening the HTTP connection; Modal has not replied yet. |
+| `Checking BEHAV3D guidance` | Modal is online and the server is retrieving local documentation. |
+| `Waiting for response` | The service is ready, but the response has not started returning yet. |
+| `Receiving response` | Text or proposed actions are streaming to the application. |
+| `Retrying automatically` | A transient failure occurred before any output; one safe retry is in progress. |
+| `Offline` / `Issue` | The tooltip and transcript identify Modal, DeepSeek, configuration, or the response stream as the failing component. |
+
+The **Check status** button calls the provider-probing health route and reports
+Modal, the RAG index, DeepSeek, model name, latency, and any request ID in the
+status tooltip. At startup, the client performs only the lightweight health
+check. After an outage it repeats health checks every 15 seconds and returns to
+`Online` automatically. A chat request is retried once after two seconds only
+when the failure is transient and no text or tool action has arrived; partial
+responses are never replayed, avoiding duplicate form changes.
+
+For command-line diagnosis:
+
+```bash
+# Modal and RAG only
+curl -s <url>/health
+
+# Modal, RAG, and a live DeepSeek request
+curl -s '<url>/health?probe_provider=true'
+
+# Observe request stages and retain request_id for server-log correlation
+curl -N -X POST <url>/chat \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Explain this screen"}],"context":{"current_step":"tracking"},"tools":[]}'
+```
 
 Run a hot-reloading Modal endpoint:
 

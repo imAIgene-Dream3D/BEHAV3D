@@ -14,6 +14,8 @@ matplotlib.use("Agg", force=True)
 from behav3d.analysis.behavior.track.contact_grouping import (
     compute_track_contact_features,
     merge_track_contact_features_into_obs,
+    build_target_class_lookup_from_state_adata,
+    touching_column_name,
 )
 from behav3d.analysis.behavior.track.visualization.plots.reports import (
     save_track_contact_group_analysis,
@@ -196,6 +198,108 @@ def test_contact_group_analysis_without_extra_group_cols(tmp_path):
     # No group_x/group_y/extra_group_cols at all — the cluster-stack grid page is skipped
     # entirely; only the plain per-sample contact-rate page is produced.
     assert result["cluster_stack_grid"] == {"n_pages": 0, "csv_path": None}
+
+    # Target-class option left off by default — no new pages/keys produced.
+    assert result["use_target_class"] is False
+    assert "target_class_analysis" not in result
+
+
+def _build_df_timepoints_with_touching():
+    """Same contact pattern as ``_build_df_timepoints``, plus a ``touching_macros`` column: every
+    contacting track touches a single macro individual for its whole bout — track index 0, 2, 4...
+    (even) touches macro TrackID 100 ("round"), odd touches TrackID 101 ("elongated") — so no track
+    here ever contacts both classes (that edge case is covered in test_contact_target_class.py)."""
+    rows = []
+    for track_id, (sample_name, _line, _treatment, _cluster, has_contact) in enumerate(_TRACKS):
+        contact_values = np.zeros(_N_TIMEPOINTS, dtype=int)
+        touching_id = "100" if track_id % 2 == 0 else "101"
+        if has_contact:
+            contact_values[: _MIN_BOUT_LENGTH + 1] = 1
+        for t in range(_N_TIMEPOINTS):
+            rows.append(
+                {
+                    "sample_name": sample_name,
+                    "TrackID": track_id,
+                    "position_t": t,
+                    "macro_contact": int(contact_values[t]),
+                    "touching_macros": touching_id if contact_values[t] else "",
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _build_target_states_adata():
+    """Target (macro) per-timepoint states, in every sample: TrackID 100 = "round", 101 =
+    "elongated", constant over time."""
+    rows = []
+    for sample_name, _line, _treatment in _SAMPLES:
+        for track_id, state in ((100, "round"), (101, "elongated")):
+            for t in range(_N_TIMEPOINTS):
+                rows.append({
+                    "sample_name": sample_name, "TrackID": track_id, "position_t": t,
+                    "behavioral_state": state,
+                })
+    obs = pd.DataFrame(rows)
+    return ad.AnnData(X=np.zeros((len(obs), 1)), obs=obs)
+
+
+def test_contact_group_analysis_with_target_class(tmp_path):
+    adata_tracks = _build_adata_tracks()
+    df_timepoints = _build_df_timepoints_with_touching()
+    adata_states = _build_target_states_adata()
+    lookup = build_target_class_lookup_from_state_adata(adata_states, state_col="behavioral_state")
+
+    result = save_track_contact_group_analysis(
+        adata_tracks,
+        df_timepoints,
+        tmp_path,
+        contact_col="macro_contact",
+        min_bout_length=_MIN_BOUT_LENGTH,
+        sample_col="sample_name",
+        class_col="ClusterID",
+        group_x="organoid_line",
+        group_y="treatment",
+        target_class_lookup=lookup,
+        touching_col=touching_column_name("macro"),
+        time_varying=True,
+        verbose=False,
+    )
+
+    # All 4 original sections are still present and unchanged.
+    assert Path(result["pdf_path"]).exists()
+    assert result["cluster_stack_grid"]["n_pages"] == 1
+    assert result["condition_comparison"]["csv_path"] is not None
+
+    # New target-class section.
+    assert result["use_target_class"] is True
+    tca = result["target_class_analysis"]
+    assert set(tca["touched_classes"]) == {"round", "elongated"}
+    assert tca["target_class_group_col"] == "macro_contact_target_class_group"
+
+    long_csv = pd.read_csv(tca["long_features_csv"])
+    assert set(long_csv["target_class"].unique()) == {"round", "elongated"}
+    assert "macro_contact_class_mean_fraction" in long_csv.columns
+    assert "macro_contact_class_max_bout_length" in long_csv.columns
+
+    assert tca["composition_grid"]["n_pages"] == 1
+    grid_csv = pd.read_csv(tca["composition_grid"]["csv_path"])
+    assert set(grid_csv["ClusterID"].unique()) == {"A", "B"}
+
+    assert tca["comparison"]["csv_path"] is not None
+    comparison_csv = pd.read_csv(tca["comparison"]["csv_path"])
+    # target_class_group has 3 levels here (no_contact/round/elongated) rather than the binary
+    # contact/no_contact of the original condition_comparison, so this falls back to the pairwise
+    # comparison layout (group_x/group_y pooled into "group") rather than a true 2D grid.
+    assert {"level_a", "level_b", "group"}.issubset(comparison_csv.columns)
+    levels = set(comparison_csv["level_a"]) | set(comparison_csv["level_b"])
+    assert levels == {"no_contact", "round", "elongated"}
+
+    # obs got the per-track bucket merged in, consistent with the per-track touching_id parity.
+    obs = adata_tracks.obs
+    even_contact = obs[(obs["TrackID"].astype(int) % 2 == 0) & (obs["macro_contact_group"] == "contact")]
+    odd_contact = obs[(obs["TrackID"].astype(int) % 2 == 1) & (obs["macro_contact_group"] == "contact")]
+    assert set(even_contact["macro_contact_target_class_group"].unique()) == {"round"}
+    assert set(odd_contact["macro_contact_target_class_group"].unique()) == {"elongated"}
 
 
 def _group_col():

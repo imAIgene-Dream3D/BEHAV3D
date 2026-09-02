@@ -503,6 +503,7 @@ def run_otsu_threshold_segmentation_from_zarr(
     mask_suffix: str = "_mask_dead",
     timepoint_range: tuple[int, int] | None = None,
     progress_cb=None,
+    overwrite: bool = True,
 ):
     """Run Otsu thresholding segmentation on the dead channel for all samples.
     
@@ -516,6 +517,10 @@ def run_otsu_threshold_segmentation_from_zarr(
         Suffix for the output mask file (default: "_mask_dead").
     timepoint_range:
         Optional (start_t, end_t) tuple for time cropping.
+    overwrite:
+        When False, samples that already have a mask at
+        ``images/<sample>/<sample><mask_suffix>.zarr`` are left untouched and
+        reported under ``summary["skipped"]``.
     
     Returns
     -------
@@ -596,8 +601,12 @@ def run_otsu_threshold_segmentation_from_zarr(
 
         masks_outpath = mask_dir / f"{sample_name}{mask_suffix}.zarr"
         
-        # Always remove existing file if present (running cell = want new segmentation)
         if masks_outpath.exists():
+            if not overwrite:
+                print(f"[SKIP] Dead mask already exists for {sample_name}: {masks_outpath}")
+                metadata.at[idx, 'dead_mask_path'] = str(masks_outpath)
+                summary["skipped"].append(sample_name)
+                continue
             print(f"[OVERWRITE] Removing existing: {masks_outpath}")
             shutil.rmtree(masks_outpath)
 
@@ -660,6 +669,7 @@ def run_otsu_and_sync_metadata(
     mask_suffix="_mask_dead",
     timepoint_range=None,
     progress_cb=None,
+    overwrite=True,
 ):
     """
     Wrapper around run_otsu_threshold_segmentation_from_zarr that automatically handles
@@ -672,6 +682,7 @@ def run_otsu_and_sync_metadata(
         mask_suffix=mask_suffix,
         timepoint_range=timepoint_range,
         progress_cb=progress_cb,
+        overwrite=overwrite,
     )
 
     # 2. Update the in-memory metadata

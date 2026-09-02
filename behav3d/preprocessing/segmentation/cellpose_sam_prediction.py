@@ -18,7 +18,6 @@ tracker consumes it with no changes.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import subprocess
@@ -45,6 +44,13 @@ from behav3d.preprocessing.segmentation.cpsam_env import (
     build_worker_env,
     cpsam_env_status,
     find_cpsam_python,
+)
+from behav3d.preprocessing.segmentation.segment_journal import (
+    JOURNAL_VERSION,
+    journal_path,
+    params_fingerprint,
+    read_journal,
+    write_journal,
 )
 
 _WORKER = Path(__file__).with_name("_cpsam_worker.py")
@@ -92,9 +98,9 @@ DEFAULT_SAM_PARAMS = {
 #: Interactive size filter, in native voxels. ``None``/0 disables a bound.
 DEFAULT_SIZE_FILTER = {"size_min": 0, "size_max": 0}
 
-#: Version tag for the on-disk progress journal, so a future format change can be
-#: detected instead of silently misreading an old file as "nothing done yet".
-_JOURNAL_VERSION = 1
+#: Version tag for the on-disk progress journal. Re-exported from
+#: :mod:`behav3d.preprocessing.segmentation.segment_journal`, which owns the schema.
+_JOURNAL_VERSION = JOURNAL_VERSION
 
 
 def power_safe_settings(n_cpus: Optional[int] = None) -> dict:
@@ -325,16 +331,10 @@ def _build_job(**kwargs) -> dict:
 
 # ── resume journal ──────────────────────────────────────────────────────────
 #
-# A power loss or a kill mid-run leaves a partially filled label zarr. The array
-# is pre-allocated and written one timepoint at a time, so the frames already in
-# it are perfectly good - the only thing missing is a record of *which* ones, and
-# a promise that they were produced with the settings now being requested. That
-# is all this journal is.
-
-
-def _journal_path(out_zarr: Path) -> Path:
-    """Return the journal path beside *out_zarr* (``..._segments.progress.json``)."""
-    return out_zarr.with_suffix(".progress.json")
+# The mechanism now lives in
+# :mod:`behav3d.preprocessing.segmentation.segment_journal` so APOC and ConvPaint
+# share it. Only the payload assembled for the fingerprint is specific to this
+# backend; the schema, the atomic write and the staleness rules are common.
 
 
 def _params_fingerprint(model_name, channels, anisotropy, sam, size_filter, drop_2d) -> str:
@@ -345,8 +345,11 @@ def _params_fingerprint(model_name, channels, anisotropy, sam, size_filter, drop
     post-processing therefore belongs in here; run bookkeeping (timepoint range,
     device, thread count, cooldown) deliberately does not, because none of it
     changes the resulting labels.
+
+    The payload keys are load-bearing: changing one invalidates every journal
+    written by an earlier version, forcing a full recompute for anyone mid-run.
     """
-    payload = json.dumps(
+    return params_fingerprint(
         {
             "model_name": str(model_name),
             "channels": list(channels),
@@ -354,47 +357,8 @@ def _params_fingerprint(model_name, channels, anisotropy, sam, size_filter, drop
             "sam": sam,
             "size_filter": size_filter,
             "drop_2d_segments": bool(drop_2d),
-        },
-        sort_keys=True,
-        default=str,
+        }
     )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
-
-
-def _read_journal(path: Path) -> Optional[dict]:
-    """Return the journal at *path*, or ``None`` if absent/unreadable/stale."""
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        # A truncated journal is the expected casualty of a power cut. Treating it
-        # as "no journal" costs a recompute; trusting it could corrupt the output.
-        return None
-    if not isinstance(data, dict) or data.get("version") != _JOURNAL_VERSION:
-        return None
-    return data
-
-
-def _write_journal(path: Path, data: dict) -> None:
-    """Write *data* to *path* atomically.
-
-    Written on every frame of a run whose whole purpose is surviving abrupt power
-    loss, so a half-written journal is a real possibility rather than a theoretical
-    one: fsync the temp file, then rename over the target.
-    """
-    tmp = Path(str(path) + ".tmp")
-    try:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(data, fh)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except Exception:
-        # Losing the journal degrades resume to a full recompute; it must never
-        # take the segmentation itself down with it.
-        try:
-            tmp.unlink(missing_ok=True)
-        except Exception:
-            pass
 
 
 def run_cellpose_sam_segmentation(
@@ -485,7 +449,7 @@ def run_cellpose_sam_segmentation(
             # Best-effort only: this drives the progress bar's denominator. The
             # authoritative (fingerprint-checked) filtering happens per unit below,
             # so a journal that turns out to be unusable just makes the bar jump.
-            journal = _read_journal(_journal_path(out_zarr))
+            journal = read_journal(journal_path(out_zarr))
             if journal:
                 done = set(journal.get("done") or ())
                 wanted = [t for t in wanted if t not in done]
@@ -556,8 +520,8 @@ def run_cellpose_sam_segmentation(
                 except Exception:
                     recreate = True
 
-            journal_file = _journal_path(out_zarr)
-            journal = None if recreate else _read_journal(journal_file)
+            journal_file = journal_path(out_zarr)
+            journal = None if recreate else read_journal(journal_file)
             # A journal only vouches for frames produced under the settings it
             # records; once those differ it says nothing about what is on disk.
             if journal is not None and journal.get("fingerprint") != fingerprint:
@@ -602,7 +566,7 @@ def run_cellpose_sam_segmentation(
                 "done": sorted(already_done),
                 "frames": (journal.get("frames") if journal else None) or {},
             }
-            _write_journal(journal_file, journal)
+            write_journal(journal_file, journal)
 
             log(
                 f"Cellpose-SAM ({model_name}) '{cell_type}' [{category}] on {sample_name}: "
@@ -641,7 +605,7 @@ def run_cellpose_sam_segmentation(
                         "seconds": event.get("seconds"),
                         "peak_vram_mb": event.get("peak_vram_mb"),
                     }
-                    _write_journal(_journal_file, _journal)
+                    write_journal(_journal_file, _journal)
                     if progress_cb is not None:
                         try:
                             progress_cb(

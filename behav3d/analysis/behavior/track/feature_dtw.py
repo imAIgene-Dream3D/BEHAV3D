@@ -55,26 +55,94 @@ def _original_behav3d_quantile_scale(values):
     return q_values
 
 
-def apply_original_behav3d_feature_scaling(df_tracks, cell_type="tcell"):
-    """Add the original BEHAV3D/R-style scaled feature columns used for feature DTW."""
-    contact_col = f"{cell_type}_contact"
+# The three kinematic features every original-BEHAV3D feature set starts with;
+# the contact features that complete it are detected per frame.
+_KINEMATIC_FEATURES = [
+    "mean_square_displacement",
+    "speed",
+    "mean_dead_dye",
+]
+
+
+def _detect_contact_feature_cols(df_columns):
+    """List of the *raw* per-partner contact columns in a track-features frame —
+    one per interacting cell type (organoids and other cell types alike).
+
+    Current feature extraction names contact columns after each interacting type
+    (e.g. ``organoid1_contact``, ``tcell1_contact``, ``nk_contact``). This returns
+    every raw per-partner ``*_contact`` column, excluding:
+
+    * derived/scaled variants (``active_/cumulative_/max_/s_/z_/q_``);
+    * the ``any_*`` aggregates (``any_organoid_contact``, ``any_immune_cell_contact``)
+      — including these alongside the per-partner columns would double-count the
+      same contact information and over-weight it in the DTW distance;
+    * ``pix_*`` contacts, the pixel-distance duplicate of the same contact (the
+      GUI hides them from feature pickers for the same reason);
+    * private ``_``-prefixed working columns;
+    * ``*_on_distance`` variants (they don't end in ``_contact``).
+
+    so each real contact partner contributes exactly one DTW feature.
+
+    Summarized track frames carry each column's per-track mean under a ``mean_``
+    prefix, so that prefix is stripped before the exclusion test -- otherwise
+    ``mean_any_organoid_contact`` would slip past the ``any_`` rule.
+    """
+    excluded_prefixes = (
+        "active_", "cumulative_", "max_", "s_", "z_", "q_", "any_", "pix_", "_",
+    )
+    cols = []
+    for col in df_columns:
+        col = str(col)
+        if not col.endswith("_contact"):
+            continue
+        base = col[len("mean_"):] if col.startswith("mean_") else col
+        if base.startswith(excluded_prefixes):
+            continue
+        cols.append(col)
+    return cols
+
+
+def apply_original_behav3d_feature_scaling(
+    df_tracks, cell_type="tcell", contact_cols=None
+):
+    """Add the original BEHAV3D/R-style scaled feature columns used for feature DTW.
+
+    The three kinematic features (``mean_square_displacement``, ``speed``,
+    ``mean_dead_dye``) are quantile-scaled per experiment. Every contact column is
+    min-max scaled per experiment into ``s_<col>`` and contributes its own DTW
+    feature — so each interacting partner (each organoid *and* each other cell
+    type) is kept separate rather than aggregated. ``contact_cols`` optionally
+    names the raw contact columns to use; if omitted they are auto-detected from
+    the frame.
+    """
+    df_scaled = df_tracks.copy()
+
+    if contact_cols is None:
+        contact_cols = _detect_contact_feature_cols(df_scaled.columns)
+    contact_cols = [c for c in contact_cols if c in df_scaled.columns]
+
     required_cols = [
         "mean_square_displacement",
         "speed",
         "mean_dead_dye",
-        "organoid_contact",
-        contact_col,
         "exp_nr",
     ]
-    missing_cols = [col for col in required_cols if col not in df_tracks.columns]
+    missing_cols = [col for col in required_cols if col not in df_scaled.columns]
     if missing_cols:
         raise ValueError(
             "feature_scaling_preset='original_behav3d' requires missing columns: "
             + ", ".join(missing_cols)
         )
+    if not contact_cols:
+        raise ValueError(
+            "feature_scaling_preset='original_behav3d' found no contact columns "
+            "(expected at least one '<cell_type>_contact' column)."
+        )
 
-    print("- Applying original BEHAV3D feature scaling preset")
-    df_scaled = df_tracks.copy()
+    print(
+        "- Applying original BEHAV3D feature scaling preset "
+        f"(contact features: {', '.join(contact_cols)})"
+    )
     quantile_features = {
         "mean_square_displacement": "q_mean_square_displacement",
         "speed": "q_speed",
@@ -89,24 +157,21 @@ def apply_original_behav3d_feature_scaling(df_tracks, cell_type="tcell"):
             .transform(_original_behav3d_quantile_scale)
         )
 
-    contact_features = {
-        "organoid_contact": "s_organoid_contact",
-        contact_col: f"s_{contact_col}",
-    }
-    for source_col, out_col in contact_features.items():
+    contact_features = []
+    for source_col in contact_cols:
+        out_col = f"s_{source_col}"
         df_scaled[out_col] = (
             df_scaled
             .groupby(group_key, group_keys=False)[source_col]
             .transform(_minmax_scale)
         )
+        contact_features.append(out_col)
 
     dtw_features = [
         "q_mean_square_displacement",
         "q_speed",
         "q_mean_dead_dye",
-        "s_organoid_contact",
-        f"s_{contact_col}",
-    ]
+    ] + contact_features
     return df_scaled, dtw_features
 
 
@@ -318,14 +383,25 @@ def _resolve_selected_plot_feature_columns(
 
 def calculate_dtw(
     df_tracks,
-    features=[
-        "z_mean_square_displacement",
-        "z_speed",
-        "z_mean_dead_dye",
-        "tcell_contact",
-        "organoid_contact",
-    ],
+    features=None,
 ):
+    """DTW distance matrix over ``features`` (one row per track).
+
+    ``features=None`` resolves to the original BEHAV3D set: the three z-scored
+    kinematic features plus every raw ``*_contact`` column present in
+    ``df_tracks`` (see ``_detect_contact_feature_cols``). The previous default
+    hardcoded ``tcell_contact``/``organoid_contact``, names current feature
+    extraction does not produce -- it emits per-partner columns such as
+    ``organoid1_contact`` -- so any caller relying on the default raised a
+    KeyError instead of running.
+    """
+    if features is None:
+        features = [
+            "z_mean_square_displacement",
+            "z_speed",
+            "z_mean_dead_dye",
+        ] + _detect_contact_feature_cols(df_tracks.columns)
+
     print("- Calculating the dynamic time warping distance matrix")
     df_tracks = df_tracks.sort_values(by=["sample_name", "TrackID", "relative_time"])
 
@@ -490,7 +566,32 @@ def cluster_umap(
         results_outdir, f"BEHAV3D_{cell_type}_combined_track_features_clustered.csv"
     )
     print(f"- Writing clustered track info to {df_clust_tracks_out_path}")
-    df_tracks = pd.merge(df_tracks, df_umap[["TrackID", "ClusterID"]], on="TrackID", how="left")
+    # TrackIDs restart in every sample, so the cluster labels must be joined on
+    # (sample_name, TrackID) -- the key every other stage uses (see
+    # summarize_feature_dtw_tracks and the "TrackID--sample_name" DTW rownames).
+    # Merging on TrackID alone cross-joined tracks sharing an id across samples:
+    # each timepoint row came back once per sample carrying that id, so this CSV
+    # had inflated row counts and rows tagged with another sample's ClusterID.
+    cluster_merge_keys = [
+        key for key in ("sample_name", "TrackID")
+        if key in df_tracks.columns and key in df_umap.columns
+    ]
+    if "TrackID" not in cluster_merge_keys:
+        raise ValueError(
+            "Cannot attach ClusterID to tracks: 'TrackID' is missing from the "
+            "track features or the UMAP frame."
+        )
+    if "sample_name" not in cluster_merge_keys:
+        print(
+            "  Warning: no 'sample_name' column to join clusters on; TrackIDs "
+            "shared between samples may be assigned the wrong ClusterID."
+        )
+    df_tracks = pd.merge(
+        df_tracks,
+        df_umap[cluster_merge_keys + ["ClusterID"]],
+        on=cluster_merge_keys,
+        how="left",
+    )
     df_tracks.to_csv(df_clust_tracks_out_path, sep=",", index=False)
     return()
 
@@ -505,18 +606,8 @@ def run_tcell_analysis(
     df_tracks_path=None,
     df_tracks_summarized_path=None,
     cell_type="tcell",
-    columns_to_use=[
-        "mean_square_displacement",
-        "speed",
-        "mean_dead_dye",
-        "tcell_contact",
-        "organoid_contact",
-    ],
-    columns_to_normalize=[
-        "mean_square_displacement",
-        "speed",
-        "mean_dead_dye",
-    ],
+    columns_to_use=None,
+    columns_to_normalize=None,
     umap_minimal_distance=None,
     umap_n_neighbors=None,
     nr_of_clusters=None,
@@ -527,6 +618,7 @@ def run_tcell_analysis(
     feature_scaling_preset=None,
     min_track_length=None,
     max_track_length=None,
+    contact_cols=None,
 ):
     print(f"--------------- Performing {cell_type} behavioral analysis ---------------")
     start_time = time.time()
@@ -565,6 +657,18 @@ def run_tcell_analysis(
         print("Warning: The track lengths are not cut to similar length, this might influence dynamic time warping")
         print("Set 'min_track_length' and 'max_track_length' to the same value to create equal tracks")
 
+    # Resolve the feature defaults now that the frame is loaded: the contact
+    # columns can only be named once we can see them (they are per interacting
+    # partner, e.g. `organoid1_contact`), so they are detected rather than
+    # hardcoded.
+    if columns_to_normalize is None:
+        columns_to_normalize = list(_KINEMATIC_FEATURES)
+    if columns_to_use is None:
+        columns_to_use = (
+            list(_KINEMATIC_FEATURES)
+            + _detect_contact_feature_cols(df_tracks.columns)
+        )
+
     if feature_scaling_preset is None:
         non_wildcard_cols_to_normalize = []
         for col in columns_to_normalize:
@@ -577,9 +681,12 @@ def run_tcell_analysis(
             selected_features=columns_to_use,
         )
     elif feature_scaling_preset == "original_behav3d":
+        if contact_cols is None:
+            contact_cols = _detect_contact_feature_cols(df_tracks.columns)
         df_tracks, dtw_features = apply_original_behav3d_feature_scaling(
             df_tracks,
             cell_type=cell_type,
+            contact_cols=contact_cols,
         )
         plot_feature_cols = _resolve_selected_plot_feature_columns(
             df_tracks_summarized=df_tracks_summarized,
@@ -588,9 +695,7 @@ def run_tcell_analysis(
                 "mean_square_displacement",
                 "speed",
                 "mean_dead_dye",
-                f"{cell_type}_contact",
-                "organoid_contact",
-            ],
+            ] + list(contact_cols),
         )
     else:
         raise ValueError(
@@ -712,19 +817,28 @@ def _load_feature_dtw_cluster_order(output_dir, cell_type):
 def _feature_dtw_plot_info_cols(df, cell_type=None):
     """Real behavioral feature columns to display on the UMAP/heatmap QC pages.
 
-    Must mirror the feature set the original BEHAV3D clustering was run on
-    (see `_original_behav3d_features` in track_classification.py) — plotting
-    identifier/embedding columns (TrackID, UMAP1, UMAP2) here would show
-    those instead of actual behavioral features in the cluster heatmap.
+    Must mirror the feature set the original BEHAV3D clustering was run on —
+    plotting identifier/embedding columns (TrackID, UMAP1, UMAP2) here would
+    show those instead of actual behavioral features in the cluster heatmap.
+
+    Contact columns are detected from ``df`` (one per interacting partner)
+    rather than assumed to be ``organoid_contact``/``<cell_type>_contact``.
+    ``cell_type`` is kept for call-site compatibility and is no longer needed
+    to pick them.
+
+    The only caller passes the *summarized* UMAP frame, where each feature is
+    stored as its per-track mean (``mean_speed``), so the kinematic names fall
+    back to their ``mean_`` variant — the same convention
+    ``_resolve_selected_plot_feature_columns`` uses. Without that fallback none
+    of the three resolved and the QC pages showed metadata only.
     """
-    preferred = [
-        "sample_name",
-        "mean_square_displacement",
-        "speed",
-        "mean_dead_dye",
-        f"{cell_type}_contact" if cell_type else None,
-        "organoid_contact",
-    ]
+    preferred = ["sample_name"]
+    for feature in _KINEMATIC_FEATURES:
+        if feature in df.columns:
+            preferred.append(feature)
+        elif f"mean_{feature}" in df.columns:
+            preferred.append(f"mean_{feature}")
+    preferred += _detect_contact_feature_cols(df.columns)
     return [col for col in preferred if col and col in df.columns]
 
 

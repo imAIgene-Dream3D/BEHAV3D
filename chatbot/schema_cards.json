@@ -674,10 +674,11 @@
       "lap",
       "btrack",
       "propagation",
+      "bounded_propagation",
       "reporter_propagation",
       "propagation_all_organoids"
     ],
-    "description": "Tracking algorithm. Use btrack routinely for motile cells, propagation for slow overlapping non-dividing objects, and reporter propagation for static objects with intermittent fluorescence. LAP and TrackPy are alternatives without an identified routine advantage."
+    "description": "Tracking algorithm selected from measured behavior, not a biological name. Use Fragmentation Tracking (stored as 'propagation') for objects that overlap themselves between frames and may fragment; Bounded Propagation for overlapping or touching objects whose track IDs must remain within one connected region; btrack when objects lose frame-to-frame overlap; and Reporter Propagation only for static objects with intermittent fluorescence. LAP and TrackPy need a specific reason."
   },
   {
     "key": "tracking.all_organoids.overwrite",
@@ -701,10 +702,11 @@
       "lap",
       "btrack",
       "propagation",
+      "bounded_propagation",
       "reporter_propagation",
       "propagation_all_organoids"
     ],
-    "description": "Tracking algorithm. Use btrack routinely for motile cells, propagation for slow overlapping non-dividing objects, and reporter propagation for static objects with intermittent fluorescence. LAP and TrackPy are alternatives without an identified routine advantage."
+    "description": "Tracking algorithm selected from measured behavior, not a biological name. Use Fragmentation Tracking (stored as 'propagation') for objects that overlap themselves between frames and may fragment; Bounded Propagation for overlapping or touching objects whose track IDs must remain within one connected region; btrack when objects lose frame-to-frame overlap; and Reporter Propagation only for static objects with intermittent fluorescence. LAP and TrackPy need a specific reason."
   },
   {
     "key": "tracking.immune.overwrite",
@@ -939,10 +941,11 @@
       "lap",
       "btrack",
       "propagation",
+      "bounded_propagation",
       "reporter_propagation",
       "propagation_all_organoids"
     ],
-    "description": "Tracking algorithm. Use btrack routinely for motile cells, propagation for slow overlapping non-dividing objects, and reporter propagation for static objects with intermittent fluorescence. LAP and TrackPy are alternatives without an identified routine advantage."
+    "description": "Tracking algorithm selected from measured behavior, not a biological name. Use Fragmentation Tracking (stored as 'propagation') for objects that overlap themselves between frames and may fragment; Bounded Propagation for overlapping or touching objects whose track IDs must remain within one connected region; btrack when objects lose frame-to-frame overlap; and Reporter Propagation only for static objects with intermittent fluorescence. LAP and TrackPy need a specific reason."
   },
   {
     "key": "tracking.other.overwrite",
@@ -1177,10 +1180,11 @@
       "lap",
       "btrack",
       "propagation",
+      "bounded_propagation",
       "reporter_propagation",
       "propagation_all_organoids"
     ],
-    "description": "Tracking algorithm. Use btrack routinely for motile cells, propagation for slow overlapping non-dividing objects, and reporter propagation for static objects with intermittent fluorescence. LAP and TrackPy are alternatives without an identified routine advantage."
+    "description": "Tracking algorithm selected from measured behavior, not a biological name. Use Fragmentation Tracking (stored as 'propagation') for objects that overlap themselves between frames and may fragment; Bounded Propagation for overlapping or touching objects whose track IDs must remain within one connected region; btrack when objects lose frame-to-frame overlap; and Reporter Propagation only for static objects with intermittent fluorescence. LAP and TrackPy need a specific reason."
   },
   {
     "key": "tracking.organoid.overwrite",
@@ -3068,17 +3072,16 @@
       "equivalent_diameter",
       "major_axis_length",
       "minor_axis_length",
-      "axis1_length",
-      "axis2_length",
-      "axis3_length",
       "elongation",
+      "oblateness",
+      "prolateness",
       "surface_area",
       "sphericity",
       "convex_volume",
       "surface_to_volume_ratio"
     ],
     "choices": null,
-    "description": "Computed 'morphology' feature columns produced by BEHAV3D (reference, not user-tunable): nr_pixels, volume, bbox_volume, extent, solidity, equivalent_diameter, major_axis_length, minor_axis_length, axis1_length, axis2_length, axis3_length, elongation, surface_area, sphericity, convex_volume, surface_to_volume_ratio."
+    "description": "Computed 'morphology' feature columns produced by BEHAV3D (reference, not user-tunable): nr_pixels, volume, bbox_volume, extent, solidity, equivalent_diameter, major_axis_length, minor_axis_length, elongation, oblateness, prolateness, surface_area, sphericity, convex_volume, surface_to_volume_ratio."
   },
   {
     "key": "calculated_features.movement",
@@ -3092,7 +3095,6 @@
       "displacement_from_origin",
       "mean_square_displacement",
       "speed",
-      "mean_speed",
       "summed_displacement",
       "net_displacement",
       "straightness",
@@ -3101,7 +3103,7 @@
       "fraction_reversed_movement"
     ],
     "choices": null,
-    "description": "Computed 'movement' feature columns produced by BEHAV3D (reference, not user-tunable): displacement, cumulative_displacement, displacement_from_origin, mean_square_displacement, speed, mean_speed, summed_displacement, net_displacement, straightness, directional_persistence, median_turning_angle, fraction_reversed_movement."
+    "description": "Computed 'movement' feature columns produced by BEHAV3D (reference, not user-tunable): displacement, cumulative_displacement, displacement_from_origin, mean_square_displacement, speed, summed_displacement, net_displacement, straightness, directional_persistence, median_turning_angle, fraction_reversed_movement."
   },
   {
     "key": "calculated_features.intensity",
@@ -3111,10 +3113,12 @@
     "type": "list",
     "default": [
       "mean_intensity_*",
-      "mean_dead_dye"
+      "mean_dead_dye",
+      "q75_mean_intensity_*",
+      "q90_mean_intensity_*"
     ],
     "choices": null,
-    "description": "Computed 'intensity' feature columns produced by BEHAV3D (reference, not user-tunable): mean_intensity_*, mean_dead_dye."
+    "description": "Computed 'intensity' feature columns produced by BEHAV3D (reference, not user-tunable): mean_intensity_*, mean_dead_dye, q75_mean_intensity_*, q90_mean_intensity_*."
   },
   {
     "key": "calculated_features.death",
@@ -3140,11 +3144,10 @@
     "default": [
       "*_contact",
       "*_contact_on_distance",
-      "*_contact_pixels",
       "active_*_contact"
     ],
     "choices": null,
-    "description": "Computed 'contact' feature columns produced by BEHAV3D (reference, not user-tunable): *_contact, *_contact_on_distance, *_contact_pixels, active_*_contact."
+    "description": "Computed 'contact' feature columns produced by BEHAV3D (reference, not user-tunable): *_contact, *_contact_on_distance, active_*_contact."
   },
   {
     "key": "calculated_features.invasiveness",
@@ -3169,9 +3172,10 @@
     "type": "list",
     "default": [
       "is_active_killing",
-      "killing_efficiency"
+      "killing_efficiency",
+      "death_signal_increase_*tp"
     ],
     "choices": null,
-    "description": "Computed 'active_killing' feature columns produced by BEHAV3D (reference, not user-tunable): is_active_killing, killing_efficiency."
+    "description": "Computed 'active_killing' feature columns produced by BEHAV3D (reference, not user-tunable): is_active_killing, killing_efficiency, death_signal_increase_*tp."
   }
 ]

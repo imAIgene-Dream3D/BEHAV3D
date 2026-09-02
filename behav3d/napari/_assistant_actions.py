@@ -20,6 +20,7 @@ attribute names for all ~195 parameters.
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Callable, Optional
 
 
@@ -868,6 +869,9 @@ def build_actions(
             act = ProposedAction("open_analysis_view", view=view)
             labels = {
                 "death_dynamics": "Death Dynamics",
+                "interaction": "Interaction Analysis",
+                "invasiveness": "Invasiveness Analysis",
+                "active_killing": "Active Killing",
                 "behavioral_state": "Behavioral State",
                 "state_trajectory": "State Trajectory",
             }
@@ -979,8 +983,29 @@ def _values_match(actual: Any, requested: Any) -> bool:
     return actual == requested
 
 
-def apply_set_ui_value(main_widget, control_id: str, value: Any) -> bool:
+_METADATA_STRUCTURE_CONTROLS = {
+    "metadata.number_of_samples": "n_samples",
+    "metadata.number_of_organoid_types": "n_organoids",
+    "metadata.number_of_immune_types": "n_immune",
+    "metadata.number_of_other_types": "n_other",
+    "metadata.include_dead_channel": "include_dead",
+}
+
+
+def apply_set_ui_value(
+    main_widget, control_id: str, value: Any, action: ProposedAction | None = None,
+) -> bool:
     """Set one exact live control and verify the value was actually applied."""
+    metadata_field = _METADATA_STRUCTURE_CONTROLS.get(str(control_id))
+    if metadata_field is not None:
+        bridge = ProposedAction(
+            "fill_metadata_builder", field=metadata_field, value=value, index=0,
+        )
+        ok = apply_fill_metadata_builder(main_widget, bridge)
+        if action is not None and bridge.data.get("reconciled_sample_forms"):
+            action.data["reconciled_sample_forms"] = True
+        return ok
+
     from behav3d.napari._assistant_controls import find_control
 
     binding = find_control(main_widget, control_id)
@@ -1052,6 +1077,147 @@ def _metadata_cell_widget(form: dict, cell_type: Optional[str], field: str):
     return cell_fields.get(field)
 
 
+def _assistant_widget_value(widget):
+    for getter in ("currentText", "value", "isChecked", "text"):
+        method = getattr(widget, getter, None)
+        if callable(method):
+            try:
+                return method()
+            except Exception:
+                pass
+    return None
+
+
+def _snapshot_metadata_builder_structure(dp) -> dict:
+    """Capture names and form values before a dependency-changing correction."""
+    samples = []
+    for form in getattr(dp, "_sample_forms", []) or []:
+        samples.append({
+            "basic": {
+                key: _assistant_widget_value(widget)
+                for key, widget in (form.get("basic") or {}).items()
+            },
+            "dead_channel": {
+                key: _assistant_widget_value(widget)
+                for key, widget in (form.get("dead_channel") or {}).items()
+            },
+            "cell_types": {
+                cell_type: {
+                    key: _assistant_widget_value(widget)
+                    for key, widget in fields.items()
+                }
+                for cell_type, fields in (form.get("cell_types") or {}).items()
+            },
+            "org_names": list(form.get("org_names") or []),
+            "imm_names": list(form.get("imm_names") or []),
+            "oth_names": list(form.get("oth_names") or []),
+        })
+    return {
+        "had_forms": bool(samples),
+        "organoid_names": [
+            edit.text() for edit in getattr(dp, "_organoid_name_edits", [])
+        ],
+        "immune_names": [
+            edit.text() for edit in getattr(dp, "_immune_name_edits", [])
+        ],
+        "other_names": [
+            edit.text() for edit in getattr(dp, "_other_name_edits", [])
+        ],
+        "immune_multicolor": [
+            flag.isChecked()
+            for flag in getattr(dp, "_immune_multicolor_flags", [])
+        ],
+        "immune_multicolor_channels": [
+            spin.value()
+            for spin in getattr(dp, "_immune_multicolor_counts", [])
+        ],
+        "samples": samples,
+    }
+
+
+def _restore_metadata_sample_values(dp, snapshot: dict) -> None:
+    """Restore fields that still have a destination after a structural rebuild."""
+    def multicolor_base(name: str) -> str:
+        return re.sub(r"_\d+_multicolor$", "", str(name or ""))
+
+    for index, old_form in enumerate(snapshot.get("samples") or []):
+        forms = getattr(dp, "_sample_forms", []) or []
+        if index >= len(forms):
+            break
+        new_form = forms[index]
+        for section in ("basic", "dead_channel"):
+            new_widgets = new_form.get(section) or {}
+            for key, value in (old_form.get(section) or {}).items():
+                widget = new_widgets.get(key)
+                if widget is not None and value is not None:
+                    _push_to_widget(widget, value)
+
+        old_cells = old_form.get("cell_types") or {}
+        new_cells = new_form.get("cell_types") or {}
+        source_by_destination = {
+            name: name for name in new_cells if name in old_cells
+        }
+        for category_key in ("org_names", "imm_names", "oth_names"):
+            old_names = old_form.get(category_key) or []
+            new_names = new_form.get(category_key) or []
+            for old_name, new_name in zip(old_names, new_names):
+                source_by_destination.setdefault(new_name, old_name)
+            for new_name in new_names:
+                if new_name in source_by_destination:
+                    continue
+                base = multicolor_base(new_name)
+                source = next((
+                    old_name for old_name in old_names
+                    if multicolor_base(old_name) == base
+                ), None)
+                if source is not None:
+                    source_by_destination[new_name] = source
+        for new_name, fields in new_cells.items():
+            old_name = source_by_destination.get(new_name)
+            old_fields = old_cells.get(old_name, {}) if old_name else {}
+            for key, value in old_fields.items():
+                widget = fields.get(key)
+                if widget is not None and value is not None:
+                    _push_to_widget(widget, value)
+
+
+def _reconcile_metadata_builder_structure(
+    dp, snapshot: dict, *, reconfigure_names: bool,
+) -> None:
+    """Rebuild dependent forms once while retaining all compatible draft values."""
+    if not snapshot.get("had_forms"):
+        return
+    set_pulse_suppressed(True)
+    try:
+        if reconfigure_names:
+            dp._on_configure_cell_types(force=True)
+            for attr, key in (
+                ("_organoid_name_edits", "organoid_names"),
+                ("_immune_name_edits", "immune_names"),
+                ("_other_name_edits", "other_names"),
+            ):
+                for widget, value in zip(
+                    getattr(dp, attr, []), snapshot.get(key) or []
+                ):
+                    _push_to_widget(widget, value)
+            for widget, value in zip(
+                getattr(dp, "_immune_multicolor_flags", []),
+                snapshot.get("immune_multicolor") or [],
+            ):
+                _push_to_widget(widget, value)
+            for widget, value in zip(
+                getattr(dp, "_immune_multicolor_counts", []),
+                snapshot.get("immune_multicolor_channels") or [],
+            ):
+                _push_to_widget(widget, value)
+        dp._build_sample_forms(force=True)
+        _restore_metadata_sample_values(dp, snapshot)
+        if hasattr(dp, "_metadata_builder_dirty"):
+            dp._metadata_builder_dirty = True
+    finally:
+        set_pulse_suppressed(False)
+
+
 def apply_fill_metadata_builder(main_widget, action: ProposedAction) -> bool:
     """Apply a fill_metadata_builder action — sets widgets in the Metadata Builder."""
     dp = _dp(main_widget)
@@ -1061,6 +1227,15 @@ def apply_fill_metadata_builder(main_widget, action: ProposedAction) -> bool:
     value = action.data.get("value")
     index = int(action.data.get("index", 0))
     cell_type = action.data.get("cell_type")
+    dependency_fields = {
+        "n_samples", "n_organoids", "n_immune", "n_other", "include_dead",
+        "organoid_name", "immune_name", "other_name",
+        "immune_multicolor", "immune_multicolor_channels",
+    }
+    snapshot = (
+        _snapshot_metadata_builder_structure(dp)
+        if field in dependency_fields else None
+    )
     try:
         if field == "open_builder":
             dp.builder_grp.setChecked(True)
@@ -1071,37 +1246,81 @@ def apply_fill_metadata_builder(main_widget, action: ProposedAction) -> bool:
         if not getattr(dp.builder_grp, "isChecked", lambda: True)():
             dp.builder_grp.setChecked(True)
         if field == "n_samples":
-            dp.n_samples_spin.setValue(int(value)); pulse_widget(dp.n_samples_spin); return True
+            dp.n_samples_spin.setValue(int(value)); pulse_widget(dp.n_samples_spin)
+            _reconcile_metadata_builder_structure(
+                dp, snapshot, reconfigure_names=False
+            )
+            action.data["reconciled_sample_forms"] = bool(snapshot.get("had_forms"))
+            return True
         if field == "n_organoids":
-            dp.n_organoid_spin.setValue(int(value)); pulse_widget(dp.n_organoid_spin); return True
+            dp.n_organoid_spin.setValue(int(value)); pulse_widget(dp.n_organoid_spin)
+            _reconcile_metadata_builder_structure(dp, snapshot, reconfigure_names=True)
+            action.data["reconciled_sample_forms"] = bool(snapshot.get("had_forms"))
+            return True
         if field == "n_immune":
-            dp.n_immune_spin.setValue(int(value)); pulse_widget(dp.n_immune_spin); return True
+            dp.n_immune_spin.setValue(int(value)); pulse_widget(dp.n_immune_spin)
+            _reconcile_metadata_builder_structure(dp, snapshot, reconfigure_names=True)
+            action.data["reconciled_sample_forms"] = bool(snapshot.get("had_forms"))
+            return True
         if field == "n_other":
-            dp.n_other_spin.setValue(int(value)); pulse_widget(dp.n_other_spin); return True
+            dp.n_other_spin.setValue(int(value)); pulse_widget(dp.n_other_spin)
+            _reconcile_metadata_builder_structure(dp, snapshot, reconfigure_names=True)
+            action.data["reconciled_sample_forms"] = bool(snapshot.get("had_forms"))
+            return True
         if field == "include_dead":
-            dp.include_dead_cb.setChecked(_coerce_bool(value)); pulse_widget(dp.include_dead_cb); return True
+            dp.include_dead_cb.setChecked(_coerce_bool(value)); pulse_widget(dp.include_dead_cb)
+            _reconcile_metadata_builder_structure(
+                dp, snapshot, reconfigure_names=False
+            )
+            action.data["reconciled_sample_forms"] = bool(snapshot.get("had_forms"))
+            return True
         if field == "configure_cell_types":
             dp._on_configure_cell_types(); return True
         if field == "immune_multicolor":
             flags = getattr(dp, "_immune_multicolor_flags", [])
             if 0 <= index < len(flags):
-                flags[index].setChecked(_coerce_bool(value)); pulse_widget(flags[index]); return True
+                flags[index].setChecked(_coerce_bool(value)); pulse_widget(flags[index])
+                _reconcile_metadata_builder_structure(
+                    dp, snapshot, reconfigure_names=False
+                )
+                action.data["reconciled_sample_forms"] = bool(snapshot.get("had_forms"))
+                return True
         if field == "immune_multicolor_channels":
             counts = getattr(dp, "_immune_multicolor_counts", [])
             if 0 <= index < len(counts):
-                counts[index].setValue(int(value)); pulse_widget(counts[index]); return True
+                counts[index].setValue(int(value)); pulse_widget(counts[index])
+                _reconcile_metadata_builder_structure(
+                    dp, snapshot, reconfigure_names=False
+                )
+                action.data["reconciled_sample_forms"] = bool(snapshot.get("had_forms"))
+                return True
         if field == "organoid_name":
             edits = getattr(dp, "_organoid_name_edits", [])
             if 0 <= index < len(edits):
-                edits[index].setText(str(value)); pulse_widget(edits[index]); return True
+                edits[index].setText(str(value)); pulse_widget(edits[index])
+                _reconcile_metadata_builder_structure(
+                    dp, snapshot, reconfigure_names=False
+                )
+                action.data["reconciled_sample_forms"] = bool(snapshot.get("had_forms"))
+                return True
         if field == "immune_name":
             edits = getattr(dp, "_immune_name_edits", [])
             if 0 <= index < len(edits):
-                edits[index].setText(str(value)); pulse_widget(edits[index]); return True
+                edits[index].setText(str(value)); pulse_widget(edits[index])
+                _reconcile_metadata_builder_structure(
+                    dp, snapshot, reconfigure_names=False
+                )
+                action.data["reconciled_sample_forms"] = bool(snapshot.get("had_forms"))
+                return True
         if field == "other_name":
             edits = getattr(dp, "_other_name_edits", [])
             if 0 <= index < len(edits):
-                edits[index].setText(str(value)); pulse_widget(edits[index]); return True
+                edits[index].setText(str(value)); pulse_widget(edits[index])
+                _reconcile_metadata_builder_structure(
+                    dp, snapshot, reconfigure_names=False
+                )
+                action.data["reconciled_sample_forms"] = bool(snapshot.get("had_forms"))
+                return True
         if field == "create_sample_forms":
             dp._build_sample_forms(); return True
         if field == "fill_down":
@@ -1253,7 +1472,7 @@ def apply_action(main_widget, action: ProposedAction) -> bool:
         return stored
     if action.kind == "set_ui_value":
         ok = apply_set_ui_value(main_widget, action.data["control_id"],
-                                action.data["value"])
+                                action.data["value"], action=action)
         action.data["widget_updated"] = ok
         return ok
     if action.kind == "navigate_to_step":
@@ -1309,6 +1528,18 @@ def apply_action(main_widget, action: ProposedAction) -> bool:
 
 
 def _apply_open_analysis_view(main_widget, view: str) -> bool:
+    if view == "active_killing":
+        if not apply_navigate(main_widget, "feature_extraction"):
+            return False
+        feature_tab = getattr(main_widget, "feature_extraction_tab", None)
+        toggle = getattr(feature_tab, "_ak_toggle_btn", None)
+        if toggle is None:
+            return False
+        try:
+            toggle.setChecked(True)
+            return bool(toggle.isChecked())
+        except Exception:
+            return False
     if not apply_navigate(main_widget, "analysis"):
         return False
     analysis = getattr(main_widget, "analysis_tab", None)
@@ -1316,8 +1547,12 @@ def _apply_open_analysis_view(main_widget, view: str) -> bool:
     if tabs is None:
         return False
     try:
-        if view == "death_dynamics":
+        if view in {"death_dynamics", "interaction", "invasiveness"}:
             tabs.setCurrentIndex(0)
+            death_tab = getattr(analysis, "death_dynamics_tab", None)
+            start = getattr(death_tab, "_on_guided_start", None)
+            if start is not None:
+                start(view)
             return True
         single = getattr(analysis, "single_cell_tab", None)
         start = getattr(single, "_on_guided_start", None) if single is not None else None
@@ -1835,8 +2070,9 @@ TOOL_SCHEMA = [
         "name": "open_analysis_view",
         "description": (
             "Open one specific Analysis view. Use this instead of navigating to the "
-            "generic Analysis tab when the user names Death Dynamics, Behavioral "
-            "State, or State Trajectory."
+            "generic Analysis tab when the user names Death Dynamics, Interaction "
+            "Analysis, Invasiveness Analysis, Active Killing, Behavioral State, or "
+            "State Trajectory. Active Killing opens its panel in Feature Extraction."
         ),
         "parameters": {
             "type": "object",
@@ -1845,6 +2081,9 @@ TOOL_SCHEMA = [
                     "type": "string",
                     "enum": [
                         "death_dynamics",
+                        "interaction",
+                        "invasiveness",
+                        "active_killing",
                         "behavioral_state",
                         "state_trajectory",
                     ],

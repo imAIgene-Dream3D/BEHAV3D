@@ -36,13 +36,13 @@ The widget has seven tabs, stacked top to bottom inside the right-hand dock:
 
 | # | Tab | What it does | Detailed page |
 |---|---|---|---|
-| 1 | 📋 **Data Preparation** | Build / load `metadata.csv`, pick the output directory, set dimension orders, convert raw images to Zarr. | [Data Preparation](preprocessing/data_preparation) |
+| 1 | 📋 **Data Preparation** | Build / load `metadata.csv`, pick the output directory, set dimension orders, convert raw images to Zarr. | [Data Preparation](data_preparation) |
 | 2 | 👁 **Visualization** | Open any sample (raw channels, segments, tracks) in napari layers, used at every step. | [Visualization](plugin_essentials/visualization) |
 | 3 | 🦠 **Segmentation** | Six methods: APOC, ConvPaint, Pixel Classifier, Cellpose, Cellpose-SAM (zero-shot), Import existing. | [Segmentation](processing/segmentation/index) |
-| 4 | 📍 **Tracking** | Per cell-type subtabs: Propagation (organoids), Reporter Propagation, btrack (motile cells), or Import existing. Manual editing of tracked segments lives in the Visualization tab. | [Tracking](processing/tracking/index) |
+| 4 | 📍 **Tracking** | Per cell-type subtabs: btrack (objects that do not overlap between frames), fragmentation tracking (objects that do), Bounded Propagation, Reporter Propagation, LAP, TrackPy, or Import existing. Manual editing of tracked segments lives in the Visualization tab. | [Tracking](processing/tracking/index) |
 | 5 | 🧪 **Feature Extraction** | Movement, intensity, morphology, contact and death features per track. Extended analysis: active killing. | [Feature Extraction](analysis/feature_extraction) |
 | 6 | 🧹 **Filtering** | Track-length, experiment-duration, dead-at-t0 and minimal size filters. | [Filtering](analysis/filtering) |
-| 7 | 📊 **Analysis** | Death Dynamics & Interaction Analysis, plus Single Cell behavioural-state and trajectory (track) classification — each ending in a Backprojection step that paints the labels back onto the raw images. | [Analysis](analysis/index) |
+| 7 | 📊 **Analysis** | Population Analysis (signal dynamics, interaction, invasiveness), plus Single Cell behavioural-state and trajectory (track) classification — each ending in a Backprojection step that paints the labels back onto the raw images. | [Analysis](analysis/index) |
 
 At the bottom of the dock widget sits the **🛒 Processing Queue**, a collapsible panel that accepts steps from tabs 3 / 4 / 5 / 6 / 7 and runs them sequentially per sample. See [Processing Queue](plugin_essentials/processing_queue).
 
@@ -50,7 +50,7 @@ At the bottom of the dock widget sits the **🛒 Processing Queue**, a collapsib
 
 This is the happy path. Each step links to its full reference page.
 
-1. **Set up your samples in Data Preparation** ([details](preprocessing/data_preparation))
+1. **Set up your samples in Data Preparation** ([details](data_preparation))
    - Pick an output directory (everything BEHAV3D EXPLORER writes goes under it).
    - Either build a new `metadata.csv` with the Metadata Builder or load an existing one with the Metadata Loader.
    - Verify the Dimension Order table (default `TCZYX`).
@@ -66,17 +66,17 @@ This is the happy path. Each step links to its full reference page.
    - In the Visualization tab the resulting tracked segments can be manually corrected.
 5. **Extract features in Feature Extraction** ([details](analysis/feature_extraction))
    - Pick the feature families you want from the six available (movement, intensity, morphology, contact, invasiveness, death). Some are forced on for some cell types — e.g. movement for immune cells, death whenever a dead channel is present. Set the global organoid dead threshold and per-immune/per-other cell types thresholds.
-   - For immune + organoid datasets, you can also run Extended Analysis → Active Killing to detect which immune contacts actually killed their target organoid. Requires baseline feature extraction (with contact + death features) on both cell types first.
+   - You can also run Extended Analysis → Active Killing to detect which effector contacts were followed by a signal rise in the target they touched. Requires baseline feature extraction (with contact + death features) on both cell types first, and the effector must be declared as an immune (`im_`) type. It is explained with the other [population analyses](analysis/population_analysis/index).
 6. **Filter in Filtering** ([details](analysis/filtering))
    - Drop tracks shorter than `min_track_length`, optionally cap them at `max_track_length`, drop undersized starting cells with `min_size_t1`, drop dead-at-t0 cells, cap the experiment duration.
 7. **Analyse in Analysis** ([details](analysis/index))
-   - **💀 Death Dynamics** — population death dynamics for your target cells and target–effector interaction analysis ([details](analysis/death_dynamics)).
+   - **💀 Population Analysis** — signal dynamics across your target populations, target–effector interaction, invasiveness, and active killing ([details](analysis/population_analysis/index)).
    - **🧬 Single Cell** — classify each cell's behavioural states over time ([State Classification](analysis/single_cell/state_classification)) and group whole trajectories into clusters ([Track Classification](analysis/single_cell/track_classification)).
    - Each Single Cell workflow ends with a **Backprojection** step that overlays the behavioural-state / track-cluster labels on the raw images so you can sanity-check the analysis and export figures or movies.
 
 ## Next steps
 
 - → Deep dive on the cross-tab tools: [Plugin Essentials](plugin_essentials/index)
-- → Preprocessing section: [Preprocessing](preprocessing/index) with detailed Data Preparation reference: [Data Preparation](preprocessing/data_preparation)
+- → Full reference: [Data Preparation](data_preparation)
 - → Processing section (Segmentation + Tracking): [Processing](processing/index)
 - → Analysis section: [Analysis](analysis/index)

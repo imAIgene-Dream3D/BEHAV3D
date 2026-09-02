@@ -1013,6 +1013,91 @@ def test_hmm_deployment_artifact_roundtrip_and_apply(tmp_path):
     )
 
 
+def test_relabel_cluster_ids_preserves_nan_rows_through_hmm_rename_and_save(tmp_path):
+    df_positions = _make_positions_df(n_tracks=6, track_len=15)
+    output_dir = Path(tmp_path) / "hmm_relabel_nan_rows"
+
+    cluster_out = state_classification.run_hmm_state_clustering(
+        features=["speed", "elongation"],
+        binary_features_to_group=[],
+        output_dir=output_dir,
+        cell_type="tcell",
+        n_states=2,
+        random_state=11,
+        start_offset=3,
+        start_offset_fill_mode="leave_unassigned",
+        df_positions=df_positions,
+        return_details=True,
+        verbose=False,
+    )
+    hmm_model = cluster_out["hmm_model"]
+    state_paths = cluster_out["state_paths"]
+
+    # Rename widgets operate on a model_adata reloaded from disk (as the rename
+    # widget does), not the freshly-computed in-memory object: the h5ad
+    # round-trip degrades the intrinsic column's nullable "string" categories
+    # to plain object categories, which is what actually exposes the
+    # astype(str) -> "nan" corruption this test guards against.
+    cluster_out["model_adata"].write(state_paths.model_adata_path, compression="gzip")
+    model_adata = sc.read_h5ad(state_paths.model_adata_path)
+
+    intrinsic_before = model_adata.obs[state_classification.INTRINSIC_STATE_COL]
+    assert pd.isna(intrinsic_before).any(), "expected some rows to be left unassigned"
+    assert intrinsic_before.dropna().astype(str).nunique() == 2
+
+    intrinsic_labels = sorted(
+        intrinsic_before.dropna().astype(str).unique().tolist(),
+        key=state_classification._mixed_label_sort_key,
+    )
+    mapping = {label: f"state_{label}" for label in intrinsic_labels}
+    state_classification.relabel_cluster_ids(
+        adata=model_adata,
+        mapping=mapping,
+        cluster_key=state_classification.INTRINSIC_STATE_COL,
+        new_key=state_classification.INTRINSIC_STATE_COL,
+        keep_unmapped=True,
+        overwrite_original=True,
+    )
+
+    intrinsic_after = model_adata.obs[state_classification.INTRINSIC_STATE_COL]
+    assert pd.isna(intrinsic_after).sum() == pd.isna(intrinsic_before).sum()
+    assert "nan" not in {str(v) for v in intrinsic_after.dropna().unique()}
+    assert set(intrinsic_after.cat.categories) == set(mapping.values())
+
+    state_classification._rebuild_hmm_full_behavioral_state_from_intrinsic(
+        adata=model_adata,
+        binary_cols_to_merge=[],
+        intrinsic_col=state_classification.INTRINSIC_STATE_COL,
+    )
+    full_state = model_adata.obs[state_classification.FULL_STATE_COL]
+    assert full_state.dropna().astype(str).nunique() == 2
+    assert not any("nan" in str(v) for v in full_state.dropna().unique())
+    assert pd.isna(full_state).sum() == pd.isna(intrinsic_before).sum()
+
+    full_labels = sorted(
+        full_state.dropna().astype(str).unique().tolist(),
+        key=state_classification._mixed_label_sort_key,
+    )
+    full_mapping = {label: f"curated_{label}" for label in full_labels}
+    state_classification.relabel_cluster_ids(
+        adata=model_adata,
+        mapping=full_mapping,
+        cluster_key=state_classification.FULL_STATE_COL,
+        overwrite_original=True,
+        keep_unmapped=True,
+    )
+
+    artifact_path = Path(tmp_path) / "saved_hmm_deployment.pkl"
+    state_classification.save_hmm_deployment_artifact(
+        output_path=artifact_path,
+        model_adata=model_adata,
+        hmm_model=hmm_model,
+        state_paths=state_paths,
+        source_model_adata_path=state_paths.model_adata_path,
+        verbose=False,
+    )
+
+
 def test_hmm_deployment_artifact_updates_after_intrinsic_rename(tmp_path):
     df_positions = _with_binary_contact_flag(_make_positions_df(n_tracks=6, track_len=8))
     output_dir = Path(tmp_path) / "hmm_deployment_rename"

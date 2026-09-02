@@ -51,18 +51,18 @@ Launch the plugin, take the 5-minute tour, learn the dock widget layout.
 Visualization, the Processing Queue, and the canonical output folder layout — concepts that span every step.
 ::::
 
-::::{grid-item-card} 🔬 Preprocessing
-:link: preprocessing/index
+::::{grid-item-card} 📋 Data Preparation
+:link: data_preparation
 :link-type: doc
 
-Data preparation: building the metadata table, setting up the output folder, converting raw images to Zarr for fast access.
+Building the metadata table, declaring your cell types, setting up the output folder, and converting raw images to Zarr for fast access.
 ::::
 
 ::::{grid-item-card} ⚙️ Processing
 :link: processing/index
 :link-type: doc
 
-Segmentation (6 methods, including zero-shot Cellpose-SAM) and Tracking (Propagation, Reporter Propagation, btrack, Import) — the heavy computation that turns images into trackable cells.
+Segmentation (6 methods, including zero-shot Cellpose-SAM) and Tracking (LAP, TrackPy, Fragmentation Tracking, Bounded Propagation, Reporter Propagation, btrack, Import) — the heavy computation that turns images into trackable cells.
 ::::
 
 ::::{grid-item-card} 📈 Analysis
@@ -102,7 +102,8 @@ plugin_essentials/index
 :caption: Pipeline
 :maxdepth: 3
 
-preprocessing/index
+quick_protocol
+data_preparation
 processing/index
 analysis/index
 ```

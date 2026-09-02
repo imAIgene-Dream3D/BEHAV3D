@@ -99,7 +99,11 @@ Both default to **off**. napari-convpaint documents **Tile image** as being for 
 
 ### 5 · Per cell-type tab — Instance-preview parameters
 
-Each cell-type tab includes an "Instance Segmentation Preview" group whose spinboxes (EDT threshold, mask / seed thresholds, opening, min size, fill holes) depend on the chosen strategy. Their meaning and tuning are documented once in [Instance post-processing parameters](./index.md#instance-post-processing-parameters); the set shown per strategy and most defaults match APOC for the equivalent strategy.
+```{seealso}
+**These instance post-processing parameters are explained once, centrally — read them there.** What each control does (EDT threshold, Mask/Seed threshold, Min size, Opening, Fill holes): [Instance post-processing parameters](./index.md#instance-post-processing-parameters). What to change when the result looks wrong: [Tuning (failure mode → fix)](./index.md#instance-post-processing-tuning). Starting points for large vs small objects: [Advice: large vs small objects](./index.md#advice-large-vs-small-objects).
+```
+
+Each cell-type tab includes an "Instance Segmentation Preview" group whose spinboxes (EDT threshold, mask / seed thresholds, opening, min size, fill holes) depend on the chosen strategy. The set shown per strategy and most defaults match APOC for the equivalent strategy.
 
 ### 6 · Train + Preview
 

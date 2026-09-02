@@ -58,7 +58,7 @@ Export the result as a TIFF time-series (or a zarr) and point the metadata colum
 
 ## After importing
 
-Once each row shows ✅ Ready for tracking, the Visualization tab can load these segments as Labels layers, and the Tracking tab can run on them just like segmentations produced by APOC / ConvPaint / Pixel Classifier / Cellpose.
+Once each row shows ✅ Ready for tracking, the Visualization tab can load these segments as Labels layers, and the Tracking tab can run on them just like segmentations produced by APOC / ConvPaint / Pixel Classifier / Cellpose / Cellpose-SAM.
 
 ## Tips
 
@@ -68,6 +68,6 @@ Once each row shows ✅ Ready for tracking, the Visualization tab can load these
 ## See also
 
 - [Segmentation overview](./index.md) — method comparison and shared concepts.
-- [Data Preparation](../../preprocessing/data_preparation) — where the `*_segments_image_path` columns are filled in.
+- [Data Preparation](../../data_preparation) — where the `*_segments_image_path` columns are filled in.
 - [Output Directory & File Layout](../../plugin_essentials/output_layout) — the canonical zarr layout.
 - [Import existing tracks](../tracking/import) — analogous workflow for tracking data.

@@ -290,7 +290,9 @@ def compute_track_state_shift_features(
     - "track_windows": the DataFrame from ``compute_contact_bout_windows`` (all tracks, including
       excluded ones, for transparency/CSV export).
     - "state_timepoints": long DataFrame, one row per (track, period, timepoint), with columns
-      ``[*groupby_cols, "period", time_col, state_col, "contact_group"]``.
+      ``[*groupby_cols, "period", time_col, state_col, "contact_group", "relative_t"]``, where
+      ``relative_t`` is signed time-from-the-bout (<=0 before the bout start, >=0 after the bout
+      end), for plotting a continuous composition-over-time view aligned across tracks.
     - "n_contact_tracks", "n_no_contact_tracks", "n_excluded_tracks": ints for logging/tests.
     """
     groupby_cols = [str(c) for c in list(groupby_cols)]
@@ -357,8 +359,10 @@ def compute_track_state_shift_features(
 
     before_rows = merged.loc[before_mask, join_cols + [time_col, state_col, "contact_group"]].copy()
     before_rows["period"] = BEFORE_LABEL
+    before_rows["relative_t"] = merged.loc[before_mask, time_col] - merged.loc[before_mask, "bout_start_t"]
     after_rows = merged.loc[after_mask, join_cols + [time_col, state_col, "contact_group"]].copy()
     after_rows["period"] = AFTER_LABEL
+    after_rows["relative_t"] = merged.loc[after_mask, time_col] - merged.loc[after_mask, "bout_end_t"]
 
     state_timepoints = pd.concat([before_rows, after_rows], ignore_index=True)
 

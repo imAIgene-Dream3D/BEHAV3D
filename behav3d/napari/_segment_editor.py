@@ -1768,8 +1768,12 @@ class TrackedSegmentEditor(QWidget):
                     )
             if prev_active is not None and getattr(prev_active, "name", None) != _HIGHLIGHT_LAYER:
                 self.viewer.layers.selection.active = prev_active
-        except Exception:
-            pass
+        except Exception as exc:
+            # Do not swallow silently: if ``add_labels`` fails inside napari's
+            # own inserted-event handling, the layer is already in the viewer
+            # but has no controls widget, and the failure only resurfaces much
+            # later as a KeyError that aborts a bulk layer clear.
+            self._log_msg(f"Could not refresh the label highlight overlay: {exc}")
 
     def _apply_split(self) -> None:
         self._clear_preview()

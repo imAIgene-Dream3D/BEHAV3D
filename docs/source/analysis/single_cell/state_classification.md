@@ -1,6 +1,6 @@
 # 🔬 State Classification
 
-The first inner sub-tab of **Analysis → 🧬 Single Cell**. It assigns every cell, at every timepoint, to a recurring **behavioural state**, built in two stages. First, a **Hidden Markov Model (HMM)** clusters the continuous, dynamic features you choose — by default movement and morphology — into a handful of **intrinsic states** (an HMM models behaviour as a sequence, rather than treating each timepoint independently). Second, any **binary features** you also select (for example a contact flag or a `dead` flag) are layered on top — not fit by the HMM itself — to subdivide each intrinsic state into a **full behavioural cluster** (for example *slow-moving & in contact* vs *slow-moving & not in contact*). See *Feature Selection* and *Binary Group Selection* below for how each half is configured.
+The first inner sub-tab of **Analysis → 🧬 Single Cell**. It assigns every cell, at every timepoint, to a recurring **behavioural state**, built in two stages. First, a **Hidden Markov Model (HMM)** clusters the continuous, dynamic features you choose — by default movement and morphology — into a handful of **intrinsic states** (an HMM models behaviour as a sequence, rather than treating each timepoint independently). Second, any **binary features** you also select (for example a contact, dead or active killing flag) are layered on top — not fit by the HMM itself — to subdivide each intrinsic state into a **full behavioural cluster** (for example *slow-moving & in contact* vs *slow-moving & not in contact*). See *Feature Selection* and *Binary Group Selection* below for how each half is configured.
 
 The analysis runs on the **cell type chosen in the dropdown at the top of the Single Cell sub-tab** (immune / other only) and reads that cell type's per-track features table from [Feature Extraction](../feature_extraction).
 
@@ -28,8 +28,8 @@ This is where you choose what features the model "sees" and how many states to f
 This section is populated **from the actual feature columns** found in the selected cell type's features CSV, so you only ever see features you really computed.
 
 - **Timepoint features** — checkboxes for the per-timepoint measurements from Feature Extraction, grouped by family (movement, intensity, morphology, contact, death, …). Tick the ones that define the behaviour you care about. If no features appear, run [Feature Extraction](../feature_extraction) for this cell type first. **By default**, when present in the features table, **speed**, **elongation**, **sphericity**, **extent** and **solidity** are pre-ticked as a sensible starting set covering both movement and morphology.
-- **Window features** — features computed over a short, trailing, rolling window rather than a single frame (e.g. displacement, straightness):
-  - **Window size** (default `5`, range 1–500) — how many timepoints each window spans. Keep it around 5 for motility behaviour; **set it to 1 when the events you care about happen at a single timepoint** (e.g. calcium-intensity peaks), so a window doesn't smear them out. The HMM still assigns a state *per timepoint* regardless of this setting — that is what a hidden Markov model does; the window only controls how the window-based features are aggregated.
+- **Window features** — features computed over a short, trailing, rolling window rather than a single frame (e.g. net displacement, straightness) that add extra description to your cell behaviour:
+  - **Window size** (default `5`, range 1–500) — how many timepoints each window spans. **This is a count of frames, so what it means in real time depends on your interval**: 5 windows is 10 minutes at a 2-minute interval, but 25 seconds at 5 seconds. Multiply by your `time_interval` and judge the duration, not the number. Around 5 suits motility behaviour at typical live-imaging cadences; **set it to 1 when the events you care about happen at a single timepoint** (e.g. calcium-intensity peaks), so a window doesn't smear them out. The HMM still assigns a state *per timepoint* regardless of this setting — that is what a hidden Markov model does; the window only controls how the window-based features are aggregated.
   - **net_displacement**, **straightness**, **mean_square_displacement** — tick the window-based motility summaries you want added. These are computed here, from the per-timepoint feature table — they are **not** columns in the Feature Extraction CSV. **net_displacement** is ticked by default; the other two are off by default.
 
 ```{tip}
@@ -54,6 +54,14 @@ Optional clean-up applied to the chosen features before fitting:
 ### Binary Group Selection
 
 Contains checkboxes for the binary (**categorical / true-false**) flags that are assigned to cells at each timepoint in the features table (for example a `dead` flag, an `*_contact` column, or an active-killing flag). These are deliberately **kept out of the HMM fit** — clustering on binary columns tends to create artificial states — and instead **subdivide** each behavioural state afterwards. A state such as *slow-moving* can be split into *slow-moving & in contact* vs *slow-moving & not in contact*. This is what later produces the **full behavioural clusters** (see Step 2).
+
+```{tip}
+**`any_organoid_contact` / `any_immune_cell_contact` vs. per-type contact columns** - Feature Extraction writes a separate contact column for each specific organoid or immune subtype (e.g. `organoid_lineA_contact`, `organoid_lineB_contact`). `any_organoid_contact` and `any_immune_cell_contact` are a simpler summary of these: `True` whenever a cell is touching any of that type — any organoid, or any immune cell — no matter which specific subtype it happens to be.
+
+**Reach for the `any_*` version**, when you have several organoid lines or immune subtypes in the same dataset and you believe behavior should be unrelated to whatever subtype it is contacting (e.g. you want organoid engagement to not depend on what organoid type it is engaging with but keep engagement as a general behavior). It keeps things to a plain "in contact or not."
+
+**Use a per-type column instead** when *which* population was contacted is actually part of the behaviour you are trying to find — for example contact between two different immune populations, such as T cells and macrophages, where touching one may mean something different from touching the other. You'll get more, smaller full behavioural clusters in exchange for that detail.
+```
 
 ### Number of states
 

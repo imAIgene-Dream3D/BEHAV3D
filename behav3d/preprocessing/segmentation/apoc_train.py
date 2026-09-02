@@ -15,11 +15,10 @@ import shutil
 import contextlib
 from pathlib import Path
 
-# Defeat buggy PyOpenCL compiler caching that causes TypeErrors on some systems
-# (e.g. enqueue_knl_predict() argument-count mismatches from a stale cached kernel).
-# Must be set before pyclesperanto_prototype/apoc are imported. See apoc_segment.py.
-os.environ['PYOPENCL_NO_CACHE'] = '1'
-os.environ['PYOPENCL_COMPILER_OUTPUT'] = '0'
+# Configure PyOpenCL (cache off, build chatter silenced) before
+# pyclesperanto_prototype/apoc are imported below.
+from behav3d.core.opencl_env import configure_pyopencl
+configure_pyopencl()
 
 import numpy as np
 import napari
@@ -304,6 +303,29 @@ def _channel_index_from_name(name):
 def _channel_name_from_index(index):
     """Format a channel index as the canonical Napari training layer name."""
     return f"Channel {int(index)}"
+
+
+def _loose_channel_index(name):
+    """Best-effort channel index from a layer name.
+
+    Tolerates historical and renamed forms (``Channel 2 (dead)``, ``Ch 2``,
+    ``ch2``) so a selection saved under one naming scheme still matches the
+    layers of another. ``_channel_index_from_name`` stays strict for the
+    canonical ``Channel N`` form written into classifier metadata.
+    """
+    text = str(name or "")
+    match = re.search(r"\((\d+)\)", text)
+    if match:
+        return int(match.group(1))
+    match = re.search(
+        r"(?:^|\b)(?:channel|ch)\s*(\d+)(?:\b|$)", text, flags=re.IGNORECASE
+    )
+    if match:
+        return int(match.group(1))
+    nums = re.findall(r"\d+", text)
+    if nums:
+        return int(nums[-1])
+    return None
 
 
 def _normalize_channel_names(channel_names=None, channel_indices=None):
@@ -1057,7 +1079,14 @@ class CellTypeTab(QWidget):
             or _default_grid_sigmas_text()
         )
         ip = {f"apoc_{cell_type}_{key}": value for key, value in cfg.items()}
-        self._default_channel_names = list(cfg.get("channels", []))
+        # Single source of truth for this tab's channel selection. ``None``
+        # means "never configured" and is deliberately distinct from ``[]``:
+        # only ``None`` falls back to the all-channels default, and only a
+        # non-``None`` value is ever persisted. See ``configured_channels``.
+        saved_channels = cfg.get("channels")
+        self._selected_channel_names = (
+            [str(name) for name in saved_channels] if saved_channels else None
+        )
 
         layout = QVBoxLayout()
         layout.setContentsMargins(8, 8, 8, 8)
@@ -1807,71 +1836,148 @@ class CellTypeTab(QWidget):
         consider_orig = self.consider_original_cb.isChecked()
         return _build_feature_string_from_checked(checked, consider_original=consider_orig, current_sigmas=self.current_sigmas)
 
-    def refresh_channel_checkboxes(self):
-        """Rebuild channel checkboxes from current Napari image layers."""
-        existing_names = {cb.text() for cb in self.channel_checkboxes}
-        checked_names = {cb.text() for cb in self.channel_checkboxes if cb.isChecked()}
-        default_names = set(self._default_channel_names)
-        use_defaults = not self.channel_checkboxes
+    # ── Channel selection ───────────────────────────────────────
+    # ``_selected_channel_names`` owns the selection; the checkboxes are only
+    # a view rendered from it. That view is rebuilt on every layer insert and
+    # remove, and the rebuild must never write back into the model.
 
+    def _eligible_channel_layers(self):
+        """Image layers that count as selectable classifier input channels."""
+        return [
+            layer for layer in self.viewer.layers
+            if isinstance(layer, napari.layers.Image)
+            and not layer.name.startswith("Pixel Classification")
+            and not layer.name.startswith("Probability Map")
+            and not layer.name.startswith("Instance Segmentation")
+        ]
+
+    def configured_channels(self):
+        """The selection the user actually made, or ``None`` if never set.
+
+        Callers that persist config must omit the key when this is ``None``.
+        Writing ``[]`` instead reads back as "unconfigured" on the next load
+        and silently reverts the tab to all channels.
+        """
+        if self._selected_channel_names is None:
+            return None
+        return list(self._selected_channel_names)
+
+    def effective_channels(self):
+        """Channel names actually in use right now, in viewer order.
+
+        Restricted to layers that currently exist, so this always matches what
+        ``_get_images_for_tab`` feeds the classifier and the ``.cl`` header can
+        never record a channel that was not trained on. The model may still
+        name a channel this session has not loaded; that name is preserved in
+        ``configured_channels`` rather than silently dropped.
+
+        Falls back to every eligible layer when nothing was configured, which
+        is the documented first-run default (all channels checked).
+        """
+        eligible = [layer.name for layer in self._eligible_channel_layers()]
+        if self._selected_channel_names is None:
+            return eligible
+        names, indices = self._selection_matchers()
+        return [n for n in eligible if self._layer_is_selected(n, names, indices)]
+
+    def _selection_matchers(self):
+        """Return ``(names, indices)`` used to match layers against the model."""
+        selected = self._selected_channel_names or []
+        names = {str(name) for name in selected}
+        indices = {
+            idx for idx in (_loose_channel_index(name) for name in selected)
+            if idx is not None
+        }
+        return names, indices
+
+    @staticmethod
+    def _layer_is_selected(layer_name, names, indices):
+        """Match by exact name, falling back to the parsed channel index.
+
+        The index fallback keeps a selection working when layer names differ
+        between sessions (e.g. ``Channel 2`` vs ``Channel 2 (dead)``).
+        """
+        if layer_name in names:
+            return True
+        if not indices:
+            return False
+        idx = _loose_channel_index(layer_name)
+        return idx is not None and idx in indices
+
+    def refresh_channel_checkboxes(self):
+        """Re-render the channel checkboxes from the current image layers.
+
+        Pure view rebuild — ``_selected_channel_names`` is never written here.
+        Image layers arrive one at a time (one ``add_image`` per channel while
+        a session loads), so this runs repeatedly against a still-partial set
+        of layers; narrowing the model to whatever exists at that moment is
+        exactly what used to drop a saved selection.
+        """
         for cb in self.channel_checkboxes:
             self.chan_checkbox_layout.removeWidget(cb)
             cb.deleteLater()
         self.channel_checkboxes = []
 
-        # Image layers can arrive one at a time (e.g. one `add_image` call per
-        # channel while a session loads), so this rebuild can run repeatedly
-        # against a still-partial set of layers. Only a real user click
-        # (``_on_channel_checkbox_toggled``) is allowed to update
-        # ``_default_channel_names`` — otherwise an in-progress load would
-        # permanently forget a saved channel selection that hasn't appeared
-        # as a layer yet.
+        configured = self._selected_channel_names is not None
+        names, indices = self._selection_matchers()
+
         self._rebuilding_channel_checkboxes = True
         try:
-            for layer in self.viewer.layers:
-                if (
-                    isinstance(layer, napari.layers.Image)
-                    and not layer.name.startswith("Pixel Classification")
-                    and not layer.name.startswith("Probability Map")
-                    and not layer.name.startswith("Instance Segmentation")
-                ):
-                    cb = QCheckBox(layer.name)
-                    if use_defaults and default_names:
-                        checked = layer.name in default_names
-                    elif layer.name in existing_names:
-                        checked = layer.name in checked_names
-                    elif default_names:
-                        checked = layer.name in default_names
-                    else:
-                        checked = True
-                    cb.setChecked(checked)
-                    cb.toggled.connect(self._on_channel_checkbox_toggled)
-                    self.chan_checkbox_layout.addWidget(cb)
-                    self.channel_checkboxes.append(cb)
+            for layer in self._eligible_channel_layers():
+                cb = QCheckBox(layer.name)
+                # Never configured -> documented default is all channels.
+                checked = (
+                    True if not configured
+                    else self._layer_is_selected(layer.name, names, indices)
+                )
+                cb.setChecked(checked)
+                cb.toggled.connect(self._on_channel_checkbox_toggled)
+                self.chan_checkbox_layout.addWidget(cb)
+                self.channel_checkboxes.append(cb)
         finally:
             self._rebuilding_channel_checkboxes = False
 
     def _on_channel_checkbox_toggled(self, _checked=None):
-        """Update the remembered default only in response to a real user click."""
+        """The only path from checkbox state back into the owned model."""
         if getattr(self, "_rebuilding_channel_checkboxes", False):
             return
-        self._default_channel_names = [
+        self._selected_channel_names = [
             cb.text() for cb in self.channel_checkboxes if cb.isChecked()
         ]
 
-    def channel_selection_is_complete(self):
-        """Whether ``channel_checkboxes`` covers every eligible image layer.
+    def set_channel_selection(self, channel_names):
+        """Apply an explicit selection (config restore, import, organoid sync).
 
-        False while a session is still loading channels one at a time, which
-        callers use to avoid persisting a partial channel selection.
+        An empty or absent value is ignored so a stale or partially-loaded
+        config can never clear a good selection.
         """
-        expected = {
-            layer.name for layer in self.viewer.layers
-            if isinstance(layer, napari.layers.Image)
-            and not layer.name.startswith("Pixel Classification")
-            and not layer.name.startswith("Probability Map")
-            and not layer.name.startswith("Instance Segmentation")
-        }
+        if not channel_names:
+            return
+        self._selected_channel_names = [str(name) for name in channel_names]
+        names, indices = self._selection_matchers()
+        # Update the existing widgets in place instead of rebuilding them: the
+        # host wires persistence handlers onto these exact checkboxes and only
+        # re-wires after a ``channels_refreshed`` emission.
+        self._rebuilding_channel_checkboxes = True
+        try:
+            for cb in self.channel_checkboxes:
+                cb.blockSignals(True)
+                cb.setChecked(self._layer_is_selected(cb.text(), names, indices))
+                cb.blockSignals(False)
+        finally:
+            self._rebuilding_channel_checkboxes = False
+
+    def channel_selection_is_complete(self):
+        """Whether the checkboxes cover every eligible image layer.
+
+        False while a session is still loading channels one at a time — and
+        also false when no channel layers are loaded at all, since an empty
+        checkbox list would otherwise read back as a deliberate empty
+        selection and overwrite the saved one.
+        """
+        expected = {layer.name for layer in self._eligible_channel_layers()}
+        if not expected:
+            return False
         current = {cb.text() for cb in self.channel_checkboxes}
         return current == expected
 
@@ -1893,9 +1999,7 @@ class CellTypeTab(QWidget):
             "checked_features":   [list(pair) for pair in checked_set],
             "max_depth":          self.max_depth_spin.value(),
             "num_ensembles":      self.num_ensembles_spin.value(),
-            "channels":           [
-                cb.text() for cb in self.channel_checkboxes if cb.isChecked()
-            ],
+            "channels":           self.effective_channels(),
             "prob_mask_threshold": (
                 float(self.prob_mask_threshold_spin.value()) if self.prob_mask_threshold_spin is not None else None
             ),
@@ -1943,10 +2047,8 @@ class CellTypeTab(QWidget):
             self.max_depth_spin.setValue(int(cfg["max_depth"]))
         if "num_ensembles" in cfg:
             self.num_ensembles_spin.setValue(int(cfg["num_ensembles"]))
-        if "channels" in cfg:
-            for cb in self.channel_checkboxes:
-                cb.setChecked(cb.text() in cfg["channels"])
-            self._default_channel_names = list(cfg["channels"])
+        if cfg.get("channels"):
+            self.set_channel_selection(cfg["channels"])
         if "prob_mask_threshold" in cfg and self.prob_mask_threshold_spin is not None and cfg["prob_mask_threshold"] is not None:
             self.prob_mask_threshold_spin.setValue(float(cfg["prob_mask_threshold"]))
         if "prob_seed_threshold" in cfg and self.prob_seed_threshold_spin is not None and cfg["prob_seed_threshold"] is not None:
@@ -2005,11 +2107,8 @@ class CellTypeTab(QWidget):
         self.consider_original_cb.blockSignals(False)
 
         # Channel checkboxes
-        if channels_used is not None:
-            self._default_channel_names = list(channels_used)
-            channels_used_set = set(channels_used)
-            for cb in self.channel_checkboxes:
-                cb.setChecked(cb.text() in channels_used_set)
+        if channels_used:
+            self.set_channel_selection(channels_used)
 
         # --- Disable all controls ---
         self.feature_combo.setEnabled(False)
@@ -2701,6 +2800,29 @@ class APOCTrainingWidget(QWidget):
     # Core training logic
     # ------------------------------------------------------------------
 
+    def _schedule_statistics(self, cell_types):
+        """Open the per-cell-type statistics dialogs from the main event loop.
+
+        Deferred with a zero-delay timer so the modal dialogs never nest an
+        event loop inside a background operation's completion callback or
+        Qt's worker-teardown path.
+        """
+        pending = [ct for ct in cell_types if ct in self.tabs]
+        if not pending:
+            return
+
+        def _show():
+            for ct in pending:
+                tab = self.tabs.get(ct)
+                if tab is None:
+                    continue
+                try:
+                    tab._on_show_statistics()
+                except Exception as exc:
+                    self._log(f"  ⚠️ Could not show statistics for '{ct}': {exc}")
+
+        QTimer.singleShot(0, _show)
+
     def _get_images_for_tab(self, ct):
         """Return numpy arrays for the image layers checked in a tab."""
         tab = self.tabs[ct]
@@ -3273,9 +3395,17 @@ class APOCTrainingWidget(QWidget):
             successes = list(results.keys())
             for ct, r in results.items():
                 self._update_prediction_layers(ct, r["display_segments"], r["prob_result"])
-                # Auto-show statistics
-                if ct in self.tabs:
-                    self.tabs[ct]._on_show_statistics()
+
+            # Auto-show statistics, but only once this callback has unwound.
+            # ``_on_show_statistics`` opens a modal dialog, and a nested event
+            # loop started from inside BackgroundOperation's ``on_done`` also
+            # runs the deferred activity-dock teardown that ``_cleanup_ui``
+            # just scheduled (``close_activity_progress`` fires ~600 ms later
+            # and hides napari's activity dialog) plus the worker thread's
+            # queued ``finished`` handler — all while this frame is still on
+            # the stack. Tearing the activity panel down underneath a user who
+            # is clicking in it is how this crashes napari outright.
+            self._schedule_statistics(list(results.keys()))
 
             elapsed_s   = time.time() - training_start
             elapsed_txt = f"{elapsed_s:.1f}s"
@@ -3606,10 +3736,12 @@ class APOCTrainingWidget(QWidget):
             params[f"apoc_{ct}_checked_features"]      = cfg["checked_features"]
             params[f"apoc_{ct}_max_depth"]             = cfg["max_depth"]
             params[f"apoc_{ct}_num_ensembles"]         = cfg["num_ensembles"]
-            # Channel layers can still be loading in one at a time; don't
-            # overwrite the saved selection with a partial checkbox state.
-            if tab.channel_selection_is_complete():
-                params[f"apoc_{ct}_channels"] = cfg["channels"]
+            # Only persist a selection the user actually made. ``None``
+            # means "never configured"; writing ``[]`` would read back as
+            # unconfigured and silently revert the tab to all channels.
+            configured = tab.configured_channels()
+            if configured is not None:
+                params[f"apoc_{ct}_channels"] = configured
             if cfg["prob_mask_threshold"] is not None:
                 params[f"{ct}_prob_mask_threshold"] = cfg["prob_mask_threshold"]
             if cfg["prob_seed_threshold"] is not None:

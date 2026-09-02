@@ -23,6 +23,7 @@ import dask.array as da
 import pandas as pd
 
 from behav3d.core.metadata import is_multicolor_celltype
+from behav3d.napari._track_colors import sync_tracks_colors_to_labels
 
 
 _CHANNEL_COLORS = ["cyan", "yellow", "green", "red", "blue", "magenta"]
@@ -289,6 +290,14 @@ def load_tracks_into_viewer(
             viewer.add_tracks(arr, name=name, visible=visible)
             log(f"    + Tracks layer: {name}")
             added.append(name)
+
+            # Color each track the same as its cell's tracked-segments
+            # label, instead of napari's default track_id gradient.
+            seg_layer_name = f"{sample_name} – {ct_name} tracked segments"
+            if seg_layer_name in viewer.layers:
+                sync_tracks_colors_to_labels(
+                    viewer.layers[name], viewer.layers[seg_layer_name]
+                )
         except Exception as exc:
             log(f"    ⚠️ Could not load tracks for {ct_name}: {exc}")
     return added

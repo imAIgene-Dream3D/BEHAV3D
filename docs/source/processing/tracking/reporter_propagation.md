@@ -24,6 +24,12 @@ each object's shape and position are genuinely static. Any real movement or
 morphology change is masked out, because the same shape is pasted into every frame.
 ```
 
+If the reporter flickers **and the object moves**, do not use Reporter Propagation.
+Track a constitutive channel and extract the reporter as an intensity feature. If no
+constitutive channel exists, use permissive segmentation that accepts some false
+positives and a moving-object tracker such as btrack. Reporter flicker and static
+position are both required for this method.
+
 ## Parameters
 
 The Tracking sub-tab exposes two parameters for this method:
@@ -57,5 +63,5 @@ Standard BEHAV3D EXPLORER tracking outputs:
 ## See also
 
 - [Tracking overview](index).
-- [Propagation](propagation) — overlap-based propagation for objects that are
-  segmented reliably at every timepoint.
+- [Fragmentation tracking](fragmentation_tracking) — overlap-based tracking for objects
+  that are segmented reliably at every timepoint.

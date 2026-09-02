@@ -22,6 +22,7 @@ from behav3d.analysis.behavior.state.hmm import (
 from behav3d.analysis.behavior.state.utils import (
     A4_LANDSCAPE,
     _apply_log1p_to_feature_matrix,
+    _apply_state_order,
     _get_classification_state_colors,
     _get_classification_state_order,
     _infer_binary_group_constraints,
@@ -1095,6 +1096,48 @@ def _build_hmm_transition_label_mapping(adata, *, cluster_col):
     return mapping, {str(k): float(v) for k, v in weights.items()}
 
 
+def _write_full_state_count_outputs(adata, output_dir, *, full_state_col=FULL_STATE_COL, title=None, verbose=True):
+    """Write a bar-chart PDF + CSV of per-timepoint observation counts for each full state."""
+    output_dir = Path(output_dir)
+    if adata is None or adata.n_obs == 0 or full_state_col not in adata.obs.columns:
+        return {}
+
+    counts = pd.Series(adata.obs[full_state_col], dtype="string").dropna().value_counts()
+    if counts.empty:
+        return {}
+
+    order = _get_classification_state_order(adata, full_state_col)
+    labels = _apply_state_order(counts.index.tolist(), order) if order else sorted(
+        counts.index.tolist(), key=_mixed_label_sort_key
+    )
+    counts = counts.reindex(labels).fillna(0).astype(int)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    counts_csv = output_dir / "behavioral_clustering_full_state_counts.csv"
+    counts.rename_axis(full_state_col).reset_index(name="count").to_csv(counts_csv, index=False)
+    _vsave(verbose, "state-hmm", "full state counts csv", counts_csv)
+
+    colors_map = _get_classification_state_colors(adata, full_state_col)
+    bar_colors = [colors_map.get(label, "#888888") for label in labels]
+
+    counts_pdf = output_dir / "behavioral_clustering_full_state_counts.pdf"
+    with PdfPages(counts_pdf) as pdf:
+        fig, ax = plt.subplots()
+        ax.bar(labels, counts.values, color=bar_colors)
+        for i, v in enumerate(counts.values):
+            ax.text(i, v, str(int(v)), ha="center", va="bottom", fontsize=8)
+        ax.set_ylabel("Number of timepoints (cell-frames)")
+        ax.set_xlabel(full_state_col)
+        ax.set_title((f"{title} | " if title else "") + "full state counts")
+        plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
+        fig.tight_layout(rect=[0, 0, 1, 0.97])
+        _save_pdf_page_a4(pdf, fig, orientation="landscape")
+        plt.close(fig)
+    _vsave(verbose, "state-hmm", "full state counts pdf", counts_pdf)
+
+    return {"full_state_counts_csv": str(counts_csv), "full_state_counts_pdf": str(counts_pdf)}
+
+
 def save_hmm_quality_control_outputs(
     adata,
     *,
@@ -1186,6 +1229,10 @@ def save_hmm_quality_control_outputs(
     )
     _vsave(verbose, "state-hmm", "state counts csv", state_counts_csv)
 
+    full_state_outputs = _write_full_state_count_outputs(
+        adata, output_dir, full_state_col=FULL_STATE_COL, title=title, verbose=verbose,
+    )
+
     selection_csv = None
     if isinstance(selection_df, pd.DataFrame) and (not selection_df.empty):
         selection_csv = output_dir / "behavioral_clustering_hmm_model_selection.csv"
@@ -1215,6 +1262,8 @@ def save_hmm_quality_control_outputs(
         "state_counts_csv": str(state_counts_csv),
         "transition_matrix_csv": None if transition_csv is None else str(transition_csv),
         "model_selection_csv": None if selection_csv is None else str(selection_csv),
+        "full_state_counts_csv": full_state_outputs.get("full_state_counts_csv"),
+        "full_state_counts_pdf": full_state_outputs.get("full_state_counts_pdf"),
     }
 
 def _plot_hmm_feature_distribution_pdf(
@@ -1856,6 +1905,11 @@ def run_hmm_state_clustering(
     )
     _vdone(verbose, "state-hmm", "write HMM state counts CSV", state_counts_started)
     _vsave(verbose, "state-hmm", "state counts csv", state_counts_csv)
+
+    _write_full_state_count_outputs(
+        model_adata, state_clustering_outdir, full_state_col=FULL_STATE_COL,
+        title=f"all_data | hmm (states={int(model.n_components)})", verbose=verbose,
+    )
 
     selection_csv = None
     if isinstance(selection_df, pd.DataFrame) and (not selection_df.empty):

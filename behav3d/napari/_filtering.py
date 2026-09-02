@@ -26,7 +26,7 @@ from qtpy.QtWidgets import (
 )
 from qtpy.QtCore import Qt, Signal
 
-from behav3d.core.qt_help import HelpButton, make_help_row
+from behav3d.core.qt_help import HelpButton, make_help_row, reset_scroll_on_page_change
 from behav3d.napari._units import UnitGroupManager, TimeUnitGroupManager
 from behav3d.napari._results_panel import (
     ResultsPanel,
@@ -74,7 +74,9 @@ class CellTypeFilterPanel(QWidget):
         md = metadata_loader.metadata
         self._has_dead = False
         if md is not None:
-            self._has_dead = "dead_channel" in md.columns and md["dead_channel"].notna().any()
+            self._has_dead = bool(
+                "dead_channel" in md.columns and md["dead_channel"].notna().any()
+            )
 
         # Read saved config
         params = self.metadata_loader.behav3d_parameters
@@ -305,8 +307,9 @@ class CellTypeFilterPanel(QWidget):
             "Filter By Minimal Size At T1",
             "When enabled, a track is removed entirely if the cell's size "
             "at its first timepoint (relative_time == 1) is below 'Min "
-            "size'. Size is read from the 'volume' column when available, "
-            "otherwise from 'nr_pixels'.\n\n"
+            "size'. 'Min size' is a voxel count, so it is compared against "
+            "the 'nr_pixels' column when available, otherwise 'volume' "
+            "(physical um³) is used as a fallback.\n\n"
             "Runs after the 'Max timepoints' trim but before the 'Min "
             "length' and 'Max length' filters, so it removes small/spurious "
             "objects (e.g. segmentation fragments) before track-length "
@@ -693,6 +696,7 @@ class FilteringTab(QWidget):
         self.cell_tabs = QTabWidget()
         self.cell_tabs.setTabPosition(QTabWidget.West)
         layout.addWidget(self.cell_tabs)
+        reset_scroll_on_page_change(self.cell_tabs)
 
         self.btn_run_batch = QPushButton("Run Batch Filtering (All Cell Types)")
         self.btn_run_batch.setStyleSheet(

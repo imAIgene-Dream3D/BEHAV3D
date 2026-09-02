@@ -367,14 +367,27 @@ def get_package_manager():
     return conda_path if conda_path else None
 
 def check_env_exists(conda_path, env_name):
-    """Check if conda environment exists."""
+    """Check if conda environment exists (exact name match, not substring)."""
     try:
         # Use best available package manager
         pkg_mgr = get_package_manager()
         if not pkg_mgr:
             pkg_mgr = conda_path
         result = run_command(f'"{pkg_mgr}" env list', capture=True)
-        return env_name in result
+        if not result:
+            return False
+        # Only match the name column: a substring test would report e.g.
+        # 'behav3d_napari_test' as if 'behav3d' existed.
+        for line in result.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            # Nameless (--prefix) envs list only a path; those aren't
+            # addressable with -n, so skip them.
+            if len(parts) >= 2 and parts[0] == env_name:
+                return True
+        return False
     except:
         return False
 

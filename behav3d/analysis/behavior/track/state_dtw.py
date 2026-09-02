@@ -22,6 +22,7 @@ from behav3d.features.state_descriptive_features import extract_descibing_track_
 from behav3d.analysis.behavior.track.dtw import (
     _add_cluster_medoids,
     _cluster_precomputed_distances,
+    _cluster_precomputed_distances_leiden,
     _ensure_dtaidistance_umap,
     _relabel_by_cluster_size,
     _validate_distance_matrix,
@@ -568,6 +569,12 @@ def _dtai_meta(adata_tracks):
     return meta if isinstance(meta, dict) else {}
 
 
+# Trajectory-clustering methods whose adata.X is a per-track feature matrix
+# rather than a pairwise DTW distance matrix - diagnostics that assume a
+# square (n_obs, n_obs) X must not run for these.
+FEATURE_ONLY_METHODS = {"original_behav3d_feature_dtw", "bouts_feature_clustering"}
+
+
 def _resolve_cluster_key(adata_tracks, cluster_key=None):
     if cluster_key is not None:
         return str(cluster_key)
@@ -605,11 +612,12 @@ def save_dtaidistance_diagnostics(
     """
     paths = _resolve_dtaidistance_paths(output_dir, cell_type)
     resolved_cluster_key = _resolve_cluster_key(adata_tracks, cluster_key=cluster_key)
-    if _dtai_meta(adata_tracks).get("method") == "original_behav3d_feature_dtw":
+    if _dtai_meta(adata_tracks).get("method") in FEATURE_ONLY_METHODS:
         raise ValueError(
-            "Diagnostics are not available for the 'Original BEHAV3D' feature-DTW model — "
-            "no pairwise distance matrix is stored for this clustering method. Use "
-            "_save_feature_dtw_quality_control() instead."
+            "Diagnostics are not available for this clustering model — no pairwise "
+            "distance matrix is stored for feature-based clustering methods (e.g. "
+            "'Original BEHAV3D' feature-DTW or bouts/state feature clustering). Use "
+            "the method-appropriate quality-control/diagnostics generator instead."
         )
     distances = _validate_distance_matrix(adata_tracks.X, adata_tracks.n_obs)
     plot_paths = _save_diagnostics(
@@ -682,6 +690,88 @@ def save_dtaidistance_exemplar_overview(
     if bool(verbose):
         _winfo("trajectory-dtai", f"saved exemplar overview: {overview_pdf}")
     return str(overview_pdf)
+
+
+def _build_medoid_overview_figure(
+    adata_filt,
+    adata_tracks,
+    *,
+    cluster_key,
+    state_key,
+    time_col,
+    window_key="trajectory_window_id",
+):
+    """One panel per cluster, each showing only its medoid (most representative) track.
+
+    Reuses the same distance-based medoid flags (`{cluster_key}_medoid`) that
+    `_add_cluster_medoids` computes at clustering time from the precomputed DTW
+    distance matrix - available regardless of whether clusters came from
+    `clustering_method="agglomerative"` or `"leiden"`, since both cluster that same
+    distance matrix rather than deriving medoids from the clustering method itself.
+    """
+    medoid_col = f"{cluster_key}_medoid"
+    if medoid_col not in adata_tracks.obs.columns:
+        raise ValueError(
+            f"adata_tracks.obs missing '{medoid_col}' - re-run clustering to compute cluster medoids."
+        )
+    fig, _, _ = plot_exemplar_tracks_by_cluster(
+        adata_filt,
+        adata_tracks,
+        n_per_cluster=1,
+        sample_key="sample_name",
+        track_key="TrackID",
+        time_key=time_col,
+        state_key=state_key,
+        cluster_key=cluster_key,
+        tmin_key="position_t_min",
+        tmax_key="position_t_max",
+        seed=0,
+        query=f"{medoid_col} == True",
+        window_key=window_key,
+    )
+    return fig
+
+
+def save_dtaidistance_medoid_overview(
+    adata_tracks,
+    output_dir,
+    cell_type,
+    *,
+    outfolder=None,
+    verbose=True,
+):
+    """Save a one-page overview PDF with one panel per cluster, each showing only
+    that cluster's medoid track - the single track closest (on average) to every
+    other track in its cluster under the DTW distance used for clustering.
+    """
+    paths = _resolve_dtaidistance_paths(output_dir, cell_type)
+    meta = _dtai_meta(adata_tracks)
+    resolved_cluster_key = _resolve_cluster_key(adata_tracks)
+    state_col = str(meta.get("state_col", FULL_STATE_COL))
+    time_col = str(meta.get("time_col", "position_t"))
+    adata_filt = _load_filtered_state_adata_for_model(
+        adata_tracks, output_dir, cell_type, verbose=verbose,
+    )
+    _ensure_exemplar_coordinate_columns(
+        adata_filt, output_dir=output_dir, cell_type=cell_type, require_pixel_for_video=False,
+    )
+    dest = Path(outfolder) if outfolder is not None else paths["quality_control_outfolder"]
+    dest.mkdir(parents=True, exist_ok=True)
+    fig = _build_medoid_overview_figure(
+        adata_filt,
+        adata_tracks,
+        cluster_key=resolved_cluster_key,
+        state_key=state_col,
+        time_col=time_col,
+        window_key=str(meta.get("trajectory_window_col", "trajectory_window_id")),
+    )
+    medoid_overview_pdf = dest / "medoid_tracks_overview.pdf"
+    with PdfPages(medoid_overview_pdf) as pdf:
+        pdf.savefig(fig, bbox_inches="tight", dpi=300)
+    plt.close(fig)
+    if bool(verbose):
+        _winfo("trajectory-dtai", f"saved medoid overview: {medoid_overview_pdf}")
+    return str(medoid_overview_pdf)
 
 
 def _load_filtered_state_adata_for_model(
@@ -790,6 +880,7 @@ def save_dtaidistance_exemplar_plots(
     chosen_exemplars.to_csv(exemplar_selection_csv, index=False)
 
     overview_pdf = None
+    medoid_overview_pdf = None
     per_cluster_pdf_out = {}
     backprojection_pdf_out = {}
     backprojection_mp4_out = {}
@@ -812,6 +903,24 @@ def save_dtaidistance_exemplar_plots(
         with PdfPages(overview_pdf) as pdf:
             pdf.savefig(fig_exemplar, bbox_inches="tight", dpi=300)
         plt.close(fig_exemplar)
+
+        try:
+            fig_medoid = _build_medoid_overview_figure(
+                adata_filt,
+                adata_tracks,
+                cluster_key=resolved_cluster_key,
+                state_key=state_col,
+                time_col=time_col,
+                window_key=str(meta.get("trajectory_window_col", "trajectory_window_id")),
+            )
+            medoid_overview_pdf = exemplar_root / "medoid_tracks_overview.pdf"
+            with PdfPages(medoid_overview_pdf) as pdf:
+                pdf.savefig(fig_medoid, bbox_inches="tight", dpi=300)
+            plt.close(fig_medoid)
+        except Exception as exc:
+            medoid_overview_pdf = None
+            if bool(verbose):
+                _winfo("trajectory-dtai", f"skipping medoid overview due to error: {exc}")
 
         per_cluster_pdf_out = save_exemplar_statebar_track_pdf_per_cluster(
             adata_full=adata_filt,
@@ -881,6 +990,7 @@ def save_dtaidistance_exemplar_plots(
     plot_paths = {
         "exemplar_selection_csv": str(exemplar_selection_csv),
         "exemplar_tracks_overview_pdf": str(overview_pdf) if overview_pdf is not None else None,
+        "medoid_tracks_overview_pdf": str(medoid_overview_pdf) if medoid_overview_pdf is not None else None,
         "exemplar_statebar_track_pdf_by_cluster": dict(per_cluster_pdf_out.get("pdf_paths_by_cluster", {})),
         "exemplar_statebar_track_pdf_by_example_rank": dict(
             per_cluster_pdf_out.get("pdf_paths_by_example_rank", {})
@@ -940,6 +1050,9 @@ def run_categorical_dtaidistance_trajectory_clustering(
     psi=None,
     parallel=True,
     linkage="average",
+    clustering_method="agglomerative",
+    leiden_n_neighbors=15,
+    leiden_resolution=1.0,
     missing_policy="keep",
     cluster_key="ClusterID",
     save_outputs=True,
@@ -956,7 +1069,14 @@ def run_categorical_dtaidistance_trajectory_clustering(
     random_state=123,
     verbose=True,
 ):
-    """Cluster categorical state trajectories with dtaidistance over one-hot encodings."""
+    """Cluster categorical state trajectories with dtaidistance over one-hot encodings.
+
+    clustering_method="agglomerative" (default) uses AgglomerativeClustering with a
+    fixed n_clusters/linkage. clustering_method="leiden" instead runs Leiden graph
+    clustering (leiden_n_neighbors/leiden_resolution) on the same precomputed distance
+    matrix that the QC UMAP embedding is built from, so the emergent number of clusters
+    tends to track the density blobs visible in that plot rather than a fixed split.
+    """
     started = time.perf_counter()
     if bool(clear_outputs):
         outfolder = Path(output_dir).expanduser() / "analysis" / str(cell_type) / str(output_subdir_name)
@@ -1039,15 +1159,34 @@ def run_categorical_dtaidistance_trajectory_clustering(
     )
     dtw_backend = "dtaidistance"
 
-    if bool(verbose):
-        _winfo("trajectory-dtai", f"clustering precomputed distances with n_clusters={int(n_clusters)}")
-    raw_labels, _ = _cluster_precomputed_distances(
-        distances,
-        n_clusters=int(n_clusters),
-        linkage=str(linkage),
-    )
+    clustering_method = str(clustering_method).strip().lower()
+    if clustering_method not in {"agglomerative", "leiden"}:
+        raise ValueError("clustering_method must be 'agglomerative' or 'leiden'.")
+
+    if clustering_method == "leiden":
+        if bool(verbose):
+            _winfo(
+                "trajectory-dtai",
+                "clustering precomputed distances with Leiden "
+                f"(n_neighbors={int(leiden_n_neighbors)}, resolution={leiden_resolution})",
+            )
+        raw_labels, _ = _cluster_precomputed_distances_leiden(
+            distances,
+            n_neighbors=int(leiden_n_neighbors),
+            resolution=leiden_resolution,
+            random_state=int(random_state),
+        )
+    else:
+        if bool(verbose):
+            _winfo("trajectory-dtai", f"clustering precomputed distances with n_clusters={int(n_clusters)}")
+        raw_labels, _ = _cluster_precomputed_distances(
+            distances,
+            n_clusters=int(n_clusters),
+            linkage=str(linkage),
+        )
     labels, size_mapping = _relabel_by_cluster_size(raw_labels)
     track_obs[cluster_key] = pd.Categorical(labels)
+    track_obs[f"{cluster_key}_raw"] = pd.Categorical(labels)
 
     var_names = [f"distance_to_track_{i}" for i in range(distances.shape[0])]
     adata_tracks = ad.AnnData(
@@ -1065,7 +1204,8 @@ def run_categorical_dtaidistance_trajectory_clustering(
         silhouette = None
 
     adata_tracks.uns["dtai_trajectory_clustering"] = {
-        "method": "categorical_onehot_dtaidistance_agglomerative",
+        "method": f"categorical_onehot_dtaidistance_{clustering_method}",
+        "clustering_method": str(clustering_method),
         "dtw_backend": str(dtw_backend),
         "local_encoding": "one_hot",
         "inner_dist": "squared euclidean",
@@ -1081,14 +1221,17 @@ def run_categorical_dtaidistance_trajectory_clustering(
         "split_long_tracks": bool(split_long_tracks),
         "trajectory_window_col": str(trajectory_window_col),
         "max_tracks": None if max_tracks is None else int(max_tracks),
-        "n_clusters": int(n_clusters),
+        "n_clusters": int(n_clusters) if clustering_method == "agglomerative" else None,
+        "n_clusters_found": int(len(set(labels))),
         "window": None if window is None else int(window),
         "max_dist": None if max_dist is None else float(max_dist),
         "max_length_diff": None if max_length_diff is None else int(max_length_diff),
         "penalty": None if penalty is None else float(penalty),
         "psi": None if psi is None else int(psi),
         "parallel": bool(parallel),
-        "linkage": str(linkage),
+        "linkage": str(linkage) if clustering_method == "agglomerative" else None,
+        "leiden_n_neighbors": int(leiden_n_neighbors) if clustering_method == "leiden" else None,
+        "leiden_resolution": leiden_resolution if clustering_method == "leiden" else None,
         "missing_policy": str(missing_policy),
         "cluster_key": str(cluster_key),
         "raw_label_size_mapping": dict(size_mapping),
@@ -1156,6 +1299,24 @@ def run_categorical_dtaidistance_trajectory_clustering(
                 pdf.savefig(fig_exemplar, bbox_inches="tight", dpi=300)
             plt.close(fig_exemplar)
 
+            medoid_overview_pdf = None
+            try:
+                fig_medoid = _build_medoid_overview_figure(
+                    adata_filt,
+                    adata_tracks,
+                    cluster_key=str(cluster_key),
+                    state_key=str(state_cols[0]),
+                    time_col=str(time_col),
+                )
+                medoid_overview_pdf = exemplar_root / "medoid_tracks_overview.pdf"
+                with PdfPages(medoid_overview_pdf) as pdf:
+                    pdf.savefig(fig_medoid, bbox_inches="tight", dpi=300)
+                plt.close(fig_medoid)
+            except Exception as exc:
+                medoid_overview_pdf = None
+                if bool(verbose):
+                    _winfo("trajectory-dtai", f"skipping medoid overview due to error: {exc}")
+
             try:
                 per_cluster_pdf_out = save_exemplar_statebar_track_pdf_per_cluster(
                     adata_full=adata_filt,
@@ -1187,6 +1348,7 @@ def run_categorical_dtaidistance_trajectory_clustering(
                 {
                     "exemplar_selection_csv": str(exemplar_selection_csv),
                     "exemplar_tracks_overview_pdf": str(overview_pdf),
+                    "medoid_tracks_overview_pdf": str(medoid_overview_pdf) if medoid_overview_pdf is not None else None,
                     "exemplar_statebar_track_pdf_by_cluster": dict(pdf_paths_by_cluster),
                     "exemplar_statebar_track_pdf_by_example_rank": dict(pdf_paths_by_example_rank),
                     "exemplar_statebar_warning": exemplar_warning,
