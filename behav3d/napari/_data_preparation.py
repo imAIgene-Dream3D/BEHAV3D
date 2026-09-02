@@ -521,7 +521,7 @@ class DataPreparationTab(QWidget):
             multi_n.setRange(2, 10)
             multi_n.setValue(2)
             multi_n.setMaximumWidth(70)
-            multi_n.setSuffix(" ch")
+            multi_n.setSuffix(" populations")
             multi_n.setEnabled(False)
 
             def _toggle_multi(state, spin=multi_n):

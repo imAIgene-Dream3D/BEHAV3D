@@ -2031,6 +2031,10 @@ class MulticolorTrackingPanel(QWidget):
             tab_progress_row=tab_progress_row,
             switch_to_data_prep_edit_callback=switch_to_data_prep_edit_callback,
         )
+        # A multicolor run executes on the inner panel's runner; alias it here
+        # so TrackingTab.request_tab_exit — which looks for ``_bg`` on each
+        # panel it holds — can see the run and block the tab switch.
+        self._bg = self._inner_panel._bg
 
         self._build_ui()
 

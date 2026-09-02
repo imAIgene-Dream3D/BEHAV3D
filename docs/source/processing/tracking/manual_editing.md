@@ -29,6 +29,8 @@ The toolbar exposes six operations:
 | **Dilate** | Dilate the selected label with a 3D isotropic ball; expansion never crosses into another label. | `Radius XY (px)` spinbox (0–50, default 1) |
 | **Delete** | Erase the selected label(s) across the chosen time range. | Confirmation checkbox "Yes, erase the selected label(s)" |
 | **Create** | Drop ≥ 1 seed point(s) on unlabelled background pixels; each seed becomes a new label, propagated forward and backward in time. | Seed points layer |
+| **Fill Holes** | Fill internal holes / cavities inside a hollow (shell-like) label; only background voxels inside the filled region are assigned to the label. | — |
+| **Fill Gaps** | Reconstruct timepoints where a track briefly disappears and reappears, by interpolating (shape-morphing) the mask between the frames bracketing the gap. Gaps larger than the limit are skipped and reported. | `Max gap size (timepoints)` spinbox (1–100, default 5) |
 
 Every tool has a **👁 Preview … (single timepoint)** button next to the Apply button — it runs the operation on the currently displayed frame only, so you can tune the radius / confirm the selection before committing to the full lifetime.
 

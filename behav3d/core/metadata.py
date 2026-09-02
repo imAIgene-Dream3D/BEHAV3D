@@ -127,6 +127,43 @@ def expand_multicolor_celltype_names(base_name, n_channels):
         raise ValueError("n_channels must be at least 1")
     return [f"{base_name}_{idx}_multicolor" for idx in range(1, n_channels + 1)]
 
+
+def multicolor_sources_for_base(metadata_or_row, base_name):
+    """List the per-channel multicolor source cell types for ``base_name``.
+
+    Scans column/index names for ``{prefix}_{base}_{idx}_multicolor_tracks_image_path``
+    (prefix optional / one of ``or_``, ``im_``, ``ot_``) and returns the channel
+    cell-type names sorted by channel index, e.g.
+    ``["tcells_1_multicolor", "tcells_2_multicolor", "tcells_3_multicolor"]``.
+
+    Accepts either a metadata DataFrame or a single metadata row (Series); only
+    the set of column/index names is used, so channels are detected from what
+    actually exists rather than an assumed count.  Returns ``[]`` when none are
+    found.
+    """
+    base_name = str(base_name).strip()
+    if not base_name:
+        return []
+
+    if hasattr(metadata_or_row, "columns"):
+        names = list(metadata_or_row.columns)
+    else:
+        names = list(getattr(metadata_or_row, "index", []))
+
+    pattern = re.compile(
+        r'^(?:or_|im_|ot_)?'
+        + re.escape(base_name)
+        + r'_([0-9]+)_multicolor_tracks_image_path$'
+    )
+    found = {}
+    for name in names:
+        m = pattern.match(str(name))
+        if m:
+            idx = int(m.group(1))
+            found[idx] = f"{base_name}_{idx}_multicolor"
+    return [found[idx] for idx in sorted(found)]
+
+
 def detect_organoid_types_from_metadata(metadata):
     """
     Detect organoid types from metadata column names.

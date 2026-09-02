@@ -54,11 +54,14 @@ from behav3d.editing import (
     delete_labels,
     dilate_label,
     erode_label,
-    fill_label,
+    fill_gaps,
+    fill_holes,
     lifetime_of,
     merge_labels,
     split_label,
+    swap_labels,
 )
+from behav3d.napari._widgets import HelpButton
 from behav3d.napari._loaders import tracked_segments_paths_for
 from behav3d.napari._tutorial_dialog import TutorialButton, TutorialStep
 
@@ -387,11 +390,13 @@ class TrackedSegmentEditor(QWidget):
         for i, (label, tip) in enumerate([
             ("Split",   "Split a label into two using two or more seed points"),
             ("Merge",   "Merge two or more labels into one"),
+            ("Swap",    "Swap two labels' TrackIDs to fix an identity swap from tracking"),
             ("Erode",   "Erode the selected label by N pixels (3D)"),
             ("Dilate",  "Expand the selected label by N pixels without crossing into other labels"),
             ("Delete",  "Erase the selected label across the chosen time range"),
             ("Create",  "Create new label(s) from seed points placed in unlabelled background pixels"),
-            ("Fill",    "Fill internal holes/cavities in a hollow (shell-like) label"),
+            ("Fill Holes", "Fill internal holes/cavities in a hollow (shell-like) label"),
+            ("Fill Gaps", "Fill temporal gaps in a label's lifetime via mask interpolation"),
         ]):
             btn = QToolButton()
             btn.setText(label)
@@ -409,11 +414,13 @@ class TrackedSegmentEditor(QWidget):
         layout.addWidget(self.tool_stack)
         self.tool_stack.addWidget(self._build_split_page())   # 0
         self.tool_stack.addWidget(self._build_merge_page())   # 1
-        self.tool_stack.addWidget(self._build_erode_page())   # 2
-        self.tool_stack.addWidget(self._build_dilate_page())  # 3
-        self.tool_stack.addWidget(self._build_delete_page())  # 4
-        self.tool_stack.addWidget(self._build_create_page())  # 5
-        self.tool_stack.addWidget(self._build_fill_page())    # 6
+        self.tool_stack.addWidget(self._build_swap_page())    # 2
+        self.tool_stack.addWidget(self._build_erode_page())   # 3
+        self.tool_stack.addWidget(self._build_dilate_page())  # 4
+        self.tool_stack.addWidget(self._build_delete_page())  # 5
+        self.tool_stack.addWidget(self._build_create_page())  # 6
+        self.tool_stack.addWidget(self._build_fill_holes_page())   # 7
+        self.tool_stack.addWidget(self._build_fill_gaps_page())    # 8
         self._tool_buttons[0].setChecked(True)
         self.tool_stack.setCurrentIndex(0)
 
@@ -778,7 +785,7 @@ class TrackedSegmentEditor(QWidget):
         lay.addStretch(1)
         return page
 
-    def _build_fill_page(self) -> QWidget:
+    def _build_fill_holes_page(self) -> QWidget:
         page = QWidget()
         lay = QVBoxLayout(page)
         lay.setContentsMargins(2, 2, 2, 2)
@@ -791,22 +798,87 @@ class TrackedSegmentEditor(QWidget):
         info.setWordWrap(True)
         info.setStyleSheet("color:#555; font-style:italic;")
         lay.addWidget(info)
-        self.btn_fill_preview = QPushButton("👁 Preview fill (single timepoint)")
-        self.btn_fill_preview.setToolTip(
+        self.btn_fill_holes_preview = QPushButton("👁 Preview fill holes (single timepoint)")
+        self.btn_fill_holes_preview.setToolTip(
             "Preview the fill on the current frame only so you can verify\n"
             "how many voxels will be added before committing to the full lifetime."
         )
-        self.btn_fill_preview.setStyleSheet(
+        self.btn_fill_holes_preview.setStyleSheet(
             "QPushButton{color:#1565C0;border:1px solid #90CAF9;"
             "border-radius:3px;padding:4px;}"
             "QPushButton:hover{background:#E3F2FD;}"
             "QPushButton:disabled{color:#aaa;border-color:#ddd;}"
         )
-        self.btn_fill_preview.clicked.connect(self._preview_fill)
-        lay.addWidget(self.btn_fill_preview)
-        self.btn_fill_apply = QPushButton("Apply fill")
-        self.btn_fill_apply.clicked.connect(self._apply_fill)
-        lay.addWidget(self.btn_fill_apply)
+        self.btn_fill_holes_preview.clicked.connect(self._preview_fill_holes)
+        lay.addWidget(self.btn_fill_holes_preview)
+        self.btn_fill_holes_apply = QPushButton("Apply fill holes")
+        self.btn_fill_holes_apply.clicked.connect(self._apply_fill_holes)
+        lay.addWidget(self.btn_fill_holes_apply)
+        lay.addStretch(1)
+        return page
+
+    _FILL_GAPS_HELP = (
+        "A gap is a run of consecutive timepoints where this track disappears "
+        "and then comes back (e.g. the tracker briefly lost the cell).\n\n"
+        "Max gap size is the largest gap, in timepoints, that will be "
+        "reconstructed. If a gap has this many missing frames or fewer, the "
+        "label's mask is interpolated across the missing frames (shape-morphed "
+        "between the frame before and the frame after the gap). Longer gaps are "
+        "left untouched and listed in the log — a long gap is usually a "
+        "tracking / merge error that needs a Split or Swap, not a true dropout.\n\n"
+        "Only background (value = 0) voxels are ever filled; if the "
+        "interpolated mask would overlap another label the gap is reported as "
+        "conflicted and skipped."
+    )
+
+    def _build_fill_gaps_page(self) -> QWidget:
+        """Build the UI page for the fill_gaps operation."""
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(2, 2, 2, 2)
+        info = QLabel(
+            "Fill temporal gaps in a label's lifetime by interpolating the "
+            "binary mask between the last frame before each gap and the first "
+            "frame after. Only background (value = 0) pixels are filled.\n\n"
+            "Gaps larger than the max gap size set below are skipped and "
+            "reported in the log."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#555; font-style:italic;")
+        lay.addWidget(info)
+
+        gap_row = QHBoxLayout()
+        gap_row.addWidget(QLabel("Max gap size (timepoints):"))
+        self.spin_fill_gaps_max = QSpinBox()
+        self.spin_fill_gaps_max.setRange(1, 100)
+        self.spin_fill_gaps_max.setValue(5)
+        self.spin_fill_gaps_max.setMaximumWidth(70)
+        self.spin_fill_gaps_max.setToolTip(
+            "Largest gap (number of missing timepoints) to interpolate. "
+            "Gaps with more missing frames than this are skipped."
+        )
+        gap_row.addWidget(self.spin_fill_gaps_max)
+        gap_row.addWidget(HelpButton("Max gap size", self._FILL_GAPS_HELP))
+        gap_row.addStretch(1)
+        lay.addLayout(gap_row)
+
+        self.btn_fill_gaps_preview = QPushButton("👁 Preview fill gaps (gap at current frame)")
+        self.btn_fill_gaps_preview.setToolTip(
+            "Preview gap-filling for the gap around the currently displayed "
+            "frame only, so you can check the interpolation before committing "
+            "to the full lifetime."
+        )
+        self.btn_fill_gaps_preview.setStyleSheet(
+            "QPushButton{color:#1565C0;border:1px solid #90CAF9;"
+            "border-radius:3px;padding:4px;}"
+            "QPushButton:hover{background:#E3F2FD;}"
+            "QPushButton:disabled{color:#aaa;border-color:#ddd;}"
+        )
+        self.btn_fill_gaps_preview.clicked.connect(self._preview_fill_gaps)
+        lay.addWidget(self.btn_fill_gaps_preview)
+        self.btn_fill_gaps_apply = QPushButton("Apply fill gaps")
+        self.btn_fill_gaps_apply.clicked.connect(self._apply_fill_gaps)
+        lay.addWidget(self.btn_fill_gaps_apply)
         lay.addStretch(1)
         return page
 
@@ -1060,6 +1132,8 @@ class TrackedSegmentEditor(QWidget):
             getattr(self, "btn_split_apply", None),
             getattr(self, "btn_merge_preview", None),
             getattr(self, "btn_merge_apply", None),
+            getattr(self, "btn_swap_preview", None),
+            getattr(self, "btn_swap_apply", None),
             getattr(self, "btn_erode_preview", None),
             getattr(self, "btn_erode_apply", None),
             getattr(self, "btn_dilate_preview", None),
@@ -1068,8 +1142,10 @@ class TrackedSegmentEditor(QWidget):
             getattr(self, "btn_delete_apply", None),
             getattr(self, "btn_create_preview", None),
             getattr(self, "btn_create_apply", None),
-            getattr(self, "btn_fill_preview", None),
-            getattr(self, "btn_fill_apply", None),
+            getattr(self, "btn_fill_holes_preview", None),
+            getattr(self, "btn_fill_holes_apply", None),
+            getattr(self, "btn_fill_gaps_preview", None),
+            getattr(self, "btn_fill_gaps_apply", None),
             getattr(self, "btn_save", None),
             getattr(self, "btn_seeds_layer", None),
             getattr(self, "btn_create_seeds_layer", None),
@@ -1442,9 +1518,40 @@ class TrackedSegmentEditor(QWidget):
         layer = self.viewer.layers[self.layer_name]
         try:
             layer.data = self._build_dask_with_dirty_frames()
+            # napari 0.5 skips re-slicing the current frame when an edit does
+            # not change a label's spatial footprint — the case for Swap, which
+            # only exchanges two ID values in place.  Force the async slicer to
+            # re-request the displayed frame (same technique as _on_save's
+            # step-bounce), but only when that frame actually changed.
+            self._force_current_reslice(frames)
             layer.refresh()
         except Exception:
             traceback.print_exc()
+
+    def _force_current_reslice(self, frames: Optional[List[int]] = None) -> None:
+        """Nudge napari's async slicer to re-fetch the current timepoint.
+
+        Reassigning ``layer.data`` and calling ``refresh()`` repaints edits
+        that grow/shrink a label, but napari 0.5 can skip the repaint for a
+        pure value remap (e.g. Swap) where the occupied voxels are unchanged.
+        A one-frame step-bounce on the time axis makes the slicer issue a fresh
+        slice request, exactly like the save path.  When ``frames`` is given,
+        the bounce is skipped unless the currently displayed frame is among the
+        changed frames, so out-of-view edits cost nothing.
+        """
+        try:
+            axis = 0
+            T = int(self.buffer.shape[0])
+            if T < 2:
+                return
+            t_now = int(self.viewer.dims.current_step[axis])
+            if frames is not None and t_now not in {int(f) for f in frames}:
+                return
+            t_other = (t_now + 1) % T
+            self.viewer.dims.set_current_step(axis, t_other)
+            self.viewer.dims.set_current_step(axis, t_now)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Selection / interactions
@@ -1531,8 +1638,8 @@ class TrackedSegmentEditor(QWidget):
     def _on_tool_changed(self, idx: int) -> None:
         self._clear_preview()
         self.tool_stack.setCurrentIndex(idx)
-        # Seeds layer is shared by Split (0) and Create (5).
-        is_seed_tool = idx in (0, 5)
+        # Seeds layer is shared by Split (0) and Create (6).
+        is_seed_tool = idx in (0, 6)
         if not is_seed_tool and _SPLIT_SEEDS_LAYER in self.viewer.layers:
             self.viewer.layers[_SPLIT_SEEDS_LAYER].visible = False
         if not is_seed_tool:
@@ -1540,7 +1647,7 @@ class TrackedSegmentEditor(QWidget):
         if is_seed_tool and _SPLIT_SEEDS_LAYER in self.viewer.layers:
             self.viewer.layers[_SPLIT_SEEDS_LAYER].visible = True
         # Refresh channel list whenever the user switches to Create.
-        if idx == 5:
+        if idx == 6:
             self._refresh_create_channels()
 
     @property
@@ -1811,6 +1918,88 @@ class TrackedSegmentEditor(QWidget):
                 t_range=(t_now, t_now),
             ),
             tool_name="merge",
+        )
+
+    # ---- Swap --------------------------------------------------------
+    def _build_swap_page(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(2, 2, 2, 2)
+        info = QLabel(
+            "Fix an identity swap from tracking: pick exactly 2 labels and their\n"
+            "TrackIDs are exchanged across the chosen time range. Each label is\n"
+            "rewritten even in frames where only one of the two is present, so\n"
+            "tracking gaps stay consistent."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#555; font-style:italic;")
+        lay.addWidget(info)
+        warn = QLabel(
+            "⚠️ Use a Custom range starting at the frame where the swap began — "
+            "swapping over the full lifetime just renames the two tracks and does "
+            "not fix a partial swap."
+        )
+        warn.setWordWrap(True)
+        warn.setStyleSheet("color:#E65100; font-size:10px; font-style:italic;")
+        lay.addWidget(warn)
+        self.btn_swap_preview = QPushButton("👁 Preview swap (single timepoint)")
+        self.btn_swap_preview.setToolTip(
+            "Preview the swap on the current frame only so you can verify the\n"
+            "result before committing to the full time range."
+        )
+        self.btn_swap_preview.setStyleSheet(
+            "QPushButton{color:#1565C0;border:1px solid #90CAF9;"
+            "border-radius:3px;padding:4px;}"
+            "QPushButton:hover{background:#E3F2FD;}"
+            "QPushButton:disabled{color:#aaa;border-color:#ddd;}"
+        )
+        self.btn_swap_preview.clicked.connect(self._preview_swap)
+        lay.addWidget(self.btn_swap_preview)
+        self.btn_swap_apply = QPushButton("Apply swap")
+        self.btn_swap_apply.clicked.connect(self._apply_swap)
+        lay.addWidget(self.btn_swap_apply)
+        lay.addStretch(1)
+        return page
+
+    def _apply_swap(self) -> None:
+        self._clear_preview()
+        if len(self._selected_labels) != 2:
+            self._log_msg("Pick exactly 2 labels (Shift-click to add/remove).")
+            return
+        label_ids = list(self._selected_labels)
+        if self.rb_full.isChecked():
+            rng = None
+        else:
+            rng = (int(self.spin_t0.value()), int(self.spin_t1.value()))
+        self._log_msg(f"  Running swap of {label_ids[0]} <-> {label_ids[1]}…")
+        self._run_operation_async(
+            swap_labels,
+            (self.buffer,),
+            dict(
+                label_ids=label_ids,
+                t_range=rng,
+                n_workers=self._n_workers,
+            ),
+            desc=f"Swapping labels {label_ids[0]} <-> {label_ids[1]}…",
+        )
+
+    def _preview_swap(self) -> None:
+        if len(self._selected_labels) != 2:
+            self._log_msg("Pick exactly 2 labels (Shift-click to add/remove).")
+            return
+        label_ids = list(self._selected_labels)
+        t_now = int(self.viewer.dims.current_step[0])
+        self._log_msg(
+            f"  Previewing swap of {label_ids[0]} <-> {label_ids[1]} at t={t_now}…"
+        )
+        self._run_preview_async(
+            swap_labels,
+            (self.buffer,),
+            dict(
+                label_ids=label_ids,
+                t_range=(t_now, t_now),
+            ),
+            tool_name="swap",
         )
 
     # ---- Erode / Dilate ---------------------------------------------
@@ -2342,8 +2531,10 @@ class TrackedSegmentEditor(QWidget):
             getattr(self, "btn_dilate_apply", None),
             getattr(self, "btn_delete_preview", None),
             getattr(self, "btn_delete_apply", None),
-            getattr(self, "btn_fill_preview", None),
-            getattr(self, "btn_fill_apply", None),
+            getattr(self, "btn_fill_holes_preview", None),
+            getattr(self, "btn_fill_holes_apply", None),
+            getattr(self, "btn_fill_gaps_preview", None),
+            getattr(self, "btn_fill_gaps_apply", None),
         ):
             if btn is not None:
                 btn.setEnabled(has_sel)
@@ -2352,6 +2543,12 @@ class TrackedSegmentEditor(QWidget):
             self.btn_merge_preview.setEnabled(needs_two)
         if hasattr(self, "btn_merge_apply"):
             self.btn_merge_apply.setEnabled(needs_two)
+        # Swap needs EXACTLY two labels (unlike merge, which accepts ≥ 2).
+        exactly_two = len(self._selected_labels) == 2
+        if hasattr(self, "btn_swap_preview"):
+            self.btn_swap_preview.setEnabled(exactly_two)
+        if hasattr(self, "btn_swap_apply"):
+            self.btn_swap_apply.setEnabled(exactly_two)
         # Create does not need a label selection — always enabled.
         for btn in (
             getattr(self, "btn_create_preview", None),
@@ -2375,8 +2572,8 @@ class TrackedSegmentEditor(QWidget):
                     "color:#E65100; font-style:italic; font-size:10px;"
                 )
 
-    # ---- Fill --------------------------------------------------------
-    def _apply_fill(self) -> None:
+    # ---- Fill Holes -------------------------------------------------
+    def _apply_fill_holes(self) -> None:
         self._clear_preview()
         if not self._selected_labels:
             self._log_msg("Pick a label first.")
@@ -2384,26 +2581,75 @@ class TrackedSegmentEditor(QWidget):
         label_id = self._selected_labels[0]
         rng = self._selected_t_range(label_id)
         n_workers = self._n_workers
-        self._log_msg(f"  Running fill of label {label_id} ({n_workers} worker(s))…")
+        self._log_msg(f"  Running fill holes of label {label_id} ({n_workers} worker(s))…")
         self._run_operation_async(
-            fill_label,
+            fill_holes,
             (self.buffer,),
             dict(label_id=label_id, t_range=rng, n_workers=n_workers),
-            desc=f"Filling label {label_id}…",
+            desc=f"Filling holes in label {label_id}…",
         )
 
-    def _preview_fill(self) -> None:
+    def _preview_fill_holes(self) -> None:
         if not self._selected_labels:
             self._log_msg("Pick a label first.")
             return
         label_id = self._selected_labels[0]
         t_now = int(self.viewer.dims.current_step[0])
-        self._log_msg(f"  Previewing fill of label {label_id} at t={t_now}…")
+        self._log_msg(f"  Previewing fill holes of label {label_id} at t={t_now}…")
         self._run_preview_async(
-            fill_label,
+            fill_holes,
             (self.buffer,),
             dict(label_id=label_id, t_range=(t_now, t_now)),
-            tool_name="fill",
+            tool_name="fill holes",
+        )
+
+    # ---- Fill Gaps -------------------------------------------------
+    def _apply_fill_gaps(self) -> None:
+        self._clear_preview()
+        if not self._selected_labels:
+            self._log_msg("Pick a label first.")
+            return
+        label_id = self._selected_labels[0]
+        rng = self._selected_t_range(label_id)
+        n_workers = self._n_workers
+        max_gap = int(self.spin_fill_gaps_max.value())
+        self._log_msg(
+            f"  Running fill gaps of label {label_id} (max gap {max_gap} tp, "
+            f"{n_workers} worker(s))…"
+        )
+        self._run_operation_async(
+            fill_gaps,
+            (self.buffer,),
+            dict(
+                label_id=label_id,
+                t_range=rng,
+                max_gap_size=max_gap,
+                n_workers=n_workers,
+            ),
+            desc=f"Filling gaps in label {label_id}…",
+        )
+
+    def _preview_fill_gaps(self) -> None:
+        if not self._selected_labels:
+            self._log_msg("Pick a label first.")
+            return
+        label_id = self._selected_labels[0]
+        t_now = int(self.viewer.dims.current_step[0])
+        max_gap = int(self.spin_fill_gaps_max.value())
+        # Window wide enough to bracket a fillable gap around the current frame
+        # (both bounding segments must be inside the range for the interpolation
+        # to have endpoints). _normalize_t_range clamps to the volume.
+        w = max_gap + 1
+        rng = (t_now - w, t_now + w)
+        self._log_msg(
+            f"  Previewing fill gaps of label {label_id} around t={t_now} "
+            f"(max gap {max_gap} tp)…"
+        )
+        self._run_preview_async(
+            fill_gaps,
+            (self.buffer,),
+            dict(label_id=label_id, t_range=rng, max_gap_size=max_gap),
+            tool_name="fill gaps",
         )
 
     # ---- Delete short tracks -----------------------------------------

@@ -419,6 +419,85 @@ def combine_multicolor_tracked_outputs_for_base(
         n_workers=n_workers,
     )
     
+def check_multicolor_tracked_overlap(
+    metadata,
+    output_dir,
+    source_cell_types,
+):
+    """Read-only pre-flight: detect cross-channel voxel overlap before merging.
+
+    Loads each channel's tracked image per sample and, for every timepoint,
+    counts the voxels claimed by more than one channel.  Returns a list of
+    overlap records (empty when clean)::
+
+        [{"sample_name": ..., "timepoint": t,
+          "channel_a": ..., "channel_b": ...,
+          "voxel_count": n}, ...]
+
+    Nothing is written.  Callers use a non-empty result to abort a rebuild and
+    leave any existing merged output untouched.
+    """
+    output_dir = Path(output_dir).expanduser()
+    source_cell_types = [
+        str(cell_type).strip()
+        for cell_type in source_cell_types
+        if str(cell_type).strip()
+    ]
+    if len(source_cell_types) < 2:
+        # A single channel cannot overlap with anything.
+        return []
+    if "sample_name" not in metadata.columns:
+        raise ValueError("metadata must contain a 'sample_name' column.")
+
+    sample_name_col = metadata["sample_name"].astype("string").str.strip()
+    sample_names = (
+        sample_name_col.dropna().replace("", pd.NA).dropna().unique().tolist()
+    )
+
+    records = []
+    for sample_name in sample_names:
+        sample = metadata[sample_name_col == sample_name].iloc[0]
+
+        source_arrays = []
+        for cell_type in source_cell_types:
+            img_path, _csv_path, _prefix = _resolve_source_tracking_paths(
+                sample, output_dir, cell_type
+            )
+            if not Path(img_path).exists():
+                # Missing inputs are handled (and reported) by the merge planner;
+                # the overlap pre-flight simply skips what it cannot read.
+                continue
+            source_arrays.append(
+                {"cell_type": cell_type, "arr": load_zarr(img_path)}
+            )
+
+        if len(source_arrays) < 2:
+            continue
+
+        n_timepoints = int(np.asarray(source_arrays[0]["arr"]).shape[0])
+        for t in range(n_timepoints):
+            occupancies = [
+                (np.asarray(item["arr"][t]) > 0, item["cell_type"])
+                for item in source_arrays
+            ]
+            for idx_a in range(len(occupancies)):
+                occ_a, name_a = occupancies[idx_a]
+                for idx_b in range(idx_a + 1, len(occupancies)):
+                    occ_b, name_b = occupancies[idx_b]
+                    voxel_count = int(np.count_nonzero(occ_a & occ_b))
+                    if voxel_count:
+                        records.append(
+                            {
+                                "sample_name": sample_name,
+                                "timepoint": t,
+                                "channel_a": name_a,
+                                "channel_b": name_b,
+                                "voxel_count": voxel_count,
+                            }
+                        )
+    return records
+
+
 def test():
     metadata = "/Volumes/T7_Sam/BHVD_BEHAV3D/BEHAV3D_python/runs/NatureBriefComm/LowDensity_MultiColor/metadata.csv"
     metadata = pd.read_csv(metadata)
