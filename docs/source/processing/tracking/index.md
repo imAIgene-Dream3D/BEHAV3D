@@ -26,31 +26,54 @@ The sub-tabs use a colour code:
 Special cases:
 
 - **Multicolor cell types** (e.g. `tcell_1_multicolor`, `tcell_2_multicolor`) get a single combined panel that tracks each channel separately and then merges them into `{base}_merged`.
-- **Track all organoids together**: by **default** all organoid cell types are collapsed into a single combined **🟣 All Organoids** sub-tab (fragmentation tracking only), with the "Track all organoids together" checkbox enabled — useful when you have multiple organoid types in the same well but want one unified track set. Unticking the checkbox rebuilds one independent sub-tab per organoid type.
+- **Track all organoids together**: by **default** all organoid cell types are collapsed into a single combined **🟣 All Organoids** sub-tab (fragmentation tracking only), with the "Track all organoids together" checkbox enabled — useful when you have multiple organoid types in the same well but want one unified track set where each voxel is occupied by only 1 organoid type_. Unticking the checkbox rebuilds one independent sub-tab per organoid type.
 
 ## The tracking methods
 
-Each cell type is tracked with one of the following methods, picked from the method dropdown in its sub-tab:
+Each cell type is tracked with one of the following methods, picked from the method
+dropdown in its sub-tab. Methods fall into two families — **centroid-based** (link by
+how far a detection moved) and **overlap-based / propagation** (link by how much a
+detection overlaps its previous position).
+
+### Centroid-based tracking methods
+
+Link detections frame-to-frame by comparing centroid positions, not overlap. Use one of
+these when an object moves enough between frames that it may no longer overlap itself —
+roughly one cell diameter or more.
 
 | Method | What it does |
 |---|---|
-| **LAP (laptrack)** | Linear Assignment Problem tracking: links detections frame-to-frame by solving a global optimization on the centroid-distance cost matrix, with gap closing and optional merge/split events. See [LAP](lap). |
-| **TrackPy** | Crocker-Grier style nearest-neighbour linker with adaptive search radius and memory-based gap recovery. Simpler/faster alternative to LAP for sparser data. See [TrackPy](trackpy). |
-| **Fragmentation tracking** | Propagates the previous timepoint's labels onto the current timepoint's mask by spatial overlap (watershed-based, not centroid distance). No tunable parameters. Handles objects that stay put and change only by fragmenting. See [Fragmentation tracking](fragmentation_tracking). |
-| **Bounded Propagation** | Uses overlap-based watershed propagation while preventing one track ID from spanning disconnected regions. Useful when touching or joined masks can otherwise spread an ID across separate objects. See [Bounded Propagation](bounded_propagation). |
-| **Reporter Propagation** | Pools all segments across the whole movie, groups spatially-overlapping ones regardless of time, and stamps each group's single largest detection onto every timepoint. For near-static objects whose segmentation flickers on and off. See [Reporter Propagation](reporter_propagation). |
-| **btrack (Bayesian)** | Bayesian tracker with a Kalman-filter motion model, optionally followed by a global hypothesis optimiser. See [btrack](btrack). |
+| **btrack (Bayesian)** | Bayesian tracker with a Kalman-filter motion model, optionally followed by a global hypothesis optimiser. The routine choice for objects that lose overlap between frames. See [btrack](btrack). |
+| **LAP (laptrack)** | Linear Assignment Problem tracking: links detections by solving a global optimization on the centroid-distance cost matrix, with gap closing and optional merge/split events. An alternative to btrack when you specifically need globally-optimal linking or built-in division/fusion modelling. See [LAP](lap). |
+| **TrackPy** | Crocker-Grier style nearest-neighbour linker with adaptive search radius and memory-based gap recovery. The lightest-weight option — only reliable when cells are well-separated relative to how far they move per frame. See [TrackPy](trackpy). |
+
+### Overlap-based tracking methods (propagation)
+
+Propagate the previous timepoint's labels onto the current timepoint's mask by spatial
+overlap (watershed-based), not centroid distance. Use one of these when an object stays
+largely in place so consecutive frames still overlap — typical for organoids and other
+near-static structures.
+
+| Method | What it does |
+|---|---|
+| **Fragmentation tracking** | Propagates labels by overlap; no tunable parameters. The default propagation method — use it when objects mainly change by **fragmenting** (e.g. a structure breaking up on death, such as organoids) and the set of objects is closed, i.e. nothing new appears mid-movie. See [Fragmentation tracking](fragmentation_tracking). |
+| **Bounded Propagation** | Same overlap-based propagation, but with a topology rule that stops one track ID from spanning disconnected regions. Use it instead of Fragmentation Tracking when masks can **touch or join** but should stick to single connected regions and new objects can appear throughout the movie. See [Bounded Propagation](bounded_propagation). |
+| **Reporter Propagation** | Pools segments across the whole movie, groups spatially-overlapping ones regardless of time, and stamps each group's single largest detection onto every timepoint. Use it for near-static objects whose segmentation **flickers on and off** (e.g. an intermittent reporter signal). See [Reporter Propagation](reporter_propagation). |
+
+### Import tracking
+
+| Method | What it does |
+|---|---|
 | **Import tracking** | Validates and re-chunks an externally-produced tracked zarr / TIFF into BEHAV3D EXPLORER's canonical layout. See [Import tracking](import). |
 
+
 ```{note}
-**Pick the method from what you measure, not from the cell type.** Between two
+**Pick the family from what you measure, not from the cell type.** Between two
 consecutive frames, does an object still overlap where it was?
 
-- **Large overlap** → a propagation-family method. Use Fragmentation Tracking when
-  fragmentation is the main issue; use Bounded Propagation when touching or joined masks
-  could make one ID span disconnected regions.
+- **Large overlap** → an overlap-based/propagation method (second table above).
 - **Little or no overlap** (the object moves about one cell diameter or more between
-  frames) → **btrack**.
+  frames) → a centroid-based method (first table above), normally **btrack**.
 
 Whether a given population falls on one side or the other depends on your **frame
 interval**, not on what the cells are: the same cell is "slow" at a short interval and

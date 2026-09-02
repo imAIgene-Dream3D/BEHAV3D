@@ -46,9 +46,11 @@ from behav3d.core.metadata import (
 )
 from behav3d.core.qt_help import reset_scroll_on_page_change
 from behav3d.napari._preview_dims import (
+    clear_viewer_layers,
     disconnect_all_preview_dims_listeners,
     stop_dim_playback,
 )
+from behav3d.napari._track_colors import sync_tracks_colors_to_labels
 # Channel colormaps (cycled if there are many channels)
 _CHANNEL_COLORS = ["cyan", "yellow", "green", "red", "blue", "magenta"]
 # Label colormaps per cell-type category
@@ -383,6 +385,14 @@ class VisualizationTab(QWidget):
     # Load dataset into napari
     # ------------------------------------------------------------------
     def _on_load_dataset(self):
+        # Always read the loader's current frame rather than the copy handed
+        # over by the last ``metadata_loaded`` emission: a Segmentation or
+        # Tracking run updates ``data_prep.metadata`` in place and may jump
+        # straight here, so the cached copy can be one run out of date.
+        live_md = getattr(self.data_prep, "metadata", None)
+        if live_md is not None and live_md is not self._metadata:
+            self._metadata = live_md
+
         if self._metadata is None:
             self.info_label.setText("⚠️  No metadata loaded.")
             return
@@ -412,7 +422,7 @@ class VisualizationTab(QWidget):
         # those firing reentrantly mid-clear() is what desyncs napari's own
         # vispy canvas bookkeeping and raises a KeyError.
         disconnect_all_preview_dims_listeners(self.viewer)
-        self.viewer.layers.clear()
+        clear_viewer_layers(self.viewer)
 
         output_dir = self.data_prep.output_dir or ""
 
@@ -747,6 +757,15 @@ class VisualizationTab(QWidget):
                     visible=False,
                 )
                 self._log(f"    + Tracks layer: {layer_name}")
+
+                # Color each track the same as its cell's tracked-segments
+                # label, instead of napari's default track_id gradient.
+                seg_layer_name = f"{sample_name} – {name} tracked segments"
+                if seg_layer_name in self.viewer.layers:
+                    sync_tracks_colors_to_labels(
+                        self.viewer.layers[layer_name],
+                        self.viewer.layers[seg_layer_name],
+                    )
             except Exception as e:
                 self._log(f"    ⚠️ Could not load tracks for {name}: {e}")
 
@@ -815,14 +834,36 @@ class VisualizationTab(QWidget):
             except Exception as e:
                 self._log(f"    ⚠️ Could not load tracked segments for {name}: {e}")
 
+    @staticmethod
+    def _layer_cell_type(name: str, suffix: str) -> str | None:
+        """Return the cell-type part of ``"sample – celltype <suffix>"``.
+
+        ``None`` when the layer name does not follow that pattern.
+        """
+        if not name.endswith(suffix):
+            return None
+        body = name[: -len(suffix)].rstrip()
+        if " – " not in body:
+            return None
+        return body.rsplit(" – ", 1)[1].strip()
+
     def _on_toggle_layer_group(self, state, group_type):
-        """Batch show/hide layers based on their name suffix/pattern."""
+        """Batch show/hide layers based on their name suffix/pattern.
+
+        Per-channel multicolor layers are loaded hidden on purpose (there is
+        one per channel, so showing them all at once buries the merged
+        result).  They still follow the switch *downwards*: flipping a group
+        off hides them along with everything else, but flipping it back on
+        only restores the non-multicolor layers, leaving the multicolor ones
+        for the user to enable individually in napari's layer list.
+        """
         visible = bool(state)
-        
+
         for layer in self.viewer.layers:
             name = layer.name
             match = False
-            
+            multicolor = False
+
             if group_type == "raw":
                 # Raw images usually: "sample_name – Ch0"
                 if " – Ch" in name:
@@ -833,23 +874,23 @@ class VisualizationTab(QWidget):
                     match = True
             elif group_type == "tracked_segments":
                 # Tracked segments: "sample_name – celltype tracked segments"
-                if name.endswith(" tracked segments"):
-                    body = name[:-17].rstrip()
-                    if " – " in body:
-                        ct_name = body.rsplit(" – ", 1)[1].strip()
-                        if not is_multicolor_celltype(ct_name):
-                            match = True
+                ct_name = self._layer_cell_type(name, " tracked segments")
+                if ct_name is not None:
+                    match = True
+                    multicolor = is_multicolor_celltype(ct_name)
             elif group_type == "tracks":
                 # Tracks: "sample_name – celltype tracks"
-                if name.endswith(" tracks"):
-                    body = name[:-7].rstrip()
-                    if " – " in body:
-                        ct_name = body.rsplit(" – ", 1)[1].strip()
-                        if not is_multicolor_celltype(ct_name):
-                            match = True
-                    
-            if match:
-                layer.visible = visible
+                ct_name = self._layer_cell_type(name, " tracks")
+                if ct_name is not None:
+                    match = True
+                    multicolor = is_multicolor_celltype(ct_name)
+
+            if not match:
+                continue
+            if multicolor and visible:
+                # Hide-only: never auto-show a per-channel multicolor layer.
+                continue
+            layer.visible = visible
 
     # ------------------------------------------------------------------
     # Manual Edition section
@@ -952,7 +993,7 @@ class VisualizationTab(QWidget):
         stop_dim_playback(self.viewer)
         self._display_save_timer.stop()
         disconnect_all_preview_dims_listeners(self.viewer)
-        self.viewer.layers.clear()
+        clear_viewer_layers(self.viewer)
         saved_channels = (
             self.data_prep.behav3d_parameters
             .get("viewer_display", {})

@@ -8,7 +8,7 @@ from behav3d.napari._widgets import (
     resolve_external_path,
 )
 from behav3d.core.qt_help import reset_scroll_on_page_change
-from behav3d.napari._preview_dims import disconnect_all_preview_dims_listeners
+from behav3d.napari._preview_dims import disconnect_all_preview_dims_listeners, clear_viewer_layers
 import yaml
 from magicgui.widgets import create_widget
 from qtpy.QtWidgets import (
@@ -60,6 +60,90 @@ from behav3d.napari._background_runner import (
 # make_features is imported from napari_pixelclassifier and built per-sample
 # inside _on_load_training_clicked using actual pixel sizes from metadata,
 # so training and batch inference use the same physical-unit sigma values.
+
+
+def _segmentation_output_path(output_dir, sample_name, cell_type):
+    """Where APOC/ConvPaint write the output for ``cell_type`` of a sample.
+
+    The ``dead`` cell type is written as ``<sn>_mask_dead.zarr`` by both
+    backends; every other cell type gets ``<sn>_<ct>_segments.zarr``.  Using
+    the wrong name here makes existence checks silently miss dead masks, so
+    the overwrite prompt never fires.
+    """
+    fname = (
+        f"{sample_name}_mask_dead.zarr" if cell_type == "dead"
+        else f"{sample_name}_{cell_type}_segments.zarr"
+    )
+    return Path(output_dir) / "images" / sample_name / fname
+
+
+def _segmentation_output_label(cell_type, sample_name):
+    """Human-readable entry for the overwrite prompt listing."""
+    if cell_type == "dead":
+        return f"dead mask for {sample_name}"
+    return f"{cell_type} segments for {sample_name}"
+
+
+def _segmentation_output_entries(output_dir, sample_names, cell_types):
+    """List the existing APOC/ConvPaint outputs, each with how complete it is.
+
+    "Already exists" is not the same as "already finished": a run killed by a power
+    cut, or a sub-range run, leaves an array that is real but partial. The progress
+    journal beside each array knows the difference, so the prompt can say which is
+    which instead of making the user guess.
+
+    Returns ``(items, any_incomplete)``. *items* are prompt lines like
+    ``"tcell segments for S2 - INCOMPLETE (47/120)"``; *any_incomplete* drives the
+    Skip button's label.
+    """
+    from behav3d.preprocessing.segmentation.segment_journal import (
+        describe_state, journal_state,
+    )
+
+    items = []
+    any_incomplete = False
+    for sn in sample_names:
+        for ct in cell_types:
+            path = _segmentation_output_path(output_dir, sn, ct)
+            state, n_done, t_total = journal_state(path)
+            if state == "missing":
+                continue
+            if state == "partial":
+                any_incomplete = True
+            items.append(
+                f"{_segmentation_output_label(ct, sn)} — "
+                f"{describe_state(state, n_done, t_total)}"
+            )
+    return items, any_incomplete
+
+
+#: Extra line shown under the listing when something in it is resumable, so the
+#: Skip button's new name is self-explanatory.
+_RESUME_HINT = (
+    "Skip & Resume keeps completed timepoints and finishes the incomplete ones.\n"
+    "What do you want to do?"
+)
+
+
+def _notify_metadata_refresh(metadata_loader, log_fn=None, context="segmentation"):
+    """Ask the Data Preparation tab to reload metadata.csv and re-broadcast it.
+
+    Every segmentation backend writes its new ``*_segments_path`` columns to
+    the metadata CSV, but nothing told the other tabs about it — the
+    Visualization tab kept the frame it was handed at load time, so results
+    only appeared after a manual "Load Metadata".  Calling this at the end of
+    each run closes that gap.  A ``metadata_loader`` without the method (the
+    notebook widget layer) is silently ignored.
+    """
+    refresh = getattr(metadata_loader, "refresh_metadata_after_processing", None)
+    if refresh is None:
+        return
+    try:
+        refresh(context)
+    except Exception as e:  # never let a refresh failure break a finished run
+        if log_fn is not None:
+            log_fn(f"⚠️ Could not refresh metadata after {context}: {e}")
+
 
 class SegmentationTab(QWidget):
     def __init__(self, viewer: napari.Viewer, metadata_loader):
@@ -216,17 +300,32 @@ class SegmentationTab(QWidget):
         self._on_metadata_updated()
 
     def _on_metadata_updated(self):
-        """Trigger updates in sub-widgets."""
-        if hasattr(self, 'pixel_classifier_page'):
-            self.pixel_classifier_page._on_metadata_updated()
-        self.cellpose_page._on_metadata_updated()
-        if hasattr(self, 'cellpose_sam_page'):
-            self.cellpose_sam_page._on_metadata_updated()
-        self.import_page._on_metadata_updated()
-        if hasattr(self, 'apoc_page'):
-            self.apoc_page._on_metadata_updated()
-        if hasattr(self, 'convpaint_page'):
-            self.convpaint_page._on_metadata_updated()
+        """Trigger updates in sub-widgets.
+
+        Each sub-page's refresh is isolated in its own try/except: these
+        pages are otherwise independent, so a bug in one (e.g. a stray
+        numpy.bool_ handed to a Qt setter) must not silently prevent every
+        page after it from ever rebuilding — that previously left the APOC/
+        ConvPaint training panels stuck on their "load metadata" placeholder
+        with no visible error, since a PyQt slot exception only prints to
+        the console rather than the in-app log.
+        """
+        pages = [
+            ('pixel_classifier_page', getattr(self, 'pixel_classifier_page', None)),
+            ('cellpose_page', self.cellpose_page),
+            ('cellpose_sam_page', getattr(self, 'cellpose_sam_page', None)),
+            ('import_page', self.import_page),
+            ('apoc_page', getattr(self, 'apoc_page', None)),
+            ('convpaint_page', getattr(self, 'convpaint_page', None)),
+        ]
+        for name, page in pages:
+            if page is None:
+                continue
+            try:
+                page._on_metadata_updated()
+            except Exception as e:
+                traceback.print_exc()
+                self._log(f"⚠️ {name} failed to refresh after metadata update: {e}")
 
     def _log(self, msg):
         import datetime
@@ -1363,6 +1462,7 @@ class PixelClassifierWidget(QWidget):
                 except Exception as e:
                     self.log(f"  Warning: Could not save metadata CSV: {e}")
             self.log("Batch segmentation finished successfully!")
+            _notify_metadata_refresh(self.metadata_loader, self.log, "segmentation")
 
         if block:
             try:
@@ -1508,7 +1608,7 @@ class PixelClassifierWidget(QWidget):
                     load_existing = True
 
             disconnect_all_preview_dims_listeners(self.viewer)
-            self.viewer.layers.clear() # Clear after prompting, to avoid removing if cancel
+            clear_viewer_layers(self.viewer) # Clear after prompting, to avoid removing if cancel
 
             if load_existing:
                 # --- FAST PATH: load from cached zarr files ---
@@ -2982,6 +3082,7 @@ class CellposeWidget(QWidget):
             else:
                 self.log(f"Cellpose finished for all {n_proc} samples.")
             self.log("Metadata updated.")
+            _notify_metadata_refresh(self.metadata_loader, self.log, "segmentation")
 
         if block:
             try:
@@ -3072,10 +3173,7 @@ class CellposeWidget(QWidget):
             timepoint_range = (self.spin_t_start.value(), self.spin_t_end.value())
 
         if not overwrite_existing:
-            self.log(
-                "\u26a0\ufe0f Backend does not yet support partial skipping; "
-                "existing dead masks will be overwritten."
-            )
+            self.log("Samples with an existing dead mask will be skipped.")
 
         def _do_otsu(progress_cb=None):
             return run_otsu_threshold_segmentation_from_zarr(
@@ -3083,6 +3181,7 @@ class CellposeWidget(QWidget):
                 metadata=self.metadata_loader.metadata,
                 timepoint_range=timepoint_range,
                 progress_cb=progress_cb,
+                overwrite=overwrite_existing,
             )
 
         def _apply_otsu(result):
@@ -3093,6 +3192,7 @@ class CellposeWidget(QWidget):
                 updated_metadata.to_csv(csv_path, index=False)
             n_proc = len(summary["processed"])
             self.log(f"Otsu dead mask finished: {n_proc} samples processed.")
+            _notify_metadata_refresh(self.metadata_loader, self.log, "dead-mask segmentation")
 
         if block:
             try:
@@ -4163,7 +4263,7 @@ class CellposeSAMWidget(QWidget):
             # single timepoint, so with nothing else in the viewer there is no
             # time slider left to imply "every timepoint got segmented".
             disconnect_all_preview_dims_listeners(self.viewer)
-            self.viewer.layers.clear()
+            clear_viewer_layers(self.viewer)
             self._preview_labels = {}
             self._preview_sizes = {}
             self._preview_key = (sample_name, timepoint, tuple(cell_types))
@@ -4470,6 +4570,7 @@ class CellposeSAMWidget(QWidget):
             else:
                 self.log(f"Cellpose-SAM finished: {n_proc} processed.")
             self.log("Metadata updated.")
+            _notify_metadata_refresh(self.metadata_loader, self.log, "segmentation")
 
         if block:
             try:
@@ -5279,6 +5380,12 @@ class ImportWidget(QWidget):
                                     f"The metadata CSV has been updated:\n{csv_path}")
         if refresh_ui:
             self._rebuild_table()
+            # Only on the final (UI-refreshing) save — the per-row calls made
+            # while converting a whole batch would otherwise re-read the CSV
+            # and rebuild every tab once per row.
+            _notify_metadata_refresh(
+                self.metadata_loader, self.log, "segmentation import"
+            )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -5556,10 +5663,9 @@ class APOCWidget(QWidget):
         w_form.addRow("Workers:", self.spin_workers)
         batch_lay.addLayout(w_form)
 
-        # Overwrite checkbox
-        self.check_overwrite = QCheckBox("Overwrite existing results")
-        self.check_overwrite.setChecked(False)
-        batch_lay.addWidget(self.check_overwrite)
+        # Overwrite is decided by the Run confirmation dialog (interactive) or
+        # by the queue's skip_existing setting -- no redundant checkbox.
+        self._overwrite_existing = False
 
         # Run button
         self.btn_run_segmentation = QPushButton("▶ Run APOC Batch Segmentation")
@@ -5732,43 +5838,6 @@ class APOCWidget(QWidget):
         else:
             self.log("APOC training controls locked. Load training data to enable classifier training.")
 
-    def _channel_index_from_name(self, channel_name):
-        text = str(channel_name or "")
-        import re
-        match = re.search(r"\((\d+)\)", text)
-        if match:
-            return int(match.group(1))
-        match = re.search(r"(?:^|\b)(?:channel|ch)\s*(\d+)(?:\b|$)", text, flags=re.IGNORECASE)
-        if match:
-            return int(match.group(1))
-        nums = re.findall(r"\d+", text)
-        if nums:
-            return int(nums[-1])
-        return None
-
-    def _restore_tab_channels_fallback(self, tab, configured_channels):
-        configured = [str(name) for name in (configured_channels or []) if str(name).strip()]
-        exact = set(configured)
-        configured_idx = {
-            idx for idx in (self._channel_index_from_name(name) for name in configured)
-            if idx is not None
-        }
-
-        any_checked = False
-        for cb in getattr(tab, "channel_checkboxes", []):
-            checked = cb.text() in exact
-            if not checked and configured_idx:
-                current_idx = self._channel_index_from_name(cb.text())
-                checked = current_idx in configured_idx if current_idx is not None else False
-            cb.setChecked(checked)
-            any_checked = any_checked or checked
-
-        if hasattr(tab, "_default_channel_names"):
-            if any_checked:
-                tab._default_channel_names = [cb.text() for cb in getattr(tab, "channel_checkboxes", []) if cb.isChecked()]
-            else:
-                tab._default_channel_names = list(configured)
-
     def _extract_tab_config(self, apoc_params, ct):
         prefix = f"apoc_{ct}_"
         cfg = {}
@@ -5780,9 +5849,10 @@ class APOCWidget(QWidget):
     def _on_training_channels_refreshed(self, ct):
         """Slot: APOCTrainingWidget rebuilt the channel checkboxes for *ct*.
 
-        Restores saved channel selections from the persisted tab config and
-        re-wires the organoid-mirroring signal handlers. Used instead of
-        monkey-patching ``tab.refresh_channel_checkboxes``.
+        Nothing is restored here. The tab owns its channel selection and
+        re-applies it during the rebuild; re-applying the YAML value on top
+        would override the trained classifier's own channel metadata, which
+        is the higher-precedence source (see ``CellTypeTab.__init__``).
         """
         if self._training_widget is None:
             return
@@ -5793,13 +5863,6 @@ class APOCWidget(QWidget):
         can_train = bool(self._is_session_active)
         for cb in getattr(tab, "channel_checkboxes", []):
             cb.setEnabled(can_train)
-        cfg = getattr(tab, "_saved_config_for_restore", None)
-        if not (isinstance(cfg, dict) and cfg.get("channels")):
-            # Stash is empty or has no channel selection — read from live YAML.
-            live_params = self.metadata_loader.behav3d_parameters.get("apoc", {})
-            cfg = self._extract_tab_config(live_params, ct) or {}
-        if isinstance(cfg, dict) and cfg.get("channels"):
-            self._restore_tab_channels_fallback(tab, cfg.get("channels", []))
         # Channel checkboxes are recreated by refresh; re-wire sync handlers.
         self._wire_organoid_tab_sync_signals(ct, tab, include_channels=True, include_rf=False)
         self._wire_non_organoid_tab_channel_signals(ct, tab)
@@ -5813,9 +5876,11 @@ class APOCWidget(QWidget):
 
         for ct, tab in tw.tabs.items():
             cfg = tab.get_config()
-            if not tab.channel_selection_is_complete():
-                # Channel layers are still loading in — don't overwrite the
-                # saved selection with this partial checkbox state.
+            # Only persist a selection the user actually made. ``get_config``
+            # reports the *effective* channels (all of them when nothing was
+            # chosen), which must never be written back as if it were a
+            # deliberate choice.
+            if tab.configured_channels() is None:
                 cfg.pop("channels", None)
             for k, v in cfg.items():
                 apoc_config[f"apoc_{ct}_{k}"] = v
@@ -5900,15 +5965,14 @@ class APOCWidget(QWidget):
             cfg = self._extract_tab_config(apoc_params, ct)
             if not cfg:
                 continue
-            # Stash so :meth:`_on_training_channels_refreshed` can re-apply
-            # channel selections every time the checkboxes get rebuilt.
-            tab._saved_config_for_restore = dict(cfg)
+            # Channels are resolved once, in ``CellTypeTab.__init__``, where
+            # the trained classifier's own metadata outranks this YAML
+            # value. Re-applying it here would let a stale entry win.
+            cfg.pop("channels", None)
             try:
                 tab.apply_config(cfg)
             except Exception as e:
                 self.log(f"⚠️ Could not restore APOC tab config for '{ct}': {e}")
-            if cfg.get("channels"):
-                self._restore_tab_channels_fallback(tab, cfg.get("channels", []))
 
     def _reorder_apoc_training_layers(self):
         """Enforce grouped training layer order: channels, labels, probabilities, segments."""
@@ -6065,26 +6129,16 @@ class APOCWidget(QWidget):
                     load_existing = True
             # else: no data exists → generate immediately without any dialog
 
-            # Flush current channel selections and tab config to YAML BEFORE
-            # clearing layers, so the subsequent checkbox rebuild can restore
-            # the live UI state rather than a stale one-time stash.
-            current_tab_cfg = self._collect_apoc_tab_config()
-            existing_apoc = self.metadata_loader.behav3d_parameters.get("apoc", {})
-            for key in list(current_tab_cfg.keys()):
-                if key.endswith("_channels") and not current_tab_cfg[key]:
-                    existing_val = existing_apoc.get(key)
-                    if existing_val:
-                        current_tab_cfg[key] = existing_val
-            self._save_apoc_params_to_yaml(updated_apoc_params=current_tab_cfg)
-            # Refresh the per-tab stash from the freshly written YAML so that
-            # _on_training_channels_refreshed re-applies the correct channels.
-            self._restore_training_tab_configs(
-                self.metadata_loader.behav3d_parameters.get("apoc", {})
+            # Flush the current tab config to YAML before clearing layers.
+            # The tabs own their channel selection across the rebuild, so
+            # nothing needs restoring afterwards.
+            self._save_apoc_params_to_yaml(
+                updated_apoc_params=self._collect_apoc_tab_config()
             )
 
             # Clear all viewer layers entirely
             disconnect_all_preview_dims_listeners(self.viewer)
-            self.viewer.layers.clear()
+            clear_viewer_layers(self.viewer)
 
             # Load images
             self.log("Running _load_training_images...")
@@ -6692,6 +6746,13 @@ class APOCWidget(QWidget):
         # Apply import
         self._training_widget.apply_import(meta, data_by_celltype, cell_type_mapping, source_path=path)
 
+        # Imported training data is usable on its own (training reads
+        # directly from ``_imported_training_data``), so unlock the
+        # feature-selection UI and training controls just like Generate
+        # Training Data does.
+        self._is_session_active = True
+        self._update_training_controls_state()
+
         # Persist import path to YAML
         pc = self.metadata_loader.behav3d_parameters.setdefault("pixel_classifier", {})
         pc["apoc_imported_training_path"] = str(path)
@@ -6963,6 +7024,10 @@ class APOCWidget(QWidget):
             self._training_widget.apply_import(
                 meta, data_by_celltype, cell_type_mapping, source_path=saved_path
             )
+            # Restoring a saved import also makes the classifier trainable,
+            # same as a fresh manual import — unlock the UI accordingly.
+            self._is_session_active = True
+            self._update_training_controls_state()
             self._update_import_panel()
             self.log(f"↩ Restored import from {saved_path}")
         except Exception as exc:
@@ -7051,7 +7116,7 @@ class APOCWidget(QWidget):
             "strategy_name": strategy,
             "gpu_device_name": self._selected_gpu_device_name(),
             "force_cpu": self.btn_force_cpu.isChecked() if hasattr(self, 'btn_force_cpu') else False,
-            "overwrite": self.check_overwrite.isChecked(),
+            "overwrite": self._overwrite_existing,
             "workers": self.spin_workers.value(),
             "process_all": self.check_process_all.isChecked(),
             "t_start": self.spin_t_start.value(),
@@ -7063,6 +7128,11 @@ class APOCWidget(QWidget):
             per_ct_strategies = {}
             for ct, tab in self._training_widget.tabs.items():
                 cfg = tab.get_config()
+                if tab.configured_channels() is None:
+                    # Never configured — let the replaying tab fall back to
+                    # its own default instead of freezing in whatever layers
+                    # happen to be loaded now.
+                    cfg.pop("channels", None)
                 per_ct_params[ct] = cfg
                 per_tab_combo = getattr(tab, "_per_tab_strategy_combo", None)
                 if per_tab_combo is not None:
@@ -7346,13 +7416,12 @@ class APOCWidget(QWidget):
 
         output_dir = Path(self.metadata_loader.output_dir)
 
-        # Check for pre-existing segments and prompt
+        # Check for pre-existing segments and prompt.  The dead cell type is
+        # stored as ``<sn>_mask_dead.zarr``, not ``<sn>_dead_segments.zarr``.
         sample_names = md['sample_name'].unique()
-        existing = [
-            f"{ct} segments for {sn}"
-            for sn in sample_names
-            if (output_dir / "images" / sn / f"{sn}_{ct}_segments.zarr").exists()
-        ]
+        existing, any_incomplete = _segmentation_output_entries(
+            output_dir, sample_names, [ct],
+        )
 
         overwrite = False
         if existing:
@@ -7361,6 +7430,8 @@ class APOCWidget(QWidget):
                 self,
                 f"Run {ct.capitalize()} Segmentation",
                 existing,
+                skip_label="Skip & Resume" if any_incomplete else "Skip",
+                body_suffix=_RESUME_HINT if any_incomplete else "What do you want to do?",
             )
             if choice == "cancel":
                 return
@@ -7368,14 +7439,14 @@ class APOCWidget(QWidget):
 
         # Run segmentation for this cell type only.  Use the background
         # path (``block=False``) so napari remains interactive.
-        orig_overwrite = self.check_overwrite.isChecked()
-        self.check_overwrite.setChecked(overwrite)
+        orig_overwrite = self._overwrite_existing
+        self._overwrite_existing = overwrite
         try:
             self._on_run_segmentation(
                 interactive=True, only_cell_types=[ct], block=False,
             )
         finally:
-            self.check_overwrite.setChecked(orig_overwrite)
+            self._overwrite_existing = orig_overwrite
 
     def _update_global_run_btn_label(self, tab_index):
         """Update the global Run button label to reflect the active cell-type tab."""
@@ -7507,24 +7578,23 @@ class APOCWidget(QWidget):
             # prompt in ``_on_global_run_instance``) ----------------------
             if interactive and only_cell_types is None:
                 check_cts = list(self.all_cell_types or [])
-                existing = []
-                for sn in md["sample_name"].unique():
-                    for ct in check_cts:
-                        seg_path = output_dir / "images" / sn / f"{sn}_{ct}_segments.zarr"
-                        if seg_path.exists():
-                            existing.append(f"{ct} segments for {sn}")
+                existing, any_incomplete = _segmentation_output_entries(
+                    output_dir, md["sample_name"].unique(), check_cts,
+                )
                 if existing:
                     from behav3d.napari._overwrite_prompt import prompt_overwrite_batch
                     choice = prompt_overwrite_batch(
                         self,
                         "Overwrite Existing APOC Segmentations?",
                         existing,
+                        skip_label="Skip & Resume" if any_incomplete else "Skip Existing",
+                        body_suffix=_RESUME_HINT if any_incomplete else "What do you want to do?",
                     )
                     if choice == "cancel":
                         self.log("APOC segmentation cancelled.")
                         fire_extra_callback(extra_callbacks, "on_failed", "cancelled")
                         return
-                    self.check_overwrite.setChecked(choice == "overwrite")
+                    self._overwrite_existing = (choice == "overwrite")
 
             # Timepoint range
             if only_cell_types is not None and hasattr(self, 'check_limit_timerange_ct'):
@@ -7545,29 +7615,14 @@ class APOCWidget(QWidget):
                     return
                 timepoint_range = (t_start, t_end)
 
-            # Collect APOC config from training widget tabs (Qt thread).
-            apoc_config = {}
-            if self._training_widget is not None:
-                for ct, tab in self._training_widget.tabs.items():
-                    cfg = tab.get_config()
-                    for k, v in cfg.items():
-                        apoc_config[f"apoc_{ct}_{k}"] = v
+            # Collect APOC config from the training widget tabs (Qt thread).
+            # Goes through the shared collector so an unchosen "all
+            # channels" state is never written to YAML; the backend then
+            # falls back to each classifier's own header metadata.
+            apoc_config = self._collect_apoc_tab_config()
 
             # Save all parameters safely
             self._save_apoc_params_to_yaml(updated_apoc_params=apoc_config)
-
-            # Fix channel names for apoc_segment.py parser (backend expects 'Ch 0' format)
-            import re
-            for key in list(apoc_config.keys()):
-                if key.endswith("_channels") and isinstance(apoc_config[key], list):
-                    fixed_chans = []
-                    for ch_name in apoc_config[key]:
-                        match = re.search(r'\((\d+)\)', str(ch_name))
-                        if match:
-                            fixed_chans.append(f"Ch {match.group(1)}")
-                        else:
-                            fixed_chans.append(ch_name)
-                    apoc_config[key] = fixed_chans
 
             # GUI-side compatibility preflight: ensure classifier headers can drive predict(image=...).
             incompatible = self._apoc_preflight_classifier_headers(output_dir, md)
@@ -7601,7 +7656,7 @@ class APOCWidget(QWidget):
                 strat_summary = ", ".join(f"{k}:{v[:4]}" for k, v in per_ct_strategies.items())
                 self.log(f"  Advanced strategies: {strat_summary}")
 
-            overwrite_val = self.check_overwrite.isChecked()
+            overwrite_val = self._overwrite_existing
             n_workers_val = self.spin_workers.value()
             gpu_device_val = self._selected_gpu_device_name()
 
@@ -7631,6 +7686,7 @@ class APOCWidget(QWidget):
                         except Exception as e:
                             self.log(f"Warning: Could not save metadata: {e}")
                 self.log("✅ APOC batch segmentation finished!")
+                _notify_metadata_refresh(self.metadata_loader, self.log, "segmentation")
                 if interactive:
                     self._prompt_visualize_after_apoc_segmentation()
 
@@ -7855,9 +7911,9 @@ class ConvPaintWidget(QWidget):
         w_form.addRow("Workers:", self.spin_workers)
         batch_lay.addLayout(w_form)
 
-        self.check_overwrite = QCheckBox("Overwrite existing results")
-        self.check_overwrite.setChecked(False)
-        batch_lay.addWidget(self.check_overwrite)
+        # Overwrite is decided by the Run confirmation dialog (interactive) or
+        # by the queue's skip_existing setting -- no redundant checkbox.
+        self._overwrite_existing = False
 
         self.btn_run_segmentation = QPushButton("▶ Run ConvPaint Batch Segmentation")
         self.btn_run_segmentation.setStyleSheet(
@@ -8192,7 +8248,7 @@ class ConvPaintWidget(QWidget):
                     overwrite_images = False
 
             disconnect_all_preview_dims_listeners(self.viewer)
-            self.viewer.layers.clear()
+            clear_viewer_layers(self.viewer)
 
             all_images, pixel_class_outdir, has_death, all_cell_types = _load_training_images(
                 metadata=md,
@@ -8504,7 +8560,7 @@ class ConvPaintWidget(QWidget):
             "strategy_index": all_strats.index(strategy) if strategy in all_strats else 0,
             "strategy_name": strategy,
             "device": self._selected_device(),
-            "overwrite": self.check_overwrite.isChecked(),
+            "overwrite": self._overwrite_existing,
             "workers": self.spin_workers.value(),
             "process_all": self.check_process_all.isChecked(),
             "t_start": self.spin_t_start.value(),
@@ -8602,24 +8658,23 @@ class ConvPaintWidget(QWidget):
             # ---- Overwrite check (batch only) ---------------------------
             if interactive and only_cell_types is None:
                 check_cts = list(self.all_cell_types or [])
-                existing = []
-                for sn in md["sample_name"].unique():
-                    for ct in check_cts:
-                        seg_path = output_dir / "images" / sn / f"{sn}_{ct}_segments.zarr"
-                        if seg_path.exists():
-                            existing.append(f"{ct} segments for {sn}")
+                existing, any_incomplete = _segmentation_output_entries(
+                    output_dir, md["sample_name"].unique(), check_cts,
+                )
                 if existing:
                     from behav3d.napari._overwrite_prompt import prompt_overwrite_batch
                     choice = prompt_overwrite_batch(
                         self,
                         "Overwrite Existing ConvPaint Segmentations?",
                         existing,
+                        skip_label="Skip & Resume" if any_incomplete else "Skip Existing",
+                        body_suffix=_RESUME_HINT if any_incomplete else "What do you want to do?",
                     )
                     if choice == "cancel":
                         self.log("ConvPaint segmentation cancelled.")
                         fire_extra_callback(extra_callbacks, "on_failed", "cancelled")
                         return
-                    self.check_overwrite.setChecked(choice == "overwrite")
+                    self._overwrite_existing = (choice == "overwrite")
 
             # Quick preflight: a unified ConvPaint model must exist.
             from behav3d.preprocessing.segmentation.convpaint_label_map import (
@@ -8687,7 +8742,7 @@ class ConvPaintWidget(QWidget):
 
             convpaint_config["convpaint_device"] = self._selected_device()
 
-            overwrite_val = self.check_overwrite.isChecked()
+            overwrite_val = self._overwrite_existing
             n_workers_val = self.spin_workers.value()
 
             def _do_convpaint(progress_cb=None):
@@ -8715,6 +8770,7 @@ class ConvPaintWidget(QWidget):
                         except Exception as e:
                             self.log(f"Warning: Could not save metadata: {e}")
                 self.log("✅ ConvPaint batch segmentation finished!")
+                _notify_metadata_refresh(self.metadata_loader, self.log, "segmentation")
                 if interactive:
                     self._prompt_visualize_after_segmentation()
 

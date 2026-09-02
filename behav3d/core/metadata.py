@@ -244,8 +244,10 @@ def has_dead_channel(metadata):
     if 'dead_channel' not in metadata.columns:
         return False
     
-    # Check if any row has a non-null dead_channel value
-    return metadata['dead_channel'].notna().any()
+    # Check if any row has a non-null dead_channel value.
+    # bool(...) normalizes numpy.bool_ -> Python bool: some callers hand this
+    # straight to Qt setters (e.g. QWidget.setVisible), which reject numpy.bool_.
+    return bool(metadata['dead_channel'].notna().any())
 
 def has_dead_mask(metadata):
     """
@@ -261,7 +263,7 @@ def has_dead_mask(metadata):
     # Check if any row has a non-null AND non-empty dead_mask_path value
     # (empty strings '' are not NaN but should be treated as missing)
     mask_values = metadata['dead_mask_path'].fillna('')
-    return (mask_values.str.strip() != '').any()
+    return bool((mask_values.str.strip() != '').any())
 
 def load_behav3d_metadata(
     metadata_path

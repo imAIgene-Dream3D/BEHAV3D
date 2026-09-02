@@ -160,6 +160,87 @@ def prepare_state_code_lookup(sample_obs, state_col, code_map, track_col="TrackI
     )
 
 
+_PIXEL_POSITION_TRIPLETS = (
+    ("pixel_position_z", "pixel_position_y", "pixel_position_x"),
+    ("pixel_position_y", "pixel_position_x"),
+)
+
+
+def prepare_state_trajectory_data(
+    sample_obs,
+    state_col,
+    track_col="TrackID",
+    time_col="position_t",
+):
+    """
+    Build one pixel-space position array per state label, ready for one
+    ``viewer.add_tracks(...)`` call per state (see
+    ``behav3d.analysis.behavior.track.visualization.backprojection.
+    add_track_cluster_trajectory_layers``, reused as-is for state trajectories).
+
+    Unlike a whole-track classification (constant label per TrackID), a state
+    label can vary along a single track's timeline. Grouping naively by
+    ``state_col`` would incorrectly bridge a track's separate visits to the
+    same state (e.g. ``1,1,2,2,1,1``) into one straight line jumping across
+    the intervening state. To avoid that, each track is split into
+    contiguous same-state runs first, and each run gets its own synthetic id
+    (``__run_id``) in place of the real ``TrackID`` — napari's Tracks layer
+    only connects rows sharing the same id, so non-adjacent runs of the same
+    state naturally render as separate stretches instead of one bridged line.
+
+    Parameters
+    ----------
+    sample_obs : pandas.DataFrame
+        Single-sample obs slice with ``track_col``, ``time_col``, ``state_col``
+        and pixel-space position columns (see ``ensure_exemplar_coordinate_columns``
+        to guarantee the latter are present before calling this).
+
+    Returns
+    -------
+    dict[str, np.ndarray]
+        ``{state_label: Nx4/5 array}`` with columns
+        ``[__run_id, position_t, (pixel_position_z), pixel_position_y, pixel_position_x]``.
+    """
+    pos_triplet = None
+    for candidate in _PIXEL_POSITION_TRIPLETS:
+        if all(c in sample_obs.columns for c in candidate):
+            pos_triplet = candidate
+            break
+    if pos_triplet is None:
+        raise ValueError(
+            "sample_obs is missing pixel-space position columns needed to build "
+            "state trajectory layers (expected 'pixel_position_z'/'pixel_position_y'/"
+            "'pixel_position_x', or 'pixel_position_y'/'pixel_position_x' for 2D data)."
+        )
+
+    needed_cols = [str(track_col), str(time_col), str(state_col)] + list(pos_triplet)
+    missing = [c for c in needed_cols if c not in sample_obs.columns]
+    if len(missing) > 0:
+        raise ValueError(f"sample_obs missing required columns: {missing}")
+
+    obs = sample_obs[needed_cols].copy()
+    obs["__track"] = pd.to_numeric(obs[str(track_col)], errors="coerce")
+    obs["__time"] = pd.to_numeric(obs[str(time_col)], errors="coerce")
+    obs = obs.dropna(subset=["__track", "__time"] + list(pos_triplet)).copy()
+    if len(obs) == 0:
+        return {}
+
+    obs["__track"] = obs["__track"].astype(np.int64)
+    obs["__time"] = obs["__time"].astype(np.int64)
+    obs = obs.sort_values(["__track", "__time"], kind="mergesort")
+
+    state_str = obs[str(state_col)].astype(str)
+    new_run = obs["__track"].ne(obs["__track"].shift()) | state_str.ne(state_str.shift())
+    obs["__run_id"] = new_run.cumsum().astype(np.int64)
+    obs["__state"] = state_str
+
+    trajectory_data = {}
+    cols = ["__run_id", "__time"] + list(pos_triplet)
+    for label, group in obs.groupby("__state", observed=True, sort=False):
+        trajectory_data[str(label)] = group[cols].to_numpy(dtype=np.float64, copy=True)
+    return trajectory_data
+
+
 def backproject_state_at_timepoint(
     labels_frame,
     state_code_lookup,
