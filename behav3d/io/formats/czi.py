@@ -1,6 +1,8 @@
 from aicspylibczi import CziFile
 from behav3d.core.utils import element_to_dict
 import numpy as np
+import pandas as pd
+import xml.etree.ElementTree as ET
 
 _DATA_AXES = set("TCZYX")
 
@@ -118,25 +120,92 @@ def load_elsizes_czi(path):
         elsize_x = float(metadata["Metadata"]["Scaling"]["Items"]["Distance"][0]["Value"]["Value"])*(10**6)
         elsize_y = float(metadata["Metadata"]["Scaling"]["Items"]["Distance"][1]["Value"]["Value"])*(10**6)
         elsize_z = float(metadata["Metadata"]["Scaling"]["Items"]["Distance"][2]["Value"]["Value"])*(10**6)
-    
-    ### Interval unit does not make sense as it seems to be in seconds but "defaultunit is minutes"
+
+    # Prefer the actual measured interval (from real per-timepoint
+    # AcquisitionTime stamps) over the nominal/configured SetIntervalAction
+    # value: the configured interval is only a target and, especially for
+    # multi-scene/multi-Z time-lapses, real cadence can run slower (or
+    # otherwise drift) than requested. See get_actual_time_intervals_czi.
     try:
-        time_interval = float(metadata["Metadata"]["Experiment"]["ExperimentBlocks"]["AcquisitionBlock"]["TimeSeriesSetup"]["Switches"]["Switch"]["SwitchAction"]["SetIntervalAction"]["Interval"]["TimeSpan"]["Value"]["Value"])
-        interval_unit = metadata["Metadata"]["Experiment"]["ExperimentBlocks"]["AcquisitionBlock"]["TimeSeriesSetup"]["Switches"]["Switch"]["SwitchAction"]["SetIntervalAction"]["Interval"]["TimeSpan"]["DefaultUnitFormat"]["DefaultUnitFormat"]
-    except:
-        time_interval = float(metadata["Metadata"]["Experiment"]["ExperimentBlocks"]["AcquisitionBlock"]["SubDimensionSetups"]["TimeSeriesSetup"]["Interval"]["TimeSpan"]["Value"]["Value"])
-        interval_unit = metadata["Metadata"]["Experiment"]["ExperimentBlocks"]["AcquisitionBlock"]["SubDimensionSetups"]["TimeSeriesSetup"]["Interval"]["TimeSpan"]["DefaultUnitFormat"]["DefaultUnitFormat"]
-    
+        actual = get_actual_time_intervals_czi(path)
+        time_interval = actual["median_interval"]
+    except Exception:
+        ### Interval unit does not make sense as it seems to be in seconds but "defaultunit is minutes"
+        try:
+            time_interval = float(metadata["Metadata"]["Experiment"]["ExperimentBlocks"]["AcquisitionBlock"]["TimeSeriesSetup"]["Switches"]["Switch"]["SwitchAction"]["SetIntervalAction"]["Interval"]["TimeSpan"]["Value"]["Value"])
+            interval_unit = metadata["Metadata"]["Experiment"]["ExperimentBlocks"]["AcquisitionBlock"]["TimeSeriesSetup"]["Switches"]["Switch"]["SwitchAction"]["SetIntervalAction"]["Interval"]["TimeSpan"]["DefaultUnitFormat"]["DefaultUnitFormat"]
+        except:
+            time_interval = float(metadata["Metadata"]["Experiment"]["ExperimentBlocks"]["AcquisitionBlock"]["SubDimensionSetups"]["TimeSeriesSetup"]["Interval"]["TimeSpan"]["Value"]["Value"])
+            interval_unit = metadata["Metadata"]["Experiment"]["ExperimentBlocks"]["AcquisitionBlock"]["SubDimensionSetups"]["TimeSeriesSetup"]["Interval"]["TimeSpan"]["DefaultUnitFormat"]["DefaultUnitFormat"]
+
     elsizes = {
         "x": elsize_x,
         "y": elsize_y,
         "z": elsize_z,
         "elsize_unit": "µm",
         "t": time_interval,
-        # For some reason there doesnt seem 
-        "time_interval_unit": "s"   
+        # For some reason there doesnt seem
+        "time_interval_unit": "s"
     }
     return(elsizes)
+
+
+def get_actual_time_intervals_czi(path, s=0, z=0, c=0):
+    """
+    Measure the actual per-timepoint interval (in seconds) from the real
+    AcquisitionTime recorded in each subblock's own metadata, as opposed to
+    the nominal/configured interval reported by load_czi_metadata /
+    load_elsizes_czi (SetIntervalAction). The configured interval is only a
+    target: if a full T-cycle (all scenes/Z-planes/channels) takes longer to
+    actually scan than the configured interval, ZEN does not wait for it, so
+    the real cadence can run slower than requested, or otherwise drift.
+
+    Fixes a single scene/Z-plane/channel (s, z, c) so exactly one real
+    timestamp exists per timepoint, then diffs consecutive timepoints'
+    timestamps to get the actual interval between two subsequent timepoints.
+
+    Args:
+        path: Path to the .czi file.
+        s, z, c: Scene / Z-plane / Channel index to fix while T varies.
+            Defaults to the first of each.
+    Returns:
+        dict with:
+            "timepoints": sorted T indices (np.ndarray[int])
+            "timestamps": actual acquisition datetime per timepoint (pd.Series)
+            "intervals": actual interval in seconds between each pair of
+                subsequent timepoints (np.ndarray[float], length len(timepoints)-1)
+            "mean_interval", "median_interval": summary stats (float)
+    """
+    czifile = CziFile(path)
+    subblocks = czifile.read_subblock_metadata(S=s, Z=z, C=c, unified_xml=False)
+
+    records = []
+    for dims, xml_str in subblocks:
+        t = dims.get("T", 0)
+        root = ET.fromstring(xml_str)
+        acquisition_time = root.find(".//AcquisitionTime")
+        if acquisition_time is None or acquisition_time.text is None:
+            continue
+        records.append((t, acquisition_time.text))
+
+    if not records:
+        raise ValueError(
+            f"No AcquisitionTime found in subblock metadata for S={s}, Z={z}, C={c} in {path}."
+        )
+
+    timestamps = pd.DataFrame(records, columns=["t", "timestamp"]).drop_duplicates("t")
+    timestamps["timestamp"] = pd.to_datetime(timestamps["timestamp"])
+    timestamps = timestamps.sort_values("t").reset_index(drop=True)
+
+    intervals = timestamps["timestamp"].diff().dt.total_seconds().to_numpy()[1:]
+
+    return {
+        "timepoints": timestamps["t"].to_numpy(),
+        "timestamps": timestamps["timestamp"],
+        "intervals": intervals,
+        "mean_interval": float(np.mean(intervals)) if len(intervals) else float("nan"),
+        "median_interval": float(np.median(intervals)) if len(intervals) else float("nan"),
+    }
 
 def get_czi_shape(path, take_dims="TCZYX"):
     """

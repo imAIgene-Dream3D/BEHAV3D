@@ -20,6 +20,9 @@ from behav3d.analysis.behavior.state.visualization.backprojection import (
     _build_code_map,
     export_behavioral_state_backprojection_zarrs,
 )
+from behav3d.analysis.behavior.track.visualization.backprojection import (
+    add_track_cluster_trajectory_layers,
+)
 from behav3d.analysis.behavior.state.visualization.plots.state_transitions import (
     compute_cluster_transition_matrix,
     save_state_transition_report,
@@ -74,6 +77,48 @@ def test_build_code_map_honors_saved_state_order():
     code_map = _build_code_map(obs, state_col=_STATE_COL, state_order=_CUSTOM_ORDER)
     assert list(code_map.keys()) == _CUSTOM_ORDER
     assert code_map == {"mu": 1, "zeta": 2, "alpha": 3}
+
+
+class _FakeViewer:
+    """Minimal stand-in for `napari.Viewer` that just records `add_tracks` call order."""
+
+    def __init__(self):
+        self.added_names = []
+
+    def add_tracks(self, data, name, **kwargs):
+        self.added_names.append(name)
+        return name
+
+
+def test_add_track_cluster_trajectory_layers_honors_label_map_order():
+    """`trajectory_data` comes from a `groupby(..., sort=False)` whose key order is
+    incidental (e.g. alphabetical, or order of first appearance), not the user's saved
+    state order. The napari `Tracks` layers must be added in `label_map`'s order (which
+    already reflects the saved `state_order`, see `_build_code_map`), not
+    `trajectory_data`'s own key order."""
+    # Deliberately alphabetical (mimics `merged.sort_values([output_col, ...])`), i.e.
+    # NOT in `_CUSTOM_ORDER`.
+    trajectory_data = {
+        "alpha": np.array([[0, 0, 0.0, 0.0]]),
+        "mu": np.array([[0, 0, 1.0, 1.0]]),
+        "zeta": np.array([[0, 0, 2.0, 2.0]]),
+    }
+    code_map = _build_code_map(
+        pd.DataFrame({_STATE_COL: _CUSTOM_ORDER}), state_col=_STATE_COL, state_order=_CUSTOM_ORDER,
+    )
+    label_map = {str(code): str(label) for label, code in code_map.items()}
+
+    viewer = _FakeViewer()
+    add_track_cluster_trajectory_layers(
+        viewer,
+        trajectory_data=trajectory_data,
+        code_colors={},
+        label_map=label_map,
+        output_col=_STATE_COL,
+        tail_length=1,
+    )
+
+    assert viewer.added_names == [f"{_STATE_COL} trajectory: {label}" for label in _CUSTOM_ORDER]
 
 
 def test_export_behavioral_state_backprojection_zarrs_resolves_saved_order(tmp_path):

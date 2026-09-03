@@ -589,15 +589,42 @@ class StateClassificationSubTab(QWidget):
         train_lay.setSpacing(4)
 
         # Feature Selection
+        # Split into two tabs so "Timepoint features" (the primary, usually
+        # much longer, category-grouped set) is never hidden below the
+        # fold behind the shorter "Window features" block -- both are
+        # equally reachable via the tab bar instead of one continuous
+        # scrolling column. Timepoint features is tab 0 (shown by default)
+        # since it's the primary feature set most configuration goes into.
         feat_sel_sec = CollapsibleSection("Feature Selection", expanded=True)
         self.feat_sel_scroll = QScrollArea()
         self.feat_sel_scroll.setWidgetResizable(True)
-        self.feat_sel_scroll.setMinimumHeight(150)
-        feat_sel_content = QWidget()
-        self.feat_sel_lay = QVBoxLayout(feat_sel_content)
-        self.feat_sel_lay.setSpacing(2)
+        self.feat_sel_scroll.setMinimumHeight(260)
+        self.feat_sel_tabs = QTabWidget()
 
-        self.feat_sel_lay.addWidget(QLabel("<b>Window features</b>"))
+        # ── Tab: Timepoint features ────────────────────────────────────
+        timepoint_tab = QWidget()
+        timepoint_tab_lay = QVBoxLayout(timepoint_tab)
+        timepoint_tab_lay.setSpacing(2)
+        timepoint_tab_lay.addWidget(_make_info_label(
+            "Timepoint features are per-frame measurements read directly from the "
+            "track-features table (e.g. speed, sphericity, elongation) — one value per "
+            "timepoint. Select which ones the HMM should cluster on."
+        ))
+        self.timepoint_features_lay = QVBoxLayout()
+        timepoint_tab_lay.addLayout(self.timepoint_features_lay)
+        timepoint_tab_lay.addStretch(1)
+        self.feat_sel_tabs.addTab(timepoint_tab, "Timepoint Features")
+
+        # ── Tab: Window features ───────────────────────────────────────
+        window_tab = QWidget()
+        window_tab_lay = QVBoxLayout(window_tab)
+        window_tab_lay.setSpacing(2)
+        window_tab_lay.addWidget(_make_info_label(
+            "Window features are short-term trajectory-shape descriptors (net displacement, "
+            "straightness, mean-square displacement) computed on the fly over a rolling "
+            "window of consecutive timepoints, then merged in alongside the timepoint "
+            "features for clustering."
+        ))
         win_feat_form = QFormLayout()
         self.spin_window_size = QSpinBox()
         self.spin_window_size.setRange(1, 500)
@@ -612,20 +639,18 @@ class StateClassificationSubTab(QWidget):
         self.lbl_window_size_time = _make_timepoint_time_label()
         win_feat_form.addRow("", self.lbl_window_size_time)
         self.spin_window_size.valueChanged.connect(self._update_timepoint_time_labels)
-        self.feat_sel_lay.addLayout(win_feat_form)
+        window_tab_lay.addLayout(win_feat_form)
 
         self.chk_net_disp = QCheckBox("net_displacement")
         self.chk_straight = QCheckBox("straightness")
         self.chk_msd = QCheckBox("mean_square_displacement")
-        self.feat_sel_lay.addWidget(self.chk_net_disp)
-        self.feat_sel_lay.addWidget(self.chk_straight)
-        self.feat_sel_lay.addWidget(self.chk_msd)
+        window_tab_lay.addWidget(self.chk_net_disp)
+        window_tab_lay.addWidget(self.chk_straight)
+        window_tab_lay.addWidget(self.chk_msd)
+        window_tab_lay.addStretch(1)
+        self.feat_sel_tabs.addTab(window_tab, "Window Features")
 
-        self.feat_sel_lay.addWidget(QLabel("<b>Timepoint features</b>"))
-        self.timepoint_features_lay = QVBoxLayout()
-        self.feat_sel_lay.addLayout(self.timepoint_features_lay)
-
-        self.feat_sel_scroll.setWidget(feat_sel_content)
+        self.feat_sel_scroll.setWidget(self.feat_sel_tabs)
         feat_sel_sec.addWidget(self.feat_sel_scroll)
         train_lay.addWidget(feat_sel_sec)
 
@@ -1197,6 +1222,9 @@ class StateClassificationSubTab(QWidget):
         self.chk_net_disp.toggled.connect(self._update_config_summary)
         self.chk_straight.toggled.connect(self._update_config_summary)
         self.chk_msd.toggled.connect(self._update_config_summary)
+        self.chk_net_disp.toggled.connect(self._update_feature_tab_labels)
+        self.chk_straight.toggled.connect(self._update_feature_tab_labels)
+        self.chk_msd.toggled.connect(self._update_feature_tab_labels)
         self.spin_hmm_feature_smoothing_window.valueChanged.connect(self._update_config_summary)
         self.spin_quant_lo.valueChanged.connect(self._update_config_summary)
         self.spin_quant_hi.valueChanged.connect(self._update_config_summary)
@@ -1469,7 +1497,23 @@ class StateClassificationSubTab(QWidget):
         except Exception:
             traceback.print_exc()
 
+    def _update_feature_tab_labels(self):
+        """Show a live '(N selected)' count on each Feature Selection tab so
+        selections in the non-visible tab aren't overlooked."""
+        tabs = getattr(self, "feat_sel_tabs", None)
+        if tabs is None:
+            return
+        n_timepoint = sum(
+            1 for cb in getattr(self, "_timepoint_checkboxes", {}).values() if cb.isChecked()
+        )
+        n_window = sum(
+            1 for cb in (self.chk_net_disp, self.chk_straight, self.chk_msd) if cb.isChecked()
+        )
+        tabs.setTabText(0, f"Timepoint Features ({n_timepoint})")
+        tabs.setTabText(1, f"Window Features ({n_window})")
+
     def _rebuild_log_scale_features(self, state=None):
+        self._update_feature_tab_labels()
         while self.log_scale_lay.count():
             child = self.log_scale_lay.takeAt(0)
             if child.widget():
@@ -1582,6 +1626,7 @@ class StateClassificationSubTab(QWidget):
                 for w in [self.spin_window_size, self.chk_net_disp, self.chk_straight, self.chk_msd,
                           self.spin_hmm_feature_smoothing_window, self.spin_quant_lo, self.spin_quant_hi]:
                     w.setEnabled(False)
+                self._update_feature_tab_labels()
                 self._last_features_key = features_key
                 return
 
@@ -1675,6 +1720,12 @@ class StateClassificationSubTab(QWidget):
             self._logscale_candidate_cols = list(feat_cols)
             self._logscale_csv_path = Path(csv_path)
 
+            # Live "(n/total selected)" count on each category's collapsed
+            # header, so a collapsed group's selections aren't overlooked.
+            def _refresh_group_header(gname, group_sec, checkboxes):
+                n = sum(1 for cb in checkboxes if cb.isChecked())
+                group_sec.setTitle(f"{gname} ({n}/{len(checkboxes)} selected)")
+
             from copy import deepcopy
             base_groups = deepcopy(behav3d_calculated_features)
             matched = set()
@@ -1687,31 +1738,45 @@ class StateClassificationSubTab(QWidget):
                     group_sec = CollapsibleSection(gname, expanded=False)
                     group_content = QWidget()
                     grid = QGridLayout(group_content)
+                    group_checkboxes = []
                     for i, f in enumerate(clean_vals):
                         cb = QCheckBox(f)
                         if f in saved_features:
                             cb.setChecked(True)
                         cb.stateChanged.connect(self._rebuild_log_scale_features)
                         self._timepoint_checkboxes[f] = cb
+                        group_checkboxes.append(cb)
                         grid.addWidget(cb, i // 3, i % 3)
                     group_sec.addWidget(group_content)
                     self.timepoint_features_lay.addWidget(group_sec)
                     matched.update(clean_vals)
+                    for cb in group_checkboxes:
+                        cb.stateChanged.connect(
+                            lambda _=None, g=gname, s=group_sec, cbs=group_checkboxes: _refresh_group_header(g, s, cbs)
+                        )
+                    _refresh_group_header(gname, group_sec, group_checkboxes)
 
             other = sorted([c for c in feat_cols if c not in matched])
             if other:
                 group_sec = CollapsibleSection("other", expanded=False)
                 group_content = QWidget()
                 grid = QGridLayout(group_content)
+                group_checkboxes = []
                 for i, f in enumerate(other):
                     cb = QCheckBox(f)
                     if f in saved_features:
                         cb.setChecked(True)
                     cb.stateChanged.connect(self._rebuild_log_scale_features)
                     self._timepoint_checkboxes[f] = cb
+                    group_checkboxes.append(cb)
                     grid.addWidget(cb, i // 3, i % 3)
                 group_sec.addWidget(group_content)
                 self.timepoint_features_lay.addWidget(group_sec)
+                for cb in group_checkboxes:
+                    cb.stateChanged.connect(
+                        lambda _=None, g="other", s=group_sec, cbs=group_checkboxes: _refresh_group_header(g, s, cbs)
+                    )
+                _refresh_group_header("other", group_sec, group_checkboxes)
 
             self._rebuild_log_scale_features()
 
@@ -3294,7 +3359,7 @@ class TrackClassificationSubTab(QWidget):
         self.chk_use_original_top.hide()
         g1.addWidget(self.chk_use_original_top)
 
-        # Shared: Trajectory size + N clusters (always visible)
+        # Shared: Trajectory size + divide-long-tracks (always visible)
         basic_form = QFormLayout()
         basic_form.setSpacing(3)
         self.spin_traj_size = QSpinBox()
@@ -3312,16 +3377,32 @@ class TrackClassificationSubTab(QWidget):
         self.lbl_traj_size_time = _make_timepoint_time_label()
         basic_form.addRow("", self.lbl_traj_size_time)
         self.spin_traj_size.valueChanged.connect(self._update_timepoint_time_labels)
+        self.chk_split_long_tracks = QCheckBox("Divide long tracks")
+        self.chk_split_long_tracks.setChecked(False)
+        basic_form.addRow("", _make_chk_help_row(
+            self.chk_split_long_tracks, "Divide long tracks",
+            "Split tracks longer than Trajectory size into non-overlapping full-length "
+            "analysis windows. Leftover timepoints are discarded. Original TrackID values "
+            "are preserved for backprojection."
+        ))
+        g1.addLayout(basic_form)
+
+        # N clusters — only meaningful for agglomerative clustering (Leiden's cluster
+        # count is emergent, set via Leiden resolution instead below), so it lives in
+        # its own frame that _apply_clustering_controls_mode hides/shows as a whole row.
+        self._n_clusters_frame = QFrame()
+        n_clusters_form = QFormLayout(self._n_clusters_frame)
+        n_clusters_form.setSpacing(3)
         self.spin_n_clusters = QSpinBox()
         self.spin_n_clusters.setRange(2, 200)
         self.spin_n_clusters.setValue(6)
         self.spin_n_clusters.setMaximumWidth(90)
-        basic_form.addRow("N clusters:", make_help_row(
+        n_clusters_form.addRow("N clusters:", make_help_row(
             self.spin_n_clusters, "N clusters",
             "Number of trajectory clusters to create via hierarchical clustering of "
             "DTW distances."
         ))
-        g1.addLayout(basic_form)
+        g1.addWidget(self._n_clusters_frame)
 
         # Trajectory basis + clustering method — the two main choices, kept always
         # visible (not buried in Advanced Configuration) since they each gate a
@@ -3383,9 +3464,10 @@ class TrackClassificationSubTab(QWidget):
         # Advanced Configuration (hidden in original mode, contains "Use original" checkbox)
         self.adv1 = CollapsibleSection("⚙ Advanced Configuration", expanded=False)
 
-        # Trim mode + divide-long-tracks apply to both bases (DTW and Bouts/proportions
-        # both truncate/split tracks the same way before clustering), so they stay in a
-        # plain shared form rather than a basis-toggled frame.
+        # Trim mode applies to both bases (DTW and Bouts/proportions both truncate
+        # tracks to Trajectory size the same way before clustering), so it stays in a
+        # plain shared form rather than a basis-toggled frame. ("Divide long tracks" is
+        # shown up in the always-visible basic_form, directly under Trajectory size.)
         trim_form = QFormLayout()
         trim_form.setSpacing(3)
         self.combo_trim = QComboBox()
@@ -3396,14 +3478,6 @@ class TrackClassificationSubTab(QWidget):
             "How to trim each track to Trajectory size: "
             "'last' keeps each track's final N timepoints (removes leading/early ones); "
             "'first' keeps each track's first N timepoints (removes trailing/late ones)."
-        ))
-        self.chk_split_long_tracks = QCheckBox("Divide long tracks")
-        self.chk_split_long_tracks.setChecked(False)
-        trim_form.addRow("", _make_chk_help_row(
-            self.chk_split_long_tracks, "Divide long tracks",
-            "Split tracks longer than Trajectory size into non-overlapping full-length "
-            "analysis windows. Leftover timepoints are discarded. Original TrackID values "
-            "are preserved for backprojection."
         ))
         self.adv1.addLayout(trim_form)
 
@@ -4516,6 +4590,7 @@ class TrackClassificationSubTab(QWidget):
         is_bouts = self.combo_trajectory_basis.currentText() == "bouts"
         is_leiden = self.combo_clustering_method.currentText() == "leiden"
 
+        self._n_clusters_frame.setVisible(not is_leiden)
         self._leiden_frame.setVisible(is_leiden)
         self._dtw_linkage_frame.setVisible(not is_leiden and not is_bouts)
         self._bouts_linkage_frame.setVisible(not is_leiden and is_bouts)

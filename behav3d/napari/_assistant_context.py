@@ -1161,6 +1161,9 @@ def _feature_extraction_state(main_widget) -> dict:
                 getattr(active, "spin_threshold_mult", None)
             ),
             "minimum_contact_duration": minimum_contact,
+            "contact_column": _widget_value(
+                getattr(active, "contact_column_combo", None)
+            ),
             "setup_ready": not issues,
             "setup_issues": issues,
         },

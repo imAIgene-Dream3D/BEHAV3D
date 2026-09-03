@@ -8,6 +8,8 @@ membership is recorded in ``behav3d_parameters.yml`` under
 should be used *after* Filtering, not before Feature Extraction.
 """
 
+import os
+
 import ipywidgets as widgets
 import yaml
 from pathlib import Path
@@ -159,6 +161,20 @@ class GroupBuilder(widgets.VBox):
             ),
         )
 
+        default_n_workers = int(self._params().get("n_workers", max(1, (os.cpu_count() or 4) // 2)))
+        self.n_workers = widgets.IntText(
+            description="Workers",
+            value=default_n_workers,
+            max=max(1, os.cpu_count() or 4),
+            style={'description_width': '160px'},
+            layout=widgets.Layout(width='220px'),
+            tooltip=(
+                'Number of threads used to process each sample\'s '
+                'timepoints in parallel (samples are still built one at a '
+                'time, so console progress stays readable).'
+            ),
+        )
+
         self.create_btn = widgets.Button(
             description='Create Group',
             button_style='success',
@@ -211,7 +227,7 @@ class GroupBuilder(widgets.VBox):
             selector_label,
             checkbox_items,
             widgets.VBox([group_name_label, self.group_name_input]),
-            self.build_tracked_checkbox,
+            widgets.HBox([self.build_tracked_checkbox, self.n_workers]),
             widgets.HBox([self.create_btn, self.remove_btn, self.preview_btn, self.build_tracked_btn]),
             widgets.HBox([self.tracked_progress, self.tracked_progress_label]),
             self.status_output,
@@ -233,11 +249,17 @@ class GroupBuilder(widgets.VBox):
         Blocking (no background-thread infra in the notebook layer), but
         the IntProgress widget still updates live during the call.
         """
+        n_workers = int(self.n_workers.value) if hasattr(self, "n_workers") else 1
+        params = self._params()
+        if params.get("n_workers") != n_workers:
+            params["n_workers"] = n_workers
+            self._persist_params()
         try:
             written = create_group_tracked_segments(
                 output_dir, group_id, self.metadata_loader.metadata,
                 log=print,
                 progress_cb=self._tracked_progress_cb,
+                n_workers=n_workers,
             )
             return written, None
         except Exception as e:

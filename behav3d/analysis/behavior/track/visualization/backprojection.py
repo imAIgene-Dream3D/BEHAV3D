@@ -537,8 +537,16 @@ def add_track_cluster_trajectory_layers(
     label_to_code = {str(v): str(k) for k, v in (label_map or {}).items()}
     code_colors = code_colors or {}
 
+    # Add layers in the user's saved state/label order (mirrored by
+    # label_map's insertion order, see `_build_code_map`/`_apply_state_order`),
+    # not trajectory_data's incidental groupby(sort=False) order. Any label
+    # missing from label_map (e.g. not yet classified) is appended after.
+    ordered_labels = [label for label in label_to_code if label in trajectory_data]
+    ordered_labels += [label for label in trajectory_data if label not in label_to_code]
+
     added_layers = []
-    for label, data in trajectory_data.items():
+    for label in ordered_labels:
+        data = trajectory_data[label]
         if data is None or data.shape[0] == 0:
             continue
         code = label_to_code.get(str(label))

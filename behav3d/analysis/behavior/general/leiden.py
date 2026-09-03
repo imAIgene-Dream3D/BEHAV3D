@@ -132,15 +132,22 @@ def run_leiden_clustering(
             )
         # print(f"Using precomputed neighbors graph (n_neighbors={resolved_n_neighbors}).")
     else:
-        scanpy.pp.neighbors(
-            adata,
+        neighbors_kwargs = dict(
             n_neighbors=n_neighbors,
             metric=metric,
             method=method,
             knn=True,
             use_rep=use_rep,
-            random_state=random_state
+            random_state=random_state,
         )
+        if metric == "precomputed":
+            # Precomputed distance matrices (e.g. DTW/DTAI) aren't valid inputs for
+            # pynndescent's approximate search, which scanpy silently switches to
+            # once n_obs is large (see scanpy.neighbors._handle_transformer). Force
+            # the exact sklearn brute-force transformer, which supports
+            # metric="precomputed", regardless of n_obs.
+            neighbors_kwargs["transformer"] = "sklearn"
+        scanpy.pp.neighbors(adata, **neighbors_kwargs)
 
     if resolution in ("auto", None):
         labels, best_res, summary = leiden_stability_search(
@@ -315,8 +322,7 @@ def leiden_stability_search(
                 sub_names = obs_names[idx]
                 ad_sub = adata[idx].copy()
 
-                scanpy.pp.neighbors(
-                    ad_sub,
+                sub_neighbors_kwargs = dict(
                     n_neighbors=min(n_neighbors, max(2, ad_sub.n_obs - 1)),
                     metric=metric,
                     method=method,
@@ -324,6 +330,12 @@ def leiden_stability_search(
                     use_rep=use_rep,
                     random_state=subsample_random_state + i,
                 )
+                if metric == "precomputed":
+                    # See matching comment in run_leiden_clustering: pynndescent
+                    # cannot handle a precomputed distance matrix, so force the
+                    # exact sklearn transformer.
+                    sub_neighbors_kwargs["transformer"] = "sklearn"
+                scanpy.pp.neighbors(ad_sub, **sub_neighbors_kwargs)
                 scanpy.tl.leiden(
                     ad_sub,
                     resolution=float(res),

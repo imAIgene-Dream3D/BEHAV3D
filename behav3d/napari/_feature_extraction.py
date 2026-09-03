@@ -2771,6 +2771,31 @@ class ActiveKillingPanel(QWidget):
                 "Default: 1 (all contacts are included).",
             ),
         )
+
+        self.contact_column_combo = QComboBox()
+        self.contact_column_combo.addItems(["contact", "contact_on_distance"])
+        self.contact_column_combo.setCurrentText(
+            self._saved_cfg.get("contact_column", "contact")
+        )
+        self.contact_column_combo.setMaximumWidth(220)
+        self.contact_column_combo.currentTextChanged.connect(lambda _: self._validate())
+        params_form.addRow(
+            "Contact column:",
+            make_help_row(
+                self.contact_column_combo,
+                "Contact Column",
+                "Which per-target-type column decides when a contact event starts/ends:\n\n"
+                "  contact              - pixel/mask adjacency (segments within ~1.73 px).\n"
+                "                         Ignores the Contact Threshold set in Feature\n"
+                "                         Extraction. This is the original behavior.\n"
+                "  contact_on_distance  - real (µm) distance-based contact, using the\n"
+                "                         Contact Threshold configured in Feature\n"
+                "                         Extraction. Matches the distance-based matching\n"
+                "                         already used to identify which target was touched.\n\n"
+                "Only affects the contact-event gate (start/end/duration); which touched\n"
+                "target is evaluated for killing is unaffected by this setting.",
+            ),
+        )
         layout.addWidget(params_group)
 
         # ── Viewer preview ─────────────────────────────────────────────────
@@ -2979,6 +3004,29 @@ class ActiveKillingPanel(QWidget):
             self.btn_run.setEnabled(False)
             if hasattr(self, "btn_queue"):
                 self.btn_queue.setEnabled(self._queue_callback is not None and False)
+            return
+
+        contact_column = self.contact_column_combo.currentText()
+        expected_cols = {f"{t}_{contact_column}" for t in targets}
+        try:
+            header_cols = set(pd.read_csv(csv, nrows=0).columns)
+        except Exception:
+            header_cols = None
+        if header_cols is not None and not (expected_cols & header_cols):
+            self.validation_label.setText(
+                f"\u26a0\ufe0f No '{contact_column}' column found for {', '.join(targets)} in "
+                f"{csv.name}.\n"
+                + (
+                    "Re-run Feature Extraction with the Contact Threshold enabled to produce "
+                    "'_contact_on_distance' columns, or switch Contact column back to 'contact'."
+                    if contact_column == "contact_on_distance" else
+                    "Re-run Feature Extraction to produce '_contact' columns."
+                )
+            )
+            self.validation_label.setStyleSheet("color: #E57373; font-size: 10px;")
+            self.btn_run.setEnabled(False)
+            if hasattr(self, "btn_queue"):
+                self.btn_queue.setEnabled(self._queue_callback is not None and False)
         else:
             self.validation_label.setText(f"\u2713 Ready  \u2014  using: {csv.name}")
             self.validation_label.setStyleSheet("color: #66BB6A; font-size: 10px;")
@@ -3003,6 +3051,7 @@ class ActiveKillingPanel(QWidget):
                 if self.check_abs_threshold.isChecked() else None
             ),
             "min_contact_duration": int(self.spin_min_contact.value()),
+            "contact_column": self.contact_column_combo.currentText(),
             "target_types": self._get_selected_targets()
         }
 
@@ -3065,7 +3114,8 @@ class ActiveKillingPanel(QWidget):
             f"\u25b6 Active Killing Analysis: {immune} vs {targets}  "
             f"(window={params['observation_window']}, "
             f"signal={params['death_signal_column']}, "
-            f"multiplier={params['killing_threshold_multiplier']})\u2026"
+            f"multiplier={params['killing_threshold_multiplier']}, "
+            f"contact_column={params['contact_column']})\u2026"
         )
 
         output_dir_str = str(self.metadata_loader.output_dir)
@@ -3082,6 +3132,7 @@ class ActiveKillingPanel(QWidget):
                     killing_threshold_multiplier=params["killing_threshold_multiplier"],
                     absolute_killing_threshold=params.get("absolute_killing_threshold"),
                     min_contact_duration=params["min_contact_duration"],
+                    contact_column=params["contact_column"],
                     save_results=True,
                     output_subfolder=subfolder
                 )
@@ -3293,9 +3344,10 @@ class ActiveKillingPanel(QWidget):
                 f"▶ Active Killing Analysis: {immune} vs {targets}  "
                 f"(window={params['observation_window']}, "
                 f"signal={params['death_signal_column']}, "
-                f"multiplier={params['killing_threshold_multiplier']})…"
+                f"multiplier={params['killing_threshold_multiplier']}, "
+                f"contact_column={params['contact_column']})…"
             )
-            
+
             output_dir_str = str(self.metadata_loader.output_dir)
             df_killing, df_summary, stats = None, None, None
 
@@ -3310,6 +3362,7 @@ class ActiveKillingPanel(QWidget):
                     killing_threshold_multiplier=params["killing_threshold_multiplier"],
                     absolute_killing_threshold=params.get("absolute_killing_threshold"),
                     min_contact_duration=params["min_contact_duration"],
+                    contact_column=params["contact_column"],
                     save_results=True,
                     output_subfolder=subfolder
                 )

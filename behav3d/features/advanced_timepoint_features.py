@@ -58,18 +58,22 @@ from behav3d.io.images import load_image
 ZERO_BASELINE_EPSILON = 0.1
 
 
+_CONTACT_COLUMN_CHOICES = ("contact", "contact_on_distance")
+
+
 def identify_contact_events_global(
     df_immune_tracks: pd.DataFrame,
     target_cell_types: List[str],
-    min_contact_duration: int = 1
+    min_contact_duration: int = 1,
+    contact_column: str = "contact"
 ) -> pd.DataFrame:
     """
     Identify distinct contact events between immune cells and ANY target cell.
-    
+
     A contact event is defined as a continuous period where an immune cell
     is in contact with ANY target cell type. The total duration is measured
     across the entire continuous contact period.
-    
+
     Parameters
     ----------
     df_immune_tracks : pd.DataFrame
@@ -78,26 +82,41 @@ def identify_contact_events_global(
         List of target cell types to check for contact (e.g., ['organoid', 'organoid2'])
     min_contact_duration : int
         Minimum number of timepoints for a valid contact event
-        
+    contact_column : str
+        Which per-target contact flag gates a contact event: ``"contact"`` (default) uses
+        ``{target_type}_contact``, the pixel/mask-adjacency flag (segments within ~1.73 px),
+        computed independently of any distance setting. ``"contact_on_distance"`` uses
+        ``{target_type}_contact_on_distance``, which respects the real (µm) Contact Threshold
+        configured in Feature Extraction. Either way, target attribution
+        (``touching_{target_type}s``, used to fill ``target_track_ids`` below) is always
+        distance-based, so choosing ``"contact_on_distance"`` makes the event gate consistent
+        with which targets get attributed to it; choosing ``"contact"`` reproduces this
+        function's original, pixel-gated behavior.
+
     Returns
     -------
     df_contact_events : pd.DataFrame
         DataFrame with one row per contact event (contact with any target)
     """
+    if contact_column not in _CONTACT_COLUMN_CHOICES:
+        raise ValueError(
+            f"contact_column must be one of {_CONTACT_COLUMN_CHOICES}, got {contact_column!r}"
+        )
+
     df = df_immune_tracks.copy()
     df = df.sort_values(by=["sample_name", "TrackID", "position_t"])
-    
+
     # Create a global contact column (True if contacting ANY target type)
-    contact_columns = [f"{target_type}_contact" for target_type in target_cell_types]
+    contact_columns = [f"{target_type}_{contact_column}" for target_type in target_cell_types]
     existing_contact_cols = [c for c in contact_columns if c in df.columns]
-    
+
     if not existing_contact_cols:
-        print(f"  Warning: No contact columns found for target types: {target_cell_types}")
+        print(f"  Warning: No '{contact_column}' columns found for target types: {target_cell_types}")
         return pd.DataFrame()
-    
+
     # Combine all contact columns
     df["_any_contact"] = df[existing_contact_cols].any(axis=1)
-    
+
     # Combine all touching columns
     touching_columns = [f"touching_{target_type}s" for target_type in target_cell_types]
     existing_touching_cols = [c for c in touching_columns if c in df.columns]
@@ -450,6 +469,7 @@ def run_active_killing_analysis(
     min_contact_duration: int = 1,
     killing_threshold_multiplier: float = 1.5,
     absolute_killing_threshold: Optional[float] = None,
+    contact_column: str = "contact",
     save_results: bool = True,
     output_subfolder: str = ""
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict]:
@@ -494,6 +514,10 @@ def run_active_killing_analysis(
         If provided, use this flat value as the killing threshold instead of the
         multiplier-based threshold. Useful when organoids start with near-zero signal.
         Default is None (uses killing_threshold_multiplier instead).
+    contact_column : str
+        Which per-target contact flag gates a contact event -- ``"contact"`` (default,
+        pixel/mask adjacency) or ``"contact_on_distance"`` (respects the µm Contact Threshold
+        configured in Feature Extraction). See ``identify_contact_events_global`` for details.
     save_results : bool
         Whether to save results to CSV files
         
@@ -520,6 +544,7 @@ def run_active_killing_analysis(
             raise ValueError("No organoid types detected in metadata. Please specify target_cell_types.")
     
     print(f"Target cell types: {target_cell_types}")
+    print(f"Contact column: {contact_column}")
     print(f"Observation window: {observation_window} timepoints")
     print(f"Min contact duration: {min_contact_duration} timepoints")
     if absolute_killing_threshold is not None:
@@ -587,7 +612,8 @@ def run_active_killing_analysis(
     df_contact_events = identify_contact_events_global(
         df_immune_tracks=df_immune_tracks,
         target_cell_types=target_cell_types,
-        min_contact_duration=min_contact_duration
+        min_contact_duration=min_contact_duration,
+        contact_column=contact_column
     )
     
     if df_contact_events.empty:
@@ -659,6 +685,7 @@ def run_active_killing_analysis(
         "overall_killing_rate": df_killing_per_tp["is_active_killing"].mean() if not df_killing_per_tp.empty else 0.0,
         "observation_window": observation_window,
         "min_contact_duration": min_contact_duration,
+        "contact_column": contact_column,
         "killing_threshold_multiplier": killing_threshold_multiplier,
         "absolute_killing_threshold": absolute_killing_threshold,
         "threshold_mode": "absolute" if absolute_killing_threshold is not None else "multiplier",

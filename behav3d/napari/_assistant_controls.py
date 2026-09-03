@@ -178,6 +178,12 @@ _ACTIVE_KILLING_SIGNAL_LABELS = {
 }
 
 
+_ACTIVE_KILLING_CONTACT_LABELS = {
+    "contact": "Pixel adjacency (contact)",
+    "contact_on_distance": "Distance threshold (contact_on_distance)",
+}
+
+
 def _apoc_feature_grid_binding(control_id, label, tab, **kwargs):
     checks_by_key = getattr(tab, "_feat_sigma_checks", {}) or {}
     checks = {
@@ -850,34 +856,40 @@ def _feature_bindings(main_widget) -> list[dict]:
              "spin_abs_threshold", None, absolute),
             ("minimum_contact_duration", "Minimum contact duration",
              "spin_min_contact", "timepoints", True),
+            ("contact_column", "Contact column",
+             "contact_column_combo", None, True),
             ("top_killers_to_display", "Top killers to display",
              "spin_top_n", None, True),
         ]
+        _token_label_specs = {
+            "death_signal": _ACTIVE_KILLING_SIGNAL_LABELS,
+            "contact_column": _ACTIVE_KILLING_CONTACT_LABELS,
+        }
         for suffix, label, attr, unit, relevant in specs:
             widget = getattr(active, attr, None)
             if widget is not None:
                 binding_kwargs = {}
-                if suffix == "death_signal":
-                    labels = _ACTIVE_KILLING_SIGNAL_LABELS
+                labels = _token_label_specs.get(suffix)
+                if labels is not None:
                     values = {
                         display.lower(): token
                         for token, display in labels.items()
                     }
 
-                    def get_signal(combo=widget, display_labels=labels):
+                    def get_token(combo=widget, display_labels=labels):
                         token = str(_safe(combo.currentText, "") or "")
                         return display_labels.get(token, token)
 
-                    def set_signal(value, combo=widget, signal_values=values):
-                        token = signal_values.get(str(value).strip().lower())
+                    def set_token(value, combo=widget, token_values=values):
+                        token = token_values.get(str(value).strip().lower())
                         if token is None:
                             return False
                         combo.setCurrentText(token)
                         return str(_safe(combo.currentText, "") or "") == token
 
                     binding_kwargs = {
-                        "getter": get_signal,
-                        "setter": set_signal,
+                        "getter": get_token,
+                        "setter": set_token,
                     }
                 item = _binding(
                     f"features.active_killing.{suffix}",
@@ -892,8 +904,8 @@ def _feature_bindings(main_widget) -> list[dict]:
                     # proposal when the mode checkbox also changes.
                     item["enabled"] = expanded
                     item["active"] = relevant
-                if suffix == "death_signal":
-                    item["choices"] = list(_ACTIVE_KILLING_SIGNAL_LABELS.values())
+                if labels is not None:
+                    item["choices"] = list(labels.values())
                 out.append(item)
         target_list = getattr(active, "target_list", None)
         if target_list is not None:

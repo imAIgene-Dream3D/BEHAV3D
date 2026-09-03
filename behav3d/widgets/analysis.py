@@ -1156,7 +1156,8 @@ class ActiveKillingPanel:
         self.death_signal_dd = widgets.Dropdown(options=["percentage_dead_mask", "mean_dead_dye", "nr_dead_mask_pixels"], value=self._cfg.get("death_signal_column", "percentage_dead_mask"), description="Death signal:", style={'description_width': '150px'}, layout=widgets.Layout(width="300px"))
         self.killing_threshold = widgets.FloatText(description="Killing threshold:", value=float(self._cfg.get("killing_threshold_multiplier", 1.5)), style={'description_width': '150px'}, layout=widgets.Layout(width="220px"))
         self.min_contact_duration = widgets.IntText(description="Min contact duration:", value=int(self._cfg.get("min_contact_duration", 1)), style={'description_width': '150px'}, layout=widgets.Layout(width="220px"))
-        
+        self.contact_column_dd = widgets.Dropdown(options=["contact", "contact_on_distance"], value=self._cfg.get("contact_column", "contact"), description="Contact column:", style={'description_width': '150px'}, layout=widgets.Layout(width="300px"))
+
         # Absolute threshold option
         self.use_absolute_threshold = widgets.Checkbox(description="Use absolute threshold", value=bool(self._cfg.get("use_absolute_threshold", False)), indent=False, layout=widgets.Layout(width="200px"))
         self.absolute_threshold = widgets.FloatText(description="Absolute threshold:", value=float(self._cfg.get("absolute_killing_threshold", 0.0) or 0.0), style={'description_width': '150px'}, layout=widgets.Layout(width="220px"), disabled=not self._cfg.get("use_absolute_threshold", False))
@@ -1203,6 +1204,7 @@ class ActiveKillingPanel:
             self.immune_dd, self.target_dd, self.validation_html, widgets.HTML("<hr>"),
             widgets.HBox([self.observation_window, widgets.HTML('<span style="color:#666;font-size:12px;">timepoints after contact</span>'), widgets.HTML("&nbsp;&nbsp;&nbsp;"), self.killing_threshold, widgets.HTML('<span style="color:#666;font-size:12px;">× organoid\'s own signal at contact start</span>')], layout=widgets.Layout(align_items="center")),
             widgets.HBox([self.min_contact_duration, widgets.HTML('<span style="color:#666;font-size:12px;">timepoints</span>'), widgets.HTML("&nbsp;&nbsp;&nbsp;"), self.death_signal_dd], layout=widgets.Layout(align_items="center")),
+            widgets.HBox([self.contact_column_dd, widgets.HTML('<span style="color:#666;font-size:12px;">"contact" = pixel adjacency; "contact_on_distance" = respects the Contact Threshold (µm) set in Feature Extraction</span>')], layout=widgets.Layout(align_items="center")),
             widgets.HBox([self.use_absolute_threshold, self.absolute_threshold, widgets.HTML('<span style="color:#666;font-size:12px;">death signal increase (bypasses multiplier)</span>')], layout=widgets.Layout(align_items="center")),
             self.absolute_hint_html,
             widgets.HTML("<hr>"),
@@ -1328,6 +1330,7 @@ class ActiveKillingPanel:
                 self._cfg["death_signal_column"] = self.death_signal_dd.value
                 self._cfg["killing_threshold_multiplier"] = self.killing_threshold.value
                 self._cfg["min_contact_duration"] = self.min_contact_duration.value
+                self._cfg["contact_column"] = self.contact_column_dd.value
                 self._cfg["use_absolute_threshold"] = self.use_absolute_threshold.value
                 self._cfg["absolute_killing_threshold"] = self.absolute_threshold.value
                 self._cfg["save_results"] = self.save_results.value
@@ -1357,6 +1360,7 @@ class ActiveKillingPanel:
                         death_signal_column=self.death_signal_dd.value,
                         killing_threshold_multiplier=float(self.killing_threshold.value),
                         min_contact_duration=int(self.min_contact_duration.value),
+                        contact_column=self.contact_column_dd.value,
                         absolute_killing_threshold=abs_thresh,
                         save_results=bool(self.save_results.value),
                         output_subfolder=subfolder

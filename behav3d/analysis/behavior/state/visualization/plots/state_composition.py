@@ -430,7 +430,7 @@ def _compute_relative_auc_table(
         time_max = float(x.max()) if n_timepoints > 0 else np.nan
         for state in state_order:
             y = mat[state].to_numpy(dtype=float) if state in mat.columns else np.zeros(n_timepoints, dtype=float)
-            auc = float(np.trapz(y=y, x=x)) if n_timepoints >= 2 else 0.0
+            auc = float(np.trapezoid(y=y, x=x)) if n_timepoints >= 2 else 0.0
             rows.append(
                 {
                     "sample_name": str(sample_name),

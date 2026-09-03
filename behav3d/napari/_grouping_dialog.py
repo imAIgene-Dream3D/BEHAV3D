@@ -27,6 +27,7 @@ from qtpy.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -225,6 +226,23 @@ class GroupBuilderDialog(QDialog):
         )
         tracked_row.addWidget(self.build_tracked_checkbox)
         tracked_row.addStretch()
+
+        import multiprocessing as _mp
+        _n_cores = max(1, _mp.cpu_count())
+        _default_w = max(1, _n_cores // 2)
+        tracked_row.addWidget(QLabel("Workers:"))
+        self.spin_workers = QSpinBox()
+        self.spin_workers.setRange(1, max(1, _n_cores - 1))
+        self.spin_workers.setValue(_default_w)
+        self.spin_workers.setMaximumWidth(70)
+        self.spin_workers.setToolTip(
+            "Number of CPU threads used to process each sample's timepoints "
+            "in parallel (samples are still built one at a time).\nThis "
+            "value is shared across all pipeline tabs — changing it here "
+            f"updates every other Workers field (and vice-versa). "
+            f"[{_n_cores} cores detected]"
+        )
+        tracked_row.addWidget(self.spin_workers)
         layout.addLayout(tracked_row)
 
         # Status label
@@ -397,6 +415,7 @@ class GroupBuilderDialog(QDialog):
                 "output_dir": output_dir,
                 "group_id": group_id,
                 "metadata": self.metadata_loader.metadata,
+                "n_workers": self.spin_workers.value(),
             },
             desc=f"Building tracked segments for '{group_id}'…",
             progress_row=self.progress_row,

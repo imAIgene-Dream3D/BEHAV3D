@@ -374,6 +374,12 @@ class BEHAV3DWidget(QWidget):
         # Feature extraction tab
         if hasattr(self.feature_extraction_tab, "spin_workers"):
             self.workers_ctrl.link(self.feature_extraction_tab.spin_workers)
+        # Analysis tab — Group Builder dialog's Workers spinbox is created
+        # on demand (the dialog doesn't exist yet here), so hand the tab a
+        # direct reference to the controller instead; it links the dialog's
+        # spinbox itself when the dialog is opened (see
+        # AnalysisTab._on_open_grouping_dialog).
+        self.analysis_tab.workers_ctrl = self.workers_ctrl
         # When a new parameters file is loaded, reload the global value.
         self.data_prep_tab.metadata_loaded.connect(
             lambda _: self.workers_ctrl.reload()

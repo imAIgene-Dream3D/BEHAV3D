@@ -19,6 +19,7 @@ writing them into metadata.csv.
 from __future__ import annotations
 
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -163,7 +164,124 @@ def create_cell_type_group(output_dir, group_name: str, member_cell_types) -> Pa
     return out_csv
 
 
-def create_group_tracked_segments(output_dir, group_id: str, metadata, log=None, progress_cb=None) -> dict:
+def _build_group_tracked_sample(
+    output_dir, group_id: str, sample_name: str, sdf, metadata_row,
+    n_workers: int = 1, log=None, show_progress: bool = True,
+):
+    """Build one sample's combined tracked zarr + tracks CSV for a group.
+
+    Samples are processed one at a time (see :func:`create_group_tracked_segments`);
+    parallelism happens *within* a sample, across its timepoints — each
+    timepoint's relabel-and-combine is independent numpy work, dispatched to
+    ``n_workers`` threads (numpy releases the GIL, so this gets real
+    parallel CPU use without the pickling/process overhead of the member
+    label images). Threads write to fixed indices of a pre-allocated output
+    zarr (:func:`~behav3d.io.formats.zarr.write_zarr_parallel`) rather than
+    sequentially appending, since timepoints can finish out of order.
+
+    ``show_progress`` shows one live ``tqdm`` bar for this sample
+    (``"{sample_name} [{group_id}]"``, ticking 0 -> timepoint count) whether
+    ``n_workers`` is 1 or more — safe because samples are never processed
+    concurrently with each other, so there's only ever one bar active.
+
+    Returns ``{"image": Path, "csv": Path}``, or ``None`` if the sample was
+    skipped (logged via ``log``, if given).
+    """
+    from behav3d.io.images import load_image
+    from behav3d.io.formats.zarr import write_zarr_parallel
+    from behav3d.preprocessing.tracking import convert_tracked_image_to_csv
+
+    def _log(msg):
+        if log:
+            log(msg)
+
+    output_dir = Path(output_dir)
+    row = metadata_row
+
+    member_images = {}
+    n_timepoints = None
+    for cell_type in sorted(sdf["origin_cell_type"].astype(str).unique()):
+        img_path = _member_tracked_image_path(row, cell_type)
+        if not img_path or not Path(img_path).exists():
+            _log(f"  - {sample_name}/{cell_type}: tracked image not found, skipping member")
+            continue
+        arr = load_image(img_path)
+        member_images[cell_type] = arr
+        n_timepoints = len(arr) if n_timepoints is None else min(n_timepoints, len(arr))
+
+    if not member_images:
+        _log(f"  - Skipping {sample_name}: no member tracked images available")
+        return None
+
+    img_out = group_tracked_image_path(output_dir, sample_name, group_id)
+    csv_out = group_tracked_csv_path(output_dir, sample_name, group_id)
+    img_out.parent.mkdir(parents=True, exist_ok=True)
+    csv_out.parent.mkdir(parents=True, exist_ok=True)
+    if img_out.exists():
+        shutil.rmtree(img_out) if img_out.is_dir() else img_out.unlink()
+
+    # Per member cell type, per timepoint: pairs of (origin_TrackID in
+    # that member's tracked image, new group TrackID to relabel it to).
+    relabel_by_ct_t: dict[str, dict[int, np.ndarray]] = {}
+    for cell_type in member_images:
+        ct_df = sdf[sdf["origin_cell_type"].astype(str) == cell_type]
+        for t, tdf in ct_df.groupby("position_t"):
+            pairs = tdf[["origin_TrackID", "TrackID"]].dropna().to_numpy()
+            relabel_by_ct_t.setdefault(cell_type, {})[int(t)] = pairs
+
+    first_frame = np.asarray(next(iter(member_images.values()))[0])
+    write_zarr_parallel(
+        outpath=img_out,
+        shape=(n_timepoints,) + first_frame.shape,
+        dtype=first_frame.dtype,
+        overwrite=True,
+    )
+
+    def _process_timepoint(t):
+        combined = None
+        for cell_type, arr in member_images.items():
+            t_img = np.asarray(arr[t])
+            if combined is None:
+                combined = np.zeros_like(t_img)
+            for old_id, new_id in relabel_by_ct_t.get(cell_type, {}).get(t, ()):
+                combined[t_img == old_id] = new_id
+        write_zarr_parallel(outpath=img_out, index=t, data=combined)
+
+    desc = f"{sample_name} [{group_id}]"
+    n_workers = max(1, int(n_workers or 1))
+    if n_workers <= 1:
+        frame_iter = range(n_timepoints)
+        if show_progress:
+            frame_iter = tqdm(frame_iter, desc=desc)
+        for t in frame_iter:
+            _process_timepoint(t)
+    else:
+        with ThreadPoolExecutor(max_workers=min(n_workers, n_timepoints)) as ex:
+            futures = [ex.submit(_process_timepoint, t) for t in range(n_timepoints)]
+            done_iter = as_completed(futures)
+            if show_progress:
+                done_iter = tqdm(done_iter, total=len(futures), desc=desc)
+            for fut in done_iter:
+                fut.result()  # surface any per-timepoint exception
+
+    elsize_x = row.get("pixel_distance_xy", 1) or 1
+    elsize_y = row.get("pixel_distance_xy", 1) or 1
+    elsize_z = row.get("pixel_distance_z", 1) or 1
+    convert_tracked_image_to_csv(
+        img_path=img_out,
+        outpath=csv_out,
+        element_size_x=elsize_x,
+        element_size_y=elsize_y,
+        element_size_z=elsize_z,
+    )
+
+    _log(f"  + {sample_name}: {img_out.name}, {csv_out.name}")
+    return {"image": img_out, "csv": csv_out}
+
+
+def create_group_tracked_segments(
+    output_dir, group_id: str, metadata, log=None, progress_cb=None, n_workers: int = 1
+) -> dict:
     """Build per-sample tracked label images + tracks CSVs for a group.
 
     Reuses each member cell type's existing tracked zarr (label value ==
@@ -183,12 +301,19 @@ def create_group_tracked_segments(output_dir, group_id: str, metadata, log=None,
     convention in ``behav3d.napari._background_runner`` so this can be run
     off the UI thread with a live progress bar.
 
+    ``n_workers`` controls parallelism *within* each sample: samples are
+    still built one at a time (each one reads its own member tracked images
+    and writes to its own output paths, but they're processed in sequence
+    so console progress stays legible — see
+    :func:`_build_group_tracked_sample`), while a sample's own timepoints
+    are split across ``n_workers`` threads. This helps most when there are
+    few samples but many timepoints each; the default of ``1`` preserves
+    the original strictly-serial behavior.
+
     Returns ``{sample_name: {"image": Path, "csv": Path}}`` for samples
     that produced output; samples missing every member's tracked image are
     skipped (logged via ``log`` if given).
     """
-    from behav3d.io.images import load_image, append_to_zarr
-    from behav3d.preprocessing.tracking import convert_tracked_image_to_csv
 
     def _log(msg):
         if log:
@@ -218,70 +343,23 @@ def create_group_tracked_segments(output_dir, group_id: str, metadata, log=None,
         )
 
     written = {}
+    n_workers = max(1, int(n_workers or 1))
     sample_groups = list(df.groupby("sample_name", sort=False))
     n_samples = len(sample_groups)
     for sample_idx, (sample_name, sdf) in enumerate(sample_groups):
+        sample_name = str(sample_name)
         _progress(sample_idx, n_samples, f"{sample_name} ({sample_idx + 1}/{n_samples})")
-        sample_rows = metadata.loc[metadata["sample_name"].astype(str) == str(sample_name)]
+        sample_rows = metadata.loc[metadata["sample_name"].astype(str) == sample_name]
         if sample_rows.empty:
             _log(f"  - Skipping {sample_name}: not found in metadata")
             continue
         row = sample_rows.iloc[0]
 
-        member_images = {}
-        n_timepoints = None
-        for cell_type in sorted(sdf["origin_cell_type"].astype(str).unique()):
-            img_path = _member_tracked_image_path(row, cell_type)
-            if not img_path or not Path(img_path).exists():
-                _log(f"  - {sample_name}/{cell_type}: tracked image not found, skipping member")
-                continue
-            arr = load_image(img_path)
-            member_images[cell_type] = arr
-            n_timepoints = len(arr) if n_timepoints is None else min(n_timepoints, len(arr))
-
-        if not member_images:
-            _log(f"  - Skipping {sample_name}: no member tracked images available")
-            continue
-
-        img_out = group_tracked_image_path(output_dir, sample_name, group_id)
-        csv_out = group_tracked_csv_path(output_dir, sample_name, group_id)
-        img_out.parent.mkdir(parents=True, exist_ok=True)
-        csv_out.parent.mkdir(parents=True, exist_ok=True)
-        if img_out.exists():
-            shutil.rmtree(img_out) if img_out.is_dir() else img_out.unlink()
-
-        # Per member cell type, per timepoint: pairs of (origin_TrackID in
-        # that member's tracked image, new group TrackID to relabel it to).
-        relabel_by_ct_t: dict[str, dict[int, np.ndarray]] = {}
-        for cell_type in member_images:
-            ct_df = sdf[sdf["origin_cell_type"].astype(str) == cell_type]
-            for t, tdf in ct_df.groupby("position_t"):
-                pairs = tdf[["origin_TrackID", "TrackID"]].dropna().to_numpy()
-                relabel_by_ct_t.setdefault(cell_type, {})[int(t)] = pairs
-
-        for t in tqdm(range(n_timepoints), desc=f"{sample_name} [{group_id}]"):
-            combined = None
-            for cell_type, arr in member_images.items():
-                t_img = np.asarray(arr[t])
-                if combined is None:
-                    combined = np.zeros_like(t_img)
-                for old_id, new_id in relabel_by_ct_t.get(cell_type, {}).get(t, ()):
-                    combined[t_img == old_id] = new_id
-            append_to_zarr(img=np.expand_dims(combined, axis=0), outpath=img_out)
-
-        elsize_x = row.get("pixel_distance_xy", 1) or 1
-        elsize_y = row.get("pixel_distance_xy", 1) or 1
-        elsize_z = row.get("pixel_distance_z", 1) or 1
-        convert_tracked_image_to_csv(
-            img_path=img_out,
-            outpath=csv_out,
-            element_size_x=elsize_x,
-            element_size_y=elsize_y,
-            element_size_z=elsize_z,
+        result = _build_group_tracked_sample(
+            output_dir, group_id, sample_name, sdf, row, n_workers=n_workers, log=_log
         )
-
-        written[str(sample_name)] = {"image": img_out, "csv": csv_out}
-        _log(f"  + {sample_name}: {img_out.name}, {csv_out.name}")
+        if result is not None:
+            written[sample_name] = result
 
     _progress(n_samples, n_samples, "Done")
     return written

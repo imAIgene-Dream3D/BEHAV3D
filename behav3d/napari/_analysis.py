@@ -205,6 +205,20 @@ class CollapsibleSection(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(2)
 
+        # Outer "card" — always visible (collapsed or expanded) so the section
+        # reads as a distinct, clickable box rather than plain text.
+        card = QFrame()
+        card.setObjectName("collapsibleCard")
+        card.setStyleSheet(
+            "QFrame#collapsibleCard { background: #2a2a2e; "
+            "border: 1px solid #3a3a40; border-radius: 6px; }"
+        )
+        outer.addWidget(card)
+
+        card_lay = QVBoxLayout(card)
+        card_lay.setContentsMargins(4, 4, 4, 4)
+        card_lay.setSpacing(2)
+
         self._toggle = QToolButton()
         self._toggle.setStyleSheet(
             "QToolButton { border: none; font-weight: bold; color: #ddd; "
@@ -216,15 +230,16 @@ class CollapsibleSection(QWidget):
         self._toggle.setChecked(expanded)
         self._toggle.setText(title)
         self._toggle.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._toggle.setCursor(Qt.PointingHandCursor)
         self._toggle.clicked.connect(self._on_toggled)
-        outer.addWidget(self._toggle)
+        card_lay.addWidget(self._toggle)
 
         self._content = QFrame()
         self._content.setFrameShape(QFrame.NoFrame)
         self._content_layout = QVBoxLayout(self._content)
         self._content_layout.setContentsMargins(12, 2, 4, 4)
         self._content_layout.setSpacing(4)
-        outer.addWidget(self._content)
+        card_lay.addWidget(self._content)
         self._content.setVisible(expanded)
 
         self._update_arrow()
@@ -246,6 +261,9 @@ class CollapsibleSection(QWidget):
 
     def addLayout(self, lay):
         self._content_layout.addLayout(lay)
+
+    def setTitle(self, title: str):
+        self._toggle.setText(title)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2532,6 +2550,9 @@ class AnalysisTab(QWidget):
             return
 
         dlg = GroupBuilderDialog(self.metadata_loader, parent=self)
+        ctrl = getattr(self, "workers_ctrl", None)
+        if ctrl is not None and hasattr(dlg, "spin_workers"):
+            ctrl.link(dlg.spin_workers)
         dlg.group_created.connect(self._on_group_changed)
         dlg.group_removed.connect(self._on_group_changed)
         dlg.exec_()
