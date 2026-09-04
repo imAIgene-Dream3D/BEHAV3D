@@ -26,7 +26,7 @@ The sub-tabs use a colour code:
 Special cases:
 
 - **Multicolor cell types** (e.g. `tcell_1_multicolor`, `tcell_2_multicolor`) get a single combined panel that tracks each channel separately and then merges them into `{base}_merged`.
-- **Track all organoids together**: by **default** all organoid cell types are collapsed into a single combined **🟣 All Organoids** sub-tab (fragmentation tracking only), with the "Track all organoids together" checkbox enabled — useful when you have multiple organoid types in the same well but want one unified track set where each voxel is occupied by only 1 organoid type_. Unticking the checkbox rebuilds one independent sub-tab per organoid type.
+- **Track all organoids together**: by **default** all organoid cell types are collapsed into a single combined **🟣 All Organoids** sub-tab (fragmentation propagation only), with the "Track all organoids together" checkbox enabled — useful when you have multiple organoid types in the same well but want one unified track set where each voxel is occupied by only 1 organoid type_. Unticking the checkbox rebuilds one independent sub-tab per organoid type.
 
 ## The tracking methods
 
@@ -44,7 +44,7 @@ roughly one cell diameter or more.
 | Method | What it does |
 |---|---|
 | **btrack (Bayesian)** | Bayesian tracker with a Kalman-filter motion model, optionally followed by a global hypothesis optimiser. The routine choice for objects that lose overlap between frames. See [btrack](btrack). |
-| **LAP (laptrack)** | Linear Assignment Problem tracking: links detections by solving a global optimization on the centroid-distance cost matrix, with gap closing and optional merge/split events. An alternative to btrack when you specifically need globally-optimal linking or built-in division/fusion modelling. See [LAP](lap). |
+| **LapTrack** | Linear Assignment Problem tracking: links detections by solving a global optimization on the centroid-distance cost matrix, with gap closing and optional merge/split events. An alternative to btrack when you specifically need globally-optimal linking or built-in division/fusion modelling. See [LapTrack](lap). |
 | **TrackPy** | Crocker-Grier style nearest-neighbour linker with adaptive search radius and memory-based gap recovery. The lightest-weight option — only reliable when cells are well-separated relative to how far they move per frame. See [TrackPy](trackpy). |
 
 ### Overlap-based tracking methods (propagation)
@@ -56,8 +56,8 @@ near-static structures.
 
 | Method | What it does |
 |---|---|
-| **Fragmentation tracking** | Propagates labels by overlap; no tunable parameters. The default propagation method — use it when objects mainly change by **fragmenting** (e.g. a structure breaking up on death, such as organoids) and the set of objects is closed, i.e. nothing new appears mid-movie. See [Fragmentation tracking](fragmentation_tracking). |
-| **Bounded Propagation** | Same overlap-based propagation, but with a topology rule that stops one track ID from spanning disconnected regions. Use it instead of Fragmentation Tracking when masks can **touch or join** but should stick to single connected regions and new objects can appear throughout the movie. See [Bounded Propagation](bounded_propagation). |
+| **Fragmentation Propagation** | Propagates labels by overlap; no tunable parameters. The default propagation method — use it when objects mainly change by **fragmenting** (e.g. a structure breaking up on death, such as organoids) and the set of objects is closed, i.e. nothing new appears mid-movie. See [Fragmentation Propagation](fragmentation_tracking). |
+| **Bounded Propagation** | Same overlap-based propagation, but with a topology rule that stops one track ID from spanning disconnected regions. Use it instead of Fragmentation Propagation when masks can **touch or join** but should stick to single connected regions and new objects can appear throughout the movie. See [Bounded Propagation](bounded_propagation). |
 | **Reporter Propagation** | Pools segments across the whole movie, groups spatially-overlapping ones regardless of time, and stamps each group's single largest detection onto every timepoint. Use it for near-static objects whose segmentation **flickers on and off** (e.g. an intermittent reporter signal). See [Reporter Propagation](reporter_propagation). |
 
 ### Import tracking
@@ -84,7 +84,7 @@ verify every method visually on at least one sample before a batch run.
 ## Generic workflow per sub-tab
 
 1. **Method dropdown** — pick the method.
-2. **Method-specific parameter panel** appears below (fragmentation tracking has no tunable parameters, btrack has a two-part layout — Kalman-filter tracking + global optimisation, Import has a per-sample status table).
+2. **Method-specific parameter panel** appears below (fragmentation propagation has no tunable parameters, btrack has a two-part layout — Kalman-filter tracking + global optimisation, Import has a per-sample status table).
 3. **Apply to all *Category* / Apply to all** — two buttons that propagate the current sub-tab's settings to other sub-tabs (same category, or all cell types).
 4. **Run *Cell type* Tracking** — the green button at the bottom of the sub-tab (e.g. *Run Tcell Tracking*). It runs the selected method for **every sample** in the metadata for this one cell type, immediately, and blocks the GUI until it finishes.
 

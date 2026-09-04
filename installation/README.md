@@ -142,7 +142,7 @@ The installer sets up:
 2. **Visualization**: Matplotlib, Seaborn, Plotly
 3. **Image Processing**: scikit-image, tifffile, imageio, Pillow
 4. **Deep Learning**: PyTorch (with CUDA if available), Cellpose
-5. **Tracking**: TrackPy, LAP solver
+5. **Tracking**: TrackPy, LapTrack solver
 6. **Napari**: For visualization and interaction
 7. **Jupyter**: Notebook support
 

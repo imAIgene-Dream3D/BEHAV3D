@@ -26,7 +26,6 @@ from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
 import numpy as np
-import torch
 import pandas as pd
 from skimage.filters import threshold_otsu
 
@@ -58,15 +57,29 @@ def _label_to_channel_from_stored_map(stored: dict | None) -> dict[str, int]:
         out[str(label)] = int(ch_idx)
     return out
 
-# Cellpose import is relatively expensive - only load when we actually need it.
+# ``cellpose`` (and the ``torch`` it drags in) costs ~5 s to import, so it is
+# loaded inside ``run_cellpose_prediction`` rather than at module scope. The
+# napari GUI imports this module on every metadata load just to reach the
+# pure-Python ``_label_to_channel_from_stored_map`` above, and used to pay
+# that 5 s on the Qt main thread for the privilege.
 
-try:
-    from cellpose import models  # noqa: WPS433 (allow external import)
-except ImportError as err:  # pragma: no cover - handled at runtime
-    raise ImportError(
-        "cellpose is required for `behav3d.preprocessing.segmentation.cellpose_prediction`. "
-        "Please install it via `pip install cellpose==3.1.1.2` (or compatible).",
-    ) from err
+
+def _import_cellpose():
+    """Import ``cellpose.models`` and ``torch`` on demand.
+
+    Raises a clear ImportError naming the missing dependency instead of the
+    bare ``ModuleNotFoundError`` cellpose/torch would produce.
+    """
+    try:
+        import torch  # noqa: WPS433 (allow external import)
+        from cellpose import models  # noqa: WPS433 (allow external import)
+    except ImportError as err:  # pragma: no cover - handled at runtime
+        raise ImportError(
+            "cellpose is required for `behav3d.preprocessing.segmentation.cellpose_prediction`. "
+            "Please install it via `pip install cellpose==3.1.1.2` (or compatible).",
+        ) from err
+    return models, torch
+
 
 def run_cellpose_prediction(  # noqa: WPS231 (complexity) - unavoidable for pipeline function
     image: np.ndarray,  #already loaded image
@@ -127,6 +140,8 @@ def run_cellpose_prediction(  # noqa: WPS231 (complexity) - unavoidable for pipe
     # ---------------------------------------------------------------------
     # 1. Prepare input & model
     # ---------------------------------------------------------------------
+    models, torch = _import_cellpose()
+
     if verbose:
         print("Loaded image with shape (T, C, Z, Y, X):", image.shape)
     

@@ -62,13 +62,13 @@ Method names and defaults here are **what the pipeline does**, not recommended v
 
 | Between frames… | Method |
 |---|---|
-| Large overlap, mainly **fragments** | **Fragmentation Tracking** |
+| Large overlap, mainly **fragments** | **Fragmentation Propagation** |
 | Overlap but masks **touch / join** | **Bounded Propagation** |
 | **Near-static**, detection flickers on/off | **Reporter Propagation** |
 | **Little / no overlap** (moves ~1 cell diameter or more) | **btrack** |
 | Already tracked elsewhere | **Import** |
 
-*(LAP and TrackPy are centroid-distance linkers, also available.)*
+*(LapTrack and TrackPy are centroid-distance linkers, also available.)*
 
 1. Per sub-tab: pick method → set params → **Run <cell type> Tracking**.
 2. **Inspect in Visualization** — a correctly tracked cell keeps the **same ID / colour across frames**.

@@ -1634,6 +1634,11 @@ class ProcessingQueuePanel(QWidget):
 
         # Torch device combo stores the device string as item data ("cuda:0"),
         # not as the display text ("GPU 0: NVIDIA ..."), so match on data.
+        # The device combo is populated lazily (torch import), so probe before
+        # matching -- otherwise ``findData`` misses against the seeded
+        # single-item combo and the step silently runs on the wrong device.
+        if hasattr(cp, "_ensure_torch_devices"):
+            cp._ensure_torch_devices()
         device = p.get("device")
         if device and hasattr(cp, "combo_gpu_device"):
             idx = cp.combo_gpu_device.findData(str(device))
@@ -1892,6 +1897,11 @@ class ProcessingQueuePanel(QWidget):
         tw = getattr(convpaint_widget, "_training_widget", None)
 
         # Torch device
+        # The device combo is populated lazily (torch import), so probe before
+        # matching -- otherwise ``findData`` misses against the seeded
+        # single-item combo and the step silently runs on the wrong device.
+        if hasattr(convpaint_widget, "_ensure_torch_devices"):
+            convpaint_widget._ensure_torch_devices()
         device = p.get("device")
         if device and hasattr(convpaint_widget, "combo_gpu_device"):
             idx = convpaint_widget.combo_gpu_device.findData(str(device))

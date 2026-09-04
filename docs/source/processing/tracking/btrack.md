@@ -140,4 +140,4 @@ CSV columns: `TrackID, SegmentID, position_t, position_x/y/z, pixel_position_x/y
 
 - [btrack documentation](https://btrack.readthedocs.io/) — upstream library, including precise definitions of every hypothesis and motion-model parameter.
 - `models/README_btrack.md` in the BEHAV3D repo — JSON config format and example files.
-- [Fragmentation tracking](fragmentation_tracking) — the overlap-based method for objects that stay put and change only by fragmenting.
+- [Fragmentation propagation](fragmentation_tracking) — the overlap-based method for objects that stay put and change only by fragmenting.

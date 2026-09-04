@@ -3090,10 +3090,15 @@ class _FakeWorkflowTabs:
 class _FakeTrackingPanel:
     def __init__(self, cell_type, radius):
         self.cell_type = cell_type
+        # Same canonical order as behav3d.napari._tracking._METHOD_ORDER.
+        self._method_order = [
+            "btrack", "propagation", "bounded_propagation",
+            "reporter_propagation", "trackpy", "lap", "import",
+        ]
         self.combo_method = _FakeCombo(
-            ["LAP", "TrackPy", "Fragmentation Tracking", "Bounded Propagation",
-             "Reporter Propagation", "btrack"],
-            5,
+            ["btrack (Bayesian)", "Fragmentation Propagation", "Bounded Propagation",
+             "Reporter Propagation", "TrackPy", "LapTrack", "Import tracking"],
+            0,
         )
         self.lap_merge_cost = _FakeSpin(0)
         self.lap_split_cost = _FakeSpin(0)
@@ -3111,6 +3116,9 @@ class _FakeTrackingPanel:
         self.bt_hyp_checks = {"P_FP": _FakeCheck(True), "P_branch": _FakeCheck(False)}
         self._bt_unit_mgr = type("_Unit", (), {"physical": True})()
         self.persisted = 0
+
+    def _get_method_key(self):
+        return self._method_order[self.combo_method.currentIndex()]
 
     def _persist(self): self.persisted += 1
 
@@ -3148,7 +3156,7 @@ def test_live_control_registry_targets_actual_cell_type_only():
 def test_tracking_registry_separates_reporter_propagation_from_btrack():
     from types import SimpleNamespace
     panel = _FakeTrackingPanel("reporter", 100)
-    panel.combo_method.setCurrentIndex(4)
+    panel.combo_method.setCurrentIndex(3)  # reporter_propagation
     main = SimpleNamespace(
         tracking_tab=SimpleNamespace(
             panels={"reporter": panel},
@@ -3163,7 +3171,7 @@ def test_tracking_registry_separates_reporter_propagation_from_btrack():
         "tracking.reporter.btrack.maximum_search_radius"
     ]["visible"] is False
 
-    panel.combo_method.setCurrentIndex(3)
+    panel.combo_method.setCurrentIndex(2)  # bounded_propagation
     controls = {item["id"]: item for item in control_registry(main)}
     assert controls[
         "tracking.reporter.bounded_propagation.minimum_overlap"

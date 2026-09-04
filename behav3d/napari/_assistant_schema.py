@@ -105,7 +105,7 @@ _DESCRIPTIONS: dict[str, str] = {
     "drop_2d_segments": "Remove flat single-slice fragments after Cellpose-SAM. Keep enabled unless real objects genuinely occupy one slice.",
     # tracking — general
     "track_organoids_together": "Track all organoids as a single merged object rather than individually.",
-    "method": "Tracking algorithm selected from measured behavior, not a biological name. Use Fragmentation Tracking (stored as 'propagation') for objects that overlap themselves between frames and may fragment; Bounded Propagation for overlapping or touching objects whose track IDs must remain within one connected region; btrack when objects lose frame-to-frame overlap; and Reporter Propagation only for static objects with intermittent fluorescence. LAP and TrackPy need a specific reason.",
+    "method": "Tracking algorithm selected from measured behavior, not a biological name. Use Fragmentation Propagation (stored as 'propagation') for objects that overlap themselves between frames and may fragment; Bounded Propagation for overlapping or touching objects whose track IDs must remain within one connected region; btrack when objects lose frame-to-frame overlap; and Reporter Propagation only for static objects with intermittent fluorescence. LapTrack and TrackPy need a specific reason.",
     "overwrite": "Re-run and overwrite existing outputs instead of skipping completed samples.",
     # tracking — trackpy
     "search_range_px": "Max distance (pixels) a cell may move between consecutive frames. Set just above the fastest expected displacement; too small drops links, too large makes spurious ones.",
@@ -113,11 +113,11 @@ _DESCRIPTIONS: dict[str, str] = {
     "adaptive_stop": "trackpy adaptive-search lower bound; linking subdivides the search range down to this value when ambiguous.",
     "adaptive_step": "Factor by which trackpy shrinks the search range on each adaptive subdivision (0–1).",
     # tracking — lap
-    "track_cost_px": "LAP frame-to-frame linking cost cutoff in pixels (akin to a max move distance).",
-    "gap_close_cost_px": "LAP cost cutoff for bridging gaps where a cell was briefly undetected.",
-    "gap_close_max_frames": "Maximum gap length (frames) LAP will bridge when gap-closing.",
-    "merging_cost_px": "LAP cost for allowing two tracks to merge (0 disables merging).",
-    "splitting_cost_px": "LAP cost for allowing a track to split (0 disables splitting).",
+    "track_cost_px": "LapTrack frame-to-frame linking cost cutoff in pixels (akin to a max move distance).",
+    "gap_close_cost_px": "LapTrack cost cutoff for bridging gaps where a cell was briefly undetected.",
+    "gap_close_max_frames": "Maximum gap length (frames) LapTrack will bridge when gap-closing.",
+    "merging_cost_px": "LapTrack cost for allowing two tracks to merge (0 disables merging).",
+    "splitting_cost_px": "LapTrack cost for allowing a track to split (0 disables splitting).",
     # tracking — overlap based
     "min_overlap_fraction": "Minimum overlap fraction required to associate detections. Interpret it only for the selected overlap-based method and calibrate it from a preview.",
     "segment_size_min": "Minimum segment volume retained by the selected overlap-based method. Derive it from object size and image sampling, then verify in a preview.",

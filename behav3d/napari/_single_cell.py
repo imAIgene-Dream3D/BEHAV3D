@@ -1696,11 +1696,15 @@ class StateClassificationSubTab(QWidget):
             excluded = excluded_non_behavior_columns(cols, metadata=md)
             usable_cols = [c for c in cols if c not in excluded]
             # Value-based binary detection over the full CSV (see
-            # behav3d.widgets.base_state_classification.detect_binary_columns_from_csv).
+            # behav3d.core.column_detection.detect_binary_columns_from_csv).
             # The previous 5-row dtype heuristic mis-classified numeric feature
             # columns as "binary" whenever the sampled rows were NaN/blank, so
             # switching cell types could dump every feature into the binary list.
-            from behav3d.widgets.base_state_classification import (
+            # Imported from the leaf ``core.column_detection`` module rather than
+            # ``widgets.base_state_classification``: the latter pulls in scanpy/
+            # umap/pynndescent, whose numba JIT costs ~12 s on the Qt main thread
+            # the first time metadata is loaded.
+            from behav3d.core.column_detection import (
                 detect_binary_columns_from_csv,
                 detect_non_numeric_columns_from_csv,
             )

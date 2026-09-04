@@ -143,7 +143,7 @@ def _tracking_profile_defaults(category):
 
 class TrackingPanel:
     """
-    Minimal UI for tracking (LAP, TrackPy, or Propagation) for any cell type.
+    Minimal UI for tracking (LapTrack, TrackPy, or Fragmentation Propagation) for any cell type.
     - Automatically detects cell type category (organoid/immune/other)
     - Loads appropriate default configuration based on category
     - Uses metadata_loader.output_dir and metadata_loader.metadata_csv_path directly
@@ -168,9 +168,9 @@ class TrackingPanel:
         params = dict(self.metadata_loader.behav3d_parameters or {})
         tcfg = self._get_config_for_cell_type(params)
         individual_method_options = [
-            ("LAP (laptrack)", "lap"),
+            ("LapTrack", "lap"),
             ("TrackPy", "trackpy"),
-            ("Fragmentation Tracking", "propagation"),
+            ("Fragmentation Propagation", "propagation"),
             ("Bounded Propagation", "bounded_propagation"),
         ]
         if self.category == "organoid" and not self._has_linked_organoid_mode():
@@ -233,7 +233,7 @@ class TrackingPanel:
         )
         self._lap_unit_mgr.register(self.splitting_cost_dist, "distance", lap.get("splitting_cost_px", 0), native_unit="physical")
         self.lap_params = widgets.VBox([
-            widgets.HTML("<b>LAP parameters</b>"),
+            widgets.HTML("<b>LapTrack parameters</b>"),
             self._lap_unit_mgr.header_row("Distance units:"),
             self.track_cost_dist, self.gap_cost_dist, self.gap_max_frames,
             self.merging_cost_dist, self.splitting_cost_dist
@@ -267,7 +267,7 @@ class TrackingPanel:
         ])
 
         self.prop_params = widgets.VBox([
-            widgets.HTML("<b>Fragmentation Tracking</b>"),
+            widgets.HTML("<b>Fragmentation Propagation</b>"),
             widgets.HTML("<i>No tunable parameters.</i>")
         ])
 
