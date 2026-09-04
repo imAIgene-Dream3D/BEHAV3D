@@ -1,4 +1,9 @@
 from aicspylibczi import CziFile
+# aicspylibczi has no attachment-reading API, so the "TimeStamps" attachment
+# (see get_actual_time_intervals_czi) is read with czifile instead. Imported
+# under a different name to avoid clashing with the `czifile` variable name
+# used throughout this module for aicspylibczi.CziFile instances.
+import czifile as _czifile_pkg
 from behav3d.core.utils import element_to_dict
 import numpy as np
 import pandas as pd
@@ -128,7 +133,7 @@ def load_elsizes_czi(path):
     # otherwise drift) than requested. See get_actual_time_intervals_czi.
     try:
         actual = get_actual_time_intervals_czi(path)
-        time_interval = actual["median_interval"]
+        time_interval = actual["mean_interval"]
     except Exception:
         ### Interval unit does not make sense as it seems to be in seconds but "defaultunit is minutes"
         try:
@@ -150,15 +155,61 @@ def load_elsizes_czi(path):
     return(elsizes)
 
 
-def get_actual_time_intervals_czi(path, s=0, z=0, c=0):
+def _actual_time_intervals_from_timestamps_attachment(path):
     """
-    Measure the actual per-timepoint interval (in seconds) from the real
-    AcquisitionTime recorded in each subblock's own metadata, as opposed to
-    the nominal/configured interval reported by load_czi_metadata /
-    load_elsizes_czi (SetIntervalAction). The configured interval is only a
-    target: if a full T-cycle (all scenes/Z-planes/channels) takes longer to
-    actually scan than the configured interval, ZEN does not wait for it, so
-    the real cadence can run slower than requested, or otherwise drift.
+    Read the file's "TimeStamps" attachment (CZTIMS segment), if present:
+    a dedicated array with one real acquisition time (seconds elapsed since
+    some fixed reference, not necessarily timepoint 0) per T-index. ZEN
+    writes this for essentially all time-lapse experiments, and it is
+    present even when per-subblock AcquisitionTime metadata is not --
+    which is the common case for large multi-scene time-lapses, where ZEN
+    omits per-subblock metadata entirely to save space.
+
+    ZEN pre-allocates the attachment for the originally planned number of
+    timepoints and zero-fills any that were never reached (e.g. an
+    acquisition stopped early), so this keeps only the leading run of
+    strictly increasing values and discards the rest as padding.
+
+    Returns None (rather than raising) when there is no TimeStamps
+    attachment, or fewer than 1 valid entry in it, so callers can fall back
+    to another method.
+    """
+    try:
+        with _czifile_pkg.CziFile(path) as reader:
+            arr = None
+            for attachment in reader.attachments():
+                if attachment.attachment_entry.name == "TimeStamps":
+                    arr = np.asarray(attachment.data(), dtype=float)
+                    break
+    except Exception:
+        return None
+
+    if arr is None or arr.size == 0:
+        return None
+
+    diffs = np.diff(arr)
+    non_increasing = np.where(diffs <= 0)[0]
+    n_valid = int(non_increasing[0] + 1) if len(non_increasing) else len(arr)
+    if n_valid == 0:
+        return None
+    seconds = arr[:n_valid]
+    seconds = seconds - seconds[0]
+
+    intervals = np.diff(seconds)
+    return {
+        "timepoints": np.arange(len(seconds)),
+        "timestamps": pd.Series(seconds),
+        "intervals": intervals,
+        "mean_interval": float(np.mean(intervals)) if len(intervals) else float("nan"),
+        "median_interval": float(np.median(intervals)) if len(intervals) else float("nan"),
+    }
+
+
+def _actual_time_intervals_from_subblock_metadata(path, s=None, z=None, c=None):
+    """
+    Fallback for files with no TimeStamps attachment: measure the actual
+    per-timepoint interval from the real AcquisitionTime recorded in each
+    subblock's own metadata.
 
     Fixes a single scene/Z-plane/channel (s, z, c) so exactly one real
     timestamp exists per timepoint, then diffs consecutive timepoints'
@@ -167,21 +218,31 @@ def get_actual_time_intervals_czi(path, s=0, z=0, c=0):
     Args:
         path: Path to the .czi file.
         s, z, c: Scene / Z-plane / Channel index to fix while T varies.
-            Defaults to the first of each.
-    Returns:
-        dict with:
-            "timepoints": sorted T indices (np.ndarray[int])
-            "timestamps": actual acquisition datetime per timepoint (pd.Series)
-            "intervals": actual interval in seconds between each pair of
-                subsequent timepoints (np.ndarray[float], length len(timepoints)-1)
-            "mean_interval", "median_interval": summary stats (float)
+            Defaults to the first valid index reported by the file for that
+            axis (via get_dims_shape()), which is not necessarily 0 -- some
+            multi-scene CZI files have dimension ranges that don't start at
+            0. An axis absent from the file is left unconstrained.
     """
     czifile = CziFile(path)
-    subblocks = czifile.read_subblock_metadata(S=s, Z=z, C=c, unified_xml=False)
+    dim_shape = czifile.get_dims_shape()[0]
+
+    def _resolve(axis, value):
+        if value is not None:
+            return value
+        return int(dim_shape[axis][0]) if axis in dim_shape else None
+
+    s = _resolve("S", s)
+    z = _resolve("Z", z)
+    c = _resolve("C", c)
+
+    fix_kwargs = {k: v for k, v in (("S", s), ("Z", z), ("C", c)) if v is not None}
+    subblocks = czifile.read_subblock_metadata(unified_xml=False, **fix_kwargs)
 
     records = []
     for dims, xml_str in subblocks:
         t = dims.get("T", 0)
+        if not xml_str:
+            continue
         root = ET.fromstring(xml_str)
         acquisition_time = root.find(".//AcquisitionTime")
         if acquisition_time is None or acquisition_time.text is None:
@@ -206,6 +267,50 @@ def get_actual_time_intervals_czi(path, s=0, z=0, c=0):
         "mean_interval": float(np.mean(intervals)) if len(intervals) else float("nan"),
         "median_interval": float(np.median(intervals)) if len(intervals) else float("nan"),
     }
+
+
+def get_actual_time_intervals_czi(path, s=None, z=None, c=None):
+    """
+    Measure the actual per-timepoint interval (in seconds) from real
+    acquisition timing recorded in the file, as opposed to the
+    nominal/configured interval reported by load_czi_metadata /
+    load_elsizes_czi (SetIntervalAction). The configured interval is only a
+    target: if a full T-cycle (all scenes/Z-planes/channels) takes longer to
+    actually scan than the configured interval, ZEN does not wait for it, so
+    the real cadence can run slower than requested, or otherwise drift.
+
+    Tries two sources, in order:
+        1. The file's "TimeStamps" attachment -- one real timestamp per
+           T-index, independent of scene/Z/channel. Present for essentially
+           all time-lapse acquisitions, including large multi-scene ones
+           where per-subblock metadata is stripped (see
+           _actual_time_intervals_from_timestamps_attachment).
+        2. Per-subblock AcquisitionTime metadata for a fixed (s, z, c), as a
+           fallback for files with no TimeStamps attachment (see
+           _actual_time_intervals_from_subblock_metadata).
+
+    Args:
+        path: Path to the .czi file.
+        s, z, c: Scene / Z-plane / Channel index to fix if falling back to
+            per-subblock metadata (ignored when a TimeStamps attachment is
+            found). See _actual_time_intervals_from_subblock_metadata.
+    Returns:
+        dict with:
+            "timepoints": sorted T indices (np.ndarray[int])
+            "timestamps": acquisition time per timepoint (pd.Series). From
+                the TimeStamps attachment this is seconds elapsed since the
+                first timepoint (float); from subblock metadata it is an
+                actual datetime.
+            "intervals": actual interval in seconds between each pair of
+                subsequent timepoints (np.ndarray[float], length len(timepoints)-1)
+            "mean_interval", "median_interval": summary stats (float)
+    Raises:
+        ValueError: if neither source yields any real per-timepoint timing.
+    """
+    result = _actual_time_intervals_from_timestamps_attachment(path)
+    if result is not None:
+        return result
+    return _actual_time_intervals_from_subblock_metadata(path, s, z, c)
 
 def get_czi_shape(path, take_dims="TCZYX"):
     """

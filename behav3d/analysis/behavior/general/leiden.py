@@ -6,6 +6,8 @@ import scanpy  # used as scanpy.pp.*, scanpy.tl.*, scanpy.AnnData
 from itertools import combinations
 from sklearn.metrics import adjusted_rand_score
 
+from behav3d.analysis.behavior.utils import _categorical_natural_sorted
+
 def run_pca(
     adata, 
     ncomps=50, 
@@ -203,9 +205,9 @@ def run_leiden_clustering(
         adata.uns["leiden_stability_best_res"] = float(resolution)
 
     # Return labels based from 1 isntead of 0
-    adata.obs[key_added] = (
-        adata.obs[key_added].astype(int) + 1
-    ).astype(str).astype("category")
+    adata.obs[key_added] = _categorical_natural_sorted(
+        (adata.obs[key_added].astype(int) + 1).astype(str)
+    )
     
     if inplace:
         return adata

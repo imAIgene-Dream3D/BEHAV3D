@@ -15,7 +15,11 @@ from behav3d.analysis.behavior.track.visualization.plots.feature_dtw import (
     plot_clustering_feature_heatmap,
     plot_feature_umap,
 )
-from behav3d.analysis.behavior.utils import _handle_nan_in_distance_matrix, _save_adata_obs_csv
+from behav3d.analysis.behavior.utils import (
+    _categorical_natural_sorted,
+    _handle_nan_in_distance_matrix,
+    _save_adata_obs_csv,
+)
 from behav3d.core.utils import expand_column_patterns, format_time
 
 
@@ -930,7 +934,7 @@ def _save_feature_dtw_quality_control(
     if "ClusterName" in df_plot.columns:
         df_plot["ClusterID"] = pd.Categorical(df_plot["ClusterName"].astype(str))
     elif "ClusterID" in df_plot.columns:
-        df_plot["ClusterID"] = pd.Categorical(df_plot["ClusterID"].astype(str))
+        df_plot["ClusterID"] = _categorical_natural_sorted(df_plot["ClusterID"])
     else:
         raise ValueError("Original BEHAV3D UMAP CSV is missing ClusterID.")
 
@@ -1019,7 +1023,7 @@ def _create_original_behav3d_adata(output_dir, cell_type):
         X = np.zeros((len(obs), 0), dtype=float)
 
     if "ClusterID" in obs.columns:
-        obs["ClusterID"] = pd.Categorical(obs["ClusterID"].astype(str))
+        obs["ClusterID"] = _categorical_natural_sorted(obs["ClusterID"])
 
     adata = ad.AnnData(X=X, obs=obs)
     adata.uns["dtai_trajectory_clustering"] = {

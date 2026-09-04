@@ -42,6 +42,7 @@ from behav3d.analysis.behavior.track.bouts import (
     train_track_classifier,
 )
 from behav3d.analysis.behavior.utils import (
+    _categorical_natural_sorted,
     _mixed_label_sort_key,
     _sanitize_filename_token,
     _save_adata_obs_csv,
@@ -1185,8 +1186,8 @@ def run_categorical_dtaidistance_trajectory_clustering(
             linkage=str(linkage),
         )
     labels, size_mapping = _relabel_by_cluster_size(raw_labels)
-    track_obs[cluster_key] = pd.Categorical(labels)
-    track_obs[f"{cluster_key}_raw"] = pd.Categorical(labels)
+    track_obs[cluster_key] = _categorical_natural_sorted(labels)
+    track_obs[f"{cluster_key}_raw"] = _categorical_natural_sorted(labels)
 
     var_names = [f"distance_to_track_{i}" for i in range(distances.shape[0])]
     adata_tracks = ad.AnnData(

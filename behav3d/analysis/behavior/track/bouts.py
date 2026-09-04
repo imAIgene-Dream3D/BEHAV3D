@@ -90,6 +90,7 @@ from behav3d.analysis.behavior.track.visualization.plots.reports import (
     _apply_best_pdf_orientation,
 )
 from behav3d.analysis.behavior.utils import (
+    _categorical_natural_sorted,
     _mixed_label_sort_key,
     _resolve_output_dir,
     _save_adata_obs_csv,
@@ -1901,7 +1902,7 @@ def run_state_based_analysis(
             raw_labels = AgglomerativeClustering(**kwargs).fit_predict(X_cluster)
         ranked = pd.Series(raw_labels).astype(str).value_counts().sort_values(ascending=False)
         label_map = {old: str(i + 1) for i, old in enumerate(ranked.index.tolist())}
-        adata_state_features.obs[cluster_key] = pd.Categorical(
+        adata_state_features.obs[cluster_key] = _categorical_natural_sorted(
             pd.Series(raw_labels, index=adata_state_features.obs.index).astype(str).map(label_map).astype(str)
         )
         _vdone(verbose, "trajectory-clustering", "Agglomerative clustering", clustering_started)

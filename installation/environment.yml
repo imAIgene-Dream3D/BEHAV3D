@@ -47,6 +47,7 @@ dependencies:
   - imageio>=2.30
   - pillow>=10.0
   - aicspylibczi>=3.1
+  - czifile>=2019.7  # reads the CZI "TimeStamps" attachment; aicspylibczi has no attachment API
   - zarr>=2.16
   - h5py>=3.10
   - readlif>=0.6.6

@@ -52,6 +52,15 @@ def _natural_sort_key(value):
     return [int(p) if p.isdigit() else p.lower() for p in parts]
 
 
+def _categorical_natural_sorted(values):
+    """Build a pandas Categorical whose categories are ordered via
+    _mixed_label_sort_key (numeric-looking labels sort numerically, e.g. '2' before
+    '10') instead of pandas' default plain lexicographic category order."""
+    series = pd.Series(values).astype(str)
+    categories = sorted(series.unique(), key=_mixed_label_sort_key)
+    return pd.Categorical(series, categories=categories)
+
+
 def _sanitize_filename_token(value, fallback="value"):
     token = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value).strip())
     token = token.strip("._-")
