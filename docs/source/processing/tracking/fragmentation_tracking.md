@@ -1,6 +1,6 @@
-# 🧩 Fragmentation tracking
+# 🧩 Fragmentation propagation
 
-Fragmentation tracking is **not** a centroid-distance method. For each consecutive pair of frames `t → t+1` it propagates the labels of frame `t` into frame `t+1` segmentation mask (watershed-based overlap tracking).
+Fragmentation propagation is **not** a centroid-distance method. For each consecutive pair of frames `t → t+1` it propagates the labels of frame `t` into frame `t+1` segmentation mask (watershed-based overlap tracking).
 
 ## When it applies
 
@@ -16,11 +16,11 @@ Multicellular structures such as organoids and spheroids are the usual case (see
 
 ## Parameters
 
-The napari plugin **does not expose any tunable parameters** for fragmentation tracking.
+The napari plugin **does not expose any tunable parameters** for fragmentation propagation.
 
 ## "Track all organoids together" checkbox (organoids only)
 
-By **default**, all organoid cell types are tracked as one cohort. The Tracking tab shows a single combined **🟣 All Organoids** sub-tab (locked to fragmentation tracking) with the checkbox already enabled:
+By **default**, all organoid cell types are tracked as one cohort. The Tracking tab shows a single combined **🟣 All Organoids** sub-tab (locked to fragmentation propagation) with the checkbox already enabled:
 
 > ☑ Track all organoids together
 
@@ -28,10 +28,10 @@ By **default**, all organoid cell types are tracked as one cohort. The Tracking 
 :class: important
 
 - **Leave it ON (default)** to track all organoid types in **one merged watershed with a single, shared set of track IDs** — the combined `all_organoids` output. Per-type tracked files are still written from that same run (split out of the combined result), so each type can still be analysed on its own.
-- **Turn it OFF** to track each organoid type **separately** — its own pass, its own independent IDs, and each sub-tab free to pick a **different tracking method**. (The combined tab is locked to Fragmentation Tracking; separate runs share neither a watershed nor an ID space.)
+- **Turn it OFF** to track each organoid type **separately** — its own pass, its own independent IDs, and each sub-tab free to pick a **different tracking method**. (The combined tab is locked to Fragmentation Propagation; separate runs share neither a watershed nor an ID space.)
 ```
 
-When checked, fragmentation tracking runs **once on merged organoid masks** so track IDs are assigned in a single shared scene. This is useful when:
+When checked, fragmentation propagation runs **once on merged organoid masks** so track IDs are assigned in a single shared scene. This is useful when:
 
 - Multiple organoid types coexist in the same well (e.g. `or_organoidA`, `or_organoidB`) and your main analysis is the combined **`all_organoids`** output (one cohort, one set of paths).
 - You want a unified "any organoid" view without running separate tracking jobs per type.
@@ -50,7 +50,7 @@ You **can still analyse each organoid type separately** after a combined run: BE
 ## Step-by-step in the napari plugin
 
 1. **Open the Tracking tab.** By default organoids appear as a single **🟣 All Organoids** sub-tab; if you previously unticked "Track all organoids together", pick the individual organoid sub-tab (🟣) instead.
-2. **Method is Fragmentation Tracking.** On the combined All Organoids sub-tab the method is fixed; on an individual sub-tab pick it from the **Method** dropdown. Either way the parameter panel shows just one message and the checkbox — there is nothing else to tune from the GUI.
+2. **Method is Fragmentation Propagation.** On the combined All Organoids sub-tab the method is fixed; on an individual sub-tab pick it from the **Method** dropdown. Either way the parameter panel shows just one message and the checkbox — there is nothing else to tune from the GUI.
 3. **Decide whether to keep `Track all organoids together`:**
    - **On** (default) → one combined run; primary combined output is `all_organoids`, plus per-type tracked files from the same run. Use when you want the unified cohort or will analyse each type from its own `*_tracked.zarr` paths.
    - **Off** → each organoid type is tracked in **its own** pass (isolated masks, no shared ID space). Use when types must not influence each other during tracking (e.g. touching regions in the merged scene).

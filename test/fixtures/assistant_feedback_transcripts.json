@@ -88,10 +88,10 @@
   {
     "id": "tracking_method_choice",
     "step": "tracking",
-    "user": "Help choose between Fragmentation Tracking, Bounded Propagation, Reporter Propagation and btrack.",
+    "user": "Help choose between Fragmentation Propagation, Bounded Propagation, Reporter Propagation and btrack.",
     "required": [
       "fast and slow are acquisition-dependent measurements",
-      "fragmentation tracking for spatially overlapping",
+      "fragmentation propagation for spatially overlapping",
       "bounded propagation when overlapping or touching",
       "reporter propagation only when both conditions hold",
       "use btrack when moving objects no longer overlap",

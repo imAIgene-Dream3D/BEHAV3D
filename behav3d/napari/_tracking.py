@@ -1,7 +1,8 @@
 """
 BEHAV3D napari plugin – Tracking Tab.
 
-Provides per-cell-type sub-tabs with method selection (LAP / TrackPy / Propagation),
+Provides per-cell-type sub-tabs with method selection
+(LapTrack / TrackPy / Fragmentation Propagation),
 method-specific parameters, and batch-tracking options.
 
 Run buttons execute backend tracking in a background ``QThread`` (via
@@ -45,6 +46,26 @@ from behav3d.napari._background_runner import (
     ThreadSafeLogger,
     fire_extra_callback,
 )
+
+
+# Canonical order + display labels for the tracking-method selector. The
+# internal keys (left column) are load-bearing — they are what gets persisted
+# to behav3d_parameters.yml and dispatched to the backend — while the labels
+# and their order here are purely presentational.
+_METHOD_ORDER = [
+    "btrack", "propagation", "bounded_propagation",
+    "reporter_propagation", "trackpy", "lap", "import",
+]
+_METHOD_LABELS = {
+    "btrack": "btrack (Bayesian)",
+    "propagation": "Fragmentation Propagation",
+    "bounded_propagation": "Bounded Propagation",
+    "reporter_propagation": "Reporter Propagation",
+    "trackpy": "TrackPy",
+    "lap": "LapTrack",
+    "import": "Import tracking",
+}
+_METHOD_IDX = {k: i for i, k in enumerate(_METHOD_ORDER)}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -598,18 +619,9 @@ class CellTypeTrackingPanel(QWidget):
         method_layout = QHBoxLayout()
         method_layout.setContentsMargins(6, 4, 6, 4)
         self.combo_method = QComboBox()
-        self.combo_method.addItems([
-            "LAP (laptrack)", "TrackPy", "Fragmentation Tracking",
-            "Bounded Propagation",
-            "Reporter Propagation",
-            "btrack (Bayesian)", "Import tracking",
-        ])
+        self.combo_method.addItems([_METHOD_LABELS[k] for k in _METHOD_ORDER])
         saved_method = tcfg.get("method", def_method)
-        idx_map = {
-            "lap": 0, "trackpy": 1, "propagation": 2, "bounded_propagation": 3,
-            "reporter_propagation": 4, "btrack": 5, "import": 6,
-        }
-        self.combo_method.setCurrentIndex(idx_map.get(saved_method, 0))
+        self.combo_method.setCurrentIndex(_METHOD_IDX.get(saved_method, 0))
         method_layout.addWidget(QLabel("Method:"))
         method_layout.addWidget(self.combo_method)
         # The three propagation variants differ in ways a paragraph describes
@@ -618,19 +630,13 @@ class CellTypeTrackingPanel(QWidget):
             "Tracking Method",
             [
                 HelpSection(
-                    "LAP (laptrack)",
-                    "Links detections frame-to-frame by solving a Linear "
-                    "Assignment Problem on distance costs. Supports gap "
-                    "closing, merging and splitting.",
+                    "btrack (Bayesian)",
+                    "Kalman-filter based tracker with an optional global "
+                    "hypothesis optimizer for resolving merges, splits and "
+                    "false positives.",
                 ),
                 HelpSection(
-                    "TrackPy",
-                    "Crocker-Grier style nearest-neighbour linker with an "
-                    "adaptive search range; simple and fast, no merge/split "
-                    "support.",
-                ),
-                HelpSection(
-                    "Fragmentation Tracking",
+                    "Fragmentation Propagation",
                     "No tunable parameters. Objects are identified by spatial "
                     "overlap between frames rather than a linking cost, so one "
                     "identity survives fragmentation and fusion — which is what "
@@ -660,10 +666,16 @@ class CellTypeTrackingPanel(QWidget):
                     "tracking/reporter_propagation.png",
                 ),
                 HelpSection(
-                    "btrack (Bayesian)",
-                    "Kalman-filter based tracker with an optional global "
-                    "hypothesis optimizer for resolving merges, splits and "
-                    "false positives.",
+                    "TrackPy",
+                    "Crocker-Grier style nearest-neighbour linker with an "
+                    "adaptive search range; simple and fast, no merge/split "
+                    "support.",
+                ),
+                HelpSection(
+                    "LapTrack",
+                    "Links detections frame-to-frame by solving a Linear "
+                    "Assignment Problem on distance costs. Supports gap "
+                    "closing, merging and splitting.",
                 ),
                 HelpSection(
                     "Import tracking",
@@ -679,7 +691,16 @@ class CellTypeTrackingPanel(QWidget):
 
         # ── Stacked method params ────────────────────────────────────
         self.param_stack = QStackedWidget()
-        self.combo_method.currentIndexChanged.connect(self.param_stack.setCurrentIndex)
+        # Param pages are built below in their own (historical) source order and
+        # registered by method key; the combo order is independent of it.
+        self._method_pages = {}
+
+        def _show_params_for_combo_idx(idx):
+            key = _METHOD_ORDER[idx] if 0 <= idx < len(_METHOD_ORDER) else None
+            page = self._method_pages.get(key)
+            if page is not None:
+                self.param_stack.setCurrentIndex(page)
+        self.combo_method.currentIndexChanged.connect(_show_params_for_combo_idx)
 
         # Page 0 — LAP params
         lap_cfg = tcfg.get("lap", {})
@@ -706,7 +727,7 @@ class CellTypeTrackingPanel(QWidget):
             "Track Cost",
             "Maximum distance a cell can travel between two consecutive "
             "frames to be linked as the same track.\n\n"
-            "Entered in the unit selected above (µm by default; LAP links "
+            "Entered in the unit selected above (µm by default; LapTrack links "
             "in µm natively).\n\n"
             "Increase if cells move fast; decrease to avoid false links."
         ))
@@ -782,7 +803,7 @@ class CellTypeTrackingPanel(QWidget):
             int(lap_cfg.get("splitting_cost_px", 0)), native_unit="physical",
         )
 
-        self.param_stack.addWidget(lap_page)
+        self._method_pages["lap"] = self.param_stack.addWidget(lap_page)
 
         # Page 1 — TrackPy params
         tp_cfg = tcfg.get("trackpy", {})
@@ -825,7 +846,7 @@ class CellTypeTrackingPanel(QWidget):
             "Memory (frames)",
             "Number of frames a cell can disappear and still be "
             "reconnected to its previous track.\n\n"
-            "Similar to 'gap closing' in LAP."
+            "Similar to 'gap closing' in LapTrack."
         ))
 
         self.tp_adaptive_stop = QDoubleSpinBox()
@@ -863,7 +884,7 @@ class CellTypeTrackingPanel(QWidget):
             "Default 0.95 works well in most cases."
         ))
 
-        self.param_stack.addWidget(tp_page)
+        self._method_pages["trackpy"] = self.param_stack.addWidget(tp_page)
 
         # Page 2 — Propagation params
         prop_page = QWidget()
@@ -878,7 +899,7 @@ class CellTypeTrackingPanel(QWidget):
             self.check_all_together_prop.setChecked(False)  # False: we are in individual mode
             self.check_all_together_prop.setToolTip(
                 "When checked, all organoid types are tracked simultaneously\n"
-                "using Fragmentation Tracking, collapsing all organoid tabs into one.\n"
+                "using Fragmentation Propagation, collapsing all organoid tabs into one.\n"
                 "This is the default behaviour when multiple organoid types exist."
             )
             def _on_check_all(checked, _self=self):
@@ -887,14 +908,14 @@ class CellTypeTrackingPanel(QWidget):
             self.check_all_together_prop.toggled.connect(_on_check_all)
             prop_lay.addWidget(self.check_all_together_prop)
 
-        prop_notice = QLabel("No tunable parameters for\nFragmentation Tracking.")
+        prop_notice = QLabel("No tunable parameters for\nFragmentation Propagation.")
         prop_notice.setWordWrap(True)
         prop_notice.setAlignment(Qt.AlignCenter)
         prop_notice.setStyleSheet("color: #666; font-style: italic; padding: 10px;")
         prop_lay.addWidget(prop_notice)
         prop_lay.addStretch()
 
-        self.param_stack.addWidget(prop_page)
+        self._method_pages["propagation"] = self.param_stack.addWidget(prop_page)
 
         # Page 3 — Bounded Propagation params
         bp_cfg = tcfg.get("bounded_propagation", {})
@@ -905,7 +926,7 @@ class CellTypeTrackingPanel(QWidget):
         bp_form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
 
         bp_info = QLabel(
-            "Same as Fragmentation Tracking, but a track ID can never span more than "
+            "Same as Fragmentation Propagation, but a track ID can never span more than "
             "one disconnected region. Each region of the current frame's "
             "mask is claimed by whichever existing track overlaps it most, "
             "before watershed runs; a region no track claims becomes a new "
@@ -950,7 +971,7 @@ class CellTypeTrackingPanel(QWidget):
             "are always removed as well, regardless of this value."
         ))
 
-        self.param_stack.addWidget(bp_page)
+        self._method_pages["bounded_propagation"] = self.param_stack.addWidget(bp_page)
 
         # Page 4 — Reporter Propagation params
         rp_cfg = tcfg.get("reporter_propagation", {})
@@ -999,7 +1020,7 @@ class CellTypeTrackingPanel(QWidget):
             "for the 'largest instance' and when grouping."
         ))
 
-        self.param_stack.addWidget(rp_page)
+        self._method_pages["reporter_propagation"] = self.param_stack.addWidget(rp_page)
 
         # Page 5 — btrack (Bayesian tracking)
         bt_cfg = tcfg.get("btrack", {})
@@ -1281,7 +1302,7 @@ class CellTypeTrackingPanel(QWidget):
         _on_optimize_toggled(self.bt_use_optimize.isChecked())
 
         btrack_lay.addStretch()
-        self.param_stack.addWidget(btrack_page)
+        self._method_pages["btrack"] = self.param_stack.addWidget(btrack_page)
 
         # Page 6 — Import tracking
         import_page = _ImportTrackingPage(
@@ -1290,11 +1311,11 @@ class CellTypeTrackingPanel(QWidget):
             metadata_loader=self.metadata_loader,
             switch_to_data_prep_edit_callback=self._switch_to_data_prep_edit,
         )
-        self.param_stack.addWidget(import_page)
+        self._method_pages["import"] = self.param_stack.addWidget(import_page)
         reset_scroll_on_page_change(self.param_stack)
 
         # Set active page
-        self.param_stack.setCurrentIndex(self.combo_method.currentIndex())
+        _show_params_for_combo_idx(self.combo_method.currentIndex())
         layout.addWidget(self.param_stack)
 
         # ── Apply settings buttons ──────────────────────────────────
@@ -1318,9 +1339,10 @@ class CellTypeTrackingPanel(QWidget):
         self.btn_run.clicked.connect(self._on_run_clicked)
         layout.addWidget(self.btn_run)
 
-        # Disable run button for coming-soon methods (only Import at index 6)
+        # Disable run button for coming-soon methods (only Import tracking)
         def _on_method_idx_changed(idx):
-            is_coming_soon = idx >= 6
+            key = _METHOD_ORDER[idx] if 0 <= idx < len(_METHOD_ORDER) else None
+            is_coming_soon = key == "import"
             self.btn_run.setEnabled(not is_coming_soon)
             if is_coming_soon:
                 self.btn_run.setToolTip("This tracking method is not yet available.")
@@ -1335,10 +1357,8 @@ class CellTypeTrackingPanel(QWidget):
     # Persistence
     # ------------------------------------------------------------------
     def _get_method_key(self):
-        return [
-            "lap", "trackpy", "propagation", "bounded_propagation",
-            "reporter_propagation", "btrack", "import",
-        ][self.combo_method.currentIndex()]
+        idx = self.combo_method.currentIndex()
+        return _METHOD_ORDER[idx] if 0 <= idx < len(_METHOD_ORDER) else _METHOD_ORDER[0]
 
     def _bt_browse_config(self):
         """Open file dialog for custom btrack JSON config."""
@@ -1425,11 +1445,7 @@ class CellTypeTrackingPanel(QWidget):
             if ct in parent_tab.panels:
                 panel = parent_tab.panels[ct]
                 # Apply settings
-                idx_map = {
-                    "lap": 0, "trackpy": 1, "propagation": 2, "bounded_propagation": 3,
-                    "reporter_propagation": 4, "btrack": 5,
-                }
-                panel.combo_method.setCurrentIndex(idx_map.get(settings["method"], 0))
+                panel.combo_method.setCurrentIndex(_METHOD_IDX.get(settings["method"], 0))
 
                 # LAP
                 panel._lap_unit_mgr.set_native(panel.lap_track_cost, settings["lap"]["track_cost_px"])
@@ -1830,7 +1846,7 @@ class AllOrganoidsPropagationPanel(QWidget):
         method_layout = QHBoxLayout()
         method_layout.setContentsMargins(6, 4, 6, 4)
         method_layout.addWidget(QLabel("Method:"))
-        method_label = QLabel("Fragmentation Tracking")
+        method_label = QLabel("Fragmentation Propagation")
         method_label.setStyleSheet("font-weight: bold;")
         method_layout.addWidget(method_label)
         method_layout.addStretch()
@@ -1839,7 +1855,7 @@ class AllOrganoidsPropagationPanel(QWidget):
 
         # ── Warning banner ────────────────────────────────────────────
         warning = QLabel(
-            "⚠️  Fragmentation Tracking will be applied to ALL organoid types simultaneously. "
+            "⚠️  Fragmentation Propagation will be applied to ALL organoid types simultaneously. "
             "To run individual tracking, uncheck 'Track all organoids together'"
         )
         warning.setWordWrap(True)
@@ -1850,20 +1866,20 @@ class AllOrganoidsPropagationPanel(QWidget):
         layout.addWidget(warning)
 
         # ── Propagation parameters group ──────────────────────────────
-        prop_group = QGroupBox("Fragmentation Tracking")
+        prop_group = QGroupBox("Fragmentation Propagation")
         prop_lay = QVBoxLayout(prop_group)
         prop_lay.setSpacing(6)
 
         self.check_all_together = QCheckBox("Track all organoids together")
         self.check_all_together.setChecked(True)
         self.check_all_together.setToolTip(
-            "When checked, all organoid types are tracked simultaneously using Fragmentation Tracking.\n"
+            "When checked, all organoid types are tracked simultaneously using Fragmentation Propagation.\n"
             "Uncheck to configure and run tracking independently per organoid type."
         )
         self.check_all_together.toggled.connect(self._on_toggled)
         prop_lay.addWidget(self.check_all_together)
 
-        notice = QLabel("No additional tunable parameters for Fragmentation Tracking.")
+        notice = QLabel("No additional tunable parameters for Fragmentation Propagation.")
         notice.setWordWrap(True)
         notice.setStyleSheet("color: #666; font-style: italic; padding: 2px 0;")
         prop_lay.addWidget(notice)
@@ -1923,7 +1939,7 @@ class AllOrganoidsPropagationPanel(QWidget):
 
         types_str = ", ".join(self.organoid_types)
         self.btn_run.setText("\u23f3 Running\u2026")
-        self.log(f"\u25b6 Fragmentation Tracking \u2014 all organoids: {types_str}\u2026")
+        self.log(f"\u25b6 Fragmentation Propagation \u2014 all organoids: {types_str}\u2026")
 
         out_dir_str = str(out_path.expanduser())
         first_ct = self.organoid_types[0]

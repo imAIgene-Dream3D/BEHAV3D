@@ -32,7 +32,7 @@ These profiles describe image behavior, not biological identities.
 Often approximately one cell diameter (around 10 micrometres as an initial sizing
 reference). Use observed frame-to-frame overlap to choose tracking:
 
-- retained overlap: Fragmentation Tracking or Bounded Propagation may work;
+- retained overlap: Fragmentation Propagation or Bounded Propagation may work;
 - lost overlap: use btrack and derive the search radius from measured displacement;
 - division: enable the btrack branching hypothesis;
 - entry or exit at the field boundary: retain initialization and termination hypotheses.
@@ -53,7 +53,7 @@ Use the actual answer and each sample's XY/Z sampling to derive segmentation sca
 minimum size, and EDT starting points.
 
 For near-static or slowly drifting structures that overlap between frames, use
-Fragmentation Tracking. Track multiple distinguishable structure populations in one
+Fragmentation Propagation. Track multiple distinguishable structure populations in one
 run when they coexist and need a shared overlap-based track space; preserve their
 origin labels. Explants and much larger structures require their own measured scale.
 
@@ -86,7 +86,7 @@ Bounded Propagation with btrack.
    - No: continue.
 3. Can touching/merged masks cause one track ID to span disconnected regions?
    - Yes: use Bounded Propagation.
-   - No: use Fragmentation Tracking.
+   - No: use Fragmentation Propagation.
 4. When two methods are plausible, explain the topology difference and preview both.
 
 For btrack, derive the maximum search radius from the fastest plausible measured

@@ -1,11 +1,11 @@
-# 🔗 LAP (laptrack)
+# 🔗 LapTrack
 
-LAP — Linear Assignment Problem tracking via the [laptrack](https://github.com/yfukai/laptrack) library — links per-timepoint detections by solving a global optimization on the centroid-distance cost matrix (Hungarian-style assignment). It also supports gap closing across short disappearances and optional merge/split events.
+LapTrack — Linear Assignment Problem tracking via the [laptrack](https://github.com/yfukai/laptrack) library — links per-timepoint detections by solving a global optimization on the centroid-distance cost matrix (Hungarian-style assignment). It also supports gap closing across short disappearances and optional merge/split events.
 
 ```{note}
 **Not a recommended default.** The routine trackers are **[btrack](btrack)** for objects that
-do not overlap between frames, and **[fragmentation tracking](fragmentation_tracking)** for
-objects that do. LAP is an alternative — use it only for a reason below, not as a first choice.
+do not overlap between frames, and **[fragmentation propagation](fragmentation_tracking)** for
+objects that do. LapTrack is an alternative — use it only for a reason below, not as a first choice.
 ```
 
 ## When to use it
@@ -18,7 +18,7 @@ For each sample BEHAV3D EXPLORER extracts per-timepoint segment centroids, conve
 
 ## Parameters
 
-A **Distance units** selector sits at the top of the parameter panel and defaults to **physical units (µm)** — LAP links on micron-scaled coordinates natively. All the distance costs below are entered in whatever unit you pick there (µm by default), *not* in raw pixels.
+A **Distance units** selector sits at the top of the parameter panel and defaults to **physical units (µm)** — LapTrack links on micron-scaled coordinates natively. All the distance costs below are entered in whatever unit you pick there (µm by default), *not* in raw pixels.
 
 ```{note}
 Enter a plain **distance**. Internally laptrack's cost cutoffs are *squared* distances, and
@@ -39,7 +39,7 @@ in physical units (z scaled by `pixel_distance_z`).
 ## Step-by-step in the napari plugin
 
 1. **Open the Tracking tab** and pick the **sub-tab** for the cell type you want to track (one sub-tab per cell type — organoids 🟣, immune 🔵, other 🟡).
-2. From the **Method** dropdown, pick **LAP (laptrack)**.
+2. From the **Method** dropdown, pick **LapTrack**.
 3. **Estimate the fastest single-frame displacement in your data**, in the unit selected in the **Distance units** toggle (µm by default). The easiest way: open the Visualization tab, load one sample, scrub through two consecutive frames, and visually measure how far the fastest cell moves between them.
 4. **Set `Track cost` ≈ that displacement**, with a small margin (e.g. fastest cell moves ~30 µm → set Track cost to 35–45). The default 45 is only a starting point — always tune it to your own data (see [Tuning the parameters](#tuning-the-parameters)).
 5. **Set `Gap close cost` ≈ Track cost × 1.2 – 2** (default 60). A cell that disappears for a few frames may have moved further than a single-frame neighbour.
@@ -60,13 +60,13 @@ After looking at the result in the Visualization tab, identify which failure mod
 
 **Track IDs swap between neighbouring cells**
 
-- Cause: `Track cost` is large enough that two nearby cells' candidate links cross — LAP picks the wrong assignment.
+- Cause: `Track cost` is large enough that two nearby cells' candidate links cross — LapTrack picks the wrong assignment.
 - Fix: **lower `Track cost`**. If lowering it then fragments tracks, the dataset is genuinely ambiguous and you should consider btrack with `Use visual features` for better disambiguation.
 
 **A cell disappears for a few frames and then comes back as a new TrackID**
 
 - Cause: gap closing didn't bridge the disappearance.
-- Fix: **raise `Gap close cost`** so the cost of bridging the gap is high enough that LAP picks it over starting a new track. Also check `Gap close max frames` is at least the length of the disappearance.
+- Fix: **raise `Gap close cost`** so the cost of bridging the gap is high enough that LapTrack picks it over starting a new track. Also check `Gap close max frames` is at least the length of the disappearance.
 
 **False bridges: two unrelated cells are linked across a gap**
 
@@ -78,9 +78,9 @@ After looking at the result in the Visualization tab, identify which failure mod
 - Cause: `Splitting cost` or `Merging cost` is > 0 and is being triggered by false positives.
 - Fix: **set the offending cost to 0** (disabled). Only re-enable if you actually see biological splits / merges and the cost was previously too low to catch them.
 
-**LAP takes too long on dense data**
+**LapTrack takes too long on dense data**
 
-- Cause: LAP solves a global assignment problem; cost is roughly quadratic in the number of detections per frame.
+- Cause: LapTrack solves a global assignment problem; cost is roughly quadratic in the number of detections per frame.
 - Fix: switch to [TrackPy](trackpy) (adaptive search radius) or [btrack](btrack) with `Update method = APPROXIMATE` for very dense data.
 
 ## Outputs
@@ -98,7 +98,7 @@ CSV columns: `TrackID, SegmentID, position_t, position_x/y/z, pixel_position_x/y
 - **Set Track cost to roughly the maximum displacement of the fastest cell between two frames** in your data. Inspect a few frames in napari and measure visually — too small = fragmented tracks; too large = false links across cells.
 - **Gap close cost should be ≥ Track cost.** A cell that disappears for *n* frames may have moved further than a single-frame neighbour, so allow more room.
 - **Keep merging / splitting at 0 unless you have a biological reason to enable them.** They are off by default because false-positive merges/splits are very disruptive downstream. Turn them on only when you actually see fusion / division events in your data.
-- **LAP gets expensive on very dense data** (thousands of cells per timepoint) because it solves a global assignment problem. Consider TrackPy (adaptive search radius) or btrack (approximate update mode) for that case.
+- **LapTrack gets expensive on very dense data** (thousands of cells per timepoint) because it solves a global assignment problem. Consider TrackPy (adaptive search radius) or btrack (approximate update mode) for that case.
 
 ## Things this page does **not** claim
 

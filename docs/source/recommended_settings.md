@@ -47,7 +47,7 @@ Use frame-to-frame behavior:
 | Observed behavior | Starting method |
 |---|---|
 | Detection loses overlap with its previous position | btrack |
-| Detection overlaps and may fragment | Fragmentation Tracking |
+| Detection overlaps and may fragment | Fragmentation Propagation |
 | Detection overlaps/touches and IDs must remain within connected regions | Bounded Propagation |
 | Physical object is static but its segmented reporter flickers | Reporter Propagation |
 

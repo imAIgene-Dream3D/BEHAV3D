@@ -95,7 +95,7 @@ _LEAF_LABELS = {
 }
 
 _METHOD_GROUP_LABELS = {
-    "lap": "LAP",
+    "lap": "LapTrack",
     "trackpy": "TrackPy",
     "btrack": "btrack",
 }

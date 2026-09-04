@@ -678,7 +678,7 @@
       "reporter_propagation",
       "propagation_all_organoids"
     ],
-    "description": "Tracking algorithm selected from measured behavior, not a biological name. Use Fragmentation Tracking (stored as 'propagation') for objects that overlap themselves between frames and may fragment; Bounded Propagation for overlapping or touching objects whose track IDs must remain within one connected region; btrack when objects lose frame-to-frame overlap; and Reporter Propagation only for static objects with intermittent fluorescence. LAP and TrackPy need a specific reason."
+    "description": "Tracking algorithm selected from measured behavior, not a biological name. Use Fragmentation Propagation (stored as 'propagation') for objects that overlap themselves between frames and may fragment; Bounded Propagation for overlapping or touching objects whose track IDs must remain within one connected region; btrack when objects lose frame-to-frame overlap; and Reporter Propagation only for static objects with intermittent fluorescence. LapTrack and TrackPy need a specific reason."
   },
   {
     "key": "tracking.all_organoids.overwrite",
@@ -706,7 +706,7 @@
       "reporter_propagation",
       "propagation_all_organoids"
     ],
-    "description": "Tracking algorithm selected from measured behavior, not a biological name. Use Fragmentation Tracking (stored as 'propagation') for objects that overlap themselves between frames and may fragment; Bounded Propagation for overlapping or touching objects whose track IDs must remain within one connected region; btrack when objects lose frame-to-frame overlap; and Reporter Propagation only for static objects with intermittent fluorescence. LAP and TrackPy need a specific reason."
+    "description": "Tracking algorithm selected from measured behavior, not a biological name. Use Fragmentation Propagation (stored as 'propagation') for objects that overlap themselves between frames and may fragment; Bounded Propagation for overlapping or touching objects whose track IDs must remain within one connected region; btrack when objects lose frame-to-frame overlap; and Reporter Propagation only for static objects with intermittent fluorescence. LapTrack and TrackPy need a specific reason."
   },
   {
     "key": "tracking.immune.overwrite",
@@ -726,7 +726,7 @@
     "type": "int",
     "default": 60,
     "choices": null,
-    "description": "LAP frame-to-frame linking cost cutoff in pixels (akin to a max move distance)."
+    "description": "LapTrack frame-to-frame linking cost cutoff in pixels (akin to a max move distance)."
   },
   {
     "key": "tracking.immune.lap.gap_close_cost_px",
@@ -736,7 +736,7 @@
     "type": "int",
     "default": 45,
     "choices": null,
-    "description": "LAP cost cutoff for bridging gaps where a cell was briefly undetected."
+    "description": "LapTrack cost cutoff for bridging gaps where a cell was briefly undetected."
   },
   {
     "key": "tracking.immune.lap.gap_close_max_frames",
@@ -746,7 +746,7 @@
     "type": "int",
     "default": 5,
     "choices": null,
-    "description": "Maximum gap length (frames) LAP will bridge when gap-closing."
+    "description": "Maximum gap length (frames) LapTrack will bridge when gap-closing."
   },
   {
     "key": "tracking.immune.lap.merging_cost_px",
@@ -756,7 +756,7 @@
     "type": "int",
     "default": 0,
     "choices": null,
-    "description": "LAP cost for allowing two tracks to merge (0 disables merging)."
+    "description": "LapTrack cost for allowing two tracks to merge (0 disables merging)."
   },
   {
     "key": "tracking.immune.lap.splitting_cost_px",
@@ -766,7 +766,7 @@
     "type": "int",
     "default": 0,
     "choices": null,
-    "description": "LAP cost for allowing a track to split (0 disables splitting)."
+    "description": "LapTrack cost for allowing a track to split (0 disables splitting)."
   },
   {
     "key": "tracking.immune.trackpy.search_range_px",
@@ -945,7 +945,7 @@
       "reporter_propagation",
       "propagation_all_organoids"
     ],
-    "description": "Tracking algorithm selected from measured behavior, not a biological name. Use Fragmentation Tracking (stored as 'propagation') for objects that overlap themselves between frames and may fragment; Bounded Propagation for overlapping or touching objects whose track IDs must remain within one connected region; btrack when objects lose frame-to-frame overlap; and Reporter Propagation only for static objects with intermittent fluorescence. LAP and TrackPy need a specific reason."
+    "description": "Tracking algorithm selected from measured behavior, not a biological name. Use Fragmentation Propagation (stored as 'propagation') for objects that overlap themselves between frames and may fragment; Bounded Propagation for overlapping or touching objects whose track IDs must remain within one connected region; btrack when objects lose frame-to-frame overlap; and Reporter Propagation only for static objects with intermittent fluorescence. LapTrack and TrackPy need a specific reason."
   },
   {
     "key": "tracking.other.overwrite",
@@ -965,7 +965,7 @@
     "type": "int",
     "default": 60,
     "choices": null,
-    "description": "LAP frame-to-frame linking cost cutoff in pixels (akin to a max move distance)."
+    "description": "LapTrack frame-to-frame linking cost cutoff in pixels (akin to a max move distance)."
   },
   {
     "key": "tracking.other.lap.gap_close_cost_px",
@@ -975,7 +975,7 @@
     "type": "int",
     "default": 45,
     "choices": null,
-    "description": "LAP cost cutoff for bridging gaps where a cell was briefly undetected."
+    "description": "LapTrack cost cutoff for bridging gaps where a cell was briefly undetected."
   },
   {
     "key": "tracking.other.lap.gap_close_max_frames",
@@ -985,7 +985,7 @@
     "type": "int",
     "default": 5,
     "choices": null,
-    "description": "Maximum gap length (frames) LAP will bridge when gap-closing."
+    "description": "Maximum gap length (frames) LapTrack will bridge when gap-closing."
   },
   {
     "key": "tracking.other.lap.merging_cost_px",
@@ -995,7 +995,7 @@
     "type": "int",
     "default": 0,
     "choices": null,
-    "description": "LAP cost for allowing two tracks to merge (0 disables merging)."
+    "description": "LapTrack cost for allowing two tracks to merge (0 disables merging)."
   },
   {
     "key": "tracking.other.lap.splitting_cost_px",
@@ -1005,7 +1005,7 @@
     "type": "int",
     "default": 0,
     "choices": null,
-    "description": "LAP cost for allowing a track to split (0 disables splitting)."
+    "description": "LapTrack cost for allowing a track to split (0 disables splitting)."
   },
   {
     "key": "tracking.other.trackpy.search_range_px",
@@ -1184,7 +1184,7 @@
       "reporter_propagation",
       "propagation_all_organoids"
     ],
-    "description": "Tracking algorithm selected from measured behavior, not a biological name. Use Fragmentation Tracking (stored as 'propagation') for objects that overlap themselves between frames and may fragment; Bounded Propagation for overlapping or touching objects whose track IDs must remain within one connected region; btrack when objects lose frame-to-frame overlap; and Reporter Propagation only for static objects with intermittent fluorescence. LAP and TrackPy need a specific reason."
+    "description": "Tracking algorithm selected from measured behavior, not a biological name. Use Fragmentation Propagation (stored as 'propagation') for objects that overlap themselves between frames and may fragment; Bounded Propagation for overlapping or touching objects whose track IDs must remain within one connected region; btrack when objects lose frame-to-frame overlap; and Reporter Propagation only for static objects with intermittent fluorescence. LapTrack and TrackPy need a specific reason."
   },
   {
     "key": "tracking.organoid.overwrite",
@@ -1204,7 +1204,7 @@
     "type": "int",
     "default": 60,
     "choices": null,
-    "description": "LAP frame-to-frame linking cost cutoff in pixels (akin to a max move distance)."
+    "description": "LapTrack frame-to-frame linking cost cutoff in pixels (akin to a max move distance)."
   },
   {
     "key": "tracking.organoid.lap.gap_close_cost_px",
@@ -1214,7 +1214,7 @@
     "type": "int",
     "default": 80,
     "choices": null,
-    "description": "LAP cost cutoff for bridging gaps where a cell was briefly undetected."
+    "description": "LapTrack cost cutoff for bridging gaps where a cell was briefly undetected."
   },
   {
     "key": "tracking.organoid.lap.gap_close_max_frames",
@@ -1224,7 +1224,7 @@
     "type": "int",
     "default": 3,
     "choices": null,
-    "description": "Maximum gap length (frames) LAP will bridge when gap-closing."
+    "description": "Maximum gap length (frames) LapTrack will bridge when gap-closing."
   },
   {
     "key": "tracking.organoid.lap.merging_cost_px",
@@ -1234,7 +1234,7 @@
     "type": "int",
     "default": 0,
     "choices": null,
-    "description": "LAP cost for allowing two tracks to merge (0 disables merging)."
+    "description": "LapTrack cost for allowing two tracks to merge (0 disables merging)."
   },
   {
     "key": "tracking.organoid.lap.splitting_cost_px",
@@ -1244,7 +1244,7 @@
     "type": "int",
     "default": 0,
     "choices": null,
-    "description": "LAP cost for allowing a track to split (0 disables splitting)."
+    "description": "LapTrack cost for allowing a track to split (0 disables splitting)."
   },
   {
     "key": "tracking.organoid.trackpy.search_range_px",

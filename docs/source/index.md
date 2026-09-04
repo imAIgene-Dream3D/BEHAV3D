@@ -62,7 +62,7 @@ Building the metadata table, declaring your cell types, setting up the output fo
 :link: processing/index
 :link-type: doc
 
-Segmentation (6 methods, including zero-shot Cellpose-SAM) and Tracking (LAP, TrackPy, Fragmentation Tracking, Bounded Propagation, Reporter Propagation, btrack, Import) — the heavy computation that turns images into trackable cells.
+Segmentation (6 methods, including zero-shot Cellpose-SAM) and Tracking (btrack, Fragmentation Propagation, Bounded Propagation, Reporter Propagation, TrackPy, LapTrack, Import) — the heavy computation that turns images into trackable cells.
 ::::
 
 ::::{grid-item-card} 📈 Analysis

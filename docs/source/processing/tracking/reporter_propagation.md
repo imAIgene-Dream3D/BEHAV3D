@@ -63,5 +63,5 @@ Standard BEHAV3D EXPLORER tracking outputs:
 ## See also
 
 - [Tracking overview](index).
-- [Fragmentation tracking](fragmentation_tracking) — overlap-based tracking for objects
+- [Fragmentation propagation](fragmentation_tracking) — overlap-based tracking for objects
   that are segmented reliably at every timepoint.

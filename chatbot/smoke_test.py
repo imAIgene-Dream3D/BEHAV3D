@@ -979,7 +979,7 @@ def _missing_log_error_case() -> dict:
 
 def _tracking_guide_case() -> dict:
     choices = [
-        "LAP (laptrack)", "TrackPy", "Propagation",
+        "LapTrack", "TrackPy", "Fragmentation Propagation",
         "Reporter Propagation", "btrack (Bayesian)",
     ]
     controls = [
@@ -990,7 +990,7 @@ def _tracking_guide_case() -> dict:
         for cell_type, method in (
             ("Tcell_HIV", "btrack (Bayesian)"),
             ("Tcell_cmtrm", "btrack (Bayesian)"),
-            ("collagen", "LAP (laptrack)"),
+            ("collagen", "LapTrack"),
         )
     ]
     return {
@@ -1003,11 +1003,11 @@ def _tracking_guide_case() -> dict:
 
 def _stationary_tracking_case() -> dict:
     controls = [_control(
-        "tracking.structure_A.method", "structure A: Tracking method", "LAP (laptrack)",
+        "tracking.structure_A.method", "structure A: Tracking method", "LapTrack",
         choices=[
-            "LAP (laptrack)", "TrackPy", "Fragmentation Tracking",
-            "Bounded Propagation",
-            "Reporter Propagation", "btrack (Bayesian)",
+            "btrack (Bayesian)", "Fragmentation Propagation",
+            "Bounded Propagation", "Reporter Propagation",
+            "TrackPy", "LapTrack",
         ],
         cell_type="structure_A",
     )]
@@ -1154,7 +1154,7 @@ def _reporter_propagation_case() -> dict:
         "calcium reporter: Tracking method",
         "btrack (Bayesian)",
         choices=[
-            "LAP (laptrack)", "TrackPy", "Propagation",
+            "LapTrack", "TrackPy", "Fragmentation Propagation",
             "Reporter Propagation", "btrack (Bayesian)",
         ],
         cell_type="calcium_reporter",
@@ -2990,8 +2990,8 @@ def _check_stationary_tracking(result: dict) -> list[str]:
         and str(call.get("value", "")).lower().startswith("fragmentation")
         for call in method_calls
     )
-    if "fragmentation tracking" not in text and not proposed:
-        return ["did not recommend Fragmentation Tracking from overlap behavior"]
+    if "fragmentation propagation" not in text and not proposed:
+        return ["did not recommend Fragmentation Propagation from overlap behavior"]
     return []
 
 

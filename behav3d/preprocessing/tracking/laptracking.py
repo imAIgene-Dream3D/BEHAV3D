@@ -48,7 +48,7 @@ def laptrack_image(
     df_centroids = pd.concat(df_centroids)
 
     if df_centroids.empty:
-        print("Warning: No segmented objects found — skipping LAP tracking and saving empty outputs.")
+        print("Warning: No segmented objects found — skipping LapTrack tracking and saving empty outputs.")
         df_tracks = pd.DataFrame(columns=[
             "TrackID", "SegmentID", "position_t", "position_x", "position_y", "position_z",
             "pixel_position_x", "pixel_position_y", "pixel_position_z",
@@ -123,7 +123,7 @@ def run_laptracking(
     progress_cb=None,
     **kwargs
     ):
-    """Run LAP tracking on any cell type.
+    """Run LapTrack tracking on any cell type.
     
     Parameters
     ----------

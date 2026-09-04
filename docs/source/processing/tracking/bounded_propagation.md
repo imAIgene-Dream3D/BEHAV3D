@@ -2,7 +2,7 @@
 
 Bounded Propagation is an overlap-based tracker for static or slow-moving objects that remain spatially
 overlapping between consecutive frames but may touch or form joined segmentation
-regions. It uses watershed propagation like [Fragmentation Tracking](fragmentation_tracking), with one extra
+regions. It uses watershed propagation like [Fragmentation Propagation](fragmentation_tracking), with one extra
 topology rule: a track ID cannot span more than one disconnected region.
 
 ## When to use it
@@ -14,7 +14,7 @@ Use Bounded Propagation when all of the following are true:
 - connected objects that separate during the experiment should be seen as separate tracked objects. 
 
 If detections lose overlap because displacement is large relative to the frame
-interval, use [btrack](btrack) instead. If spatially separate object should belong to the same track (dying objects that are falling apart) [Fragmentation Tracking](fragmentation_tracking) should be used. Preview both when topology makes either interpretation plausible.
+interval, use [btrack](btrack) instead. If spatially separate object should belong to the same track (dying objects that are falling apart) [Fragmentation Propagation](fragmentation_tracking) should be used. Preview both when topology makes either interpretation plausible.
 
 ## How it works
 
@@ -42,5 +42,5 @@ that small real objects are not removed by the size threshold.
 ## See also
 
 - [Tracking overview](index)
-- [Fragmentation Tracking](fragmentation_tracking)
+- [Fragmentation Propagation](fragmentation_tracking)
 - [btrack](btrack)
