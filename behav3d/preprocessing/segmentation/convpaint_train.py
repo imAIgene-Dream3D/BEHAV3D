@@ -1509,14 +1509,15 @@ class ConvPaintTrainingWidget(QWidget):
         # Device (global) — build always so _fe_device() is safe, but only
         # add to the layout when the widget is used standalone (not embedded
         # inside a plugin page that already exposes its own device selector).
+        # Seeded from the saved preference; the real enumeration (which
+        # imports torch, ~5 s) is deferred to ``_ensure_torch_devices`` so
+        # rebuilding this widget on every metadata load stays cheap.
+        from behav3d.core.qt_help import _seed_device_combo
+
+        self._torch_devices_loaded = False
+        self._saved_device_pref = str(self.ip.get("convpaint_device", "") or "").strip()
         self.device_combo = QComboBox()
-        for label, dev_str in _detect_torch_devices():
-            self.device_combo.addItem(label, dev_str)
-        idx = self.device_combo.findData(
-            self.ip.get("convpaint_device", _default_device())
-        )
-        if idx >= 0:
-            self.device_combo.setCurrentIndex(idx)
+        _seed_device_combo(self.device_combo, self._saved_device_pref)
         _compact_combo(self.device_combo, min_chars=10)
         if self._show_device:
             r = QHBoxLayout()
@@ -1887,7 +1888,31 @@ class ConvPaintTrainingWidget(QWidget):
                 )
         return model, self._fe_device()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._ensure_torch_devices()
+
+    def _ensure_torch_devices(self):
+        """Fill the device combo from a real torch probe, once.
+
+        Called from :meth:`_fe_device` (which is about to import torch anyway
+        to pin the device) and on first show -- never from
+        :meth:`_get_global_config`, which runs on the metadata-load path.
+        """
+        if self._torch_devices_loaded:
+            return
+        self._torch_devices_loaded = True
+        from behav3d.core.qt_help import _populate_device_combo
+
+        try:
+            _populate_device_combo(
+                self.device_combo, self._saved_device_pref or _default_device()
+            )
+        except Exception as exc:  # pragma: no cover - torch/driver specific
+            print(f"Could not enumerate torch devices: {exc}")
+
     def _fe_device(self):
+        self._ensure_torch_devices()
         device = self.device_combo.currentData()
         if device and device not in ("auto", "cpu"):
             _set_torch_device(device)

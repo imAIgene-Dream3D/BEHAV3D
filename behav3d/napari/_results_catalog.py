@@ -385,12 +385,22 @@ def scan_outputs(output_dir: Path) -> list[ResultFile]:
         return []
 
     results: list[ResultFile] = []
+    zarr_dirs: list[Path] = []
     for root, dirs, files in os.walk(analysis_root):
-        # Prune skip dirs and don't descend into .zarr stores (huge, opaque).
-        dirs[:] = [
-            d for d in dirs
-            if d not in _SKIP_DIR_NAMES and not d.lower().endswith(".zarr")
-        ]
+        # Prune skip dirs and don't descend into .zarr stores (huge, opaque),
+        # collecting the stores as we go. The walk already visits every .zarr
+        # by name here, so a second ``rglob("*.zarr")`` pass would re-traverse
+        # the whole tree -- and, unlike this loop, would descend *into* every
+        # store and stat each of its chunk files.
+        keep = []
+        for d in dirs:
+            if d in _SKIP_DIR_NAMES:
+                continue
+            if d.lower().endswith(".zarr"):
+                zarr_dirs.append(Path(root, d))
+            else:
+                keep.append(d)
+        dirs[:] = keep
         for fname in files:
             ext = os.path.splitext(fname)[1].lower()
             if ext not in _ALLOWED_EXTS:
@@ -409,10 +419,9 @@ def scan_outputs(output_dir: Path) -> list[ResultFile]:
                 )
             )
 
-    # Also surface .zarr stores at directory level (for "Reveal in folder").
-    for child in analysis_root.rglob("*.zarr"):
-        if not child.is_dir():
-            continue
+    # Also surface .zarr stores at directory level (for "Reveal in folder"),
+    # from the directories the walk above already pruned.
+    for child in zarr_dirs:
         category, subcategory, cell_type = _classify(child, analysis_root)
         results.append(
             ResultFile(

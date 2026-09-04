@@ -295,3 +295,60 @@ __all__ = [
     "disable_spinbox_wheel_scroll",
     "reset_scroll_on_page_change",
 ]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Lazy torch/CUDA device combo
+#
+# ``_detect_torch_devices()`` imports torch, which costs ~6 s. Both the
+# Cellpose-SAM and ConvPaint pages are built at plugin startup whether or not
+# the user ever opens them, so probing there put that 6 s squarely in the
+# napari launch path. Instead the combo is seeded with the *saved* preference
+# (no import), and the real device list is filled in on first show -- or on the
+# first read of the selection, so queue runs that never display the page still
+# resolve a real device.
+# ═══════════════════════════════════════════════════════════════════════════
+def _placeholder_device_label(value: str) -> str:
+    """Human label for a stored device value, without importing torch."""
+    v = (value or "").strip()
+    if v in ("", "auto"):
+        return "Auto (best available)"
+    if v == "cpu":
+        return "CPU"
+    if v.startswith("cuda:"):
+        return f"GPU {v.split(':', 1)[1]}"
+    return v
+
+
+def _seed_device_combo(combo, saved_value: str) -> None:
+    """Give *combo* a single item reflecting ``saved_value``.
+
+    Keeping the stored value selected means any save that happens before the
+    real probe writes back exactly what it read, rather than clobbering the
+    user's device choice with a default.
+    """
+    value = (saved_value or "").strip()
+    combo.addItem(_placeholder_device_label(value), value or "auto")
+
+
+def _populate_device_combo(combo, want: str) -> None:
+    """Replace *combo*'s contents with the probed device list, selecting *want*.
+
+    Signals are blocked while repopulating: ``clear()`` and ``addItem()`` each
+    emit ``currentTextChanged``/``currentIndexChanged``, which these pages wire
+    to their YAML autosave.
+    """
+    from behav3d.preprocessing.segmentation.convpaint_train import _detect_torch_devices
+
+    devices = _detect_torch_devices()
+    combo.blockSignals(True)
+    try:
+        combo.clear()
+        for label, value in devices:
+            combo.addItem(label, value)
+        idx = combo.findData(want)
+        if idx < 0:
+            idx = combo.findData("auto")
+        combo.setCurrentIndex(max(idx, 0))
+    finally:
+        combo.blockSignals(False)
