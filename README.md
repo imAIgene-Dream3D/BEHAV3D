@@ -17,6 +17,18 @@ There's no one-size-fits-all solution, so BEHAV3D-Explorer is built as a set of 
 
 ![BEHAV3D panel in napari](docs/source/_static/gif/Github_readme_GUI_intro_v2.gif)
 
+## Try it online, no installation
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/imAIgene-Dream3D/BEHAV3D/blob/main/demo/colab/BEHAV3D_Explorer_Colab.ipynb)
+
+Want to look before you install? The badge above opens the **real** BEHAV3D Explorer GUI on a free
+Google Colab machine and streams the napari window to your browser: `Runtime > Run all`, wait ~4
+minutes, and the demo dataset opens with segmentation and tracking already computed. Nothing is
+installed on your computer, and you get your own private session.
+
+Colab disconnects after ~90 minutes idle and saves nothing, so it is a test drive, not a workspace.
+For real analysis, install it below. Maintainer notes for the demo live in [`demo/README.md`](demo/README.md).
+
 ## Installation (3 steps, no code)
 
 1. Download this repository: green **Code > Download ZIP** button, then unzip it.

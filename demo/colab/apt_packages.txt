@@ -1,0 +1,45 @@
+# System packages needed to run the napari (Qt5) GUI headlessly and stream it
+# to a browser. One package per line; '#' comments and blank lines are ignored.
+# Used by demo/colab/colab_setup.py (Colab) and demo/build_env.sh (Docker test).
+
+# --- virtual display + VNC + web client -------------------------------------
+xvfb                    # X server that renders into RAM instead of a monitor
+x11vnc                  # exports the Xvfb framebuffer as a VNC server
+websockify              # bridges VNC <-> WebSocket (what noVNC speaks)
+novnc                   # HTML5 VNC client served at /usr/share/novnc
+fluxbox                 # minimal window manager: gives napari title bar + resize
+x11-utils               # xdpyinfo/xwininfo, used for readiness checks
+xdotool                 # lets us wait for the napari window and maximise it
+
+# --- OpenGL (software rasteriser; there is no GPU on the X display) ---------
+libgl1
+libglx-mesa0
+libgl1-mesa-dri         # llvmpipe: vispy/napari render through this
+libegl1
+
+# --- Qt5 xcb platform plugin dependencies -----------------------------------
+# Missing any one of these gives the classic
+# "Could not load the Qt platform plugin 'xcb'" crash.
+libglib2.0-0
+libdbus-1-3
+libxkbcommon-x11-0
+libxcb-icccm4
+libxcb-image0
+libxcb-keysyms1
+libxcb-randr0
+libxcb-render-util0
+libxcb-shape0
+libxcb-shm0
+libxcb-sync1
+libxcb-xfixes0
+libxcb-xinerama0
+libxcb-xkb1
+libxcb-cursor0
+libsm6
+libice6
+libxi6
+libxrender1
+libfontconfig1
+
+# --- misc --------------------------------------------------------------------
+libgomp1                # OpenMP runtime used by torch / scikit-image

@@ -1,0 +1,67 @@
+name: Build Colab demo environment
+
+# Rebuilds the prebuilt conda environment that the Colab demo downloads
+# (demo/build_env.sh) and uploads it to the Hugging Face dataset repo.
+#
+# Run it by hand from the Actions tab whenever installation/environment.yml
+# changes. Requires two repository secrets/variables:
+#   HF_TOKEN  (secret)   - Hugging Face token with write access
+#   HF_REPO   (variable) - e.g. imAIgene-Dream3D/behav3d-demo-env
+
+on:
+  workflow_dispatch:
+    inputs:
+      flavour:
+        description: "PyTorch build to bundle"
+        type: choice
+        options: [cpu, cuda]
+        default: cpu
+      upload:
+        description: "Upload to Hugging Face after building"
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # The packed environment is several GB; the default runner image leaves
+      # too little room once Docker layers are added.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo docker image prune -af
+          df -h /
+
+      - name: Build the environment tarball
+        run: |
+          chmod +x demo/build_env.sh
+          ./demo/build_env.sh --${{ inputs.flavour }}
+          ls -lh dist/
+
+      - name: Upload to Hugging Face
+        if: ${{ inputs.upload }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ vars.HF_REPO }}
+        run: |
+          if [ -z "$HF_TOKEN" ] || [ -z "$HF_REPO" ]; then
+            echo "HF_TOKEN secret or HF_REPO variable is not set - skipping upload"
+            exit 1
+          fi
+          pip install --quiet "huggingface_hub[cli]"
+          hf upload "$HF_REPO" dist/behav3d-env.tar.gz \
+            "behav3d-env${{ inputs.flavour == 'cuda' && '-cuda' || '' }}.tar.gz" \
+            --repo-type dataset
+
+      # Handy when you only want the artefact without publishing it.
+      - name: Keep the tarball as a workflow artifact
+        if: ${{ !inputs.upload }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: behav3d-env-${{ inputs.flavour }}
+          path: dist/behav3d-env.tar.gz
+          retention-days: 7

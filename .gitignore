@@ -17,3 +17,6 @@ docs/build/
 napari/.config/behav3d_env.json
 napari/analysis_ui_config.json
 assistant_log.md
+
+# Colab demo build output (multi-GB conda-pack tarballs)
+dist/
